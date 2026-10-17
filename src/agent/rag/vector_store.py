@@ -152,6 +152,11 @@ class FastEmbedEmbeddingFunction:
                         # 嵌入吞吐的主要杠杆是长度分桶（见 _embed_chunks），
                         # 线程数影响很小（#122）。
                         threads=4,
+                        # **显式强制 CPU-only**（见 _cpu_only_kwargs 注释）：
+                        # 不传时 FastEmbed 的 ``cuda=Device.AUTO`` 只在该
+                        # 环境没有 CUDAExecutionProvider 时才回退 CPU，装了
+                        # onnxruntime-gpu 的机器上会静默切到 CUDA。
+                        **_cpu_only_kwargs(TextEmbedding),
                     )
                 self._model = model
             except Exception as e:
@@ -533,6 +538,29 @@ def get_or_create_embedding_function(
 # 实例属性，先加载那份纯泄漏）。加载完成前的 GIL 释放点（_time.sleep）正好
 # 放大这个窗口。进程级锁 + 双重检查。
 _MODEL_LOAD_LOCK = threading.Lock()
+
+
+def _cpu_only_kwargs(cls) -> Dict[str, Any]:
+    """返回强制 CPU-only 所需的构造参数（当前 fastembed 不支持时返回 {}）。
+
+    显式传 ``providers=["CPUExecutionProvider"]`` 让 ONNX Runtime 的 EP 选择
+    不依赖 FastEmbed 的默认回退——否则一旦环境里装了 onnxruntime-gpu，
+    ``cuda=Device.AUTO`` 会静默切到 CUDA，与 OCR/解析全程 CPU 的设计不符，
+    同一向量库在不同机器上的数值行为也会漂移。
+
+    ``providers`` 参数在较老的 fastembed 上不存在（poetry.lock 仍锁 0.8.0，
+    而 pyproject 已要求 >=0.9.0）。用签名探测而不是 try/except TypeError：
+    加载失败的原因很多，把「参数不支持」和「模型下载失败」混在同一个异常
+    分支里会让错误信息误导用户。探测不到就退化为不传（旧版本行为不变）。
+    """
+    try:
+        import inspect
+        params = inspect.signature(cls.__init__).parameters
+    except (TypeError, ValueError):  # pragma: no cover - 内置/C 实现类
+        return {}
+    if "providers" not in params:
+        return {}
+    return {"providers": ["CPUExecutionProvider"]}
 
 
 # ---------------------------------------------------------------------------
@@ -1497,6 +1525,9 @@ class VectorStore:
                         reranker = TextCrossEncoder(
                             model_name=self._rerank_model,
                             cache_dir=cache_dir,
+                            # 与嵌入模型同款：显式强制 CPU-only，不依赖 FastEmbed
+                            # 的默认回退（见 _cpu_only_kwargs 注释）。
+                            **_cpu_only_kwargs(TextCrossEncoder),
                         )
                     # 写回实例必须持 _reranker_lock 并在锁内复查 _closed：
                     # 旧实现裸写 _reranker/_reranker_state，与 close() 的裸清
