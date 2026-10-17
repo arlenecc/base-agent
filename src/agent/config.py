@@ -57,7 +57,14 @@ class AgentConfig:
     rag_chunk_size: int = 500       # tokens per chunk
     rag_chunk_overlap: int = 50     # 10% of chunk_size
     rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
-    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3"  # FastEmbed reranker (bge-reranker-v2-m3)
+    # 重排序模型：**INT8 量化版**（~570MB）。fp32 全量是 2.27GB，4 倍体积
+    # 4 倍内存，而 cross-encoder 只输出排序分数，INT8 的排序质量损失可忽略
+    # （ONNX int8 加速在 CPU EP 上还更快）。与 deps.RERANK_MODEL_ID /
+    # vector_store.DEFAULT_RERANK_MODEL 必须是同一个值——三处曾不一致：
+    # deps 预下载并探测 int8，运行时却按 fp32 名加载，导致首次检索额外触发
+    # 一次 2.27GB 下载（预下载的 int8 白下）。_migrate() 会把旧配置里的
+    # fp32 名迁到 int8。
+    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"
     rag_rerank_enabled: bool = True
     rag_auto_ingest: bool = True
     # OCR（图片型 PDF）：检测到 Apple M 系列且 onnxruntime >= 1.31.0 时，
@@ -195,6 +202,12 @@ class AgentConfig:
         # Same 768-dim embeddings, 4x smaller download, same quality.
         elif self.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5":
             self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5-Q"
+        # fp32 全量 reranker（2.27GB）→ 官方 INT8 量化版（~570MB）。
+        # cross-encoder 只产出排序分数，INT8 的排序质量损失可忽略，体积与
+        # 常驻内存降到 1/4。旧配置里持久化的 fp32 名必须迁走，否则用户会
+        # 继续每次加载 2.27GB。
+        elif self.rag_rerank_model == "BAAI/bge-reranker-v2-m3":
+            self.rag_rerank_model = "BAAI/bge-reranker-v2-m3-int8"
         # Old LLMClient builds defaulted to max_tokens=4096. Only rewrite the
         # value when it is still that legacy default — an explicitly chosen
         # small budget (e.g. 4096 for a local 4K model) must survive; silently

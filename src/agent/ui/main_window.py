@@ -30,6 +30,7 @@ from ..skills import Skill
 from ..kernel.session import render_plan_dict
 from ..tools import ToolRegistry
 from ..rag.engine import RAGEngine
+from ..rag.vector_store import DEFAULT_RERANK_MODEL
 
 
 CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
@@ -491,7 +492,8 @@ class SyncKnowledgeWorker(QThread):
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,
                 embedding_model=self._embedding_model,
-                rerank_model=getattr(self._config, "rag_rerank_model", "BAAI/bge-reranker-v2-m3"),
+                rerank_model=getattr(self._config, "rag_rerank_model",
+                                     DEFAULT_RERANK_MODEL),
                 rerank_enabled=bool(getattr(self._config, "rag_rerank_enabled", True)),
             )
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")

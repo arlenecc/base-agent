@@ -49,7 +49,7 @@
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过 FastEmbed + LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
-- **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、FastEmbed Reranker（bge-reranker-v2-m3 重排序）、opencv-python-headless（OCR 预处理）等可选增强也会一并检测与自动安装
+- **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、FastEmbed Reranker（bge-reranker-v2-m3-int8 重排序，INT8 量化 ~570MB）、opencv-python-headless（OCR 预处理）等可选增强也会一并检测与自动安装
 - **OCR 加速与预处理** — 图片型 PDF 优先使用 rapidocr 3.x（模型目录与 docling 共享、懒加载省内存），在 **Apple M 系列 Mac** 上启用 onnxruntime **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+**ANE** 神经网络引擎，需 onnxruntime≥1.31）；CoreML 初始化失败自动回退 CPU EP，Intel/非 Apple 平台直接用 CPU EP（避免必然失败的 CoreML 初始化）。未装 3.x 时回退 rapidocr-onnxruntime 1.x（同样注入 CoreML EP）。引擎构造兼容 1.1/1.2 两代 kwargs 体系（1.2.x 缺 `det_model_path` 会抛 `KeyError`，已做降级链兜底）。识别前对每页做**尺寸归一化（自适应 DPI + 短边放大）+ 灰度 + 暗色主题自动反色 + CLAHE 对比度增强 + 锐化**预处理，提升小字、低对比度与暗色主题扫描件的识别率；纯色/空白页直接跳过。引擎每 50 页周期重建（冲刷 CoreML/ORT 按形状保留的原生缓存，真实扫描页 ~35MB/页）。以上行为均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、FastEmbed Reranker 精排过程和最终结果排名
 - **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→8 次、引用最近错误**和已试过且失败的方案**、明确禁止「停下来问用户是否继续」）；**首次失败**即要求换方法（禁止原样重发、禁止把错误念给用户）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 3 次就把步骤标 `blocked` 会被守卫拦回。失败上下文跨自动续跑段传递，续跑段仍知道上一段卡在哪
@@ -125,7 +125,7 @@ RAG 依赖（`fastembed` / `docling` / `chonkie` 等）按需安装即可；rera
 - **运行**：使用 3.12 解释器启动 `python main.py`（或用 3.12 创建 venv）。
 - **打包**：`build.sh` 已自动优先使用 `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`。
 
-> **Reranker 的 numpy 兼容性**：reranker 现由 fastembed 的 ONNX Runtime（TextCrossEncoder）提供，与 embedding 同源，**不依赖 torch / FlagEmbedding，在 numpy 2.x 下默认可用**，无需降级 numpy。首次检索时自动加载 `BAAI/bge-reranker-v2-m3`（约 2.3GB ONNX，可经依赖预下载提前缓存）。
+> **Reranker 的 numpy 兼容性**：reranker 现由 fastembed 的 ONNX Runtime（TextCrossEncoder）提供，与 embedding 同源，**不依赖 torch / FlagEmbedding，在 numpy 2.x 下默认可用**，无需降级 numpy。首次检索时自动加载 `BAAI/bge-reranker-v2-m3-int8`（INT8 量化，约 570MB，可经依赖预下载提前缓存）。
 >
 > **手工预下载注意**：fastembed 的模型名与它实际拉取的 HuggingFace 仓库不是一回事——`BAAI/bge-reranker-v2-m3` 实际拉的是 `onnx-community/bge-reranker-v2-m3-ONNX`，缓存目录名由**仓库名**推导（`~/.cache/fastembed/models--onnx-community--bge-reranker-v2-m3-ONNX`）。下到默认的 `~/.cache/huggingface` fastembed 看不到，报错依旧。依赖检查阶段的缓存探测是纯文件系统的，不会触发下载。
 
@@ -159,12 +159,12 @@ RAG 相关配置（写在同一个 `config.json` 里，界面未暴露的项可�
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `rag_embedding_model` | 嵌入模型（FastEmbed 模型名） | `nomic-ai/nomic-embed-text-v1.5-Q` |
-| `rag_rerank_model` | 重排序模型（FastEmbed cross-encoder） | `BAAI/bge-reranker-v2-m3` |
+| `rag_rerank_model` | 重排序模型（FastEmbed cross-encoder） | `BAAI/bge-reranker-v2-m3-int8` |
 | `rag_rerank_enabled` | 是否启用重排序；关闭后不加载 reranker 权重 | `true` |
 
 > 注意 fastembed 的**模型名**与它实际拉取的 HuggingFace 仓库不是一回事：
 > `nomic-ai/nomic-embed-text-v1.5-Q` → 仓库 `nomic-ai/nomic-embed-text-v1.5`；
-> `BAAI/bge-reranker-v2-m3` → 仓库 `onnx-community/bge-reranker-v2-m3-ONNX`。
+> `BAAI/bge-reranker-v2-m3-int8` → 仓库 `onnx-community/bge-reranker-v2-m3-ONNX`。
 > 缓存目录名由**仓库名**推导（`~/.cache/fastembed/models--{org}--{repo}`），
 > 所以手工预下载时必须落到 `~/.cache/fastembed`，下到默认的
 > `~/.cache/huggingface` fastembed 看不到。
@@ -290,8 +290,9 @@ RAG 相关配置（写在同一个 `config.json` 里，界面未暴露的项可�
 - **嵌入模型**：`nomic-ai/nomic-embed-text-v1.5-Q`（Q4 量化版，~137MB），通过 FastEmbed (ONNX Runtime) 本地推理，**显式强制 CPU-only**（`providers=["CPUExecutionProvider"]`），无需 GPU、无需 HuggingFace 网络、无需 PyTorch。768 维向量，量化后 4x 更小（fp32 约 548MB），质量无损。首次下载后离线可用。CPU-only 是显式传递而非依赖默认回退——不传时 FastEmbed 的 `cuda=Device.AUTO` 会在环境存在 CUDAExecutionProvider（装了 onnxruntime-gpu）时静默切到 CUDA，与 OCR/解析全程 CPU 的设计不符，也让同一向量库在不同机器上的数值行为漂移。
 - **向量数据库**：LanceDB（本地 Lance 列式格式），轻量、零配置、支持高效向量检索。向量归一化为单位长度后用 L2 距离模拟余弦相似度。每切片同时存入 embedding 向量、完整原文、来源文件名、切片编号，并开启 BM25 全文索引（原生 FTS + jieba 预分词）。
 - **混合检索**：向量相似度 + BM25 关键词并行检索（各取 top_k×4 候选），按 (source, chunk_index) 合并去重，兼顾语义召回与精确关键词命中（中文经 jieba 分词）。
-- **重排序**：FastEmbed Reranker (`BAAI/bge-reranker-v2-m3`)，对混合候选精排，提升召回精度。无重排序依赖时自动回退到距离排序。
-  - 可在配置里关掉重排序（`rag_rerank_enabled=false`）或换成别的模型（`rag_rerank_model`）；关闭后检索直接走混合排序，**不会**加载 ~2.3GB 的 reranker 权重。
+- **重排序**：FastEmbed Reranker (`BAAI/bge-reranker-v2-m3-int8`，INT8 量化版 ~570MB，fp32 全量 2.27GB)，对混合候选精排，提升召回精度。无重排序依赖时自动回退到距离排序。**CPU-only 显式强制**（`providers=["CPUExecutionProvider"]`），不依赖 FastEmbed 的默认回退。
+  - 可在配置里关掉重排序（`rag_rerank_enabled=false`）或换成别的模型（`rag_rerank_model`）；关闭后检索直接走混合排序，**不会**加载 reranker 权重。
+  - INT8 量化对 cross-encoder 的排序质量损失可忽略（只输出排序分数），体积与常驻内存降到 1/4，且 ONNX int8 在 CPU EP 上更快。
   - reranker 的原始输出是 logits，代码在首次打分时探测一次输出范围并**按模型固定**决定是否做 sigmoid 归一化（不再按「本批候选」自适应），保证 `min_similarity=0.7` 这个绝对阈值在不同查询间语义一致。
 - **相似度过滤**：rerank 后过滤语义相似度 < 0.7 的结果（不相关的切片不发回模型），最终返回 ≤ 3 条最相关切片（含完整原文与来源信息）。
 
@@ -327,7 +328,7 @@ RAG 相关配置（写在同一个 `config.json` 里，界面未暴露的项可�
 - **不存全文 Markdown**：documents 表只存「缩略版本 + 章节列表 + Markdown 缓存路径」，**不存全文**（全文已有 `rag/documents/*.md` 缓存，表内再存是第三份冗余，且会被缓存全量载入内存；该字段实际零消费者）。缓存按列读取并显式剔除 `markdown`，兼容旧数据。
 - **删除即清理**：源文件从知识库移除后，同步时一并清理向量、documents 元数据行与 manifest 条目。
 - **BM25 索引一致性**：写入（含单批写完的提前出口）与删除都会失效 FTS 标记并按需重建，`reload()` 也会重置——避免「混合检索静默退化成纯向量」或「已删文档仍被召回」。
-- **Reranker 加载去重**：FastEmbed reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程（每线程 ~500MB PyTorch 权重）；超时后后台线程完成时仍写入结果，后续调用直接复用。close 之后的实例直接拒绝加载；后台加载完成时若实例已 close，状态置 `failed` 而非卡在 `loading`（后者会让重排静默失效）。
+- **Reranker 加载去重**：FastEmbed reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程；超时后后台线程完成时仍写入结果，后续调用直接复用。close 之后的实例直接拒绝加载；后台加载完成时若实例已 close，状态置 `failed` 而非卡在 `loading`（后者会让重排静默失效）。加载的是 INT8 量化版（`BAAI/bge-reranker-v2-m3-int8`，~570MB，fp32 全量 2.27GB）且**显式 CPU-only**。
 
 ### 支持的文档格式
 
@@ -636,7 +637,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启清理残留等。
 
-当前共 626 个用例全部通过（`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`；未安装这些可选依赖时报环境错误，不影响其余测试）。
+当前共 634 个用例全部通过（`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`；未安装这些可选依赖时报环境错误，不影响其余测试）。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 

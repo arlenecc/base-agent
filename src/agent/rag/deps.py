@@ -20,7 +20,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -838,12 +838,25 @@ def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:
 
     try:
         cache_dir = _get_fastembed_cache_dir()
+        # providers 显式强制 CPU-only（lazy_load=True 本就不建 onnx 会话，
+        # 这里是防御性的：万一将来懒加载语义变化，EP 选择也不会漂到 CUDA）。
+        # 与 vector_store._cpu_only_kwargs 同一套签名探测逻辑——本地重复一份，
+        # 避免 deps 反向依赖 vector_store（会把 lancedb/fastembed 的导入拉进
+        # 依赖检查路径）。
+        _cpu_only: Dict[str, Any] = {}
+        try:
+            import inspect as _inspect
+            if "providers" in _inspect.signature(TextCrossEncoder.__init__).parameters:
+                _cpu_only = {"providers": ["CPUExecutionProvider"]}
+        except (TypeError, ValueError):  # pragma: no cover
+            pass
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             TextCrossEncoder(
                 RERANK_MODEL_ID,
                 lazy_load=True,
                 cache_dir=cache_dir,
+                **_cpu_only,
             )
         logger.info("RAG deps: reranker model downloaded and cached by FastEmbed")
         if progress_callback:

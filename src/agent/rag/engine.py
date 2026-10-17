@@ -15,7 +15,7 @@ from .parsers import extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, normalize_markdown
 from .chunker import chunk_documents
 from .document_outline import build_digest
-from .vector_store import VectorStore
+from .vector_store import DEFAULT_RERANK_MODEL, VectorStore
 from ..atomic_io import atomic_write_json
 
 logger = logging.getLogger(__name__)
@@ -406,7 +406,7 @@ class RAGEngine:
         chunk_overlap: int = 80,
         min_chunk_size: int = 100,
         overlap_percent: float = 0.10,
-        rerank_model: str = "BAAI/bge-reranker-v2-m3",
+        rerank_model: str = DEFAULT_RERANK_MODEL,
         rerank_enabled: bool = True,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
     ):
