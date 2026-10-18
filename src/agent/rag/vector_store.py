@@ -172,10 +172,13 @@ class FastEmbedEmbeddingFunction:
                     f"   → 禁用 Xet: export HF_HUB_DISABLE_XET=1\n"
                     f"3. 模型缓存目录权限不足\n"
                     f"   → 检查 ~/.cache/huggingface/ 目录权限\n"
-                    f"4. 也可手动下载模型到本地缓存：\n"
-                    f"   HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 \\\n"
-                    f"     python3 -c \"from huggingface_hub import snapshot_download; \\\n"
-                    f"     snapshot_download('nomic-ai/nomic-embed-text-v1.5')\"\n\n"
+                    f"4. 也可手动触发 fastembed 自身下载（**只拉量化权重 ~130MB，不拉整仓**）：\n"
+                    f"   HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 python3 -c '\n"
+                    f"from fastembed import TextEmbedding; from os.path import expanduser\n"
+                    f"TextEmbedding(\"nomic-ai/nomic-embed-text-v1.5-Q\", cache_dir=expanduser(\"~/.cache/fastembed\"))'\n\n"
+                    f"   （fastembed 对该模型只拉 onnx/model_quantized.onnx + tokenizer/config；\n"
+                    f"     勿用 snapshot_download('nomic-ai/nomic-embed-text-v1.5') 之类不带\n"
+                    f"     allow_patterns 的整仓下载——那会连 fp32/其它变体一起拉进来。）\n\n"
                     f"原始错误: {type(e).__name__}: {e}"
                 )
                 logger.error(msg)

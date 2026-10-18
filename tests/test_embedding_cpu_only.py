@@ -430,3 +430,61 @@ class TestModelCacheProbe:
         # vocab.txt 是 BERT 式遗留项：fastembed 的 additional_files 为空，
         # 不会下载它，列进清单 = 探测永远 False
         assert "vocab.txt" not in deps._EMBEDDING_REQUIRED_FILES
+
+
+class TestOnlyQuantizedDownloaded:
+    """首次下载只拉量化权重，不拉整仓。
+
+    fastembed 的下载走 ``snapshot_download(allow_patterns=...)``，其中
+    ``allow_patterns`` = 基础 config/tokenizer + ``model.model_file`` +
+    ``model.additional_files``。对量化版，``model_file`` 就是那**一个** onnx
+    权重文件且 ``additional_files`` 为空——因此首次下载只拉该量化变体，
+    不会把仓库里的 fp32 / 其它变体一并拉下来。
+    """
+
+    def test_registry_maps_defaults_to_single_quantized_file(self):
+        from fastembed import TextEmbedding
+        from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
+
+        from agent.rag import deps
+
+        emb = {m["model"]: m for m in TextEmbedding.list_supported_models()}
+        rr = {m["model"]: m for m in TextCrossEncoder.list_supported_models()}
+
+        e = emb[vs.DEFAULT_EMBEDDING_MODEL]
+        assert e["model_file"] == "onnx/model_quantized.onnx"
+        assert not e.get("additional_files")  # 无外挂数据 → 只拉这一个文件
+
+        r = rr[vs.DEFAULT_RERANK_MODEL]
+        assert r["model_file"] == "onnx/model_int8.onnx"
+        assert not r.get("additional_files")
+
+        # 默认名必须与 deps 的预下载常量一致（曾出现预下载 int8、运行却拉 fp32）
+        assert vs.DEFAULT_EMBEDDING_MODEL == deps.FASTEMBED_MODEL_NAME
+        assert vs.DEFAULT_RERANK_MODEL == deps.RERANK_MODEL_ID
+
+    def test_fp32_variant_would_pull_more(self):
+        """反证：fp32 名才会拉外挂数据/整仓级体积（量化版不会）。"""
+        from fastembed import TextEmbedding
+        from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
+
+        emb = {m["model"]: m for m in TextEmbedding.list_supported_models()}
+        rr = {m["model"]: m for m in TextCrossEncoder.list_supported_models()}
+        # fp32 嵌入（应避免使用）
+        assert emb["nomic-ai/nomic-embed-text-v1.5"]["model_file"] == "onnx/model.onnx"
+        # fp32 reranker 有外挂 model.onnx_data（2.27GB）；int8 没有
+        assert rr["BAAI/bge-reranker-v2-m3"].get("additional_files") == ["onnx/model.onnx_data"]
+
+    def test_error_hint_does_not_pull_whole_repo(self, monkeypatch):
+        """加载失败的兜底提示不能引导用户整仓 snapshot_download（无 allow_patterns）。"""
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        ef = FastEmbedEmbeddingFunction(model_name="nomic-ai/nonexistent-model-xyz")
+        with pytest.raises(RuntimeError) as ei:
+            ef._ensure_model()
+        msg = str(ei.value)
+        # 旧的整仓命令签名（从 huggingface_hub import snapshot_download 再裸调）
+        # 不能再作为「解决方案」出现——它不带 allow_patterns 会拉全仓库。
+        assert "from huggingface_hub import snapshot_download" not in msg
+        # 推荐的应是对 fastembed 自身下载的引导（内部经 allow_patterns 只拉量化）
+        assert "from fastembed import TextEmbedding" in msg
+        assert "allow_patterns" in msg  # 提示里说明只拉量化、别整仓的边界
