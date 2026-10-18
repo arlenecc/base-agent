@@ -40,13 +40,21 @@ pip install lancedb fastembed
 pip install python-docx      # Word 文档
 pip install openpyxl          # Excel 表格
 pip install python-pptx       # PowerPoint 演示文稿
-pip install PyMuPDF           # PDF 文档
+pip install PyMuPDF           # PDF 兜底解析（docling 缺失时使用）
 pip install ebooklib          # EPUB 电子书
 
-# OCR 依赖（可选，图片型 PDF 识别，~500MB）
+# OCR 依赖：
+#  - macOS 推荐 ocrmac（Apple Vision 原生 OCR，离线、零额外模型、比 RapidOCR 快）；
+#    `pip install -e ".[rag]"` 在 macOS 上会自动装 ocrmac。
+#  - 非 macOS / 未装 ocrmac 时，docling 自动回退 RapidOCR（~500MB ONNX 模型）。
 pip install -e ".[ocr]"
-# 或: pip install rapidocr-onnxruntime
+# 或仅装 RapidOCR 兜底: pip install rapidocr>=3.10
 ```
+
+> **PDF 处理已由 docling 全权接管**（文本层 / 扫描件 / 图片重混排统一走 docling）。
+> docling 的 OCR 后端默认 `ocrmac`（Apple Vision），扫描件/图片页由 docling 内部完成
+> OCR；不再走旧的自建 `PyMuPDF + RapidOCR` 路径。ocrmac 不可用时回退 RapidOCR。
+> 仅当 docling 整个不可用（如 `docling-parse` 未安装）时才退回 `PyMuPDF` 兜底路径。
 
 ### 2.3 一键安装全部依赖
 
@@ -161,7 +169,7 @@ export TRANSFORMERS_OFFLINE=1
 | Word | `.docx`, `.doc` | `python-docx` |
 | Excel | `.xlsx`, `.xls` | `openpyxl` |
 | PowerPoint | `.pptx`, `.ppt` | `python-pptx` |
-| PDF | `.pdf` | `PyMuPDF`（图片型 PDF 需 `rapidocr-onnxruntime`） |
+| PDF | `.pdf` | `docling`（全权接管；OCR 默认 `ocrmac`[Apple Vision，macOS 原生]，不可用时回退 `rapidocr`；`PyMuPDF` 仅作 docling 缺失时的兜底） |
 | EPUB | `.epub` | `ebooklib` + `beautifulsoup4` |
 | MOBI/AZW | `.mobi`, `.azw3`, `.azw` | calibre `ebook-convert`（可选） |
 | 纯文本 | `.txt`, `.md`, `.rst`, `.csv`, `.tsv` | 无额外依赖 |
@@ -325,13 +333,26 @@ pip install 'fastembed>=0.9.0'
 
 如果不需要重排序，可在配置中设置 `"rag_rerank_enabled": false`，系统会自动回退到向量距离排序。
 
-### 问题：PDF 文档提取为空
+### 问题：PDF 文档提取为空 / docling 转换失败
 
-**原因**：PDF 为纯图片格式，且未安装 OCR 依赖。
+**原因**：docling 未真正可用。docling 接管所有 PDF，但它依赖 `docling-parse`
+（Rust 解析后端）；若未安装，docling 会静默回退到 `PyMuPDF` 兜底路径，纯图片
+PDF 可能因缺 OCR 而为空。
 
 **解决**：
 ```bash
-pip install rapidocr-onnxruntime
+# 确认 docling 全家桶就位（含 docling-parse，macOS 上多为预编译 wheel，
+# 个别环境需从 Rust 源码编译，耗时数分钟）
+pip install -e ".[rag]"
+# macOS 上的原生 OCR 后端（Apple Vision，无需额外模型）
+pip install ocrmac        # 非 macOS 可跳过，docling 会回退 RapidOCR
+```
+
+**验证 docling 是否真的接管了 PDF**（而非静默回退 PyMuPDF）：
+```bash
+python3 -c "from agent.rag.docling_parser import _get_converter; print(_get_converter())"
+# 输出 <docling.document_converter.DocumentConverter ...> 即生效；None 表示
+# docling 未初始化（缺 docling-parse 等依赖），PDF 仍在走 PyMuPDF 兜底。
 ```
 
 ### 问题：LanceDB 文件锁冲突

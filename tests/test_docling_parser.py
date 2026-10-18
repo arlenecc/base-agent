@@ -1,7 +1,29 @@
-"""Tests for the docling unified parser (graceful fallback behaviour)."""
+"""Tests for the docling unified parser (graceful fallback behaviour).
+
+PDF 现在由 docling 全权接管（文本 / 扫描件 / 图片重统一走 docling，其 OCR
+后端默认 ocrmac）。旧实现里「扫描件 / 图片重 PDF 转交 PyMuPDF + RapidOCR」
+的分流已移除——见 rag/docling_parser.py。
+"""
 from __future__ import annotations
 
 import pytest
+
+
+def _fake_converter(markdown: str):
+    """构造一个返回固定 Markdown 的假 DocumentConverter。"""
+
+    class _FakeDoc:
+        def export_to_markdown(self):
+            return markdown
+
+    class _FakeResult:
+        document = _FakeDoc()
+
+    class _FakeConverter:
+        def convert(self, path):
+            return _FakeResult()
+
+    return _FakeConverter
 
 
 def test_extract_markdown_returns_none_when_docling_missing(monkeypatch):
@@ -33,53 +55,41 @@ def test_is_supported_extensions():
     assert not dp.is_supported(".csv")
 
 
-def test_extract_markdown_scan_pdf_delegated(monkeypatch, tmp_path):
-    """A pure-scan PDF is delegated to the RapidOCR path (returns None)."""
+def test_extract_markdown_scan_pdf_handled_by_docling(monkeypatch, tmp_path):
+    """扫描件 PDF 不再转交 PyMuPDF，而是交给 docling（含 ocrmac OCR）。"""
     from agent.rag import docling_parser as dp
 
     pdf = tmp_path / "scan.pdf"
     pdf.write_bytes(b"%PDF-1.4 dummy")
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_is_scan_pdf", lambda path: True)
-    assert dp.extract_markdown(str(pdf)) is None
+    monkeypatch.setattr(dp, "_get_converter", lambda: _fake_converter("# OCR'd scan content")())
+    # 不再有「扫描件 → 返回 None 转交 PyMuPDF」的分流
+    assert dp.extract_markdown(str(pdf)) == "# OCR'd scan content"
 
 
 def test_extract_markdown_converts_via_docling(monkeypatch, tmp_path):
-    """When docling is available and the file is text-based, return Markdown."""
+    """When docling is available, return Markdown (text or scanned alike)."""
     from agent.rag import docling_parser as dp
 
     pdf = tmp_path / "doc.pdf"
     pdf.write_bytes(b"%PDF-1.4 dummy")
 
-    class _FakeDoc:
-        def export_to_markdown(self):
-            return "# Title\n\nSome content."
-
-    class _FakeResult:
-        document = _FakeDoc()
-
-    class _FakeConverter:
-        def convert(self, path):
-            return _FakeResult()
-
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_is_scan_pdf", lambda path: False)
-    monkeypatch.setattr(dp, "_get_converter", lambda: _FakeConverter())
+    monkeypatch.setattr(dp, "_get_converter", lambda: _fake_converter("# Title\n\nSome content.")())
 
     md = dp.extract_markdown(str(pdf))
     assert md == "# Title\n\nSome content."
 
 
 def test_extract_markdown_converter_init_failure(monkeypatch, tmp_path):
-    """If converter init fails, return None (fallback)."""
+    """If converter init fails, return None (fallback to PyMuPDF path)."""
     from agent.rag import docling_parser as dp
 
     pdf = tmp_path / "doc.pdf"
     pdf.write_bytes(b"%PDF-1.4 dummy")
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_is_scan_pdf", lambda path: False)
     monkeypatch.setattr(dp, "_get_converter", lambda: None)
 
     assert dp.extract_markdown(str(pdf)) is None

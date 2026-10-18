@@ -8,11 +8,13 @@ all office/document formats.
 
 Design:
   * ``extract_markdown(filepath)`` — convert any supported document to Markdown
-    via docling.  Returns ``None`` when docling is unavailable (callers fall
-    back to the per-format parsers in :mod:`agent.rag.parsers`).
-  * Image-based PDF pages are OCR'd by RapidOCR (docling's OCR backend uses
-    RapidOCR under the hood; for pure-scan PDFs without a text layer we route
-    through the shared RapidOCR singleton in :mod:`agent.rag.parsers`).
+    via docling.  Returns ``None`` when docling is unavailable or conversion
+    fails (callers fall back to the per-format parsers in
+    :mod:`agent.rag.parsers`).
+  * **docling 全权接管所有 PDF**（文本层 / 扫描件 / 图片重混排），不再走
+    PyMuPDF + RapidOCR 的自定义路径。PDF 的 OCR 后端由 :func:`_choose_ocr_options`
+    选定：优先 ocrmac（Apple Vision 原生 OCR，离线、零额外模型、比 RapidOCR
+    快），不可用时（非 macOS / 未装）回退 docling 自带的 RapidOCR。
 """
 from __future__ import annotations
 
@@ -82,6 +84,53 @@ def is_supported(ext: str) -> bool:
     return ext.lower() in _DOCLING_EXTENSIONS
 
 
+# ---------------------------------------------------------------------------
+# PDF OCR 后端选择：ocrmac（Apple Vision）默认，RapidOCR 兜底
+# ---------------------------------------------------------------------------
+# ocrmac 是 macOS 原生 OCR（Vision 框架），离线、零额外模型，识别质量与速度
+# 都优于 RapidOCR（后者要加载 ~500MB ONNX 模型并跑 CoreML/CPU）。仅当运行环境
+# 不是 macOS 或未安装 ocrmac 时，才回退 docling 自带的 RapidOCR。
+#
+# 语种以中文为主（简体 zh-Hans + 繁体 zh-Hant），兼容英文 en-US。
+# recognition 固定 "accurate"——macOS 的 fast 档在本机（15.8.1）只支持拉丁语种，
+# 用 fast 处理中文 PDF 会直接抛 ValueError（ocrmac 校验 language_preference
+# 必须是该档可用语种的子集），已实测。
+_OCR_LANG = ["zh-Hans", "zh-Hant", "en-US"]
+
+
+def _choose_ocr_options():
+    """docling 的 PDF OCR 后端选项：优先 ocrmac，回退 RapidOCR。
+
+    返回 docling 的 ``OcrOptions`` 实例，挂到 ``PdfPipelineOptions.ocr_options``。
+    ocrmac 不可用时（非 macOS / 未安装）回退 ``RapidOcrOptions``（docling 内部
+    走默认 RapidOCR，不再是我们自己注入 CoreML EP 的版本——那是 parsers 兜底
+    路径用的）。
+    """
+    try:
+        import ocrmac  # noqa: F401  —— 仅 macOS 可用
+        from docling.datamodel.pipeline_options import OcrMacOptions
+        opts = OcrMacOptions(
+            lang=list(_OCR_LANG),
+            framework="vision",
+            recognition="accurate",
+        )
+        logger.info("docling OCR 后端：ocrmac（Apple Vision，%s）", ",".join(_OCR_LANG))
+        return opts
+    except ImportError:
+        from docling.datamodel.pipeline_options import RapidOcrOptions
+        logger.info("docling OCR 后端：ocrmac 不可用（非 macOS / 未安装），回退 RapidOCR")
+        return RapidOcrOptions()
+
+
+def _ocr_backend_name() -> str:
+    """供日志使用的 OCR 后端名（不实际构造引擎，零副作用）。"""
+    try:
+        import ocrmac  # noqa: F401
+        return "ocrmac(Apple Vision)"
+    except ImportError:
+        return "RapidOCR(回退)"
+
+
 def _get_converter():
     """Lazily build and cache the docling DocumentConverter singleton.
 
@@ -116,10 +165,15 @@ def _get_converter():
                 pdf_opts.accelerator_options = AcceleratorOptions(
                     num_threads=4, device=AcceleratorDevice.CPU
                 )
+                # PDF OCR 后端：ocrmac（Apple Vision）优先，RapidOCR 兜底。
+                pdf_opts.ocr_options = _choose_ocr_options()
                 converter = DocumentConverter(
                     format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
                 )
-                logger.info("docling DocumentConverter initialized (PDF 管线强制 CPU 加速)")
+                logger.info(
+                    "docling DocumentConverter initialized (PDF 管线强制 CPU + %s)",
+                    _ocr_backend_name(),
+                )
             except Exception as e:
                 # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到
                 # 降配入口就用默认构造——正确性不受影响，只是 macOS 上
@@ -156,18 +210,12 @@ def extract_markdown(filepath: str) -> Optional[str]:
     if suffix not in _DOCLING_EXTENSIONS:
         return None
 
-    # Image-based PDF handling: docling OCRs image pages via RapidOCR, but a
-    # pure-scan PDF (no text layer at all) is better served by the dedicated
-    # RapidOCR path in parsers.py which reuses the shared engine.  Detect that
-    # case cheaply and delegate.
-    #
-    # 混合型 PDF（文本层 + 大量图片页）同样要拦下：docling 对它们跑全量
-    # 管线（布局模型 + TableFormer + 逐页 OCR），单本耗时 40-70 分钟；而
-    # parsers.py 的 PyMuPDF + RapidOCR 路径逐页流式处理（共享单例引擎 +
-    # CoreML 加速 + 归一化），快数倍且内存有界（#116：实测 2 本图多的书
-    # 触发 30GB+ 内存与 2 小时同步）。
-    if suffix == ".pdf" and (_is_scan_pdf(path) or _pdf_is_image_heavy(path)):
-        return None
+    # 所有 PDF（文本 / 扫描 / 图片重）一律交给 docling：其 PDF 管线已配置
+    # ocrmac（Apple Vision）OCR 后端，扫描件与图片页由 docling 内部完成 OCR，
+    # 不再分流转 PyMuPDF + RapidOCR 的自定义路径（#116 的内存/耗时问题在
+    # ocrmac 原生 OCR 下不复存在——无需加载 500MB ONNX、无 MPS 缓存膨胀）。
+    # 仅当 docling 自身不可用或转换失败时才由调用方回退到 parsers 的 PyMuPDF
+    # 兜底路径。
 
     converter = _get_converter()
     if converter is None:
@@ -193,89 +241,4 @@ def extract_markdown(filepath: str) -> Optional[str]:
         return None
 
 
-def _is_scan_pdf(path: Path) -> bool:
-    """Detect whether a PDF looks like a scan (no text layer at the front).
 
-    只探测前几页：旧实现 ``for page in doc`` 把整本 PDF 的文本全提取一遍——
-    而「判定为扫描件」后走的解析器又要逐页提取/OCR 一遍，大 PDF 的解析时间
-    近乎翻倍。扫描件几乎不可能前 5 页都没有文本层，这里采样首页+中间页即可。
-
-    Uses PyMuPDF; returns False if PyMuPDF is unavailable (let docling try).
-    """
-    _PROBE_PAGES = 5
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        return False
-    try:
-        with fitz.open(str(path)) as doc:
-            n = min(_PROBE_PAGES, doc.page_count)
-            for i in range(n):
-                if doc[i].get_text("text").strip():
-                    return False
-        return True
-    except Exception:
-        return False
-
-
-# 图片页占比超过该阈值的 PDF 不进 docling：采样窗口内「docling 会为之
-# 付出逐页位图处理代价」的页越多，其全量管线（逐页布局/表格/OCR，torch
-# MPS 内存只增不放）越失控，交给 parsers.py 的 PyMuPDF+RapidOCR 路径
-# （CoreML、共享单例、有界内存）更合适。
-#
-# 「会付出位图代价」的页 = 纯图页，或嵌入图片占页面面积 ≥15% 的文本页。
-# 实测（#116）：中文电子书常见「每页文本层 + 满页背景图」的排版，纯图页
-# 占比判定为 0%，但 docling 对每个位图区域都跑 OCR——单本 225-280 页
-# 耗时 37-74 分钟、进程 RSS 涨到 36GB；而文本层直读只需数秒。
-_IMAGE_HEAVY_PROBE_PAGES = 20
-_IMAGE_HEAVY_RATIO = 0.3
-_IMAGE_SIGNIFICANT_AREA_RATIO = 0.15
-
-
-def _pdf_is_image_heavy(path: Path) -> bool:
-    """Detect whether a PDF would make docling pay for per-page bitmap work.
-
-    采样前 ``_IMAGE_HEAVY_PROBE_PAGES`` 页，统计以下两类页面占比：
-      1. 纯图页（无文本层且嵌有图片）——docling 整页 OCR；
-      2. 嵌有显著图片（面积 ≥ ``_IMAGE_SIGNIFICANT_AREA_RATIO`` × 页面）的
-         文本页——典型如满页背景图/花边的中文电子书，docling 的 auto OCR
-         仍会对位图区域逐页推理。
-
-    占比达到 ``_IMAGE_HEAVY_RATIO`` 即判定为图片重。只开一次文档、只读前
-    几页，开销毫秒级。与 ``_is_scan_pdf``（全无文本层）互补。
-    """
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        return False
-    try:
-        with fitz.open(str(path)) as doc:
-            n = min(_IMAGE_HEAVY_PROBE_PAGES, doc.page_count)
-            if n == 0:
-                return False
-            costly = 0
-            for i in range(n):
-                page = doc[i]
-                text = page.get_text("text").strip()
-                images = page.get_images(full=True)
-                if not text:
-                    if images:
-                        costly += 1
-                    continue
-                # 文本页：只有显著大图才计入（页角小 logo 不会让 docling
-                # 变慢到失控，不值得为它放弃 docling 的版面分析质量）。
-                page_area = abs(page.rect)
-                if page_area <= 0:
-                    continue
-                for img in images:
-                    try:
-                        rects = page.get_image_rects(img[0])
-                    except Exception:
-                        continue
-                    if any(abs(r) >= _IMAGE_SIGNIFICANT_AREA_RATIO * page_area
-                           for r in rects):
-                        costly += 1
-                        break
-            return costly / n >= _IMAGE_HEAVY_RATIO
-    except Exception:
-        return False

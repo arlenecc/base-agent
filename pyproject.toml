@@ -35,6 +35,12 @@ rag = [
     "python-pptx>=0.6.0",
     "PyMuPDF>=1.23.0",
     "ebooklib>=0.18",
+    # macOS 原生 OCR（Apple Vision 框架）：docling 的 PDF OCR 默认后端，
+    # 离线、零额外模型、比 RapidOCR（~500MB ONNX）更快；非 macOS / 未装时
+    # docling 自动回退 RapidOCR。仅 darwin 安装（ocrmac 依赖 pyobjc + macOS
+    # 私有框架）。注意 fast 档不支持中文，故代码固定用 accurate（见
+    # rag/docling_parser.py）。
+    "ocrmac; sys_platform == \"darwin\"",
     "chonkie[semantic]>=1.0.0",
     # 语义切片快路径：model2vec 静态嵌入（potion-base-32M）驱动 chonkie 的
     # SemanticChunker——切片决策只比较相邻窗口的相对相似度，不需要与检索
@@ -49,7 +55,7 @@ rag = [
 # PDF OCR (optional, heavy dependency ~500MB)
 # rapidocr 3.x 起为统一包名（兼容层 rapidocr-onnxruntime 仅供旧环境回退，
 # 见 parsers._get_ocr_engine）；模型目录与 docling 共享，且支持 CoreML EP。
-ocr = ["rapidocr>=3.10"]
+ocr = ["rapidocr>=3.10", "ocrmac; sys_platform == \"darwin\""]
 # All optional features
 #all = ["base-agent[test,rag,ocr]"]
 
