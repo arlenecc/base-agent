@@ -67,6 +67,15 @@ class AgentConfig:
     rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"
     rag_rerank_enabled: bool = True
     rag_auto_ingest: bool = True
+    # PDF 统一解析引擎切换（仅影响「有文本层的常规 PDF/office 文档」首选谁，
+    # 扫描件/图片重 PDF 始终走 parsers 的 RapidOCR 路径）：
+    #   - "docling"（默认，现状）：docling 统一解析，不可用回退按格式解析器
+    #   - "marker"：marker-pdf 优先（需手动 pip install marker-pdf，另依赖
+    #     llama-server 二进制；未装时静默回退 docling → 按格式解析器）。
+    # 实测（#基准）：marker 输出结构化 Markdown 且 CJK 文本层无乱码，但扫描
+    # 件比 RapidOCR 慢 8 倍、依赖重（torch + 1.4GB VLM + datalab S3 模型）；
+    # docling 对无 ToUnicode CMap 的中文文本 PDF 会输出乱码。两者取舍交给用户。
+    rag_pdf_engine: str = "docling"
     # OCR（图片型 PDF）：检测到 Apple M 系列且 onnxruntime >= 1.31.0 时，
     # 让 RapidOCR 走 CoreML EP（CPU+GPU+ANE）。关掉则回退 onnxruntime 默认 EP。
     rag_ocr_coreml: bool = True
@@ -98,7 +107,8 @@ class AgentConfig:
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio")
     _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
-                   "rag_embedding_model", "rag_rerank_model", "browser_endpoint")
+                   "rag_embedding_model", "rag_rerank_model", "rag_pdf_engine",
+                   "browser_endpoint")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess")
 

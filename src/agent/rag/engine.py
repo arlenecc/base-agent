@@ -328,22 +328,66 @@ def _escape_like(s: str) -> str:
     return s.replace("'", "''")
 
 
+# 统一 PDF/office 解析引擎（"docling" | "marker"）。经 set_pdf_engine 注入，
+# 默认 docling——与 rag_pdf_engine 配置项的默认值保持一致。
+_pdf_engine = "docling"
+
+# pandoc 优先的格式集合（与 ebook_parser.PANDOC_EXTENSIONS 一致，模块级导入
+# 失败时的兜底副本——ebook_parser 导入本身无重依赖，直接复用）。
+from .ebook_parser import PANDOC_EXTENSIONS as _PANDOC_FORMAT_EXTENSIONS  # noqa: E402
+from .ebook_parser import EBOOK_EXTENSIONS as _EBOOK_FORMAT_EXTENSIONS  # noqa: E402
+
+
+def set_pdf_engine(engine: str) -> None:
+    """注入 rag_pdf_engine 配置（同 parsers.set_ocr_config 的模块级注入模式）。
+
+    SyncKnowledgeWorker / agent 工具同进程运行，MainWindow 初始化时注入一次
+    即对两条路径生效。非法值回退 "docling"（保守默认）。
+    """
+    global _pdf_engine
+    _pdf_engine = engine if engine in ("docling", "marker") else "docling"
+
+
 def _extract_with_docling(filepath: str) -> tuple:
-    """Extract text, preferring docling (Markdown output).
+    """Extract text, preferring the configured unified parser (Markdown output).
 
     Returns ``(text, is_markdown)`` where ``is_markdown`` is True when the
-    text came from docling and is already well-formed Markdown (so the
-    caller can skip clean/normalize).  When docling is unavailable or
-    unsuitable for the format, falls back to the per-format parsers.
-    """
-    try:
-        from .docling_parser import extract_markdown
+    text came from docling/marker and is already well-formed Markdown (so the
+    caller can skip clean/normalize).  When the preferred engine is unavailable
+    or unsuitable for the format, falls back to the other unified parser and
+    then to the per-format parsers.
 
-        markdown = extract_markdown(filepath)
-        if markdown is not None:
-            return markdown, True
-    except Exception:
-        pass
+    引擎选择：``rag_pdf_engine`` 配置（经 :func:`set_pdf_engine` 注入）。
+    默认 "docling"（现状）；"marker" 时 marker-pdf 优先——基准数据（2026-10）
+    显示 marker 对 CJK 文本层无乱码且输出结构化 Markdown，但依赖更重。
+
+    例外：html/docx/tex 等 pandoc 支持格式优先走 pandoc（输出更干净的
+    Markdown 且速度快一个量级），pandoc 不可用才回落 docling/按格式解析器。
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in _PANDOC_FORMAT_EXTENSIONS:
+        from .ebook_parser import pandoc_to_markdown
+        md = pandoc_to_markdown(filepath)
+        if md is not None:
+            return md, True
+    primary, secondary = _pdf_engine, "docling"
+    if primary not in ("docling", "marker"):
+        primary = "docling"
+    if secondary == primary:
+        secondary = None
+    for engine in (primary, secondary):
+        if not engine:
+            continue
+        try:
+            if engine == "marker":
+                from .marker_parser import extract_markdown
+            else:
+                from .docling_parser import extract_markdown
+            markdown = extract_markdown(filepath)
+            if markdown is not None:
+                return markdown, True
+        except Exception:
+            pass
     return extract_text(filepath), False
 
 
@@ -720,6 +764,91 @@ class RAGEngine:
                         t0 = time.monotonic()
                         _log("  [%d/%d] 开始处理: %s", file_no, len(files_to_process), fname)
                         _flush_logs(fname)
+
+                        # ---- 电子书快速路径（epub/mobi/azw3/azw）----
+                        # pandoc 全书转 Markdown + ebooklib 目录缩略版 + 按章节
+                        # 直接切块（跳过通用切块器），切片直接进 embed/入库流程。
+                        # 解析失败时落回下方通用解析路径。
+                        if os.path.splitext(filepath)[1].lower() in _EBOOK_FORMAT_EXTENSIONS:
+                            book = None
+                            try:
+                                from .ebook_parser import extract_ebook
+                                book = extract_ebook(filepath)
+                            except Exception as e:
+                                logger.warning("    └─ ⚠ 电子书解析异常，回退通用路径: %s: %s", fname, e)
+                            if book is not None:
+                                try:
+                                    rel_path = os.path.relpath(filepath, self._knowledge_base)
+                                    md_name = _safe_filename(rel_path) + ".md"
+                                    md_path = os.path.join(self._markdown_dir, md_name)
+                                    cleaned = book["full_markdown"]
+                                    try:
+                                        with open(md_path, "w", encoding="utf-8") as f:
+                                            f.write(cleaned)
+                                    except OSError as e:
+                                        logger.warning("    ├─ Markdown 缓存写入失败: %s: %s", fname, e)
+                                    _write_md_meta(md_path, {
+                                        "doc_name": os.path.basename(filepath),
+                                        "source": rel_path,
+                                    })
+                                    # 目录缩略版：直接采用 ebooklib 目录树
+                                    try:
+                                        self.build_and_store_digest(
+                                            rel_path, cleaned, md_path=md_path,
+                                            digest=book["toc_digest"],
+                                            chapters=book["toc_chapters"],
+                                        )
+                                        _log("    ├─ 目录缩略版已生成 (ebooklib 目录树, %d 章)", len(book["toc_chapters"]))
+                                    except Exception as e:
+                                        logger.warning("    ├─ ⚠ 目录缩略版写入失败: %s: %s", fname, e)
+                                    # 章节即切片；超长章节再用通用切块器二次切分
+                                    # （避免单块超出 embedding 模型 token 上限）
+                                    doc_chunks: List[Dict[str, str]] = []
+                                    max_chars = self._chunk_size * 6
+                                    for ch in book["chapters"]:
+                                        if len(ch) <= max_chars:
+                                            doc_chunks.append({"source": filepath, "text": ch})
+                                        else:
+                                            doc_chunks.extend(chunk_documents(
+                                                [{"source": filepath, "text": ch}],
+                                                chunk_size=self._chunk_size,
+                                                chunk_overlap=self._chunk_overlap,
+                                                min_chunk_size=self._min_chunk_size,
+                                                overlap_percent=self._overlap_percent,
+                                            ))
+                                    if not doc_chunks:
+                                        raise ValueError("no chapters produced")
+                                    c_hash = _content_hash(cleaned)
+                                    with stats_lock:
+                                        stats["files_extracted"] += 1
+                                        stats["total_chars"] += len(cleaned)
+                                    _log(
+                                        "    └─ ✅ 电子书处理完成: %s (%d 章 → %d 切片, 总耗时 %.2fs)",
+                                        fname, len(book["chapters"]), len(doc_chunks), time.monotonic() - t0,
+                                    )
+                                    _flush_logs(f"✅ {fname} ({len(doc_chunks)}切片)")
+                                    del book, cleaned
+                                    if self._is_cancelled():
+                                        return
+                                    item = (filepath, doc_chunks, c_hash, len(doc_chunks))
+                                    while not self._is_cancelled() and not _abort.is_set():
+                                        try:
+                                            q.put(item, timeout=2.0)
+                                            break
+                                        except queue.Full:
+                                            continue
+                                    else:
+                                        return
+                                    del doc_chunks, item
+                                    continue
+                                except Exception as e:
+                                    msg = f"{os.path.basename(filepath)}: ebook clean/chunk failed: {e}"
+                                    logger.error("    └─ ❌ 电子书处理失败: %s: %s", fname, e, exc_info=True)
+                                    with stats_lock:
+                                        stats["errors"].append(msg)
+                                    continue
+                            # book is None → 落回通用解析路径
+
                         try:
                             # ---- 1. 解析文件 ----
                             # 优先用 docling 统一解析（直接输出 Markdown），
@@ -1575,6 +1704,13 @@ class RAGEngine:
             release_converter()
         except Exception as e:
             logger.debug("RAG: release_converter error: %s", e)
+        # marker（rag_pdf_engine=marker 时启用）共享 PdfConverter 同步释放；
+        # 未装 marker 时导入失败静默跳过。
+        try:
+            from .marker_parser import release_converter as _release_marker
+            _release_marker()
+        except Exception as e:
+            logger.debug("RAG: release marker converter error: %s", e)
 
     def reload(self) -> None:
         """Drop the cached table handle so the next search sees fresh data.

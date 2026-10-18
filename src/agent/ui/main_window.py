@@ -653,6 +653,9 @@ class MainWindow(QMainWindow):
         # _OCR_CONFIG 是模块级全局，SyncKnowledgeWorker 同进程运行，全局注入一次即可生效。
         from agent.rag import parsers as _rag_parsers
         _rag_parsers.set_ocr_config(self.config)
+        # PDF 统一解析引擎选择（docling | marker），同上全局注入一次。
+        from agent.rag import engine as _rag_engine_mod
+        _rag_engine_mod.set_pdf_engine(getattr(self.config, "rag_pdf_engine", "docling"))
         self._bridge = Bridge()
         self._callbacks = BridgeCallbacks(self._bridge)
         self._llm: Optional[LLMClient] = None

@@ -35,6 +35,73 @@ def _replace_entity(m: "re.Match") -> str:
     return " " if m.group(1) in _HTML_ENTITIES else m.group(0)
 
 
+def strip_html_entities(text: str) -> str:
+    """清除冗余 HTML 实体：已知实体名与数字/十六进制实体替换为空格。
+
+    clean_text 与电子书清洗共用（pandoc 输出的 markdown 里偶尔仍残留
+    &nbsp; / &mdash; / &#8212; 之类，尤其来自源文档未解码的片段）。
+    """
+    text = _ENTITY_RE.sub(_replace_entity, text)
+    text = re.sub(r'&#\d+;', ' ', text)
+    text = re.sub(r'&#x[0-9a-fA-F]+;', ' ', text)
+    return text
+
+
+# 句末标点：换行符紧跟其后视为真实断行（段落/句子边界），否则视为
+# 排版产生的硬回车，合并回同一段（解决 epub/PDF 提取文本的断行问题）。
+_SENTENCE_ENDINGS = tuple("。！？!?.…”’」』）】>；;")
+# Markdown 结构行前缀：这些行不参与硬回车合并（标题/列表/引用/表格/代码栅栏）。
+_STRUCTURAL_LINE_RE = re.compile(
+    r'^(#{1,6}\s|[-*+]\s|\d{1,3}[.)]\s|>|\||```|~~~|\s{4,})'
+)
+
+
+def join_hard_wrapped_lines(text: str, preserve_markdown: bool = True) -> str:
+    """合并硬回车断行：上一行不以句末标点结尾时，把下一行接到同一行（空格连接）。
+
+    规则（epub 电子书清洗的核心，也用于 clean_text 的通用清洗）：
+    - ``<br>``/``<br/>`` 先替换为空格（由调用方或本函数前半处理）
+    - 上一行以 。！?.…" 等句末标点结尾 → 保留换行（真实句子/段落边界）
+    - 空行 → 保留（段落分隔）
+    - Markdown 结构行（标题/列表/引用/表格/代码栅栏/缩进块）不参与合并，
+      避免把 ``# 标题``、``- 列表项`` 折进正文破坏 Markdown 结构
+    """
+    if not text:
+        return ""
+    # <br> 变体 → 空格（在行合并前处理，避免残留标签）
+    text = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)
+
+    lines = text.split('\n')
+    out: List[str] = []
+    buf = ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            # 空行 = 段落边界：冲刷缓冲
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append("")
+            continue
+        if preserve_markdown and _STRUCTURAL_LINE_RE.match(line):
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append(stripped)
+            continue
+        if not buf:
+            buf = stripped
+            continue
+        if buf.rstrip().endswith(_SENTENCE_ENDINGS):
+            out.append(buf)
+            buf = stripped
+        else:
+            buf = buf + " " + stripped
+    if buf:
+        out.append(buf)
+    return '\n'.join(out)
+
+
 def clean_text(text: str) -> str:
     """Clean extracted text: remove garbage tags, normalize whitespace,
     strip non-printable characters, and collapse redundant blank lines."""
@@ -54,9 +121,7 @@ def clean_text(text: str) -> str:
     text = re.sub(r'<[^>]+>', ' ', text)
 
     # 4. Remove HTML entities（只替换真实存在的实体名，见 _replace_entity）
-    text = _ENTITY_RE.sub(_replace_entity, text)
-    text = re.sub(r'&#\d+;', ' ', text)
-    text = re.sub(r'&#x[0-9a-fA-F]+;', ' ', text)
+    text = strip_html_entities(text)
 
     # 5. Remove URLs
     text = re.sub(r'https?://\S+', ' ', text)
@@ -105,6 +170,10 @@ def clean_text(text: str) -> str:
         cleaned_lines.append(stripped)
 
     text = '\n'.join(cleaned_lines)
+
+    # 11.5 合并硬回车断行：上一行不以句末标点结尾时，把下一行接到同一段
+    # （解决 PDF/epub 提取文本逐行断裂的问题；Markdown 结构行不合并）。
+    text = join_hard_wrapped_lines(text, preserve_markdown=True)
 
     # 12. Collapse 3+ consecutive newlines into 2
     text = re.sub(r'\n{3,}', '\n\n', text)

@@ -75,6 +75,7 @@ SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst",
     ".csv", ".tsv",
     ".html", ".htm",
+    ".tex", ".latex",
 }
 # 旧版二进制格式（.doc/.xls/.ppt）不在支持列表：python-docx/openpyxl/
 # python-pptx 与 docling 均只支持 OOXML，解析必然失败（extract_text 对它们

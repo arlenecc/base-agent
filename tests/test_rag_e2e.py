@@ -609,7 +609,9 @@ class TestRAGEngine:
         """Search for embedding model information."""
         engine.ingest(force=True)
 
-        results = engine.search("嵌入模型有哪些")
+        # 确定性 MD5 测试嵌入没有语义信号，top-k 命中取决于分块边界与顺序；
+        # 用大 top_k 拉回全部切片，避免清洗/分块逻辑变化导致断言抖动。
+        results = engine.search("嵌入模型有哪些", top_k=50)
         assert len(results) >= 1
         combined = " ".join(r["text"] for r in results)
         # Should find model names from the CSV
