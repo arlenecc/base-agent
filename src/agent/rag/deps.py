@@ -105,12 +105,15 @@ FASTEMBED_MODEL_NAME = "nomic-ai/nomic-embed-text-v1.5-Q"
 
 # Files actually needed by FastEmbed for the quantized model.
 # Only these files are downloaded — not the entire ~1.6GB repo snapshot.
+# 注意：**不含 vocab.txt**。fastembed 的注册表里 nomic-embed-text-v1.5-Q 的
+# additional_files 是空的——tokenizer 用自包含的 tokenizer.json（fast BPE），
+# 从不下载 vocab.txt。旧清单里有它，而它永远不会被下载 → 缓存探测永远返回
+# False → 每次同步都误报「嵌入模型未缓存」并重走下载路径。
 _EMBEDDING_REQUIRED_FILES = [
     "onnx/model_quantized.onnx",   # quantized ONNX model (~137MB)
     "tokenizer.json",              # tokenizer (~0.7MB)
     "config.json",                 # model config (~3KB)
     "tokenizer_config.json",       # tokenizer config (~4KB)
-    "vocab.txt",                   # vocabulary (~0.2MB)
 ]
 
 # HuggingFace 仓库与「必须完整落盘」的文件清单。
@@ -339,12 +342,23 @@ def _model_file_cached(model_dir: str, filename: str) -> bool:
 
     中断的下载会在 hub 缓存里留下 ``blobs/<sha>.incomplete``，而完整的
     ``blobs/<sha>`` 并不存在 —— 只按文件名判断会把半成品当成已缓存，从而跳过
-    预下载，把 ~2.3GB 的下载推迟到首次检索时现场发生。
+    预下载，把下载推迟到首次检索时现场发生。
+
+    hub 布局下 ``blobs/`` 的真实文件名有**两种**，必须都查：
+
+    * 普通小文件（config.json / tokenizer.json）→ 文件名 = 清单里的
+      ``blob_id``；
+    * LFS 大文件（所有权重 .onnx）→ 文件名 = 清单里的 **``lfs_sha256``**
+      （内容 sha256），**不是** ``blob_id``。
+
+    旧实现只查 ``blob_id``，于是所有权重文件永远判为「未缓存」——
+    表现为每次同步都误报「模型未缓存」并重走一遍下载路径（嵌入那条还会
+    真实创建 ONNX 会话、加载 137MB 权重），而模型其实早就下完了。
     """
     # 1) 旧版布局：文件直接就在目录里
     if os.path.isfile(os.path.join(model_dir, filename)):
         return True
-    # 2) hub 布局：从 trees/*.json 清单找到 blob_id，确认 blobs/<blob_id> 存在
+    # 2) hub 布局：从 trees/*.json 清单找到 blob 引用，确认 blobs/ 下有完整文件
     for tree_path in sorted(glob.glob(os.path.join(model_dir, "trees", "*.json"))):
         try:
             with open(tree_path, "r", encoding="utf-8") as f:
@@ -354,9 +368,11 @@ def _model_file_cached(model_dir: str, filename: str) -> bool:
         entry = (manifest.get("files") or {}).get(filename)
         if not isinstance(entry, dict):
             continue
-        blob_id = entry.get("blob_id")
-        if blob_id and os.path.isfile(os.path.join(model_dir, "blobs", blob_id)):
-            return True
+        # LFS 大文件按 lfs_sha256 命名，普通文件按 blob_id 命名——两个键都试。
+        for key in ("lfs_sha256", "blob_id"):
+            ref = entry.get(key)
+            if ref and os.path.isfile(os.path.join(model_dir, "blobs", ref)):
+                return True
     return False
 
 
@@ -407,9 +423,23 @@ def _download_embedding_model(progress_callback=None) -> Tuple[bool, str]:
         # own cache directory.  Use the same persistent cache_dir as
         # vector_store.py to avoid re-downloads after macOS temp cleanup.
         cache_dir = _get_fastembed_cache_dir()
+        # providers 显式强制 CPU-only：这里**不是** lazy_load，会真的创建
+        # onnxruntime 会话——不传时 FastEmbed 的 cuda=Device.AUTO 在装有
+        # onnxruntime-gpu 的机器上会选 CUDA。这个会话虽只是下载载体（随即
+        # 丢弃），但「依赖检查/预下载阶段就用 GPU」与运行时的 CPU-only 不
+        # 一致，且会无谓占用显存。与 vector_store._cpu_only_kwargs 同一套
+        # 签名探测逻辑（本地重复一份，避免 deps 反向依赖 vector_store）。
+        _cpu_only: Dict[str, Any] = {}
+        try:
+            import inspect as _inspect
+            if "providers" in _inspect.signature(TextEmbedding.__init__).parameters:
+                _cpu_only = {"providers": ["CPUExecutionProvider"]}
+        except (TypeError, ValueError):  # pragma: no cover
+            pass
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            TextEmbedding(model_name=FASTEMBED_MODEL_NAME, cache_dir=cache_dir)
+            TextEmbedding(model_name=FASTEMBED_MODEL_NAME, cache_dir=cache_dir,
+                          **_cpu_only)
         logger.info("RAG deps: embedding model downloaded and cached by FastEmbed")
         if progress_callback:
             progress_callback(f"✅ {EMBEDDING_MODEL_LABEL} 下载完成")

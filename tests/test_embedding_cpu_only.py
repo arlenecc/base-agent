@@ -288,3 +288,145 @@ class TestRerankerCpuOnly:
                 assert session._model_path.endswith("model_int8.onnx")
         finally:
             store.close()
+
+
+# ---------------------------------------------------------------------------
+# deps 预下载路径：CPU-only + 缓存探测
+# ---------------------------------------------------------------------------
+
+
+class TestDepsCpuOnly:
+    def test_embedding_download_passes_providers(self, monkeypatch):
+        """deps._download_embedding_model 也强制 CPU-only（不是 lazy_load）。"""
+        from agent.rag import deps
+
+        captured = {}
+
+        class _FakeTE:
+            def __init__(self, model_name, cache_dir=None, threads=None,
+                         providers=None, cuda=None, **kw):
+                captured.update({"providers": providers, "cuda": cuda})
+
+        monkeypatch.setitem(sys.modules, "fastembed",
+                            type(sys)("fastembed"))
+        import builtins
+        real_import = builtins.__import__
+
+        def _fake_import(name, *args, **kwargs):
+            if name == "fastembed":
+                mod = type(sys)("fastembed")
+                mod.TextEmbedding = _FakeTE
+                return mod
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+        ok, _ = deps._download_embedding_model()
+        assert ok
+        assert captured.get("providers") == ["CPUExecutionProvider"]
+        assert captured.get("cuda") != "auto"
+
+    def test_reranker_download_passes_providers(self, monkeypatch):
+        from agent.rag import deps
+
+        captured = {}
+
+        class _FakeCE:
+            def __init__(self, model_name, cache_dir=None, threads=None,
+                         providers=None, cuda=None, lazy_load=False, **kw):
+                captured.update({"providers": providers, "cuda": cuda})
+
+        import builtins
+        real_import = builtins.__import__
+
+        def _fake_import(name, *args, **kwargs):
+            if name in ("fastembed.rerank.cross_encoder", "fastembed"):
+                mod = type(sys)(name)
+                mod.TextCrossEncoder = _FakeCE
+                return mod
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+        ok, _ = deps._download_reranker_model()
+        assert ok
+        assert captured.get("providers") == ["CPUExecutionProvider"]
+        assert captured.get("cuda") != "auto"
+
+
+class TestModelCacheProbe:
+    """缓存探测：LFS 大文件按 lfs_sha256 命名，旧实现只查 blob_id 导致永远误报。"""
+
+    def test_lfs_blob_named_by_lfs_sha256(self, tmp_path):
+        from agent.rag import deps
+
+        model_dir = tmp_path / "models--org--repo"
+        (model_dir / "blobs").mkdir(parents=True)
+        (model_dir / "trees").mkdir(parents=True)
+        # LFS 大文件：blob 文件名是 lfs_sha256，不是 blob_id
+        lfs_sha = "a" * 64
+        blob_id = "b" * 64
+        (model_dir / "blobs" / lfs_sha).write_bytes(b"weights")
+        (model_dir / "trees" / "t1.json").write_text(json.dumps({
+            "files": {
+                "onnx/model_int8.onnx": {
+                    "size": 7, "blob_id": blob_id, "lfs_sha256": lfs_sha,
+                },
+            },
+        }), encoding="utf-8")
+
+        assert deps._model_file_cached(str(model_dir), "onnx/model_int8.onnx")
+        # 只写 blob_id 而没有 lfs_sha256 对应文件时（普通小文件）也要能命中
+        small_id = "c" * 64
+        (model_dir / "blobs" / small_id).write_bytes(b"cfg")
+        (model_dir / "trees" / "t1.json").write_text(json.dumps({
+            "files": {
+                "config.json": {"size": 3, "blob_id": small_id},
+                "onnx/model_int8.onnx": {
+                    "size": 7, "blob_id": blob_id, "lfs_sha256": lfs_sha,
+                },
+            },
+        }), encoding="utf-8")
+        assert deps._model_file_cached(str(model_dir), "config.json")
+
+    def test_incomplete_download_not_counted(self, tmp_path):
+        """只有 .incomplete 残留时不算缓存（避免把半成品当已下载）。"""
+        from agent.rag import deps
+
+        model_dir = tmp_path / "models--org--repo"
+        (model_dir / "blobs").mkdir(parents=True)
+        (model_dir / "trees").mkdir(parents=True)
+        lfs_sha = "d" * 64
+        # 中断的下载留下 .incomplete，完整 blob 不存在
+        (model_dir / "blobs" / (lfs_sha + ".incomplete")).write_bytes(b"partial")
+        (model_dir / "trees" / "t1.json").write_text(json.dumps({
+            "files": {"onnx/model_int8.onnx": {"blob_id": "e" * 64,
+                                               "lfs_sha256": lfs_sha}},
+        }), encoding="utf-8")
+        assert not deps._model_file_cached(str(model_dir), "onnx/model_int8.onnx")
+
+    def test_missing_file_not_counted(self, tmp_path):
+        from agent.rag import deps
+
+        model_dir = tmp_path / "models--org--repo"
+        (model_dir / "blobs").mkdir(parents=True)
+        (model_dir / "trees").mkdir(parents=True)
+        (model_dir / "trees" / "t1.json").write_text(json.dumps({
+            "files": {"other.onnx": {"blob_id": "f" * 64}},
+        }), encoding="utf-8")
+        assert not deps._model_file_cached(str(model_dir), "onnx/model_int8.onnx")
+
+    def test_embedding_required_files_all_downloadable(self):
+        """清单里不能有 fastembed 从不下载的文件（那会让探测永远失败）。"""
+        from fastembed import TextEmbedding
+
+        from agent.rag import deps
+
+        registry = {m["model"]: m for m in TextEmbedding.list_supported_models()}
+        entry = registry[deps.FASTEMBED_MODEL_NAME]
+        # fastembed 声明的必需文件：model_file + additional_files
+        needed = [entry["model_file"]] + list(entry.get("additional_files") or [])
+        # 我们清单里的 onnx 权重必须与 fastembed 声明的一致
+        assert "onnx/model_quantized.onnx" in deps._EMBEDDING_REQUIRED_FILES
+        assert "onnx/model_quantized.onnx" in needed
+        # vocab.txt 是 BERT 式遗留项：fastembed 的 additional_files 为空，
+        # 不会下载它，列进清单 = 探测永远 False
+        assert "vocab.txt" not in deps._EMBEDDING_REQUIRED_FILES
