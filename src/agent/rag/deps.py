@@ -792,8 +792,11 @@ def _is_reranker_cached() -> bool:
     """Check whether the reranker model is already cached locally.
 
     与 ``_is_embedding_model_cached`` 同样做纯文件系统探测（不实例化模型，
-    避免依赖检查阶段触发 2.3GB 下载）。bge-reranker-v2-m3 的权重是
-    ``onnx/model.onnx`` + 外挂 ``onnx/model.onnx_data``，两个都要完整才算缓存。
+    避免依赖检查阶段触发 ~570MB 下载）。当前用 INT8 量化版
+    （``BAAI/bge-reranker-v2-m3-int8``），权重是单文件
+    ``onnx/model_int8.onnx``——它是下载的最后一个文件，完整落盘即意味着
+    tokenizer 等前置文件也已就绪（中断的下载只会留下前置文件，见
+    _model_file_cached 的 .incomplete 处理）。
     """
     cache_dir = _get_fastembed_cache_dir()
     for model_dir in _model_cache_dirs(cache_dir, _RERANK_HF_REPO):

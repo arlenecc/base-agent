@@ -62,16 +62,24 @@ pip install -e ".[all]"
 
 | 模型 | 用途 | 大小 |
 |------|------|------|
-| `nomic-ai/nomic-embed-text-v1.5` | 文本嵌入向量化 | ~130 MB |
-| `BAAI/bge-reranker-v2-m3` | 检索结果重排序（可选，fastembed ONNX） | ~2.3 GB |
+| `nomic-ai/nomic-embed-text-v1.5-Q` | 文本嵌入向量化（INT8 量化版） | ~130 MB |
+| `BAAI/bge-reranker-v2-m3-int8` | 检索结果重排序（可选，fastembed ONNX，INT8 量化版） | ~570 MB |
 
 ### 3.2 离线部署方案
 
 ```bash
 # 在有网络的机器上预下载模型
 pip install huggingface_hub
-huggingface-cli download nomic-ai/nomic-embed-text-v1.5 --local-dir ./models/nomic-embed-text-v1.5
-# 重排序模型由 fastembed 在首次检索时自动下载并缓存到 ~/.cache/fastembed，无需手动下载
+# 嵌入模型：HF 仓库名是 nomic-ai/nomic-embed-text-v1.5（与 fastembed 的 -Q
+# 量化版映射到同一个仓库），量化权重是仓库里的 onnx/model_quantized.onnx
+# （~137MB；fp32 的 onnx/model.onnx 约 548MB，不需要）
+huggingface-cli download nomic-ai/nomic-embed-text-v1.5 \
+  --include "onnx/model_quantized.onnx" "tokenizer.json" "config.json" \
+  --local-dir ./models/nomic-embed-text-v1.5
+# 重排序模型由 fastembed 在首次检索时自动下载并缓存到 ~/.cache/fastembed，
+# 无需手动下载（如需离线预置，见 README「手工预下载注意」：
+# fastembed 模型名 BAAI/bge-reranker-v2-m3-int8 实际拉取 HF 仓库
+# onnx-community/bge-reranker-v2-m3-ONNX，缓存目录按仓库名推导）
 
 # 将模型目录复制到生产服务器
 scp -r ./models/ user@server:/path/to/models/
@@ -104,8 +112,8 @@ export TRANSFORMERS_OFFLINE=1
   "max_iterations": 15,
   "rag_chunk_size": 500,
   "rag_chunk_overlap": 50,
-  "rag_embedding_model": "nomic-ai/nomic-embed-text-v1.5",
-  "rag_rerank_model": "BAAI/bge-reranker-v2-m3",
+  "rag_embedding_model": "nomic-ai/nomic-embed-text-v1.5-Q",
+  "rag_rerank_model": "BAAI/bge-reranker-v2-m3-int8",
   "rag_rerank_enabled": true,
   "rag_auto_ingest": true,
   "browser_endpoint": "",
@@ -120,8 +128,8 @@ export TRANSFORMERS_OFFLINE=1
 | `knowledge_base` | 知识库文档目录路径 | 指向存放原始文档的目录 |
 | `rag_chunk_size` | 每个切片的 token 数 | 500 |
 | `rag_chunk_overlap` | 切片间重叠 token 数（10%） | 50 |
-| `rag_embedding_model` | 嵌入向量模型 | `nomic-ai/nomic-embed-text-v1.5` |
-| `rag_rerank_model` | 重排序模型 | `BAAI/bge-reranker-v2-m3` |
+| `rag_embedding_model` | 嵌入向量模型（INT8 量化版） | `nomic-ai/nomic-embed-text-v1.5-Q` |
+| `rag_rerank_model` | 重排序模型（INT8 量化版） | `BAAI/bge-reranker-v2-m3-int8` |
 | `rag_rerank_enabled` | 是否启用重排序 | `true` |
 | `rag_auto_ingest` | 是否启动时自动同步知识库 | `true` |
 
@@ -307,7 +315,7 @@ export TRANSFORMERS_OFFLINE=1
 
 ### 问题：重排序不生效
 
-**原因**：`fastembed` 未安装（或版本过低，需 >=0.9.0）或 `BAAI/bge-reranker-v2-m3` 模型未下载。
+**原因**：`fastembed` 未安装（或版本过低，需 >=0.9.0）或 `BAAI/bge-reranker-v2-m3-int8` 模型未下载。
 
 **解决**：
 ```bash
