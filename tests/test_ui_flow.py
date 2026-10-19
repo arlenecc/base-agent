@@ -147,6 +147,222 @@ def test_plan_panel_renders_signal_snapshot(qtbot, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# layout: config window + chat column + plan/log column
+# ---------------------------------------------------------------------------
+
+def test_config_button_opens_detachable_config_dialog(qtbot, tmp_path, monkeypatch):
+    """右上角「⚙ 配置」打开独立配置窗口，原配置区内容全部迁入其中。
+
+    面板在主窗口与对话框之间搬来搬去，控件对象必须常驻：关闭窗口后面板回到
+    隐藏宿主（而不是随对话框被销毁），主窗口各处引用继续可用。
+    """
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    # 配置窗口未打开时，配置面板托管在主窗口的隐藏宿主里
+    assert win._config_dialog is None
+    assert win._config_panel.parent() is win._config_host
+
+    win._on_open_config()
+    dlg = win._config_dialog
+    assert dlg is not None and dlg.isVisible()
+    assert win._config_panel.parent() is dlg
+    # 配置项控件随之进入对话框（是面板的后代——面板内按区分组嵌套）
+    for w in (win.base_url_edit, win.api_key_edit, win.model_combo,
+              win.fetch_btn, win.connect_btn, win.workspace_edit,
+              win.knowledge_base_edit, win.sync_knowledge_btn):
+        assert win._config_panel.isAncestorOf(w), w
+
+    # 关闭窗口：面板回到宿主，控件仍然可用（不是悬空引用）
+    win.base_url_edit.setText("http://127.0.0.1:9/v1")
+    dlg.close()
+    qtbot.waitUntil(lambda: not dlg.isVisible())
+    assert win._config_panel.parent() is win._config_host
+    assert win.base_url_edit.text() == "http://127.0.0.1:9/v1"
+
+    # 再次打开复用同一个窗口与同一批控件，不重建
+    win._on_open_config()
+    assert win._config_dialog is dlg
+    assert win._config_panel.parent() is dlg
+    assert win.base_url_edit.text() == "http://127.0.0.1:9/v1"
+
+
+def test_config_dialog_apply_rebuilds_agent(qtbot, tmp_path, monkeypatch):
+    """在配置窗口里点「应用配置」必须真正生效（面板搬走不影响 gather/apply）。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    win._on_open_config()
+    win.base_url_edit.setText("http://127.0.0.1:9/v1")
+    win.model_combo.setEditText("test-model")
+    win._on_apply_config()
+
+    assert win.config.base_url == "http://127.0.0.1:9/v1"
+    assert win.config.model == "test-model"
+    assert win._agent is not None
+    assert win.status_label.text() == "配置已应用"
+
+
+def test_load_model_button_shows_ready_state(qtbot, tmp_path, monkeypatch):
+    """本地模型加载成功后，「加载模型」按钮变「重新加载」并变绿；卸载后复位。"""
+    from agent.local.llm import LocalLLMClient
+    import agent.ui.main_window as mw
+
+    # 类级替换：避免真实加载权重（仅验证 UI 按钮态切换逻辑）。
+    monkeypatch.setattr(LocalLLMClient, "_ensure_model", lambda self: None)
+    monkeypatch.setattr(mw, "CONFIG_PATH", str(tmp_path / "cfg.json"))
+    win = mw.MainWindow()
+    win.workspace_edit.setText(str(tmp_path / "ws"))
+    qtbot.addWidget(win)
+
+    GREEN = "background-color:#16a34a"
+    # 初始：未加载
+    assert win.load_main_btn.text() == "加载模型"
+    assert GREEN not in win.load_main_btn.styleSheet()
+    # 点击加载 → 后台预加载成功 → 置绿 + 「重新加载」
+    win._on_load_main_model()
+    qtbot.waitUntil(lambda: GREEN in win.load_main_btn.styleSheet(), timeout=3000)
+    assert win.load_main_btn.text() == "重新加载"
+    assert win.status_label.text() == "主模型已就绪，可对话"
+    # 卸载 → 复位
+    win._on_unload_main_model()
+    assert win.load_main_btn.text() == "加载模型"
+    assert GREEN not in win.load_main_btn.styleSheet()
+
+
+
+def test_layout_chat_left_plan_thinking_right_log_in_window(qtbot, tmp_path, monkeypatch):
+    """左栏自上而下：对话 → token 速度 → 发送框；右栏：执行计划 + 思考过程；
+    日志面板搬进独立日志窗口（右上角「日志」按钮打开）。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    chat_col = win.chat_view.parent()
+    plan_col = win.plan_view.parent().parent()
+    think_col = win.think_view.parent().parent()
+    # 执行计划与思考过程在右栏同一个 splitter 里（同宽对齐）
+    assert plan_col is think_col
+    assert plan_col is not chat_col.parent()
+    # 右栏顺序：执行计划在上，思考过程在下（原日志的位置）
+    assert plan_col.indexOf(win.plan_view.parent()) < plan_col.indexOf(win.think_view.parent())
+
+    # 左栏顺序：对话在最上，token 速度居中在发送框上方，发送框贴底
+    lay = chat_col.layout()
+    order = [lay.itemAt(i).widget() for i in range(lay.count())]
+    chat_i = order.index(win.chat_view)
+    assert chat_i == 1, "对话区应紧跟标题行，占满左栏主体"
+    # token 速度行：在发送行之前，且内部是「弹性-速度-|-总量-弹性」的居中结构
+    stats_row = None
+    for i in range(lay.count()):
+        item = lay.itemAt(i)
+        if item.layout() is not None and item.layout().indexOf(win.speed_label) >= 0:
+            stats_row = item.layout()
+            stats_i = i
+            break
+    assert stats_row is not None, "token 速度必须放在发送框上方"
+    assert stats_row.indexOf(win.token_label) >= 0
+    assert stats_row.indexOf(win.speed_label) > 0, "速度标签前应有弹性空间（居中）"
+    last = lay.itemAt(lay.count() - 1)
+    assert last.layout() is not None and last.layout().indexOf(win.send_editor) >= 0, (
+        "发送框必须位于左栏最底部"
+    )
+    assert stats_i < lay.count() - 1, "token 速度必须在发送框上方"
+
+    # 顶部不再有单独的工具条：根布局下只有 body splitter 一项
+    root_lay = win.centralWidget().layout()
+    assert root_lay.count() == 1, "顶部不应再单独占一行"
+    assert root_lay.itemAt(0).widget() is chat_col.parent()
+    # 配置 / 日志入口并入对话标题行（与「对话」标签同一行）
+    header_row = chat_col.layout().itemAt(0).layout()
+    assert header_row is not None
+    for w in (win.clear_btn, win.stop_btn, win.config_btn, win.log_btn):
+        assert header_row.indexOf(w) >= 0, f"{type(w).__name__} 必须在对话标题行内"
+    assert header_row.indexOf(win.config_btn) > header_row.indexOf(win.stop_btn)
+
+    # 日志面板默认托管在主窗口的隐藏宿主里（未打开日志窗口）
+    assert win._log_window is None
+    assert win._log_panel.parent() is win._log_host
+    assert win.log_view.parent() is win._log_panel
+
+
+def test_log_button_opens_log_window(qtbot, tmp_path, monkeypatch):
+    """右上角「日志」打开独立日志窗口，原右栏日志面板迁入其中。
+
+    窗口关闭后日志仍持续写入（不丢行），重新打开复用同一批控件。
+    """
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    win._on_open_log()
+    log_win = win._log_window
+    assert log_win is not None and log_win.isVisible()
+    assert log_win.windowTitle() == "日志"
+    assert win._log_panel.parent() is log_win
+    # 日志面板的控件随之进入窗口
+    for w in (win.log_view, win.log_clear_btn):
+        assert w.parent() is win._log_panel, w
+
+    # 窗口关闭期间日志继续写入，不丢行
+    win._append_log("while closed 1")
+    log_win.close()
+    qtbot.waitUntil(lambda: not log_win.isVisible())
+    assert win._log_panel.parent() is win._log_host
+    win._append_log("while closed 2")
+    assert "while closed 1" in win.log_view.toPlainText()
+    assert "while closed 2" in win.log_view.toPlainText()
+
+    # 重新打开复用同一窗口与控件，历史日志仍在
+    win._on_open_log()
+    assert win._log_window is log_win
+    assert win._log_panel.parent() is log_win
+    assert "while closed 2" in win.log_view.toPlainText()
+    log_win.close()
+    qtbot.waitUntil(lambda: not log_win.isVisible())
+
+    # 主窗口关闭时先关日志窗口：面板不得随窗口被销毁（悬空引用）
+    win._on_open_log()
+    win.close()
+    assert win._log_panel.parent() is win._log_host
+    assert win._config_panel.parent() is win._config_host
+
+
+def test_plan_panel_marks_current_step_and_progress(qtbot, tmp_path, monkeypatch):
+    """计划面板要跟踪每项完成情况，并高亮标记当前正在进行的步骤。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    win._on_plan_updated({"goal": "部署", "steps": [
+        {"id": "1", "title": "打包", "status": "done", "note": "ok"},
+        {"id": "2", "title": "部署", "status": "doing", "note": "进行中"},
+        {"id": "3", "title": "验证", "status": "pending"},
+    ]})
+    text = win.plan_view.toPlainText()
+    assert "- [✓] 1. 打包  # ok" in text
+    assert "- [▶] 2. 部署  # 进行中 ◀ 正在进行" in text
+    assert "- [ ] 3. 验证" in text
+    assert "Now: 2. 部署" in text
+    assert "进度: 1/3 步已完成" in text
+    # 标题栏进度摘要点名当前步骤
+    assert win.plan_progress_label.text() == "1/3 步完成 · 进行中：部署"
+
+    # 步骤收尾后高亮与进度同步前移
+    win._on_plan_updated({"goal": "部署", "steps": [
+        {"id": "1", "title": "打包", "status": "done", "note": "ok"},
+        {"id": "2", "title": "部署", "status": "done", "note": "进行中"},
+        {"id": "3", "title": "验证", "status": "doing"},
+    ]})
+    assert "◀ 正在进行" not in win.plan_view.toPlainText().split("3. 验证")[0]
+    assert "◀ 正在进行" in win.plan_view.toPlainText()
+    assert win.plan_progress_label.text() == "2/3 步完成 · 进行中：验证"
+    assert "进度: 2/3 步已完成" in win.plan_view.toPlainText()
+
+    # 无计划 → 面板与摘要都清空
+    win._on_plan_updated(None)
+    assert win.plan_view.toPlainText() == ""
+    assert win.plan_progress_label.text() == ""
+
+
+# ---------------------------------------------------------------------------
 # thinking-view output control: no overlap, always append at end
 # ---------------------------------------------------------------------------
 

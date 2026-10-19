@@ -1,8 +1,18 @@
-"""PyQt6 main window: config strip, chat/send/thinking column, and log panel.
+"""PyQt6 main window: top bar with config/log entries, chat column, and
+plan/thinking column.
 
 The agent runs in a background QThread; a signal Bridge carries streaming
 events to the UI thread. Blocking confirm/ask_user dialogs are synchronised
 with threading.Event so the worker blocks until the user answers.
+
+布局（本次调整）：
+    对话标题行      「对话」+ 清空对话 / 终止对话 + ⚙ 配置 / 日志（全部并入一行）
+    左栏            对话区（占满）→ token 速度（居中）→ 发送框 + 发送按钮（贴底）
+    右栏            执行计划面板（上）→ 思考过程（下）
+
+原顶部配置区已整体移入 ``ConfigDialog``；原右栏日志面板移入 ``LogWindow``；
+思考过程调到右栏原日志的位置，左栏整块都给对话区；token 速度/总量居中放在
+发送框与发送按钮上方。配置 / 日志入口并入对话标题行，不再单独占一条顶部工具条。
 """
 from __future__ import annotations
 
@@ -20,14 +30,13 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
     QMessageBox, QInputDialog, QPlainTextEdit, QProgressBar,
-    QStatusBar, QFileDialog,
+    QStatusBar, QFileDialog, QDialog, QGroupBox,
 )
 
 from ..agent import Agent, AgentCallbacks
 from ..config import AgentConfig
 from ..llm_client import LLMClient, LLMError
 from ..skills import Skill
-from ..kernel.session import render_plan_dict
 from ..tools import ToolRegistry
 from ..rag.engine import RAGEngine
 from ..rag.vector_store import DEFAULT_RERANK_MODEL
@@ -36,6 +45,31 @@ from ..rag.vector_store import DEFAULT_RERANK_MODEL
 CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
 
 logger = logging.getLogger(__name__)
+
+# 配置窗口「模型类型」下拉标签 ↔ 本地后端标识的映射。
+# 用户可见标签用 MLX-LM / MLX-VLM / ONNX / GGUF（旧的 llama_cpp 已改名 GGUF）。
+_LLM_TYPE_TO_BACKEND = {"MLX-LM": "mlx", "MLX-VLM": "mlx", "ONNX": "onnx", "GGUF": "gguf"}
+_BACKEND_TO_LLM_TYPE = {"mlx": "MLX-LM", "onnx": "ONNX", "gguf": "GGUF"}
+
+# 本地模型加载成功后的按钮样式：文字改为「重新加载」+ 绿色背景，代表模型可用。
+_MODEL_READY_STYLE = "font-weight:600; background-color:#16a34a; color:#ffffff;"
+_MODEL_IDLE_STYLE = "font-weight:600;"
+
+
+def _impl_to_provider_backend(impl: str):
+    """Embedding/Reranker 实现下拉标签 → (provider, backend)。
+
+    fastembed → 走网络基线（provider=api）；mlx/onnx/gguf → 本地加载。
+    """
+    if impl == "fastembed":
+        return "api", "mlx"
+    return "local", impl
+
+
+def _provider_backend_to_impl(provider: str, backend: str) -> str:
+    """(provider, backend) → Embedding/Reranker 实现下拉标签。"""
+    return backend if provider == "local" else "fastembed"
+
 
 # RAG / sync 相关模块的 logger 名称前缀，用于 UI 日志面板过滤
 # 覆盖 RAG 全链路：同步引擎、向量库、解析器、清洗器、切片器、依赖检查、工具调用
@@ -166,6 +200,110 @@ def _sanitize_stream_text(text: str) -> str:
     if not text:
         return ""
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+# ---------------------------------------------------------------------------
+# 执行计划面板：plan 快照 → 带状态标记的 HTML / 进度摘要
+#
+# 数据来自 Bridge.plan 信号携带的**快照**（不能去读 agent.session：工作线程
+# 的 update_plan 工具会原地改 step dict，跨线程读共享可变状态会渲染出半新半旧
+# 的中间态）。渲染与 kernel.session.render_plan_dict 的纯文本格式逐行对应，
+# 额外按状态着色并把「正在进行」的步骤高亮。
+# ---------------------------------------------------------------------------
+
+# 终态（计入完成数）与非终态
+_PLAN_DONE_STATES = ("done", "blocked", "skipped")
+_PLAN_OPEN_STATES = ("pending", "doing")
+
+# 状态 → (标记, 颜色)
+_PLAN_STATUS_STYLE = {
+    "done": ("✓", "#059669"),      # 绿：已完成
+    "doing": ("▶", "#b45309"),     # 琥珀：正在进行（高亮）
+    "pending": (" ", "#6b7280"),
+    "blocked": ("✗", "#dc2626"),
+    "skipped": ("⊘", "#6b7280"),
+}
+
+
+def _plan_steps(plan: Any) -> List[Dict[str, Any]]:
+    if not isinstance(plan, dict):
+        return []
+    return [s for s in (plan.get("steps") or []) if isinstance(s, dict)]
+
+
+def _plan_status(step: Dict[str, Any]) -> str:
+    return str(step.get("status", "pending") or "pending").strip().lower()
+
+
+def _plan_html(plan: Any) -> str:
+    """把 plan 快照渲染成带状态标记的 HTML（右栏「执行计划」面板）。"""
+    steps = _plan_steps(plan)
+    goal = str(plan.get("goal") or "").strip() if isinstance(plan, dict) else ""
+    if not goal and not steps:
+        return ""
+    import html as _html
+
+    def esc(value: Any) -> str:
+        return _html.escape(str(value))
+
+    lines: List[str] = []
+    if goal:
+        lines.append(f'<p style="margin:2px 0;"><b>Goal:</b> {esc(goal)}</p>')
+    doing_step: Optional[Dict[str, Any]] = None
+    for s in steps:
+        status = _plan_status(s)
+        mark, color = _PLAN_STATUS_STYLE.get(status, _PLAN_STATUS_STYLE["pending"])
+        title = str(s.get("title", "") or "")
+        note = str(s.get("note", "") or "")
+        line = f"- [{mark}] {esc(s.get('id', '?'))}. {esc(title)}"
+        if note:
+            # 两个前导空格必须原样保留（与纯文本版 render_plan_dict 一致），
+            # HTML 默认折叠连续空白 → 用 white-space:pre-wrap 保住。
+            line += (
+                '<span style="white-space:pre-wrap;color:#6b7280;">'
+                f'  # {esc(note)}</span>'
+            )
+        if status == "doing" and doing_step is None:
+            doing_step = s
+            # 当前正在进行的步骤：琥珀底纹 + 明确标记
+            lines.append(
+                '<p style="margin:2px 0; padding:1px 4px; background:#fef3c7; '
+                f'color:#b45309; font-weight:600;">{line}  ◀ 正在进行</p>'
+            )
+        else:
+            lines.append(f'<p style="margin:2px 0; color:{color};">{line}</p>')
+    if doing_step is not None:
+        now = f"{doing_step.get('id', '?')}. {doing_step.get('title', '')}"
+        lines.append(f'<p style="margin:2px 0; color:#b45309;"><b>Now:</b> {esc(now)}</p>')
+    open_steps = [s for s in steps if _plan_status(s) in _PLAN_OPEN_STATES]
+    if open_steps:
+        lines.append(
+            '<p style="margin:2px 0; color:#6b7280;">'
+            f"Remaining: {len(open_steps)} step(s) not finished</p>"
+        )
+    if steps:
+        done = sum(1 for s in steps if _plan_status(s) in _PLAN_DONE_STATES)
+        lines.append(
+            '<p style="margin:2px 0; color:#374151;"><b>进度:</b> '
+            f"{done}/{len(steps)} 步已完成</p>"
+        )
+    return "\n".join(lines)
+
+
+def _plan_progress_text(plan: Any) -> str:
+    """计划面板标题栏的进度摘要：``2/5 步完成 · 进行中：部署``。"""
+    steps = _plan_steps(plan)
+    if not steps:
+        return ""
+    done = sum(1 for s in steps if _plan_status(s) in _PLAN_DONE_STATES)
+    text = f"{done}/{len(steps)} 步完成"
+    doing = next((s for s in steps if _plan_status(s) == "doing"), None)
+    if doing is not None:
+        title = str(doing.get("title", "") or "")
+        if len(title) > 16:
+            title = title[:16] + "…"
+        text += f" · 进行中：{title}"
+    return text
 
 
 # ===========================================================================
@@ -611,6 +749,107 @@ class InstallDepsWorker(QThread):
 
 
 # ===========================================================================
+# Hosted-panel dialogs: config window / log window
+# ===========================================================================
+
+
+class _HostedPanelDialog(QDialog):
+    """承载「主窗口长期持有的面板控件树」的对话框基类。
+
+    面板在对话框与主窗口的隐藏宿主之间搬移：打开窗口时挂进对话框，关闭时移回
+    宿主。控件对象因此全程常驻 —— 主窗口里各处引用（``self.base_url_edit`` /
+    ``self.log_view`` …）不必关心父窗口是谁，也不必在每次开关窗口时重建：
+    重建会丢掉用户已填未应用的输入，也会丢掉还没被查看的日志。
+    """
+
+    def __init__(self, title: str, min_w: int, min_h: int,
+                 panel: Optional[QWidget] = None,
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(10, 10, 10, 10)
+        self._lay.setSpacing(8)
+        self._panel: Optional[QWidget] = None
+        self.setWindowTitle(title)
+        self.setMinimumSize(min_w, min_h)
+        if panel is not None:
+            self.attach(panel)
+        self._build_footer(self._lay)
+
+    def _build_footer(self, lay: QVBoxLayout) -> None:
+        """对话框底部按钮行（子类可覆盖）。"""
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        close_btn = QPushButton("关闭")
+        close_btn.setFixedWidth(96)
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+    def attach(self, panel: QWidget) -> None:
+        """把面板挂进对话框（重复调用只是移动父窗口，不重建控件）。"""
+        self._panel = panel
+        self._lay.addWidget(panel)
+        panel.show()
+
+    def detach(self, host: QWidget) -> None:
+        """把面板移回隐藏宿主，避免它随对话框一起被销毁。"""
+        panel = self._panel
+        self._panel = None
+        if panel is None:
+            return
+        host_lay = host.layout()
+        if host_lay is not None:
+            host_lay.addWidget(panel)
+        else:
+            panel.setParent(host)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        parent = self.parent()
+        host = getattr(parent, self._host_attr, None)
+        if host is not None:
+            self.detach(host)
+        super().closeEvent(event)
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._center_on_parent()
+
+    def _center_on_parent(self) -> None:
+        parent = self.parent()
+        if parent is None:
+            return
+        try:
+            geo = parent.geometry()
+            self.move(geo.center().x() - self.width() // 2,
+                      geo.center().y() - self.height() // 2)
+        except Exception:
+            pass
+
+
+class ConfigDialog(_HostedPanelDialog):
+    """配置窗口：承载原主窗口顶部配置区的全部内容。"""
+
+    _host_attr = "_config_host"
+
+    def __init__(self, panel: QWidget, parent: Optional[QWidget] = None):
+        super().__init__("配置", 780, 420, panel, parent)
+
+
+class LogWindow(_HostedPanelDialog):
+    """日志窗口：承载原右栏的日志面板（右上角「日志」按钮打开）。
+
+    窗口关闭期间日志仍会持续写入面板（``_append_log`` / 知识库同步轮询都直接
+    写 ``self.log_view``），重新打开即可看到完整历史，不会丢行。
+    """
+
+    _host_attr = "_log_host"
+
+    def __init__(self, panel: QWidget, parent: Optional[QWidget] = None):
+        super().__init__("日志", 900, 620, panel, parent)
+
+
+# ===========================================================================
 # Keyed plain text editor: Enter sends, Shift+Enter newline
 # ===========================================================================
 
@@ -642,8 +881,12 @@ class SendEditor(QPlainTextEdit):
 
 
 class MainWindow(QMainWindow):
+    # 本地模型后台预加载完成（跨线程）→ UI 线程更新按钮态：key=「main」/「aux」，success=是否成功。
+    model_loaded = pyqtSignal(str, bool)
+
     def __init__(self) -> None:
         super().__init__()
+        self.model_loaded.connect(self._on_model_loaded)
         self.setWindowTitle("Base Augment Agent")
         self.resize(1280, 820)
 
@@ -710,15 +953,37 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
 
-        # Top config strip (~1/6 height) + main area below.
-        main_split = QSplitter(Qt.Orientation.Vertical)
-        outer.addWidget(main_split)
+        # ---- Body: chat column (left) + plan/thinking column (right) ----
+        # 配置 / 日志入口并入对话区上方的标题行（见 _build_chat_panel）：原先单独
+        # 一条顶部工具条在去掉标题文本后左侧只剩空条，是多余的视觉噪音。
+        body_split = QSplitter(Qt.Orientation.Horizontal)
+        outer.addWidget(body_split, 1)
+        body_split.addWidget(self._build_chat_panel())
+        body_split.addWidget(self._build_side_panel())
+        body_split.setStretchFactor(0, 4)
+        body_split.setStretchFactor(1, 1)
+        body_split.setSizes([1000, 300])
 
-        main_split.addWidget(self._build_config_panel())
-        main_split.addWidget(self._build_body_panel())
-        main_split.setStretchFactor(0, 1)
-        main_split.setStretchFactor(1, 5)
-        main_split.setSizes([140, 700])
+        # 配置面板与日志面板都不进入主布局：各自托管在一个隐藏宿主里，打开对应
+        # 窗口时挂进对话框，关闭时移回宿主 —— 控件对象常驻，主窗口各处引用无需
+        # 感知父窗口变化。
+        self._config_host = QWidget(self)
+        host_lay = QVBoxLayout(self._config_host)
+        host_lay.setContentsMargins(0, 0, 0, 0)
+        self._config_panel = self._build_config_panel()
+        host_lay.addWidget(self._config_panel)
+        # 宿主仅是面板在「对话框 ↔ 主窗口」间 reparent 的中间容器，本身不进任何布局，
+        # 必须隐藏——否则会作为浮动控件出现在主窗口 (0,0) 左上角（盖住对话区）。
+        self._config_host.hide()
+        self._config_dialog: Optional[ConfigDialog] = None
+
+        self._log_host = QWidget(self)
+        log_host_lay = QVBoxLayout(self._log_host)
+        log_host_lay.setContentsMargins(0, 0, 0, 0)
+        self._log_panel = self._build_log_panel()
+        log_host_lay.addWidget(self._log_panel)
+        self._log_host.hide()
+        self._log_window: Optional[LogWindow] = None
 
         # Status bar with progress
         self.status = QStatusBar()
@@ -732,114 +997,387 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("就绪")
         self.status.addWidget(self.status_label)
 
+    def _on_open_config(self) -> None:
+        """右上角「⚙ 配置」：打开独立配置窗口。
+
+        不做「打开时刷新」：控件里的值本来就是上次「应用配置」后的生效值
+        （``__init__`` / ``_gather_config_from_widgets`` 都会同步），再刷一次
+        只会把用户改到一半、还没点应用的编辑冲掉。
+        """
+        if self._config_dialog is None:
+            self._config_dialog = ConfigDialog(self._config_panel, self)
+        else:
+            # 上一次关闭时面板已移回宿主，这里重新挂进对话框。
+            self._config_dialog.attach(self._config_panel)
+        self._config_dialog.show()
+        self._config_dialog.raise_()
+        self._config_dialog.activateWindow()
+
+    def _on_open_log(self) -> None:
+        """右上角「日志」：打开独立日志窗口（原右栏日志面板迁入）。
+
+        与配置窗口同理不做「打开时刷新」：日志在窗口关闭期间持续写入面板，
+        重新打开看到的就是完整历史。
+        """
+        if self._log_window is None:
+            self._log_window = LogWindow(self._log_panel, self)
+        else:
+            # 上一次关闭时面板已移回宿主，这里重新挂进窗口。
+            self._log_window.attach(self._log_panel)
+        self._log_window.show()
+        self._log_window.raise_()
+        self._log_window.activateWindow()
+
     def _build_config_panel(self) -> QWidget:
+        """配置窗口内容：两大区 —— Agent 模型配置 / 知识同步配置。"""
         box = QWidget()
         lay = QVBoxLayout(box)
         lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
+        lay.setSpacing(10)
 
+        def _combo(items, min_w=None):
+            c = QComboBox()
+            c.addItems(items)
+            if min_w:
+                c.setMinimumWidth(min_w)
+            return c
+
+        def _path(placeholder="", min_w=200):
+            e = QLineEdit(placeholderText=placeholder)
+            if min_w:
+                e.setMinimumWidth(min_w)
+            return e
+
+        def _num(text, width=56):
+            e = QLineEdit(text)
+            e.setFixedWidth(width)
+            return e
+
+        def _pick_btn(edit):
+            b = QPushButton("选择")
+            b.setFixedWidth(56)
+            b.setToolTip("选择本地模型目录")
+            b.clicked.connect(lambda: self._pick_model_dir(edit))
+            return b
+
+        def _params_widget(mt, temp, tp, mp, tk, rp, to):
+            w = QWidget()
+            row = QHBoxLayout(w)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            row.addWidget(QLabel("context")); row.addWidget(mt)
+            row.addWidget(QLabel("Temp"));     row.addWidget(temp)
+            row.addWidget(QLabel("top_p"));    row.addWidget(tp)
+            row.addWidget(QLabel("min_p"));    row.addWidget(mp)
+            row.addWidget(QLabel("top_k"));    row.addWidget(tk)
+            row.addWidget(QLabel("repeat-penalty")); row.addWidget(rp)
+            row.addWidget(QLabel("超时(秒)"));  row.addWidget(to)
+            return w
+
+        # ==================================================================
+        # 区一：Agent 模型配置（主模型 + 辅助模型）
+        # ==================================================================
+        agent_box = QGroupBox("Agent 模型配置")
+        alay = QVBoxLayout(agent_box)
+        alay.setContentsMargins(10, 8, 10, 8)
+        alay.setSpacing(8)
+
+        # ---- 主模型：模式切换（本地模式 / OpenAI 兼容接口）----
+        mode_row = QHBoxLayout(); mode_row.setSpacing(8)
+        mode_row.addWidget(QLabel("主模型"))
+        mode_row.addSpacing(8)
+        mode_row.addWidget(QLabel("模式:"))
+        self.main_mode_combo = _combo(["本地模式", "OpenAI兼容接口"])
+        mode_row.addWidget(self.main_mode_combo)
+        mode_row.addStretch(1)
+        alay.addLayout(mode_row)
+
+        # 主模型 - 本地模式 row1：模型类型 + 本地路径 + 选择
+        self.main_type_combo = _combo(["MLX-LM", "MLX-VLM", "ONNX", "GGUF"], 110)
+        self.local_llm_model_edit = _path("留空=默认 qwen3.5-4b-agentic-coder-v4-4bit-mlx")
+        self.main_local_row1_w = QWidget()
+        r = QHBoxLayout(self.main_local_row1_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(8)
+        r.addWidget(QLabel("模型类型")); r.addWidget(self.main_type_combo)
+        r.addWidget(QLabel("本地路径")); r.addWidget(self.local_llm_model_edit, 1)
+        r.addWidget(_pick_btn(self.local_llm_model_edit))
+        alay.addWidget(self.main_local_row1_w)
+
+        # 主模型 - OpenAI 模式 row1：Base URL + API Key + 模型 + 获取模型
         self.base_url_edit = QLineEdit(placeholderText="https://api.openai.com/v1")
         self.api_key_edit = QLineEdit(placeholderText="sk-...", echoMode=QLineEdit.EchoMode.Password)
-        self.model_combo = QComboBox(editable=True)
-        self.model_combo.setMinimumWidth(180)
+        self.model_combo = QComboBox(editable=True); self.model_combo.setMinimumWidth(180)
         self.fetch_btn = QPushButton("获取模型")
-        self.temp_edit = QLineEdit("0.7")
-        self.temp_edit.setFixedWidth(60)
-        self.max_tokens_edit = QLineEdit("32768")
-        self.max_tokens_edit.setFixedWidth(80)
-        self.top_p_edit = QLineEdit("0.95")
-        self.top_p_edit.setFixedWidth(60)
-        self.min_p_edit = QLineEdit("0.05")
-        self.min_p_edit.setFixedWidth(60)
-        self.top_k_edit = QLineEdit("20")
-        self.top_k_edit.setFixedWidth(60)
-        self.repeat_penalty_edit = QLineEdit("1.0")
-        self.repeat_penalty_edit.setFixedWidth(60)
-        self.timeout_edit = QLineEdit("120")
-        self.timeout_edit.setFixedWidth(60)
-        self.workspace_edit = QLineEdit()
-        self.workspace_btn = QPushButton("…")
-        self.workspace_btn.setFixedWidth(28)
-        self.knowledge_base_edit = QLineEdit(placeholderText="（可选）知识库目录")
-        self.knowledge_base_btn = QPushButton("…")
-        self.knowledge_base_btn.setFixedWidth(28)
+        self.main_openai_row1_w = QWidget()
+        r = QHBoxLayout(self.main_openai_row1_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(8)
+        r.addWidget(QLabel("Base URL")); r.addWidget(self.base_url_edit, 3)
+        r.addWidget(QLabel("API Key")); r.addWidget(self.api_key_edit, 2)
+        r.addWidget(QLabel("模型")); r.addWidget(self.model_combo, 2)
+        r.addWidget(self.fetch_btn)
+        alay.addWidget(self.main_openai_row1_w)
+
+        # 主模型 - 参数行（两模式共用）+ 动作按钮（本地: 加载/卸载；API: 应用配置）
+        self.max_tokens_edit = _num("32768", 80)
+        self.temp_edit = _num("0.7")
+        self.top_p_edit = _num("0.95")
+        self.min_p_edit = _num("0.05")
+        self.top_k_edit = _num("20")
+        self.repeat_penalty_edit = _num("1.0")
+        self.timeout_edit = _num("120")
+        self.main_params_w = QWidget()
+        r = QHBoxLayout(self.main_params_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(6)
+        r.addWidget(_params_widget(self.max_tokens_edit, self.temp_edit, self.top_p_edit,
+                                   self.min_p_edit, self.top_k_edit, self.repeat_penalty_edit,
+                                   self.timeout_edit))
+        r.addStretch(1)
+        self.load_main_btn = QPushButton("加载模型")
+        self.load_main_btn.setStyleSheet("font-weight:600;")
+        self.unload_main_btn = QPushButton("卸载")
         self.connect_btn = QPushButton("应用配置")
         self.connect_btn.setStyleSheet("font-weight:600;")
-        self.clear_btn = QPushButton("清空对话")
-        self.stop_btn = QPushButton("终止对话")
-        self.stop_btn.setEnabled(False)
+        r.addWidget(self.load_main_btn); r.addWidget(self.unload_main_btn); r.addWidget(self.connect_btn)
+        alay.addWidget(self.main_params_w)
 
-        # Row 0: Base URL | API Key | 模型 | 获取模型
-        row0 = QHBoxLayout()
-        row0.setSpacing(8)
-        row0.addWidget(QLabel("Base URL"))
-        row0.addWidget(self.base_url_edit, 3)
-        row0.addWidget(QLabel("API Key"))
-        row0.addWidget(self.api_key_edit, 2)
-        row0.addWidget(QLabel("模型"))
-        row0.addWidget(self.model_combo, 2)
-        row0.addWidget(self.fetch_btn)
-        lay.addLayout(row0)
+        # ---- 辅助模型（本地专用）----
+        alay.addWidget(QLabel("辅助模型（本地专用，用于事实抽取等轻量子任务）"))
+        self.aux_type_combo = _combo(["MLX-LM", "MLX-VLM", "ONNX", "GGUF"], 110)
+        self.aux_local_llm_model_edit = _path("留空=默认 Qwen3.5-2B-MLX-4bit")
+        r = QHBoxLayout(); r.setSpacing(8)
+        r.addWidget(QLabel("模型类型")); r.addWidget(self.aux_type_combo)
+        r.addWidget(QLabel("本地路径")); r.addWidget(self.aux_local_llm_model_edit, 1)
+        r.addWidget(_pick_btn(self.aux_local_llm_model_edit))
+        alay.addLayout(r)
+        self.aux_max_tokens_edit = _num("32768", 80)
+        self.aux_temp_edit = _num("0.7")
+        self.aux_top_p_edit = _num("0.95")
+        self.aux_min_p_edit = _num("0.05")
+        self.aux_top_k_edit = _num("20")
+        self.aux_repeat_penalty_edit = _num("1.0")
+        self.aux_timeout_edit = _num("120")
+        r = QHBoxLayout(); r.setSpacing(6)
+        r.addWidget(_params_widget(self.aux_max_tokens_edit, self.aux_temp_edit, self.aux_top_p_edit,
+                                   self.aux_min_p_edit, self.aux_top_k_edit, self.aux_repeat_penalty_edit,
+                                   self.aux_timeout_edit))
+        r.addStretch(1)
+        self.load_aux_btn = QPushButton("加载模型")
+        self.load_aux_btn.setStyleSheet("font-weight:600;")
+        self.unload_aux_btn = QPushButton("卸载")
+        r.addWidget(self.load_aux_btn); r.addWidget(self.unload_aux_btn)
+        alay.addLayout(r)
 
-        # Row 1: 上下文长度 | 温度 | top_p | min_p | top_k | 重复惩罚 | 超时(秒) | 应用配置
-        row1 = QHBoxLayout()
-        row1.setSpacing(8)
-        row1.addWidget(QLabel("context"))
-        row1.addWidget(self.max_tokens_edit)
-        row1.addWidget(QLabel("Temp"))
-        row1.addWidget(self.temp_edit)
-        row1.addWidget(QLabel("top_p"))
-        row1.addWidget(self.top_p_edit)
-        row1.addWidget(QLabel("min_p"))
-        row1.addWidget(self.min_p_edit)
-        row1.addWidget(QLabel("top_k"))
-        row1.addWidget(self.top_k_edit)
-        row1.addWidget(QLabel("repeat-penalty"))
-        row1.addWidget(self.repeat_penalty_edit)
-        row1.addWidget(QLabel("超时(秒)"))
-        row1.addWidget(self.timeout_edit)
-        row1.addStretch(1)
-        row1.addWidget(self.connect_btn)
-        lay.addLayout(row1)
+        lay.addWidget(agent_box)
 
-        # Row 2: 工作目录 | … | 知识库目录 | … | 停止
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-        row2.addWidget(QLabel("工作目录"))
-        row2.addWidget(self.workspace_edit, 1)
-        row2.addWidget(self.workspace_btn)
-        row2.addWidget(QLabel("知识库"))
-        row2.addWidget(self.knowledge_base_edit, 1)
-        row2.addWidget(self.knowledge_base_btn)
+        # ==================================================================
+        # 区二：知识同步配置（工作/知识目录 + Embedding + Reranker）
+        # ==================================================================
+        kb_box = QGroupBox("知识同步配置")
+        klay = QVBoxLayout(kb_box)
+        klay.setContentsMargins(10, 8, 10, 8)
+        klay.setSpacing(8)
+
+        # row1: 工作目录 + 知识库目录
+        self.workspace_edit = QLineEdit()
+        self.workspace_btn = QPushButton("…"); self.workspace_btn.setFixedWidth(28)
+        self.knowledge_base_edit = QLineEdit(placeholderText="（可选）知识库目录")
+        self.knowledge_base_btn = QPushButton("…"); self.knowledge_base_btn.setFixedWidth(28)
+        r = QHBoxLayout(); r.setSpacing(8)
+        r.addWidget(QLabel("工作目录")); r.addWidget(self.workspace_edit, 1); r.addWidget(self.workspace_btn)
+        r.addWidget(QLabel("知识库")); r.addWidget(self.knowledge_base_edit, 1); r.addWidget(self.knowledge_base_btn)
+        klay.addLayout(r)
+
+        # row2: Embedding（实现下拉 + 模型名 + 本地路径选择 + 同步知识）
+        self.embedding_impl_combo = _combo(["fastembed", "mlx", "onnx", "gguf"], 110)
+        self.embedding_model_name_edit = _path("模型名（fastembed 模型 id）", 200)
+        self.embedding_path_edit = _path("本地路径（mlx/onnx/gguf 时选用）", 160)
+        r = QHBoxLayout(); r.setSpacing(8)
+        r.addWidget(QLabel("Embedding")); r.addWidget(self.embedding_impl_combo)
+        r.addWidget(self.embedding_model_name_edit, 2)
+        r.addWidget(self.embedding_path_edit, 2); r.addWidget(_pick_btn(self.embedding_path_edit))
         self.sync_knowledge_btn = QPushButton("同步知识")
         self.sync_knowledge_btn.setToolTip(
             "解析知识库文档、建立向量索引，支持 RAG 检索\n"
             "左键：增量同步（只处理新增/修改的文件）\n"
             "右键：强制全量重新处理"
         )
-        # Right-click context menu: force full reprocess (ignores manifest).
         self.sync_knowledge_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
         self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
         self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
-        row2.addWidget(self.sync_knowledge_btn)
-        # Stop-sync button: enabled only while a sync is running. Cancels
-        # the ingest after the current file completes (cooperative cancel).
+        r.addWidget(self.sync_knowledge_btn)
+        klay.addLayout(r)
+
+        # row3: Reranker（实现下拉 + 模型名 + 本地路径选择 + 停止同步）
+        self.reranker_impl_combo = _combo(["fastembed", "mlx", "onnx", "gguf"], 110)
+        self.reranker_model_name_edit = _path("模型名（fastembed 模型 id）", 200)
+        self.reranker_path_edit = _path("本地路径（mlx/onnx/gguf 时选用）", 160)
+        r = QHBoxLayout(); r.setSpacing(8)
+        r.addWidget(QLabel("Reranker")); r.addWidget(self.reranker_impl_combo)
+        r.addWidget(self.reranker_model_name_edit, 2)
+        r.addWidget(self.reranker_path_edit, 2); r.addWidget(_pick_btn(self.reranker_path_edit))
         self.stop_sync_btn = QPushButton("停止同步")
         self.stop_sync_btn.setEnabled(False)
         self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
-        row2.addWidget(self.stop_sync_btn)
-        lay.addLayout(row2)
+        r.addWidget(self.stop_sync_btn)
+        klay.addLayout(r)
+
+        lay.addWidget(kb_box)
+        lay.addStretch(1)
+
+        # 主模型模式切换 & 加载/卸载按钮
+        self.main_mode_combo.currentTextChanged.connect(self._on_main_mode_changed)
+        self.load_main_btn.clicked.connect(self._on_load_main_model)
+        self.unload_main_btn.clicked.connect(self._on_unload_main_model)
+        self.load_aux_btn.clicked.connect(self._on_load_aux_model)
+        self.unload_aux_btn.clicked.connect(self._on_unload_aux_model)
 
         return box
 
-    def _build_body_panel(self) -> QWidget:
-        hsplit = QSplitter(Qt.Orientation.Horizontal)
+    # ------------------------------------------------------------------
+    # 配置窗口：模型路径选择 / 主模型模式切换 / 主·辅助模型加载·卸载
+    # ------------------------------------------------------------------
+    def _pick_model_dir(self, edit: "QLineEdit") -> None:
+        d = QFileDialog.getExistingDirectory(self, "选择本地模型目录", edit.text() or "models")
+        if d:
+            edit.setText(d)
 
-        # Left column: chat / send / thinking
+    def _on_main_mode_changed(self, text: str) -> None:
+        """主模型在「本地模式」与「OpenAI兼容接口」间切换：显示对应行与动作按钮。"""
+        local = (text == "本地模式")
+        self.main_local_row1_w.setVisible(local)
+        self.load_main_btn.setVisible(local)
+        self.unload_main_btn.setVisible(local)
+        self.main_openai_row1_w.setVisible(not local)
+        self.connect_btn.setVisible(not local)
+
+    def _mark_model_loaded(self, key: str) -> None:
+        btn = self.load_main_btn if key == "main" else self.load_aux_btn
+        btn.setText("重新加载")
+        btn.setStyleSheet(_MODEL_READY_STYLE)
+
+    def _mark_model_unloaded(self, key: str) -> None:
+        btn = self.load_main_btn if key == "main" else self.load_aux_btn
+        btn.setText("加载模型")
+        btn.setStyleSheet(_MODEL_IDLE_STYLE)
+
+    def _on_model_loaded(self, key: str, success: bool) -> None:
+        """后台预加载完成（跨线程信号入队到主线程）后更新按钮态。"""
+        if success:
+            self._mark_model_loaded(key)
+            self.status_label.setText(
+                "主模型已就绪，可对话" if key == "main" else "辅助模型已就绪")
+        else:
+            self._mark_model_unloaded(key)
+
+    def _preload_client(self, client, label: str, key: str) -> None:
+        """后台预加载本地模型权重（LocalLLMClient._ensure_model），不阻塞 UI。
+
+        加载完成/失败都通过 model_loaded 信号（跨线程入队）回到主线程更新
+        按钮态：成功→绿色「重新加载」，失败→恢复「加载模型」。
+        """
+        ensure = getattr(client, "_ensure_model", None)
+        if ensure is None:
+            return
+
+        def _run():
+            try:
+                ensure()
+                logger.info("%s 权重已预加载", label)
+                self.model_loaded.emit(key, True)
+            except Exception as e:  # 预加载失败不影响主流程，首次用时再报错
+                logger.warning("%s 预加载失败: %s", label, e)
+                self.model_loaded.emit(key, False)
+
+        threading.Thread(target=_run, daemon=True, name=f"preload-{label}").start()
+
+    def _on_load_main_model(self) -> None:
+        if self._busy:
+            QMessageBox.warning(
+                self, "正在运行", "Agent 正在运行，请先「终止对话」再加载模型。")
+            return
+        self.config.save(CONFIG_PATH)
+        self._rebuild_agent()
+        self._preload_client(getattr(self, "_llm", None), "主模型", "main")
+        self.status_label.setText("主模型加载中…")
+
+    def _on_unload_main_model(self) -> None:
+        if self._busy:
+            QMessageBox.warning(
+                self, "正在运行", "Agent 正在运行，请先「终止对话」再卸载模型。")
+            return
+        old = getattr(self, "_llm", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        self._llm = None
+        self._agent = None
+        self._mark_model_unloaded("main")
+        self.status_label.setText("主模型已卸载，请选择新模型并加载")
+
+    def _on_load_aux_model(self) -> None:
+        if self._busy:
+            QMessageBox.warning(
+                self, "正在运行", "Agent 正在运行，请先「终止对话」再加载模型。")
+            return
+        self.config.save(CONFIG_PATH)
+        self._gather_config_from_widgets()
+        old = getattr(self, "_aux_llm", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+            self._aux_llm = None
+        try:
+            from ..local.factory import build_aux_llm_client
+            aux = build_aux_llm_client(self.config)
+        except Exception as e:
+            self._on_error(f"无法加载辅助模型: {e}")
+            return
+        self._aux_llm = aux
+        if self._agent is not None:
+            self._agent.aux_llm = aux
+        self._preload_client(aux, "辅助模型", "aux")
+        self.status_label.setText("辅助模型加载中…")
+
+    def _on_unload_aux_model(self) -> None:
+        old = getattr(self, "_aux_llm", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        self._aux_llm = None
+        if self._agent is not None:
+            self._agent.aux_llm = None
+        self._mark_model_unloaded("aux")
+        self.status_label.setText("辅助模型已卸载")
+
+    def _build_chat_panel(self) -> QWidget:
+        """左栏：对话区（占满）→ token 速度 → 发送框 + 发送按钮（贴底）。
+
+        思考过程已移到右栏（见 ``_build_side_panel``），日志移入独立日志窗口，
+        左栏因此整块都给对话区；token 速度/总量居中放在发送框上方。
+        """
         left = QWidget()
         llay = QVBoxLayout(left)
         llay.setContentsMargins(0, 0, 0, 0)
         llay.setSpacing(4)
+
+        # 对话控制按钮（原配置区里的两个对话动作，随对话栏走）
+        self.clear_btn = QPushButton("清空对话")
+        self.stop_btn = QPushButton("终止对话")
+        self.stop_btn.setEnabled(False)
+        # 配置 / 日志入口并入本行右侧（不再单独占一条顶部工具条）
+        self.config_btn = QPushButton("⚙ 配置")
+        self.config_btn.setFixedWidth(96)
+        self.config_btn.setStyleSheet("font-weight:600;")
+        self.config_btn.setToolTip(
+            "打开配置窗口：Base URL / API Key / 模型 / 采样参数 / 工作目录 / 知识库"
+        )
+        self.log_btn = QPushButton("日志")
+        self.log_btn.setFixedWidth(96)
+        self.log_btn.setStyleSheet("font-weight:600;")
+        self.log_btn.setToolTip("打开日志窗口：运行日志 / RAG 同步 / 工具调用记录")
 
         # chat header with controls
         chat_header = QHBoxLayout()
@@ -848,9 +1386,12 @@ class MainWindow(QMainWindow):
         chat_header.addStretch(1)
         chat_header.addWidget(self.clear_btn)
         chat_header.addWidget(self.stop_btn)
+        chat_header.addSpacing(12)
+        chat_header.addWidget(self.config_btn)
+        chat_header.addWidget(self.log_btn)
         llay.addLayout(chat_header)
 
-        # chat view
+        # chat view —— 思考/日志移走后，左栏整块都是对话区
         self.chat_view = QTextEdit()
         self.chat_view.setReadOnly(True)
         # 限制对话区保留的段落数。长会话（多轮工具调用 + 大段输出）会让
@@ -859,9 +1400,23 @@ class MainWindow(QMainWindow):
         self.chat_view.document().setDefaultStyleSheet(
             ".u{color:#2563eb}.a{color:#059669}.t{color:#7c3aed}.sys{color:#9ca3af}"
         )
-        llay.addWidget(self.chat_view, 3)
+        llay.addWidget(self.chat_view, 1)
 
-        # send
+        # token 速度 / 总量：居中放在发送框与发送按钮上方
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(8)
+        stats_row.addStretch(1)
+        self.speed_label = QLabel("0.0 tok/s")
+        self.speed_label.setStyleSheet("color:#6b7280;")
+        self.token_label = QLabel("总计 0 tokens")
+        self.token_label.setStyleSheet("color:#6b7280;")
+        stats_row.addWidget(self.speed_label)
+        stats_row.addWidget(QLabel("|"))
+        stats_row.addWidget(self.token_label)
+        stats_row.addStretch(1)
+        llay.addLayout(stats_row)
+
+        # send（贴在最底部）
         send_row = QHBoxLayout()
         self.send_editor = SendEditor()
         self.send_editor.setFixedHeight(64)
@@ -875,38 +1430,27 @@ class MainWindow(QMainWindow):
         send_row.addLayout(send_col)
         llay.addLayout(send_row)
 
-        # 执行计划（任务目标 + 步骤进度）。放在思考过程上方：它是用户判断
-        # 「Agent 在干什么、跑到哪了」的第一眼信息，比推理文本更该被看见。
-        plan_font = QFont("Menlo")
-        plan_font.setStyleHint(QFont.StyleHint.Monospace)
-        plan_header = QHBoxLayout()
-        plan_header.addWidget(QLabel("执行计划"))
-        self.plan_toggle_btn = QPushButton("收起")
-        self.plan_toggle_btn.setFixedWidth(60)
-        self.plan_toggle_btn.setCheckable(True)
-        plan_header.addStretch(1)
-        plan_header.addWidget(self.plan_toggle_btn)
-        llay.addLayout(plan_header)
-        self.plan_view = QPlainTextEdit()
-        self.plan_view.setReadOnly(True)
-        self.plan_view.setFont(plan_font)
-        self.plan_view.setMaximumBlockCount(300)
-        self.plan_view.setFixedHeight(132)
-        self.plan_view.setPlaceholderText("（尚无计划 — Agent 开始任务前会先规划）")
-        llay.addWidget(self.plan_view)
+        return left
 
-        # thinking
-        think_header = QHBoxLayout()
-        think_header.addWidget(QLabel("思考过程"))
-        self.speed_label = QLabel("0.0 tok/s")
-        self.speed_label.setStyleSheet("color:#6b7280;")
-        self.token_label = QLabel("总计 0 tokens")
-        self.token_label.setStyleSheet("color:#6b7280;")
-        think_header.addStretch(1)
-        think_header.addWidget(self.speed_label)
-        think_header.addWidget(QLabel("|"))
-        think_header.addWidget(self.token_label)
-        llay.addLayout(think_header)
+    def _build_side_panel(self) -> QWidget:
+        """右栏：执行计划（上）+ 思考过程（下）—— 日志已移入独立日志窗口。"""
+        vsplit = QSplitter(Qt.Orientation.Vertical)
+        vsplit.addWidget(self._build_plan_panel())
+        vsplit.addWidget(self._build_thinking_panel())
+        vsplit.setStretchFactor(0, 2)
+        vsplit.setStretchFactor(1, 3)
+        vsplit.setSizes([240, 460])
+        return vsplit
+
+    def _build_thinking_panel(self) -> QWidget:
+        """思考过程（原左栏中部，随日志移走后调到右栏原日志的位置）。"""
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("思考过程"))
+        lay.addLayout(header)
         self.think_view = QPlainTextEdit()
         self.think_view.setReadOnly(True)
         font = QFont("Menlo")
@@ -914,11 +1458,45 @@ class MainWindow(QMainWindow):
         self.think_view.setFont(font)
         # 防止单次超长流式推理导致内存无限增长（每轮运行前会 clear()）。
         self.think_view.setMaximumBlockCount(10000)
-        llay.addWidget(self.think_view, 2)
+        lay.addWidget(self.think_view)
+        return box
 
-        hsplit.addWidget(left)
+    def _build_plan_panel(self) -> QWidget:
+        """执行计划：任务目标 + 步骤清单 + 每项完成情况，正在进行的步骤高亮。"""
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
 
-        # Right column: log
+        plan_header = QHBoxLayout()
+        plan_header.setSpacing(8)
+        plan_header.addWidget(QLabel("执行计划"))
+        # 进度摘要：`2/5 步完成 · 进行中：部署`
+        self.plan_progress_label = QLabel("")
+        self.plan_progress_label.setStyleSheet("color:#6b7280;")
+        plan_header.addWidget(self.plan_progress_label)
+        plan_header.addStretch(1)
+        self.plan_toggle_btn = QPushButton("收起")
+        self.plan_toggle_btn.setFixedWidth(60)
+        self.plan_toggle_btn.setCheckable(True)
+        plan_header.addWidget(self.plan_toggle_btn)
+        lay.addLayout(plan_header)
+
+        self.plan_view = QTextEdit()
+        self.plan_view.setReadOnly(True)
+        plan_font = QFont("Menlo")
+        plan_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.plan_view.setFont(plan_font)
+        # 与 QPlainTextEdit 时代一致的上限：QTextDocument 同样支持。
+        self.plan_view.document().setMaximumBlockCount(300)
+        self.plan_view.setPlaceholderText(
+            "（尚无计划 — Agent 开始任务前会先规划）\n"
+            "计划制定后，这里会列出每一步及其完成情况，并标记当前正在执行的步骤。"
+        )
+        lay.addWidget(self.plan_view)
+        return box
+
+    def _build_log_panel(self) -> QWidget:
         right = QWidget()
         rlay = QVBoxLayout(right)
         rlay.setContentsMargins(0, 0, 0, 0)
@@ -932,20 +1510,19 @@ class MainWindow(QMainWindow):
         rlay.addLayout(log_header)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
+        font = QFont("Menlo")
+        font.setStyleHint(QFont.StyleHint.Monospace)
         self.log_view.setFont(font)
         self.log_view.setMaximumBlockCount(5000)  # 限制日志行数，防止内存无限增长
         rlay.addWidget(self.log_view, 1)
-        hsplit.addWidget(right)
-
-        hsplit.setStretchFactor(0, 2)
-        hsplit.setStretchFactor(1, 1)
-        hsplit.setSizes([820, 420])
-        return hsplit
+        return right
 
     # ------------------------------------------------------------------
     # wiring
     # ------------------------------------------------------------------
     def _wire_signals(self) -> None:
+        self.config_btn.clicked.connect(self._on_open_config)
+        self.log_btn.clicked.connect(self._on_open_log)
         self.fetch_btn.clicked.connect(self._on_fetch_models)
         self.connect_btn.clicked.connect(self._on_apply_config)
         self.workspace_btn.clicked.connect(self._on_pick_workspace)
@@ -991,6 +1568,34 @@ class MainWindow(QMainWindow):
         self.timeout_edit.setText(str(self.config.request_timeout))
         self.workspace_edit.setText(self.config.workspace)
         self.knowledge_base_edit.setText(self.config.knowledge_base)
+        # 主模型模式（本地 / OpenAI 兼容接口）+ 本地类型与路径
+        self.main_mode_combo.setCurrentText(
+            "本地模式" if self.config.llm_provider == "local" else "OpenAI兼容接口")
+        self.main_type_combo.setCurrentText(
+            _BACKEND_TO_LLM_TYPE.get(self.config.local_llm_backend, "MLX-LM"))
+        self.local_llm_model_edit.setText(self.config.local_llm_model)
+        # 辅助模型（本地专用）
+        self.aux_type_combo.setCurrentText(
+            _BACKEND_TO_LLM_TYPE.get(self.config.aux_local_llm_backend, "MLX-LM"))
+        self.aux_local_llm_model_edit.setText(self.config.aux_local_llm_model)
+        self.aux_temp_edit.setText(str(self.config.aux_temperature))
+        self.aux_max_tokens_edit.setText(str(self.config.aux_max_tokens))
+        self.aux_top_p_edit.setText(str(self.config.aux_top_p))
+        self.aux_min_p_edit.setText(str(self.config.aux_min_p))
+        self.aux_top_k_edit.setText(str(self.config.aux_top_k))
+        self.aux_repeat_penalty_edit.setText(str(self.config.aux_repetition_penalty))
+        self.aux_timeout_edit.setText(str(self.config.aux_request_timeout))
+        # Embedding / Reranker：实现下拉 + 模型名 + 本地路径
+        self.embedding_impl_combo.setCurrentText(_provider_backend_to_impl(
+            self.config.embedding_provider, self.config.local_embedding_backend))
+        self.embedding_model_name_edit.setText(self.config.rag_embedding_model)
+        self.embedding_path_edit.setText(self.config.local_embedding_model)
+        self.reranker_impl_combo.setCurrentText(_provider_backend_to_impl(
+            self.config.reranker_provider, self.config.local_reranker_backend))
+        self.reranker_model_name_edit.setText(self.config.rag_rerank_model)
+        self.reranker_path_edit.setText(self.config.local_reranker_model)
+        # 同步主模型模式切换的可见性
+        self._on_main_mode_changed(self.main_mode_combo.currentText())
 
     def _gather_config_from_widgets(self) -> None:
         self.config.base_url = self.base_url_edit.text().strip()
@@ -1037,6 +1642,14 @@ class MainWindow(QMainWindow):
         _num(self.top_k_edit, "top_k", 20, int, "top_k")
         _num(self.repeat_penalty_edit, "repetition_penalty", 1.0, float, "重复惩罚")
         _num(self.timeout_edit, "request_timeout", 120, float, "超时")
+        # 辅助模型参数（本地专用）
+        _num(self.aux_temp_edit, "aux_temperature", 0.7, float, "辅助温度")
+        _num(self.aux_max_tokens_edit, "aux_max_tokens", 32768, int, "辅助最大Token")
+        _num(self.aux_top_p_edit, "aux_top_p", 0.95, float, "辅助top_p")
+        _num(self.aux_min_p_edit, "aux_min_p", 0.05, float, "辅助min_p")
+        _num(self.aux_top_k_edit, "aux_top_k", 20, int, "辅助top_k")
+        _num(self.aux_repeat_penalty_edit, "aux_repetition_penalty", 1.0, float, "辅助重复惩罚")
+        _num(self.aux_timeout_edit, "aux_request_timeout", 120, float, "辅助超时")
         if invalid:
             # 状态栏提示一次；不打断流程（回退值是安全的默认）。
             self.status_label.setText(
@@ -1053,9 +1666,40 @@ class MainWindow(QMainWindow):
             # the box even when the user hasn't explicitly set a path.
             kb = os.path.join(self.config.workspace, "knowledge_base")
         self.config.knowledge_base = kb
+        # 主模型模式（本地 / OpenAI 兼容接口）+ 本地类型与路径
+        self.config.llm_provider = (
+            "local" if self.main_mode_combo.currentText() == "本地模式" else "api")
+        self.config.local_llm_backend = _LLM_TYPE_TO_BACKEND.get(
+            self.main_type_combo.currentText(), "mlx")
+        self.config.local_llm_model = self.local_llm_model_edit.text().strip()
+        # 辅助模型（本地专用）
+        self.config.aux_llm_provider = "local"
+        self.config.aux_local_llm_backend = _LLM_TYPE_TO_BACKEND.get(
+            self.aux_type_combo.currentText(), "mlx")
+        self.config.aux_local_llm_model = self.aux_local_llm_model_edit.text().strip()
+        # Embedding / Reranker：实现下拉 → (provider, backend)；模型名与本地路径分别落位
+        emb_impl = self.embedding_impl_combo.currentText().strip()
+        self.config.embedding_provider, self.config.local_embedding_backend = \
+            _impl_to_provider_backend(emb_impl)
+        name = self.embedding_model_name_edit.text().strip()
+        if name:
+            self.config.rag_embedding_model = name
+        self.config.local_embedding_model = self.embedding_path_edit.text().strip()
+        rk_impl = self.reranker_impl_combo.currentText().strip()
+        self.config.reranker_provider, self.config.local_reranker_backend = \
+            _impl_to_provider_backend(rk_impl)
+        rname = self.reranker_model_name_edit.text().strip()
+        if rname:
+            self.config.rag_rerank_model = rname
+        self.config.local_reranker_model = self.reranker_path_edit.text().strip()
 
     def _rebuild_agent(self) -> None:
         self._gather_config_from_widgets()
+        # 重建会换掉主/辅模型，先把两个按钮复位为「加载模型」未就绪态，
+        # 待各自后台预加载成功后再置绿（仅当按钮已创建时操作）。
+        if getattr(self, "load_main_btn", None) is not None:
+            self._mark_model_unloaded("main")
+            self._mark_model_unloaded("aux")
         # Shut down the old agent's resources (MCP subprocesses, httpx client)
         # before replacing it — otherwise each "应用配置" click leaks a set of
         # MCP server subprocesses and an open httpx connection.
@@ -1075,6 +1719,13 @@ class MainWindow(QMainWindow):
                 old_llm.close()
             except Exception:
                 pass
+        # 辅助模型同样需要在重建前关闭，否则每次「加载/应用」都泄漏一份权重。
+        old_aux = getattr(self, "_aux_llm", None)
+        if old_aux is not None:
+            try:
+                old_aux.close()
+            except Exception:
+                pass
         # 构造失败时必须把两个引用都清空：旧的 agent 已经被 tools.shutdown()
         # （MCP 子进程已杀、RAG 引擎已关），旧的 llm 也 close() 了。若把引用
         # 留着，用户照常点「发送」会得到一个半死的 agent —— MCP 工具全部
@@ -1082,18 +1733,24 @@ class MainWindow(QMainWindow):
         # "Cannot send a request, as the client has been closed."。
         self._agent = None
         self._llm = None
+        self._aux_llm = None
         try:
-            new_llm = LLMClient(
-                base_url=self.config.base_url, api_key=self.config.api_key,
-                model=self.config.model, timeout=self.config.request_timeout,
-                max_tokens=self.config.max_tokens,
-                top_p=self.config.top_p,
-                min_p=self.config.min_p,
-                top_k=self.config.top_k,
-                repetition_penalty=self.config.repetition_penalty,
+            # 主 LLM：按 config.llm_provider 选择网络 API 或本地加载（工厂路由）。
+            from ..local.factory import (
+                build_llm_client, build_aux_llm_client, configure_local_models,
             )
+            configure_local_models(self.config)  # 同步 embedding/reranker provider
+            new_llm = build_llm_client(self.config)
             new_agent = Agent(llm=new_llm, config=self.config, callbacks=self._callbacks)
             new_agent.max_iterations = self.config.max_iterations
+            # 辅助模型（本地）：用于事实抽取等轻量子任务。加载失败不影响主流程。
+            try:
+                new_aux = build_aux_llm_client(self.config)
+            except Exception as aux_err:
+                logger.warning("辅助模型加载失败（不影响主流程）: %s", aux_err)
+                new_aux = None
+            new_agent.aux_llm = new_aux
+            self._aux_llm = new_aux
         except Exception as e:
             self._on_error(f"无法创建 agent: {e}")
             # 保持 None：_on_send 会给出明确提示，而不是用一个坏掉的 agent。
@@ -1162,6 +1819,15 @@ class MainWindow(QMainWindow):
         if not kb:
             QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
             return
+        # 让知识同步区的 Embedding / Reranker 选择即时生效：把当前下拉与路径
+        # 收敛进 config 并同步到 vector_store 的 provider 开关（否则需先点
+        # 「应用配置/加载模型」才能让新建向量库用上所选实现）。
+        try:
+            self._gather_config_from_widgets()
+            from ..local.factory import configure_local_models
+            configure_local_models(self.config)
+        except Exception as e:
+            logger.warning("同步前应用 Embedding/Reranker 设置失败: %s", e)
         logger.info("Knowledge sync triggered: kb=%s workspace=%s force=%s", kb, ws, force)
         # Step 1: check dependencies before starting sync
         self.sync_knowledge_btn.setEnabled(False)
@@ -1806,24 +2472,26 @@ class MainWindow(QMainWindow):
             self._pending_skill = skill
 
     def _on_plan_updated(self, plan) -> None:
-        """把计划快照渲染到计划面板。
+        """把计划快照渲染到右栏「执行计划」面板。
 
         只做纯文本渲染，不弹窗、不打断流式输出 —— 计划的价值在于「随时可
         见」，而不是在每个步骤变更时抢用户的注意力。
 
-        必须用**信号携带的** plan 快照渲染（``render_plan_dict`` 纯函数）：
-        旧实现转手读 ``self._agent.session.render_plan()`` —— 工作线程的
+        必须用**信号携带的** plan 快照渲染（``_plan_html`` 纯函数）：旧实现
+        转手读 ``self._agent.session.render_plan()`` —— 工作线程的
         update_plan 工具会原地改 step dict，跨线程读共享可变状态可能渲染出
         半新半旧的中间态；且 agent 为 None 时会把面板错误清空。
         """
         try:
-            text = render_plan_dict(plan if isinstance(plan, dict) else None)
+            html = _plan_html(plan if isinstance(plan, dict) else None)
         except Exception:
-            text = ""
-        if not text:
+            html = ""
+        if not html:
             self.plan_view.clear()
+            self.plan_progress_label.setText("")
             return
-        self.plan_view.setPlainText(text)
+        self.plan_view.setHtml(html)
+        self.plan_progress_label.setText(_plan_progress_text(plan))
         self._scroll_to_bottom(self.plan_view)
 
     def _on_plan_toggle(self, checked: bool) -> None:
@@ -2041,6 +2709,16 @@ class MainWindow(QMainWindow):
         3. wait() with a timeout; if it doesn't finish, terminate() as a last
            resort — unsafe, but safer than the crash.
         """
+        # --- 先关配置/日志窗口：它们会把各自面板移回隐藏宿主。否则主窗口销毁时
+        # 会连带销毁作为子窗口的对话框，而面板是对话框的子控件 —— 主窗口仍持有
+        # 的引用会变成指向已释放 C++ 对象的悬空引用。
+        for _name in ("_config_dialog", "_log_window"):
+            try:
+                _dlg = getattr(self, _name, None)
+                if _dlg is not None:
+                    _dlg.close()
+            except Exception:
+                pass
         # --- 停止日志轮询定时器
         try:
             self._log_poll_timer.stop()

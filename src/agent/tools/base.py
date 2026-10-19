@@ -96,9 +96,12 @@ class ToolRegistry:
     # execute() 都重新构造 Signature 对象。
     _signature_cache: Dict[type, "inspect.Signature"] = {}
 
-    def __init__(self, config: AgentConfig, callbacks: "Any"):
+    def __init__(self, config: AgentConfig, callbacks: "Any", aux_llm_getter: "Any" = None):
         self.config = config
         self.callbacks = callbacks
+        # 辅助模型客户端惰性获取器：由 Agent 注入（aux 在运行时才加载/可卸载），
+        # RAG 工具用它把检索分片交给辅助模型先归纳精简。为 None 时跳过精简。
+        self._aux_llm_getter = aux_llm_getter
         self.config.ensure_workspace()
         self._tools: Dict[str, Tool] = {}
         self._mcp_clients: list = []  # MCPClient instances, for cleanup
@@ -262,7 +265,8 @@ class ToolRegistry:
             self._rag_engine = engine
 
             registered = []
-            for t in [RagSearchTool(engine), RagStatusTool(engine), RagIngestTool(engine),
+            for t in [RagSearchTool(engine, aux_llm_getter=self._aux_llm_getter),
+                      RagStatusTool(engine), RagIngestTool(engine),
                       RagOutlineTool(engine)]:
                 if t.name not in self._tools:
                     t.bind(self.config, self)

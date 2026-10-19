@@ -340,7 +340,14 @@ class Agent:
         self.llm = llm  # object with chat_stream(messages, tools, temperature)
         self.config = config
         self.callbacks = callbacks
-        self.tools = tool_registry or ToolRegistry(config=config, callbacks=callbacks)
+        # 辅助模型（用于事实抽取、RAG 检索结果归纳等轻量子任务），由 UI 在运行时
+        # 加载/卸载；初始为 None。RAG 工具通过惰性 getter 读取当前值，aux 未加载时
+        # 自动回退到「重排结果原样注入」。
+        self.aux_llm = None
+        self.tools = tool_registry or ToolRegistry(
+            config=config, callbacks=callbacks,
+            aux_llm_getter=lambda: getattr(self, "aux_llm", None),
+        )
         self.skills = skills or SkillManager(
             path=os.path.join(config.workspace, ".agent", "skills.json"),
             skills_dir=os.path.join(config.workspace, ".agent", "skills"),
@@ -678,17 +685,36 @@ class Agent:
         ``self.llm`` unchanged — those have no shared socket state.
         """
         from .llm_client import LLMClient
+        from .local.llm import LocalLLMClient
+
+        # 辅助模型（若已配置并加载）且主模型是真实客户端时，事实抽取改用它，
+        # 避免与主模型抢占推理资源。主模型是测试 mock / 脚本化 LLM 时（非真实
+        # 客户端），仍走下方逻辑复用主 llm——否则会用真实辅助模型替换掉 mock，
+        # 既偏离测试预期又白白加载一份权重。辅助客户端由 main_window 管理生命
+        # 周期（加载/卸载），这里只读用、不缓存、不关闭。
+        aux = getattr(self, "aux_llm", None)
+        main_is_real = isinstance(self.llm, (LLMClient, LocalLLMClient))
+        if aux is not None and main_is_real and isinstance(aux, (LLMClient, LocalLLMClient)):
+            return aux
 
         # 「应用配置」换模型后必须重建：缓存的客户端仍指向旧 base_url/model。
-        cur_key = (getattr(self.llm, "base_url", None), getattr(self.llm, "model", None))
+        # 本地模型按对象身份做 key（没有 base_url/model 属性）。
+        cur_key = (type(self.llm).__name__,
+                   getattr(self.llm, "base_url", None),
+                   getattr(self.llm, "model", None))
         cached = getattr(self, "_extract_llm", None)
         if cached is not None and getattr(self, "_extract_llm_key", None) == cur_key:
             return cached
 
-        if not isinstance(self.llm, LLMClient):
+        if not isinstance(self.llm, (LLMClient, LocalLLMClient)):
             # Non-LLMClient (test mock / scripted): reuse self.llm (no shared
             # socket state to race).
             return self.llm
+        if isinstance(self.llm, LocalLLMClient):
+            # 本地模型：抽取复用主客户端，避免重复加载 GB 级权重（本地推理可共享）。
+            self._extract_llm = self.llm
+            self._extract_llm_key = cur_key
+            return self._extract_llm
 
         # 懒初始化会被两个线程并发触发：confirm 弹窗的
         # _describe_code_purpose（worker 线程）与抽取守护线程。不加锁会各自

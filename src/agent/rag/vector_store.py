@@ -253,13 +253,13 @@ def _store_op(func):
 # 切片上的实测是「吞吐与内存都随子批增大单调变差」——激活工作集 ∝ 子批
 # ×批内最长序列，超出 CPU 缓存后被内存带宽卡死，「大批次摊薄开销」在此
 # 不成立。真实 200 切片实测：size2 = 2071 tok/s @ 1.28GB，size4 = 1864 @
-# 2.14GB，size12 = 1163 @ 4.99GB。1-5 覆盖「单条最省内存」到「短切片批
-# 效率」的合理区间，步长 1 让爬山在平坦段也能精细寻优；初始 2 起步即落
-# 在实测最优区（#128 用户规格）。
-_SUBBATCH_MIN = 1
-_SUBBATCH_MAX = 5
-_SUBBATCH_START = 2
-_SUBBATCH_STEP = 1
+# 2.14GB，size12 = 1163 @ 4.99GB。调优范围按用户规格改为 [2, 64]，步进 2，
+# 初始 16：下限 2 仍避开「单条最省内存」的过碎批，上限放开给长切片/高带宽
+# 机器爬升空间，爬山步长 2 在更宽区间内更快收敛。
+_SUBBATCH_MIN = 2
+_SUBBATCH_MAX = 64
+_SUBBATCH_START = 16
+_SUBBATCH_STEP = 2
 # RSS 软墙（#129，用户定参 8GB）：内存偶尔冲高是正常的（OCR 缓存、压缩
 # 计费），只要求「超墙时降档避让、回墙下即停」——无闩锁。旧 5GB 闩锁版
 # 会在真实同步基线（6-10GB）下首个子批就触发且永不解除，是「降到 1 再
@@ -307,7 +307,7 @@ _SUBBATCH_RE_CLIMB = 1.10
 
 
 class _SubBatchTuner:
-    """在 [1, 5] 内自动寻找吞吐最优的嵌入子批大小（爬山 + 降档）。
+    """在 [2, 64] 内自动寻找吞吐最优的嵌入子批大小（爬山 + 降档）。
 
     度量：不用原始 tok/s——长度分桶后各批序列长度天然不同，直接比
     tok/s 有系统性偏差。改用算力速率 ``ops/s = n × max_len² / dt``（以
@@ -511,10 +511,33 @@ class _SubBatchTuner:
             self._degrade_streak = 0
 
 
+# ---------------------------------------------------------------------------
+# 本地模型 provider 开关：embedding / reranker 可切换为「应用内加载本地权重」。
+# 由 local.factory.configure_local_models(config) 在初始化时写入一次。
+# ---------------------------------------------------------------------------
+_EMBED_PROVIDER: Dict[str, Any] = {"provider": "api", "path": "", "backend": "mlx"}
+_RERANK_PROVIDER: Dict[str, Any] = {"provider": "api", "path": "", "backend": "mlx"}
+
+
+def set_embedding_provider(provider: str, path: str = "", backend: str = "mlx") -> None:
+    """配置 embedding provider：``api``（fastembed 网络）或 ``local``（本地权重）。"""
+    _EMBED_PROVIDER.update(provider=provider or "api", path=path or "", backend=backend or "mlx")
+
+
+def set_reranker_provider(provider: str, path: str = "", backend: str = "mlx") -> None:
+    """配置 reranker provider：``api``（fastembed cross-encoder）或 ``local``。"""
+    _RERANK_PROVIDER.update(provider=provider or "api", path=path or "", backend=backend or "mlx")
+
+
 def get_or_create_embedding_function(
     model_name: str = DEFAULT_EMBEDDING_MODEL,
-) -> "FastEmbedEmbeddingFunction":
-    """Return a process-wide shared FastEmbedEmbeddingFunction.
+) -> Any:
+    """Return a process-wide shared embedding function.
+
+    当 ``_EMBED_PROVIDER["provider"] == "local"`` 时返回本地加载的
+    ``LocalEmbeddingFunction``（与 ``FastEmbedEmbeddingFunction`` 同接口）；否则
+    走原有 fastembed 路径。两者都以 ``model_name`` 为键缓存单例，避免重复加载
+    ~GB 级权重。
 
     The ONNX model (~137MB) is loaded once and shared across all callers
     (RAG VectorStore, graph_memory GraphMemoryStore, etc.).  ONNX Runtime
@@ -524,12 +547,45 @@ def get_or_create_embedding_function(
     This avoids loading multiple copies of the same ~137MB model when both
     RAG and graph_memory are active (which previously cost ~274MB).
     """
+    if _EMBED_PROVIDER["provider"] == "local":
+        key = ("__local_embed__", _EMBED_PROVIDER["path"] or "default",
+               _EMBED_PROVIDER["backend"])
+        with _EF_SINGLETONS_LOCK:
+            ef = _EF_SINGLETONS.get(key)
+            if ef is None:
+                from ..local.embedding import LocalEmbeddingFunction
+                from ..local import registry
+                path = registry.resolve_model_path("embedding", _EMBED_PROVIDER["path"])
+                ef = LocalEmbeddingFunction(path, backend=_EMBED_PROVIDER["backend"])
+                _EF_SINGLETONS[key] = ef
+            return ef
     with _EF_SINGLETONS_LOCK:
         ef = _EF_SINGLETONS.get(model_name)
         if ef is None:
             ef = FastEmbedEmbeddingFunction(model_name=model_name)
             _EF_SINGLETONS[model_name] = ef
         return ef
+
+
+def get_or_create_reranker() -> Any:
+    """返回与 fastembed ``TextCrossEncoder`` 同接口（``.rerank(query, docs)``）的精排器。
+
+    当 provider 为 ``local`` 时返回进程级单例 ``LocalReranker``；否则返回 None，
+    交由 ``VectorStore._get_reranker`` 走原有 fastembed 后台加载流程。
+    """
+    if _RERANK_PROVIDER["provider"] != "local":
+        return None
+    key = ("__local_rerank__", _RERANK_PROVIDER["path"] or "default",
+           _RERANK_PROVIDER["backend"])
+    with _EF_SINGLETONS_LOCK:
+        rk = _EF_SINGLETONS.get(key)
+        if rk is None:
+            from ..local.reranker import LocalReranker
+            from ..local import registry
+            path = registry.resolve_model_path("reranker", _RERANK_PROVIDER["path"])
+            rk = LocalReranker(path, backend=_RERANK_PROVIDER["backend"])
+            _EF_SINGLETONS[key] = rk
+        return rk
 
 
 # 懒加载互斥：_ensure_model 的「if self._model is None → TextEmbedding(...)」
@@ -1135,9 +1191,10 @@ class VectorStore:
         更新）。ONNX Runtime 的 embed() 在 C++ 计算期间持有 GIL，整批一次
         性嵌入会导致 UI 长时间冻结。
 
-        子批大小不固定（历史值 5/12）：由 :class:`_SubBatchTuner` 在 1-5 内
-        自适应（#125，#126/#127/#128 生产验证修订：真实切片上吞吐与内存都
-        随子批增大单调变差，size2 双优）。长度分桶后 padding 已归零。
+        子批大小不固定（历史值 5/12）：由 :class:`_SubBatchTuner` 在 [2, 64]
+        内自适应（用户规格：最小 2 / 最大 64 / 初始 16 / 步进 2）。真实切片上
+        吞吐与内存随子批增大单调变差，调优器会自动在 2~最优区间收敛；下限 2
+        避开单条过碎批，上限放开给长切片/高带宽机器爬升。长度分桶后 padding 已归零。
 
         形状预算（#126 修订）：每个子批组装时按 ``_shape_cap_size`` 钳制
         条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小，把瞬时激活
@@ -1477,6 +1534,9 @@ class VectorStore:
         # 会直接 return（状态置 failed），避免状态机卡死或「复活」持有权重。
         if getattr(self, "_closed", False):
             return None
+        # 本地 reranker 优先：单例、懒加载，直接复用，不走 fastembed 后台状态机。
+        if _RERANK_PROVIDER["provider"] == "local":
+            return get_or_create_reranker()
         state = getattr(self, "_reranker_state", "idle")
         if state == "done":
             return self._reranker

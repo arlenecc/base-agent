@@ -6,6 +6,10 @@ import os
 from typing import Any, Dict, TYPE_CHECKING
 
 from .base import Tool, ToolResult, ToolRegistry
+from ..rag.postprocess import (
+    condense_retrieved_chunks,
+    build_condensed_output,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +42,11 @@ class RagSearchTool(Tool):
     }
     destructive = False
 
-    def __init__(self, engine: "RAGEngine"):
+    def __init__(self, engine: "RAGEngine", aux_llm_getter: Any = None):
         self._engine = engine
+        # 辅助模型客户端惰性获取器：由 Agent 在运行时注入（aux 可能被卸载/重建），
+        # 工具自身不该持有模型引用。为 None 或取到 None 时跳过精简，回退原始结果。
+        self._aux_llm_getter = aux_llm_getter
 
     def bind(self, config: Any, registry: ToolRegistry) -> None:
         pass
@@ -65,6 +72,23 @@ class RagSearchTool(Tool):
             query[:80], top_k, source[:80],
         )
         try:
+            # 先取重排后的原始分片（含完整 text，未截断），供辅助模型通读归纳。
+            chunks = self._engine.search(query, top_k=top_k, source=source or None)
+            aux = self._aux_llm_getter() if self._aux_llm_getter else None
+            if chunks and aux is not None:
+                try:
+                    condensed = condense_retrieved_chunks(query, chunks, aux, max_chars=2000)
+                except Exception as e:  # 精简异常不应让检索整体失败
+                    logger.warning("RAG 辅助模型精简异常，回退原始结果: %s", e)
+                    condensed = ""
+                if condensed:
+                    output = build_condensed_output(query, chunks, condensed)
+                    logger.info(
+                        "✅ RAG 检索 %d 条 → 辅助模型精简为 %d 字注入主模型",
+                        len(chunks), len(condensed),
+                    )
+                    return ToolResult(success=True, output=output)
+            # 回退：辅助模型不可用 / 精简失败 / 结果为空时，维持原格式化行为。
             results = self._engine.search_formatted(
                 query, top_k=top_k, source=source or None,
             )

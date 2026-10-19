@@ -14,3 +14,5 @@ BaseAgent.iconset/
 generated-images/
 # 主线参考副本（RAG 同步的基准仓库，非本工程资产）
 Base-Aug-Agent/
+# 本地模型权重（MLX / ONNX / GGUF，体积 GB 级，按需自行下载到该目录）
+models/

@@ -83,6 +83,41 @@ class AgentConfig:
     # 关掉则把渲染出的原始位图直接送进引擎（旧行为）。
     rag_ocr_preprocess: bool = True
 
+    # ---- 本地模型 provider 开关（应用内直接加载，不走网络）----
+    # 每个模型用途一个开关：``api``（默认走网络实现）/ ``local``（加载本地权重）。
+    # embedding / reranker / 主 LLM / 辅助 LLM 默认 ``local``（仓库自带 MLX 权重）。
+    # 具体模型路径为空时走 local.registry 的默认值（models/ 下的自带权重）。
+    #
+    # 主 LLM：默认本地模式，默认加载 models/qwen3.5-4b-agentic-coder-v4-4bit-mlx。
+    llm_provider: str = "local"
+    local_llm_model: str = ""
+    local_llm_backend: str = "mlx"
+
+    # 辅助 LLM（本地专用，用于事实抽取等轻量子任务）：默认加载
+    # models/Qwen3.5-2B-MLX-4bit。不带 OpenAI 模式（辅助任务始终本地）。
+    aux_llm_provider: str = "local"
+    aux_local_llm_model: str = ""
+    aux_local_llm_backend: str = "mlx"
+    aux_temperature: float = 0.7
+    aux_max_tokens: int = 32768
+    aux_top_p: float = 0.95
+    aux_min_p: float = 0.05
+    aux_top_k: int = 20
+    aux_repetition_penalty: float = 1.0
+    aux_request_timeout: float = 120.0
+
+    embedding_provider: str = "local"
+    local_embedding_model: str = ""
+    local_embedding_backend: str = "mlx"
+
+    reranker_provider: str = "local"
+    local_reranker_model: str = ""
+    local_reranker_backend: str = "mlx"
+
+    vlm_provider: str = "api"
+    local_vlm_model: str = ""
+    local_vlm_backend: str = "mlx"
+
     # Browser endpoint for webexec_js (Playwright-like bridge). Optional.
     browser_endpoint: str = ""
 
@@ -103,12 +138,20 @@ class AgentConfig:
                    "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
                    "kernel_max_context_tokens", "kernel_raw_turns",
                    "kernel_consolidate_every", "kernel_max_tool_chars",
-                   "kernel_max_digest_lines")
+                   "kernel_max_digest_lines",
+                   "aux_max_tokens", "aux_top_k")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
-                     "request_timeout", "context_shrink_ratio")
+                     "request_timeout", "context_shrink_ratio",
+                     "aux_temperature", "aux_top_p", "aux_min_p",
+                     "aux_repetition_penalty", "aux_request_timeout")
     _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
                    "rag_embedding_model", "rag_rerank_model", "rag_pdf_engine",
-                   "browser_endpoint")
+                   "browser_endpoint", "llm_provider", "local_llm_model",
+                   "local_llm_backend", "embedding_provider", "local_embedding_model",
+                   "local_embedding_backend", "reranker_provider", "local_reranker_model",
+                   "local_reranker_backend", "vlm_provider", "local_vlm_model",
+                   "local_vlm_backend",
+                   "aux_llm_provider", "aux_local_llm_model", "aux_local_llm_backend")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess")
 
