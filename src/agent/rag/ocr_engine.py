@@ -611,14 +611,34 @@ def ocr_with_ocrmac(img: "Any") -> Optional[str]:
         # ocrmac 的 API：OCR(image, framework, recognition_level, language_
         # preference, ...)——参数名是 recognition_level，没有 LEVEL_* 常量。
         # 传错会 TypeError → 被下面的 except 吞掉静默回退，这里参数名必须对。
-        lines = []
-        for text, _conf, _box in _om.OCR(
-                pil, language_preference=_OCRMAC_LANGS,
-                recognition_level="accurate").recognize():
-            t = (text or "").strip()
-            if t:
-                lines.append(t)
-        return "\n".join(lines)
+        #
+        # **autorelease pool 是必须的**：recognize() 经 pyobjc/ffi 同步调用
+        # VNRecognizeTextRequest，产生的 Objective-C 中间对象（NSImage 副本、
+        # VNRequestHandler、每行识别结果的 NSString 等）挂在当前线程的
+        # autorelease pool 上——Python 线程没有事件循环去排空它，一次同步
+        # 数百页就累积数 GB（2026-10 实测：sample 栈显示 VNCRImageReader
+        # 队列 + ANEServicesThread 满采样，RSS 冲到 7.5GB）。每页一个 pool，
+        # 退出时统一释放。
+        try:
+            import objc
+            pool_ctx = objc.autorelease_pool
+        except Exception:
+            pool_ctx = None
+
+        def _run() -> str:
+            lines = []
+            for text, _conf, _box in _om.OCR(
+                    pil, language_preference=_OCRMAC_LANGS,
+                    recognition_level="accurate").recognize():
+                t = (text or "").strip()
+                if t:
+                    lines.append(t)
+            return "\n".join(lines)
+
+        if pool_ctx is not None:
+            with pool_ctx():
+                return _run()
+        return _run()
     except Exception as e:
         logger.debug("ocrmac 识别失败，将回退 RapidOCR: %s", e)
         return None

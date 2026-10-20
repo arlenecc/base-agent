@@ -24,6 +24,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# 与 docling_parser 同款约束：探测可用性只能用 find_spec，绝不能真实
+# import marker——marker 会连带加载 torch/surya 全家桶（~1-2GB），而这条
+# 探测在 PDF/epub 解析入口每文件都会走到。#131 离线环境变量同样适用
+# （marker 的模型经 huggingface_hub 下载，已缓存则离线可用）。
+
 # marker 2.x 原生支持的输入格式。docx/pptx/xlsx 交给 docling/按格式解析器
 # （marker 只认 PDF/图片/epub/mobi 等文档位图类输入）。
 _MARKER_EXTENSIONS = {".pdf", ".epub", ".mobi", ".azw3", ".azw", ".png", ".jpg", ".jpeg", ".webp"}
@@ -48,15 +53,18 @@ def reset_unavailable() -> None:
 
 
 def is_marker_available() -> bool:
-    """Return True if marker can be imported."""
+    """Return True if marker is installed.
+
+    用 ``find_spec`` 探测而**不是真实 import**：import marker 会连带加载
+    torch/surya 全家桶（~1-2GB），与 docling 的 find_spec 修复（#131）同理。
+    """
     global _converter_unavailable
     if _converter_unavailable:
         return False
     try:
-        import marker  # noqa: F401
-        return True
-    except ImportError:
-        _converter_unavailable = True
+        import importlib.util
+        return importlib.util.find_spec("marker") is not None
+    except Exception:
         return False
 
 

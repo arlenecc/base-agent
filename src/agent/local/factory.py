@@ -101,6 +101,13 @@ def configure_local_models(config) -> None:
     选择 fastembed 或本地模型。幂等。
     """
     from ..rag import vector_store as vs
+    # MLX 默认 cache_limit 是统一内存的 ~75%：聊天/嵌入的空闲 Metal buffer
+    # 会一路涨到上限才归还系统（16GB 机器上 ~12GB）。压到 1GB，空闲即还。
+    try:
+        from ..rag.engine import configure_mlx_memory_limits
+        configure_mlx_memory_limits()
+    except Exception:  # mlx 未装 / 非 macOS：跳过
+        pass
     vs.set_embedding_provider(
         _provider(getattr(config, "embedding_provider", "local"), "local"),
         path=getattr(config, "local_embedding_model", ""),

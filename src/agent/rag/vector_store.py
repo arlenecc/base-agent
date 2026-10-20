@@ -1269,7 +1269,12 @@ class VectorStore:
         # 一批 chunk 通常来源相同 → 缓存 source→hash 映射，避免每个 chunk
         # 都重算一次 md5（写入侧纯浪费）。
         _hash_cache: Dict[str, str] = {}
+        # FTS 分词循环是纯 Python（jieba 全程持 GIL）：书籍切片动辄几千字，
+        # 200 个切片连跑数秒 UI 线程完全拿不到 GIL——表现为「嵌入子批之间
+        # 阶段性卡住不动」（#131）。每 32 条主动让出一次 GIL。
         for j, chunk in enumerate(chunks):
+            if j and j % 32 == 0:
+                time.sleep(0.01)
             idx = start_idx + j
             source = chunk.get("source", "unknown")
             chunk_idx = chunk.get("chunk_index", idx)

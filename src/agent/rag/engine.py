@@ -49,6 +49,27 @@ def _is_stale_digest(old_digest: str) -> bool:
 DEFAULT_PARALLEL_WORKERS = 2
 
 
+def configure_mlx_memory_limits(cache_bytes: int = 1_000_000_000) -> None:
+    """给 MLX 显式设 Metal 缓冲缓存上限（#131：同步 8→18GB 的根因）。
+
+    MLX 0.32 在 macOS 上默认 ``cache_limit = recommendedMaxWorkingSetSize``
+    （统一内存的 ~75%）——空闲后的 Metal buffer 不归还系统，而是留在池里
+    一直涨到这个上限。16GB 机器上意味着缓存 alone 可到 ~12GB；再叠加
+    docling converter（torch + 布局模型，~4.6GB）驻留，进程 phys_footprint
+    冲到 19GB（实测 2026-10-20），系统开始疯狂 swap。
+
+    只限缓存：``clear_cache`` 后的空闲缓冲超过 cache_bytes 就立即归还系统。
+    活跃内存（模型权重 + 推理激活）不受影响，不设 memory_limit 以免干扰
+    同进程的 aux LLM 长上下文推理。同步开始时调用一次即可。
+    """
+    try:
+        import mlx.core as mx
+        mx.metal.set_cache_limit(cache_bytes)
+        logger.info("MLX cache limit set to %.1f GB", cache_bytes / 1e9)
+    except Exception as e:
+        logger.debug("MLX cache limit not set: %s", e)
+
+
 def release_mlx_pool() -> None:
     """把 MLX 统一内存池的空闲缓冲与解析器产生的引用循环还给系统。
 
@@ -399,11 +420,12 @@ def _extract_with_docling(filepath: str) -> tuple:
             cleaned = clean_ebook_markdown(md)
             if cleaned:
                 return cleaned, True
-    primary, secondary = _pdf_engine, "docling"
-    if primary not in ("docling", "marker"):
-        primary = "docling"
-    if secondary == primary:
-        secondary = None
+    # 回退链（#131 用户定版）：主引擎（rag_pdf_engine 配置，默认 docling）
+    # → 另一个统一引擎（marker）→ PyMuPDF 轻量路径（最后兜底，只能出纯文本，
+    # 没有版面良好的 Markdown）。旧实现 secondary 与 primary 相同时直接置
+    # None——默认配置下 docling 失败会跳过 marker 直落 PyMuPDF。
+    primary = _pdf_engine if _pdf_engine in ("docling", "marker") else "docling"
+    secondary = "marker" if primary == "docling" else "docling"
     for engine in (primary, secondary):
         if not engine:
             continue

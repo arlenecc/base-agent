@@ -689,7 +689,11 @@ class SyncKnowledgeWorker(QThread):
             # 还要叠加嵌入（~2GB）与扫描件 OCR（数 GB），起步水位越低越不容
             # 易触发系统内存压力。只清空闲缓冲，不影响已加载的模型权重。
             try:
-                from ..rag.engine import release_mlx_pool
+                from ..rag.engine import configure_mlx_memory_limits, release_mlx_pool
+                # MLX 默认 cache_limit = 统一内存的 ~75%，空闲 Metal buffer 会
+                # 一路涨到上限才归还——16GB 机器上光缓存就能到 ~12GB（实测
+                # 同步峰值 footprint 19GB 的主因）。压到 1GB，空闲即还。
+                configure_mlx_memory_limits()
                 release_mlx_pool()
             except Exception as e:  # 防御：清理失败不该中断同步
                 logger.debug("SyncKnowledgeWorker: pre-sync mlx cleanup failed: %s", e)

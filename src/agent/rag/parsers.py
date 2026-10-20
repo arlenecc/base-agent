@@ -105,8 +105,12 @@ def _force_cpu_ep() -> None:
 
 
 def _ocr_coreml_requested() -> bool:
-    """当前配置是否请求了 CoreML EP（用于判断冲刷后该不该降级）。"""
-    return bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", True)) and _is_apple_silicon()
+    """当前配置是否请求了 CoreML EP（用于判断冲刷后该不该降级）。
+
+    兜底与 AgentConfig.rag_ocr_coreml 默认值（False）一致——兜底 True 会让
+    未注入配置的调用路径意外启用 CoreML 相关行为（实测比 CPU 慢 2 倍）。
+    """
+    return bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", False)) and _is_apple_silicon()
 
 
 def set_ocr_config(config) -> None:
@@ -509,7 +513,13 @@ def _extract_pdf(path: Path) -> str:
             # _OCR_RECYCLE_PAGES 注释）。全局置 None 后，所有 worker 的
             # 下一页都会重新取用/重建——旧引擎随各 worker 页末的引用释放
             # 而销毁，原生缓存真正被冲刷。
-            if (ocr_page_count + ocr_skipped_count) % _OCR_RECYCLE_PAGES == 0:
+            # **只在 CoreML 模式下执行**：CPU EP 的 ORT arena 增量实测为
+            # 0（2026-10 对照：3 页推理后内存增量 0.00GB），重建纯属代价——
+            # 每次新建 ~0.5-1GB 引擎，4 worker 并发交叉时新旧两代共存，
+            # 实测把 RSS 顶到 6.36GB + swap 26.6GB（整机卡死）。CoreML 的
+            # 按形状缓存问题不存在于 CPU EP。
+            if ((ocr_page_count + ocr_skipped_count) % _OCR_RECYCLE_PAGES == 0
+                    and _ocr_coreml_requested() and not _OCR_FORCE_CPU):
                 release_ocr_engine()
                 logger.info("PDF '%s': OCR 引擎已周期重建（每 %d 页，冲刷原生缓存）",
                             path.name, _OCR_RECYCLE_PAGES)

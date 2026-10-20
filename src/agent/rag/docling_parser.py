@@ -18,15 +18,41 @@ Design:
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
 from pathlib import Path
 from typing import Optional
+
+# 强制 HuggingFace 离线（#131）：docling convert 首次运行会向 huggingface.co
+# 检查模型更新，网络不通时 connect() 要等完整 TCP 超时 + hub 客户端重试，
+# 实测把整个同步卡死 20+ 分钟（2026-10-20 抓到 worker 阻塞在 __connect，
+# 上层是 pydantic 模型构造，OCR 的 VN 线程同时挂起）。docling 所需模型
+# （layout-heron / TableFormer）早已缓存在 ~/.cache/huggingface，离线模式
+# 直接走缓存；未缓存的全新环境会立刻报错 → 走轻量解析器回退，不会挂死。
+# setdefault：用户显式设置的值优先。
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# 保险：若 huggingface_hub 在本模块之前已被导入（其 constants 已固化
+# HF_HUB_OFFLINE=False），直接改写常量兜底。部分 hf 模块在 import 时绑定了
+# 旧值，改不干净——根治靠 agent/__init__.py 的最早设置，这里只是兜底。
+try:
+    import huggingface_hub.constants as _hf_constants
+    if not _hf_constants.HF_HUB_OFFLINE:
+        _hf_constants.HF_HUB_OFFLINE = True
+except Exception:
+    pass
 
 logger = logging.getLogger(__name__)
 
 # Formats docling can handle natively.  Text/markdown/csv/html are handled by
 # the lightweight parsers (docling is overkill and slower for them).
-_DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".epub"}
+# 不含 .epub：EPUB 有专门的 ebook_parser（pandoc → Markdown + 章节切块，
+# 秒级完成）；docling 处理 epub 要先构建 ~3-4GB 的 DocumentConverter
+# （布局模型 + TableFormer，torch），与 ebook_parser 完全重复且慢得多。
+# 2026-10 实测：同步中 docling converter 构建是 2 秒内 +3.7GB 内存突增的
+# 元凶。.doc/.xls 等 legacy 格式由调用方提前拦截（docling 同样不支持）。
+_DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"}
 
 # Converter singleton: docling models are heavy, so share one instance across
 # all workers (access is guarded by a lock — DocumentConverter is not
@@ -39,6 +65,63 @@ _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"
 _converter = None
 _converter_lock = threading.Lock()
 _converter_unavailable = False
+
+# ---- 空闲自动释放（#131）----
+# 2026-10-20 实测：同步第 3 分钟排到第一个 PDF/office 文件时构建 converter
+# （import torch + docling-layout-heron 权重 + TableFormer + 首次推理激活）
+# 一次性 +4.6GB，此后常驻到同步结束才被 engine 的 release_converter 释放。
+# 对「大部分是 txt/epub、只夹了一两个 PDF」的语料，这 4GB+ 要白占几十分钟。
+# 这里加 in-use 计数 + 空闲计时：converter 空闲超过 _IDLE_RELEASE_SECS 且无
+# 活跃转换时由后台线程释放；下一个 docling 文件到来时 _get_converter 会重建
+# （构建 ~2s，代价远小于长时间白占 4GB+）。
+_IDLE_RELEASE_SECS = 90.0
+_IDLE_CHECK_INTERVAL = 15.0
+_converter_in_use = 0        # 正在 convert() 的调用数（含构建期间）
+_converter_last_used = 0.0   # monotonic 时间戳
+_reaper_started = False
+# reaper 启动标志的专用锁：绝不能用 _converter_lock——它在 converter.convert()
+# 期间被长时间持有（整份文档转换数分钟），_start_idle_reaper 在 _get_converter
+# 成功路径上被调用，抢这把锁会让刚构建完 converter 的 worker 卡在另一个
+# worker 的整个转换期间（2026-10-20 实测：正是这个等待让 py-spy 抓到
+# Thread-4 卡在 _start_idle_reaper，掩盖了真正的 convert 挂死）。
+_reaper_start_lock = threading.Lock()
+
+
+def _touch_converter() -> None:
+    """记录「converter 刚被使用」，重置空闲计时。"""
+    global _converter_last_used
+    _converter_last_used = time.monotonic()
+
+
+def _start_idle_reaper() -> None:
+    """启动后台空闲释放线程（进程内仅启动一次）。"""
+    global _reaper_started
+    if _reaper_started:
+        return
+    with _reaper_start_lock:
+        if _reaper_started:
+            return
+        _reaper_started = True
+
+    def _reap() -> None:
+        while True:
+            time.sleep(_IDLE_CHECK_INTERVAL)
+            with _converter_lock:
+                if (_converter is None or _converter_in_use
+                        or _converter_last_used <= 0.0):
+                    continue
+                idle = time.monotonic() - _converter_last_used
+                if idle < _IDLE_RELEASE_SECS:
+                    continue
+                logger.info(
+                    "docling converter 空闲 %.0fs，释放布局/表格模型（数 GB）", idle
+                )
+                # 仅去掉模块级引用；正在进行的调用持有局部引用，不受影响。
+                _converter = None
+
+    threading.Thread(
+        target=_reap, name="docling-idle-reaper", daemon=True
+    ).start()
 
 
 def release_converter() -> None:
@@ -67,15 +150,20 @@ def reset_unavailable() -> None:
 
 
 def is_docling_available() -> bool:
-    """Return True if docling can be imported."""
+    """Return True if docling can be imported.
+
+    用 ``find_spec`` 探测而**不是真实 import**：import docling 会连带加载
+    torch 全家桶（~1-2GB）。这条探测在每个 PDF/EPUB 的解析入口都会走到——
+    扫描 PDF 本来就会在下一步被路由到 PyMuPDF+OCR 轻量路径，为探测而加载
+    torch 纯属浪费（2026-10 实测：同步中 2 秒内 +3.7GB 的元凶之一）。
+    """
     global _converter_unavailable
     if _converter_unavailable:
         return False
     try:
-        import docling  # noqa: F401
-        return True
-    except ImportError:
-        _converter_unavailable = True
+        import importlib.util
+        return importlib.util.find_spec("docling") is not None
+    except Exception:
         return False
 
 
@@ -114,9 +202,28 @@ def _get_converter():
                 from docling.document_converter import PdfFormatOption
 
                 pdf_opts = PdfPipelineOptions()
+                # 加速器：MPS（torch Metal）。2026-10-20 60 页真实扫描书 A/B：
+                # 热转换快 ~35%（106.5s vs 160.9s）、峰值内存 2.58GB 平坦 vs
+                # CPU 版 3.94→4.80GB 持续增长；且布局模型移到 GPU 后 CPU 核
+                # 让给 RapidOCR/嵌入（原来日志里子批调优器频繁"降档避让"
+                # 就是这个争抢）。#116 的 36GB 失控由 empty_cache 护栏 +
+                # document_timeout + 峰值监控三道闸兜住（不再依赖回避 MPS）。
+                # 注意：不要设 PYTORCH_MPS_HIGH_WATERMARK_RATIO——docling 的
+                # transformers 引擎内部设 low=1.4，高水位低于它会直接报错。
                 pdf_opts.accelerator_options = AcceleratorOptions(
-                    num_threads=4, device=AcceleratorDevice.CPU
+                    num_threads=4, device=AcceleratorDevice.MPS
                 )
+                # 单文档硬超时（#131）：convert 内部可能永久挂死（实测 2026-10-20
+                # 同步中 convert 卡 20+ 分钟无 CPU 活动，疑 Apple Vision OCR 回调
+                # 不返回）。docling 原生支持 document_timeout，超时抛错 →
+                # extract_markdown 捕获 → 回退轻量解析器，同步不中断。
+                # 3600s：图片书逐页 OCR（Apple Vision）+ 布局 + TableFormer
+                # 很慢（数百页要 20-60 分钟），超时只是防永久挂死的最后防线，
+                # 不能误杀慢而正常的转换。
+                try:
+                    pdf_opts.document_timeout = 3600.0
+                except Exception:
+                    pass  # 老版本无此字段
                 # OCR 后端：Apple Vision（ocrmac）优先——中文印刷体识别质量
                 # 高于 RapidOCR，ANE 推理不占 CPU/内存；不可用（非 macOS /
                 # 未安装 ocrmac）回退 RapidOCR。lang 必须显式给中文：docling
@@ -153,6 +260,8 @@ def _get_converter():
                 converter = DocumentConverter()
             _converter = converter
             logger.info("docling DocumentConverter initialized (global singleton)")
+            _touch_converter()
+            _start_idle_reaper()
             return converter
         except ImportError:
             logger.info("docling not installed; falling back to per-format parsers")
@@ -182,21 +291,36 @@ def extract_markdown(filepath: str) -> Optional[str]:
         return None
 
     # Image-based PDF handling: docling OCRs image pages via RapidOCR, but a
-    # pure-scan PDF (no text layer at all) is better served by the dedicated
-    # RapidOCR path in parsers.py which reuses the shared engine.  Detect that
-    # case cheaply and delegate.
-    #
-    # 混合型 PDF（文本层 + 大量图片页）同样要拦下：docling 对它们跑全量
-    # 管线（布局模型 + TableFormer + 逐页 OCR），单本耗时 40-70 分钟；而
-    # parsers.py 的 PyMuPDF + RapidOCR 路径逐页流式处理（共享单例引擎 +
-    # CoreML 加速 + 归一化），快数倍且内存有界（#116：实测 2 本图多的书
-    # 触发 30GB+ 内存与 2 小时同步）。
-    if suffix == ".pdf" and (_is_scan_pdf(path) or _pdf_is_image_heavy(path)):
-        return None
+    # 图片型 PDF（扫描件/满页背景图的电子书）**不再拦截**：设计上所有 PDF
+    # 统一走 docling（内部 OCR 优先 Apple Vision/ocrmac，输出版面良好的
+    # Markdown）；PyMuPDF+RapidOCR 只是 docling 不可用/转换失败时的兜底。
+    # 旧的「扫描件/图片重 → 转投 PyMuPDF」拦截（#116）已按用户决策撤销——
+    # 当时 30GB+/40-70min 的失控根因（MPS 加速器、无超时、无内存约束）都已
+    # 修复：accelerator 强制 CPU、document_timeout 硬超时、MLX/缓存上限。
 
     converter = _get_converter()
     if converter is None:
         return None
+
+    global _converter_in_use
+    with _converter_lock:
+        _converter_in_use += 1
+        _touch_converter()
+
+    # 看门狗心跳：图片书走 docling 全量管线要 20-60 分钟且期间无任何输出，
+    # UI 只能看到「解析文件: xxx」一条日志挂着不动，会被误判为卡死（#131）。
+    # 守护线程每 60s 报一次已耗时；convert 返回/异常时自动停止。
+    _convert_done = threading.Event()
+
+    def _heartbeat() -> None:
+        t0 = time.monotonic()
+        while not _convert_done.wait(60.0):
+            logger.info(
+                "docling 仍在转换 %s（已 %.0f 分钟，图片书 20-60 分钟属正常）",
+                path.name, (time.monotonic() - t0) / 60.0,
+            )
+
+    threading.Thread(target=_heartbeat, name="docling-heartbeat", daemon=True).start()
 
     try:
         # DocumentConverter 没有声明线程安全，而 ingest 用 4 个 worker 线程
@@ -216,91 +340,19 @@ def extract_markdown(filepath: str) -> Optional[str]:
         # Never let a docling failure abort ingestion — caller falls back.
         logger.warning("docling conversion failed for %s: %s", path.name, e)
         return None
+    finally:
+        _convert_done.set()
+        # MPS 缓存护栏（#131）：torch 的 MPS caching allocator 只借不还，
+        # 逐页激活碎片会在长书转换间累积（#116 的 36GB 根因）。每次转换
+        # 结束立刻把空闲缓冲归还系统——60 页 A/B 实测峰值平坦（2.58GB）。
+        try:
+            import torch
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+        with _converter_lock:
+            _converter_in_use -= 1
+            _touch_converter()
 
 
-def _is_scan_pdf(path: Path) -> bool:
-    """Detect whether a PDF looks like a scan (no text layer at the front).
-
-    只探测前几页：旧实现 ``for page in doc`` 把整本 PDF 的文本全提取一遍——
-    而「判定为扫描件」后走的解析器又要逐页提取/OCR 一遍，大 PDF 的解析时间
-    近乎翻倍。扫描件几乎不可能前 5 页都没有文本层，这里采样首页+中间页即可。
-
-    Uses PyMuPDF; returns False if PyMuPDF is unavailable (let docling try).
-    """
-    _PROBE_PAGES = 5
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        return False
-    try:
-        with fitz.open(str(path)) as doc:
-            n = min(_PROBE_PAGES, doc.page_count)
-            for i in range(n):
-                if doc[i].get_text("text").strip():
-                    return False
-        return True
-    except Exception:
-        return False
-
-
-# 图片页占比超过该阈值的 PDF 不进 docling：采样窗口内「docling 会为之
-# 付出逐页位图处理代价」的页越多，其全量管线（逐页布局/表格/OCR，torch
-# MPS 内存只增不放）越失控，交给 parsers.py 的 PyMuPDF+RapidOCR 路径
-# （CoreML、共享单例、有界内存）更合适。
-#
-# 「会付出位图代价」的页 = 纯图页，或嵌入图片占页面面积 ≥15% 的文本页。
-# 实测（#116）：中文电子书常见「每页文本层 + 满页背景图」的排版，纯图页
-# 占比判定为 0%，但 docling 对每个位图区域都跑 OCR——单本 225-280 页
-# 耗时 37-74 分钟、进程 RSS 涨到 36GB；而文本层直读只需数秒。
-_IMAGE_HEAVY_PROBE_PAGES = 20
-_IMAGE_HEAVY_RATIO = 0.3
-_IMAGE_SIGNIFICANT_AREA_RATIO = 0.15
-
-
-def _pdf_is_image_heavy(path: Path) -> bool:
-    """Detect whether a PDF would make docling pay for per-page bitmap work.
-
-    采样前 ``_IMAGE_HEAVY_PROBE_PAGES`` 页，统计以下两类页面占比：
-      1. 纯图页（无文本层且嵌有图片）——docling 整页 OCR；
-      2. 嵌有显著图片（面积 ≥ ``_IMAGE_SIGNIFICANT_AREA_RATIO`` × 页面）的
-         文本页——典型如满页背景图/花边的中文电子书，docling 的 auto OCR
-         仍会对位图区域逐页推理。
-
-    占比达到 ``_IMAGE_HEAVY_RATIO`` 即判定为图片重。只开一次文档、只读前
-    几页，开销毫秒级。与 ``_is_scan_pdf``（全无文本层）互补。
-    """
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        return False
-    try:
-        with fitz.open(str(path)) as doc:
-            n = min(_IMAGE_HEAVY_PROBE_PAGES, doc.page_count)
-            if n == 0:
-                return False
-            costly = 0
-            for i in range(n):
-                page = doc[i]
-                text = page.get_text("text").strip()
-                images = page.get_images(full=True)
-                if not text:
-                    if images:
-                        costly += 1
-                    continue
-                # 文本页：只有显著大图才计入（页角小 logo 不会让 docling
-                # 变慢到失控，不值得为它放弃 docling 的版面分析质量）。
-                page_area = abs(page.rect)
-                if page_area <= 0:
-                    continue
-                for img in images:
-                    try:
-                        rects = page.get_image_rects(img[0])
-                    except Exception:
-                        continue
-                    if any(abs(r) >= _IMAGE_SIGNIFICANT_AREA_RATIO * page_area
-                           for r in rects):
-                        costly += 1
-                        break
-            return costly / n >= _IMAGE_HEAVY_RATIO
-    except Exception:
-        return False
