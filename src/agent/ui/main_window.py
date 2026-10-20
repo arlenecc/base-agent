@@ -19,10 +19,11 @@ from __future__ import annotations
 import io
 import logging
 import os
+import queue
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QFont, QTextCursor, QKeyEvent
@@ -30,7 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
     QMessageBox, QInputDialog, QPlainTextEdit, QProgressBar,
-    QStatusBar, QFileDialog, QDialog, QGroupBox,
+    QStatusBar, QFileDialog, QDialog, QGroupBox, QCheckBox,
 )
 
 from ..agent import Agent, AgentCallbacks
@@ -340,32 +341,59 @@ class _SummaryStripper:
         out: List[str] = []
         i, n = 0, len(buf)
         while i < n:
-            tag, tag_len = ((self._CLOSE, len(self._CLOSE)) if self._inside
-                            else (self._OPEN, len(self._OPEN)))
-            j = buf.find(tag, i)
-            if j < 0:
-                # 末尾几个字符可能是标签前缀，留到下一 chunk 再判
-                k = max(i, n - (tag_len - 1))
-                tail = buf[k:]
-                if tail and tag.startswith(tail):
-                    self._carry = tail
-                    rest = buf[i:k]
-                else:
-                    rest = buf[i:]
-                if self._inside:
-                    self._inside_buf.append(rest)   # 摘要正文：先存着
-                else:
-                    out.append(rest)                # 回复正文：直接输出
-                break
             if self._inside:
-                self._inside_buf.append(buf[i:j])
-                self._inside = False
-                self._inside_buf = []               # 正常闭合 → 摘要正文丢弃
-            else:
+                # 等闭合标签
+                j = buf.find(self._CLOSE, i)
+                if j >= 0:
+                    self._inside = False
+                    self._inside_buf = []           # 正常闭合 → 摘要正文丢弃
+                    i = j + len(self._CLOSE)
+                    continue
+                # 未闭合：除尾部可能的部分闭合标签外，全部吞进摘要缓冲
+                rest, carry = self._split_partial(buf, i, self._CLOSE)
+                self._carry = carry
+                self._inside_buf.append(rest)
+                break
+            # 未在摘要内：吞掉孤立的闭合标签（开标签落在推理流里时会出现）
+            if buf.startswith(self._CLOSE, i):
+                i += len(self._CLOSE)
+                continue
+            j = buf.find(self._OPEN, i)
+            jc = buf.find(self._CLOSE, i)
+            if jc != -1 and (j == -1 or jc < j):
+                out.append(buf[i:jc])
+                i = jc + len(self._CLOSE)
+                continue
+            if j >= 0:
                 out.append(buf[i:j])
                 self._inside = True
-            i = j + tag_len
+                i = j + len(self._OPEN)
+                continue
+            # 无完整标签：尾部可能是任一标签的**任意长度**真前缀
+            rest, carry = self._split_partial(buf, i, self._OPEN, self._CLOSE)
+            self._carry = carry
+            out.append(rest)
+            break
         return "".join(out)
+
+    @staticmethod
+    def _split_partial(buf: str, i: int, *tags: str) -> Tuple[str, str]:
+        """返回 (可安全输出的部分, 尾部 carry)。
+
+        流式 delta 可能把标签在**任意位置**切碎（如 ``…<sum`` + ``mary>…``）。
+        carry 取 buf 尾部最长的、且是任一 tag 真前缀的后缀——旧实现只检查
+        「恰好占满 tag_len-1 窗口」的情况，短前缀会把半个标签当正文发出，
+        下一 chunk 的 ``mary>`` 就再也拼不回去。
+        """
+        n = len(buf)
+        best = 0
+        for tag in tags:
+            for plen in range(min(len(tag) - 1, n - i), 0, -1):
+                if tag.startswith(buf[n - plen:]):
+                    if plen > best:
+                        best = plen
+                    break
+        return buf[i:n - best], (buf[n - best:] if best else "")
 
     def flush(self) -> str:
         """收尾：标签始终没闭合时，把吞进去的内容还回去。"""
@@ -506,23 +534,53 @@ class BridgeCallbacks(AgentCallbacks):
 
 
 class AgentWorker(QThread):
+    """常驻工作线程：所有用户消息都在**同一条线程**上执行 agent.run()。
+
+    旧实现每回合新建 QThread。这不只是开销问题：MLX 的 KV 缓存绑定创建线程
+    的 GPU stream（跨线程复用会抛 "There is no Stream(gpu, N) in current
+    thread"，llm.py 据此按线程隔离缓存），每回合换线程 → 缓存每回合都被判定
+    跨线程而丢弃 → 多轮对话退回全量预填充。常驻线程让 KV 复用真正命中
+    （多轮场景 6.5s → 0.2s 量级）。
+
+    生命周期：
+    · ``set_input()`` 入队一条用户消息；``run()`` 循环逐条执行，每条结束
+      emit ``bridge.finished``（UI 的 ``_on_finished`` 靠它复位 ``_busy``）。
+    · ``shutdown()`` 入队哨兵让循环退出（closeEvent / 重建 agent 时调用）。
+      正在执行的回合不受影响——协作取消交给 ``callbacks.cancel()``。
+    · 强杀（``_force_stop_agent`` 的 terminate）会让线程死掉但 QThread 对象
+      还在：置 ``_dead`` 后 ``set_input`` 拒绝新任务，``_on_send`` 换新线程。
+    """
+
     def __init__(self, agent: Agent, callbacks: BridgeCallbacks):
         super().__init__()
         self._agent = agent
         self._callbacks = callbacks
-        self._user_text: Optional[str] = None
+        self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._dead = False
 
-    def set_input(self, text: str) -> None:
-        self._user_text = text
+    def set_input(self, text: str) -> bool:
+        """入队一条用户消息。线程已被强杀时返回 False（调用方需换新 worker）。"""
+        if self._dead:
+            return False
+        self._queue.put(text)
+        return True
+
+    def shutdown(self) -> None:
+        """请求常驻循环退出；正在执行的回合结束后生效。"""
+        self._dead = True
+        self._queue.put(None)
 
     def run(self) -> None:  # type: ignore[override]
-        try:
-            assert self._user_text is not None
-            self._agent.run(self._user_text)
-        except Exception as e:
-            self._callbacks.bridge.error.emit(f"{type(e).__name__}: {e}")
-        finally:
-            self._callbacks.bridge.finished.emit()
+        while True:
+            text = self._queue.get()
+            if text is None:
+                break
+            try:
+                self._agent.run(text)
+            except Exception as e:
+                self._callbacks.bridge.error.emit(f"{type(e).__name__}: {e}")
+            finally:
+                self._callbacks.bridge.finished.emit()
 
 
 class FetchModelsWorker(QThread):
@@ -626,6 +684,15 @@ class SyncKnowledgeWorker(QThread):
         emit_stats = None
         emit_error = None
         try:
+            # 同步前先归还 MLX 的空闲缓冲：GUI 里主/辅模型常驻（MLX 统一内存
+            # 不可换出），其推理留下的缓存会占用几百 MB~1GB 水位。同步本身
+            # 还要叠加嵌入（~2GB）与扫描件 OCR（数 GB），起步水位越低越不容
+            # 易触发系统内存压力。只清空闲缓冲，不影响已加载的模型权重。
+            try:
+                from ..rag.engine import release_mlx_pool
+                release_mlx_pool()
+            except Exception as e:  # 防御：清理失败不该中断同步
+                logger.debug("SyncKnowledgeWorker: pre-sync mlx cleanup failed: %s", e)
             self._engine = RAGEngine(
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,
@@ -1060,7 +1127,7 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda: self._pick_model_dir(edit))
             return b
 
-        def _params_widget(mt, temp, tp, mp, tk, rp, to):
+        def _params_widget(mt, temp, tp, mp, tk, rp, thinking, to):
             w = QWidget()
             row = QHBoxLayout(w)
             row.setContentsMargins(0, 0, 0, 0)
@@ -1071,6 +1138,7 @@ class MainWindow(QMainWindow):
             row.addWidget(QLabel("min_p"));    row.addWidget(mp)
             row.addWidget(QLabel("top_k"));    row.addWidget(tk)
             row.addWidget(QLabel("repeat-penalty")); row.addWidget(rp)
+            row.addWidget(thinking)
             row.addWidget(QLabel("超时(秒)"));  row.addWidget(to)
             return w
 
@@ -1123,11 +1191,15 @@ class MainWindow(QMainWindow):
         self.top_k_edit = _num("20")
         self.repeat_penalty_edit = _num("1.0")
         self.timeout_edit = _num("120")
+        self.thinking_check = QCheckBox("思考模式")
+        self.thinking_check.setToolTip(
+            "启用 Qwen3 系思考模式（enable_thinking）。关闭后模型跳过思考直接作答，"
+            "首字延迟显著降低，但复杂任务的推理质量可能下降。")
         self.main_params_w = QWidget()
         r = QHBoxLayout(self.main_params_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(6)
         r.addWidget(_params_widget(self.max_tokens_edit, self.temp_edit, self.top_p_edit,
                                    self.min_p_edit, self.top_k_edit, self.repeat_penalty_edit,
-                                   self.timeout_edit))
+                                   self.thinking_check, self.timeout_edit))
         r.addStretch(1)
         self.load_main_btn = QPushButton("加载模型")
         self.load_main_btn.setStyleSheet("font-weight:600;")
@@ -1153,10 +1225,12 @@ class MainWindow(QMainWindow):
         self.aux_top_k_edit = _num("20")
         self.aux_repeat_penalty_edit = _num("1.0")
         self.aux_timeout_edit = _num("120")
+        self.aux_thinking_check = QCheckBox("思考模式")
+        self.aux_thinking_check.setToolTip(self.thinking_check.toolTip())
         r = QHBoxLayout(); r.setSpacing(6)
         r.addWidget(_params_widget(self.aux_max_tokens_edit, self.aux_temp_edit, self.aux_top_p_edit,
                                    self.aux_min_p_edit, self.aux_top_k_edit, self.aux_repeat_penalty_edit,
-                                   self.aux_timeout_edit))
+                                   self.aux_thinking_check, self.aux_timeout_edit))
         r.addStretch(1)
         self.load_aux_btn = QPushButton("加载模型")
         self.load_aux_btn.setStyleSheet("font-weight:600;")
@@ -1566,6 +1640,7 @@ class MainWindow(QMainWindow):
         self.top_k_edit.setText(str(self.config.top_k))
         self.repeat_penalty_edit.setText(str(self.config.repetition_penalty))
         self.timeout_edit.setText(str(self.config.request_timeout))
+        self.thinking_check.setChecked(bool(getattr(self.config, "local_llm_enable_thinking", True)))
         self.workspace_edit.setText(self.config.workspace)
         self.knowledge_base_edit.setText(self.config.knowledge_base)
         # 主模型模式（本地 / OpenAI 兼容接口）+ 本地类型与路径
@@ -1585,6 +1660,8 @@ class MainWindow(QMainWindow):
         self.aux_top_k_edit.setText(str(self.config.aux_top_k))
         self.aux_repeat_penalty_edit.setText(str(self.config.aux_repetition_penalty))
         self.aux_timeout_edit.setText(str(self.config.aux_request_timeout))
+        # 兜底与 AgentConfig 字段默认值一致：辅助模型默认关闭思考模式。
+        self.aux_thinking_check.setChecked(bool(getattr(self.config, "aux_local_llm_enable_thinking", False)))
         # Embedding / Reranker：实现下拉 + 模型名 + 本地路径
         self.embedding_impl_combo.setCurrentText(_provider_backend_to_impl(
             self.config.embedding_provider, self.config.local_embedding_backend))
@@ -1642,6 +1719,7 @@ class MainWindow(QMainWindow):
         _num(self.top_k_edit, "top_k", 20, int, "top_k")
         _num(self.repeat_penalty_edit, "repetition_penalty", 1.0, float, "重复惩罚")
         _num(self.timeout_edit, "request_timeout", 120, float, "超时")
+        self.config.local_llm_enable_thinking = self.thinking_check.isChecked()
         # 辅助模型参数（本地专用）
         _num(self.aux_temp_edit, "aux_temperature", 0.7, float, "辅助温度")
         _num(self.aux_max_tokens_edit, "aux_max_tokens", 32768, int, "辅助最大Token")
@@ -1650,6 +1728,7 @@ class MainWindow(QMainWindow):
         _num(self.aux_top_k_edit, "aux_top_k", 20, int, "辅助top_k")
         _num(self.aux_repeat_penalty_edit, "aux_repetition_penalty", 1.0, float, "辅助重复惩罚")
         _num(self.aux_timeout_edit, "aux_request_timeout", 120, float, "辅助超时")
+        self.config.aux_local_llm_enable_thinking = self.aux_thinking_check.isChecked()
         if invalid:
             # 状态栏提示一次；不打断流程（回退值是安全的默认）。
             self.status_label.setText(
@@ -1694,6 +1773,19 @@ class MainWindow(QMainWindow):
         self.config.local_reranker_model = self.reranker_path_edit.text().strip()
 
     def _rebuild_agent(self) -> None:
+        # 常驻 worker 持有旧 agent 引用：先让它退出循环，否则重建后用户再发
+        # 消息会打进已 close 的旧 agent（MCP/httpx 已关）。应用配置只在空闲时
+        # 可点（_set_controls_busy），所以线程此刻必然阻塞在 queue.get，
+        # shutdown 的哨兵会让它立刻退出。
+        old_worker = getattr(self, "_worker", None)
+        if old_worker is not None:
+            try:
+                old_worker.shutdown()
+            except Exception:
+                pass
+            if self._is_worker_running(old_worker):
+                old_worker.wait(2000)
+            self._worker = None
         self._gather_config_from_widgets()
         # 重建会换掉主/辅模型，先把两个按钮复位为「加载模型」未就绪态，
         # 待各自后台预加载成功后再置绿（仅当按钮已创建时操作）。
@@ -2171,13 +2263,15 @@ class MainWindow(QMainWindow):
         self._pending_reasoning.clear()
         self.speed_label.setText("0.0 tok/s")
         self._callbacks.reset()
-        self._worker = AgentWorker(self._agent, self._callbacks)
-        self._worker.set_input(text)
-        # Let Qt clean up the QThread asynchronously once run() returns, instead
-        # of calling QThread.wait() from a slot (which can deadlock a nested
-        # event loop). `_on_finished` is invoked via bridge.finished first.
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.start()
+        worker = self._worker
+        if worker is None or not worker.set_input(text):
+            # 首次发送，或常驻线程已被强杀 → （重）建一条。**不要**每回合新建：
+            # MLX KV 缓存按创建线程隔离，换线程 = 每回合全量预填充（约 6.5s 的
+            # 差距）。先入队再 start，线程一跑起来就有任务可取。
+            worker = AgentWorker(self._agent, self._callbacks)
+            self._worker = worker
+            worker.set_input(text)
+            worker.start()
 
     def _on_stop(self) -> None:
         # 终止当前 agent 对话（不再处理同步取消，同步取消由 _on_stop_sync 负责）
@@ -2231,6 +2325,13 @@ class MainWindow(QMainWindow):
         self._flush_stream(final=True)
         self._streaming_assistant = False
         self._summary_stripper = _SummaryStripper()
+        # 本轮只生成了一半：缓存末尾对应「被截断的输出」，历史里却是已落盘的
+        # 部分文本——两者不再是前缀关系，必须丢弃缓存，否则下一轮会错位续算。
+        try:
+            if self._agent is not None:
+                self._agent.invalidate_kv_cache()
+        except Exception as e:
+            logger.debug("UI: invalidate_kv_cache on force stop failed: %s", e)
         self._busy = False
         self._set_controls_busy(False)
         self.status_label.setText("已强制终止（工具进程可能仍在后台运行）")
@@ -2536,21 +2637,10 @@ class MainWindow(QMainWindow):
         self._streaming_assistant = False
         self._set_controls_busy(False)
         self.status_label.setText("就绪")
-        # Join the worker thread before dropping our reference. bridge.finished
-        # is emitted from the worker's `finally`, so run() has already returned
-        # and wait() returns near-instantly -- but without it, dropping the last
-        # Python reference can GC the QThread while its OS thread is still
-        # winding down, which Qt aborts as "destroyed while still running".
-        worker = self._worker
-        self._worker = None
-        if worker is not None and not worker.wait(2000):
-            # 极端情况：run() 已返回但 OS 线程仍在收尾。保留引用到进程退出
-            # （与 _force_stop_agent 同法），不冒 sip 析构运行中 QThread 的险。
-            logger.warning("UI: worker did not join in 2s; keeping reference")
-            self._orphan_workers.append(worker)
-        # Now that streaming is done and the worker thread has joined, it's
-        # safe to show the skill-suggestion modal dialog without blocking
-        # the UI event loop during streaming.
+        # 常驻 worker：回合结束但线程不退出——它阻塞在下一条消息的 queue.get
+        # 上，正是这样才保证所有回合都在同一线程执行（MLX KV 缓存按线程隔离，
+        # 见 AgentWorker 类注释）。所以这里不 join、不置 None；旧实现 wait(2000)
+        # 是因为每回合新建线程、run() 已返回，那时才能立刻 join。
         self._show_pending_skill_dialog()
 
     def _on_error(self, msg: str) -> None:
@@ -2738,6 +2828,13 @@ class MainWindow(QMainWindow):
             # terminate() and avoids corrupting tool state mid-execution.
             try:
                 self._callbacks.cancel()
+            except Exception:
+                pass
+            # 常驻线程空闲时阻塞在 queue.get：入队哨兵让它立刻退出循环，
+            # 否则下面的 wait(3000) 必然超时、被迫走 terminate 强杀路径
+            # （跳过 tools.shutdown，还留一个 _worker_terminated 标志）。
+            try:
+                self._worker.shutdown()
             except Exception:
                 pass
             if self._is_worker_running(self._worker):

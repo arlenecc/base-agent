@@ -377,57 +377,90 @@ def create_ocr_engine(use_coreml: bool = True, **kwargs):
 # Image pre-processing / normalisation
 # ---------------------------------------------------------------------------
 
-# Target short side (px) for a page before it reaches the detector.  Below
-# this the text is upscaled (small print becomes legible); far above it we
-# downscale so a 600dpi scan doesn't take minutes per page.
+# 送入引擎前的图像尺寸闸门：
+#   _TARGET_SHORT_SIDE — 渲染 DPI 的求解目标（短边 px）
+#   _MIN_SHORT_SIDE    — 短边低于此值则放大（小字才认得出）
+#   _MAX_LONG_SIDE     — 长边硬上限，超过即按比例缩小（真正的归一化闸门）
+#
+# _MAX_LONG_SIDE 4000 → 1500（实测修订）：决定单页像素总量的是**长边**，而
+# 竖版扫描件正是在这里失控——本书渲染出 2399×3725（8.9MP），长边 3725 < 4000，
+# 旧阈值完全不触发，图像原样进引擎（短边 2399 也落在 900~4000 的盲区里）。
+# 长边限 1500 后为 966×1500（1.45MP，像素 -84%）：60 页 CoreML OCR 的 RSS
+# 增长 4.08GB → 3.37GB（-17%）、峰值 4.59 → 3.88GB、速度 1.73 → 1.65 s/页；
+# 识别结果 23329 vs 23412 字符（差 0.35%，逐字重合 0.991~1.000）——质量基本无损。
+# 注意短边会被连带压到 ~1000px（A4 等效约 128dpi），小字号文档可能掉字；
+# 若实测到掉质量，调回 2000 / 2600 即可（本书上 2600 是逐字重合 1.000）。
 _TARGET_SHORT_SIDE = 1600
-_MAX_LONG_SIDE = 4000
+_MAX_LONG_SIDE = 1500
 _MIN_SHORT_SIDE = 900
+# 渲染 DPI 硬上限。走 OCR 的页面最终都会归一到长边 _MAX_LONG_SIDE，渲染 dpi
+# 只决定中间重采样率：超过上限就是在渲染一张马上要被缩掉的大位图（浪费内存
+# 与渲染时间），低于上限则只是少一次超采样（实测对扫描件质量无差别）。
+_MAX_RENDER_DPI = 150
 
 
 def render_dpi_for_page(page, target_short_side: int = _TARGET_SHORT_SIDE) -> int:
-    """Pick a render DPI that normalises the page's short side to ~target.
+    """Pick a render DPI that lands the page at its normalised size directly.
 
     PDFs ship at wildly different physical sizes (A4 vs letter vs a tiny
     cropped figure).  Rendering everything at a fixed 200dpi makes the
     detector see very different glyph sizes.  Solving for DPI first means the
     detector always works on roughly the same scale.
+
+    两个目标取更严格者：短边凑到 ``_TARGET_SHORT_SIDE``，**且**长边不超过
+    ``_MAX_LONG_SIDE``。旧实现只看短边，于是竖版大开本被解出 100dpi 后又被
+    ``max(150, ...)`` 抬回 150，渲染出 2399×3725（8.9MP）再缩到 1500——白
+    渲染 6 倍像素。按长边反推后一次渲染就落在 1500，省掉这一步浪费。
+
+    DPI 只作为「不超过 150」的上限约束，不要求等于 150：走 OCR 的页面都是
+    无文字层的扫描件（位图嵌入），渲染 dpi 只决定重采样率，最终信息量由长边
+    1500 决定。实测同一页 60/100/150dpi 渲染后归一到 1500，识别结果完全一致
+    （字符数相同、逐字重合 0.997~1.000）。
     """
     try:
         rect = page.rect
         width_in = max(float(rect.width), 1e-6) / 72.0
         height_in = max(float(rect.height), 1e-6) / 72.0
         short_in = min(width_in, height_in)
+        long_in = max(width_in, height_in)
         dpi = int(round(target_short_side / short_in))
+        # 长边约束：超过上限就按长边反推，一次渲染直接落在目标尺寸。
+        dpi = min(dpi, int(round(_MAX_LONG_SIDE / long_in)))
     except Exception:
-        return 200
-    # Clamp: below 150 the render itself loses strokes; above 400 the pixmap
-    # (and OCR time) explodes for no recognition gain.
-    return max(150, min(dpi, 400))
+        return _MAX_RENDER_DPI
+    # 硬上限 150：小页面（物理尺寸小）为凑够像素会被解出很高的 dpi，渲染出
+    # 远大于最终尺寸的位图（实测浪费 2-4 倍渲染开销与位图内存）。封顶即可，
+    # 不做下限抬升——长的那一边由上面的长边约束负责。
+    return max(1, min(dpi, _MAX_RENDER_DPI))
 
 
 def preprocess_for_ocr(
     img: "Any",
     enhance: bool = True,
-    binarize: bool = False,
+    binarize: bool = True,
 ) -> "Any":
     """Normalise + enhance a BGR image before OCR.
 
     Steps (all best-effort; any failure returns the input untouched):
 
     1. **Scale normalisation** — short side < ``_MIN_SHORT_SIDE`` is upscaled,
-       long side > ``_MAX_LONG_SIDE`` is downscaled, so the detector always
-       sees text at a sane size.
+       long side > ``_MAX_LONG_SIDE`` is downscaled, both with **Lanczos**
+       (``INTER_LANCZOS4``): 缩小用 Lanczos 保留笔画边缘，比 INTER_AREA 的字形
+       更完整（对中文这种笔画密集的字尤其明显）。
     2. **Grayscale + dark-theme inversion + CLAHE** — predominantly dark pages
        (dark mode e-books, night-mode scans) are inverted to white-background
        first; adaptive histogram equalisation then lifts faint scans and evens
-       out lighting gradients that break text detection.
+       out lighting gradients that break text detection. 后续所有处理都在
+       **灰度**上进行。
     3. **Unsharp mask** — restores edge definition lost to the resample.
-    4. *(optional)* **Adaptive binarisation** — helps clean black-and-white
-       scans, but harms screenshots / colour figures, hence off by default.
+    4. **Binarisation** (default on) — 自适应阈值（高斯加权、blockSize=31、
+       C=10）把灰度压成黑白。必须放在锐化**之后**：先增强边缘再二值化，字形
+       才完整；反过来锐化作用在二值图上没有意义。
+       关闭它请用 ``binarize=False``（截图 / 彩色插图这类非文档图像二值化会
+       丢信息）。
 
-    Returns a **BGR** ``ndarray`` (RapidOCR treats a 3-channel ndarray as BGR
-    and does no conversion).
+    Returns a **BGR** ``ndarray``（内容是灰度/二值，但通道数保持 3 —— RapidOCR
+    把 3 通道 ndarray 当 BGR 处理、不做转换）。
     """
     if img is None:
         return img
@@ -458,8 +491,11 @@ def preprocess_for_ocr(
         if long_ * scale > _MAX_LONG_SIDE:
             scale = _MAX_LONG_SIDE / float(long_)
         if abs(scale - 1.0) > 0.01:
-            interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
-            work = cv2.resize(work, None, fx=scale, fy=scale, interpolation=interp)
+            # Lanczos：缩小（超出长边上限）时保留笔画边缘，放大（短边不足）
+            # 时也比 CUBIC 更少振铃。代价是比 INTER_AREA 慢一些，相对每页
+            # 1~2s 的 OCR 可忽略。
+            work = cv2.resize(work, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_LANCZOS4)
 
         if not enhance:
             return work
@@ -488,27 +524,104 @@ def preprocess_for_ocr(
             # CLAHE unavailable on very old OpenCV builds.
             pass
 
-        if binarize:
-            # Adaptive threshold: only correct for clean B/W scans.
-            try:
-                gray = cv2.adaptiveThreshold(
-                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                    cv2.THRESH_BINARY, 31, 10,
-                )
-            except Exception:
-                pass
-
         # ---- 3. unsharp mask ----
+        # 必须在二值化**之前**：锐化增强的是灰度边缘，作用在二值图上无意义。
         try:
             blurred = cv2.GaussianBlur(gray, (0, 0), 1.2)
             sharpened = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
         except Exception:
             sharpened = gray
 
+        # ---- 4. 二值化 ----
+        if binarize:
+            # 自适应阈值：高斯加权、blockSize=31、C=10。对扫描件（白底黑字、
+            # 光照不均）能显著拉开字与纸的对比；截图/彩色插图请传
+            # binarize=False。
+            try:
+                sharpened = cv2.adaptiveThreshold(
+                    sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY, 31, 10,
+                )
+            except Exception:
+                pass
+
         return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
     except Exception as e:
         logger.debug("OCR 预处理失败，使用原图: %s", e)
         return img
+
+
+# ---------------------------------------------------------------------------
+# Apple Vision（ocrmac）：中文印刷体的识别质量高于 RapidOCR（尤其竖排、
+# 复杂版式），ANE 推理不占 CPU/内存。作为全项目 OCR 的首选后端，任何失败
+# 回退 RapidOCR。回退契约：ocrmac 不可用或调用异常返回 None；识别成功但
+# 页面上确实无文字返回空串。
+# ---------------------------------------------------------------------------
+_OCRMAC_STATE: Optional[bool] = None
+_OCRMAC_LOCK = threading.Lock()
+# 语言优先级：中文在前。ocrmac 默认 ['en-US', 'es-ES', ...] 不含中文，
+# 对中文页面会大面积漏识别。英文保留在列表里以混排（变量名/引用）兼容。
+_OCRMAC_LANGS = ["zh-Hans", "en-US"]
+
+
+def ocrmac_available() -> bool:
+    """ocrmac（Apple Vision 框架封装）是否可用；懒探测一次并缓存。"""
+    global _OCRMAC_STATE
+    if _OCRMAC_STATE is not None:
+        return _OCRMAC_STATE
+    with _OCRMAC_LOCK:
+        if _OCRMAC_STATE is None:
+            ok = False
+            if platform.system() == "Darwin":
+                try:
+                    import ocrmac  # noqa: F401
+                    ok = True
+                except Exception:
+                    ok = False
+            _OCRMAC_STATE = ok
+            logger.info("ocrmac (Apple Vision) 可用性: %s", ok)
+    return _OCRMAC_STATE
+
+
+def ocr_with_ocrmac(img: "Any") -> Optional[str]:
+    """用 Apple Vision 识别一张图片。
+
+    ``img`` 接受 BGR/gray ndarray 或 PNG/JPEG bytes（先经 :func:`decode_image`）。
+    返回识别文本（空串 = 页面上确实没有字）；ocrmac 不可用或调用失败返回
+    ``None``——调用方据此回退 RapidOCR。
+    """
+    if not ocrmac_available():
+        return None
+    try:
+        import numpy as np
+        from ocrmac import ocrmac as _om
+        from PIL import Image
+        if isinstance(img, (bytes, bytearray)):
+            decoded = decode_image(bytes(img))
+            if decoded is None:
+                return None
+            img = decoded
+        arr = np.asarray(img)
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            pil = Image.fromarray(arr[:, :, ::-1])   # BGR → RGB
+        elif arr.ndim == 2:
+            pil = Image.fromarray(arr)
+        else:
+            return None
+        # ocrmac 的 API：OCR(image, framework, recognition_level, language_
+        # preference, ...)——参数名是 recognition_level，没有 LEVEL_* 常量。
+        # 传错会 TypeError → 被下面的 except 吞掉静默回退，这里参数名必须对。
+        lines = []
+        for text, _conf, _box in _om.OCR(
+                pil, language_preference=_OCRMAC_LANGS,
+                recognition_level="accurate").recognize():
+            t = (text or "").strip()
+            if t:
+                lines.append(t)
+        return "\n".join(lines)
+    except Exception as e:
+        logger.debug("ocrmac 识别失败，将回退 RapidOCR: %s", e)
+        return None
 
 
 def decode_image(img_bytes: bytes) -> "Any":

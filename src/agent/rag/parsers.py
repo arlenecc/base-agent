@@ -47,9 +47,66 @@ _OCR_RETRY_COOLDOWN = 60.0
 # 200dpi 大页 + 密集文字框才会——不要因为「合成实验没复现」而移除。
 _OCR_RECYCLE_PAGES = 50
 
+# OCR 内存护栏：CoreML EP 的原生缓存按**输入形状**保留，实测真实扫描书
+# ~67MB/页（182 页扫描件单文件即推到 4.99GB 峰值），叠加常驻的本地 LLM
+# （MLX 统一内存不可换出）会在 16GB 机器上触发系统级内存压力（整机卡死/
+# 崩溃）。周期重建只能冲刷整代，挡不住单代内的持续爬升——400 页的书在一
+# 代内就能吃掉十几 GB。护栏按页监控 RSS 增长：超预算立即冲刷引擎；冲刷
+# 后仍超则判定该 EP 的缓存不可控，永久降级到 CPU EP。实测同一本书 CPU EP
+# 反而更快（1.06 vs 1.73 s/页）且输出一字不差，降级不损失质量。
+# 预算 1.2GB + 每 5 页一查：CoreML 实测 ~67MB/页，5 页的检测延迟约 0.33GB，
+# 即触发时实际增长 ≈1.5GB。注意 CoreML 引擎自身的常驻基线就有 ~1.7GB
+# （CPU EP 仅 ~0.3GB），压低预算才能把 CoreML 场景的峰值从 5.0GB 拉下来；
+# 代价只是更频繁的热重建（1-2s/次，182 页书约 10 次 ≈ 15s，占 8%）。
+_OCR_RSS_BUDGET_GB = 1.2    # 单个文件 OCR 期间允许的新增 RSS
+_OCR_RSS_CHECK_PAGES = 5    # 每 N 个 OCR 页检查一次
+_OCR_FORCE_CPU = False      # 降级标志：置位后新建的引擎一律走 CPU EP
+
+# 进 OCR 的位图长边硬上限（与 ocr_engine._MAX_LONG_SIDE 同源）。渲染侧必须
+# 自己兜一遍：长边归一化那一步在 preprocess_for_ocr 里，依赖 cv2/numpy——
+# 预处理被关闭或导入失败时它会被整个跳过，位图原样进引擎（大开本扫描件
+# 实测可到 2399×3725，8.9MP）。这里用 fitz 自身的缩放重渲染，使「所有进
+# OCR 的图长边 ≤ 上限」与预处理是否可用无关。
+try:
+    from .ocr_engine import _MAX_LONG_SIDE as _PIXMAP_MAX_LONG_SIDE
+except Exception:  # pragma: no cover - ocr_engine 不可用（缺 cv2/numpy 等）
+    _PIXMAP_MAX_LONG_SIDE = 1500
+
 # AgentConfig（可选注入）。未提供时按「全部开启」处理 —— config 的默认值
 # 本身就是 True，不注入不会改变行为；注入后 UI 的开关才生效。
 _OCR_CONFIG = None
+
+
+def _current_rss_gb() -> Optional[float]:
+    """当前进程 RSS（GB）。psutil/resource 都不可用时返回 None（护栏静默跳过）。"""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1e9
+    except Exception:
+        pass
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # macOS 单位是 bytes，Linux 是 KB：按量级区分后再统一成 GB。
+        return (ru / 1e9) if ru > 1e7 else (ru * 1024.0 / 1e9)
+    except Exception:
+        return None
+
+
+def _force_cpu_ep() -> None:
+    """永久降级为 CPU EP（CoreML 原生缓存不可控时调用一次）。"""
+    global _OCR_FORCE_CPU
+    if not _OCR_FORCE_CPU:
+        _OCR_FORCE_CPU = True
+        logger.warning(
+            "OCR: CoreML EP 原生缓存增长超预算，永久降级为 CPU EP"
+            "（实测真实扫描件上 CPU EP 更快且输出一致）"
+        )
+
+
+def _ocr_coreml_requested() -> bool:
+    """当前配置是否请求了 CoreML EP（用于判断冲刷后该不该降级）。"""
+    return bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", True)) and _is_apple_silicon()
 
 
 def set_ocr_config(config) -> None:
@@ -291,17 +348,25 @@ def _extract_pdf(path: Path) -> str:
         # （页末即释放，不跨页持有旧引擎——见 _OCR_RECYCLE_PAGES 注释），
         # 纯文本书不进 OCR 分支时保持 None。
         ocr_engine = None
+        # 内存护栏基线：到第一个真正要 OCR 的页才取值，避免把本文件之外的
+        # 常驻开销（其它 worker 的文档、解析缓存）算进 OCR 的预算里。
+        ocr_rss_base: Optional[float] = None
 
         # OCR 图像预处理（自适应 DPI + 尺寸归一化 + CLAHE + 锐化）：默认开启，
         # 可由 AgentConfig.rag_ocr_preprocess 关闭。放在循环外只解析一次，
         # 且导入失败（缺 cv2/numpy）时降级为原始的固定 200dpi + 裸位图。
         def _fallback_dpi(_page) -> int:
-            return 200
+            # 与 ocr_engine._MAX_RENDER_DPI 一致：预处理缺席时没有长边反推，
+            # 但仍不该渲染出超过上限 dpi 的位图（渲染侧长边兜底会再缩一次）。
+            return 150
 
         render_dpi_for_page = _fallback_dpi
         decode_image = None
         preprocess_for_ocr = None
         preprocess_enabled = bool(getattr(_OCR_CONFIG, "rag_ocr_preprocess", True))
+        # 二值化：扫描件上是纯收益（更快、字符数一致），但有阴影/渐变/彩色
+        # 插图的页面会丢信息 → 交给配置决定。
+        binarize = bool(getattr(_OCR_CONFIG, "rag_ocr_binarize", True))
         if preprocess_enabled:
             try:
                 from .ocr_engine import (
@@ -370,11 +435,23 @@ def _extract_pdf(path: Path) -> str:
                     ocr_unavailable = True
                     ocr_skipped_count += 1
                     continue
+                if ocr_rss_base is None:
+                    # 引擎已加载后再取基线：OCR 模型自身的占用不算进预算，
+                    # 之后每页新增的原生缓存才算。
+                    ocr_rss_base = _current_rss_gb()
                 # 自适应 DPI：页面物理尺寸差异很大（A4 / letter / 裁剪的小图），
                 # 固定 200dpi 会让检测器看到完全不同的字形大小。先按页面尺寸
                 # 解出「短边落在目标像素」的 DPI，再做归一化。
                 dpi = render_dpi_for_page(page)
                 pix = page.get_pixmap(dpi=dpi)
+                # 渲染侧长边兜底（见 _PIXMAP_MAX_LONG_SIDE 注释）：预处理可用
+                # 时下面的 preprocess_for_ocr 也会缩到同一上限，这里重渲染只
+                # 在它缺席时真正生效，代价是一次额外的缩放渲染。
+                _long_side = max(pix.width, pix.height)
+                if _long_side > _PIXMAP_MAX_LONG_SIDE:
+                    _zoom = (dpi / 72.0) * (_PIXMAP_MAX_LONG_SIDE / float(_long_side))
+                    pix = None
+                    pix = page.get_pixmap(matrix=fitz.Matrix(_zoom, _zoom))
                 try:
                     if _pixmap_is_blank(pix):
                         # 渲染后确认的纯色/近纯色页（纯色占位图、扫描件的
@@ -392,7 +469,7 @@ def _extract_pdf(path: Path) -> str:
                 if preprocess_enabled:
                     decoded = decode_image(img_bytes)
                     if decoded is not None:
-                        image_for_ocr = preprocess_for_ocr(decoded)
+                        image_for_ocr = preprocess_for_ocr(decoded, binarize=binarize)
                     # 解码/预处理失败 → 把原始 PNG bytes 交给引擎（旧路径）
 
                 ocr_text = _ocr_image_cached(ocr_engine, image_for_ocr,
@@ -406,6 +483,27 @@ def _extract_pdf(path: Path) -> str:
             else:
                 # OCR 返回空结果（可能是图片质量太差或引擎异常）
                 ocr_skipped_count += 1
+
+            # ---- 内存护栏（依据见 _OCR_RSS_BUDGET_GB 注释）----
+            # 只在真的超预算时才冲刷：小文档/无扫描页的正常场景 RSS 几乎不
+            # 动，不会白白付出引擎重建（热重建 1-2s）的代价。
+            if (ocr_rss_base is not None
+                    and (ocr_page_count + ocr_skipped_count) % _OCR_RSS_CHECK_PAGES == 0):
+                _rss_now = _current_rss_gb()
+                if _rss_now is not None and _rss_now - ocr_rss_base > _OCR_RSS_BUDGET_GB:
+                    release_ocr_engine()
+                    logger.warning(
+                        "PDF '%s': OCR 原生缓存 +%.2fGB 超预算 %.1fGB，已冲刷引擎",
+                        path.name, _rss_now - ocr_rss_base, _OCR_RSS_BUDGET_GB,
+                    )
+                    if not _OCR_FORCE_CPU and _ocr_coreml_requested():
+                        _force_cpu_ep()
+                    # 冲刷后重取基线：新一代引擎（可能已降级到 CPU EP）的常驻
+                    # 水位与上一代不同，沿用旧基线会让 growth 虚高，导致后面
+                    # 每 5 页就白冲刷一次。
+                    _rss_after = _current_rss_gb()
+                    if _rss_after is not None:
+                        ocr_rss_base = _rss_after
 
             # 周期性重建引擎：冲刷 CoreML/ORT 按形状保留的原生缓存（见
             # _OCR_RECYCLE_PAGES 注释）。全局置 None 后，所有 worker 的
@@ -521,8 +619,17 @@ def _get_ocr_engine():
 
 
 def _build_ocr_engine():
-    """按可用性构造 RapidOCR 引擎：3.x 优先，1.x 回退（均带 CoreML 加速）。"""
-    use_coreml = bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", True))
+    """按可用性构造 RapidOCR 引擎：3.x 优先，1.x 回退（均带 CoreML 加速）。
+
+    ``_OCR_FORCE_CPU`` 置位后（内存护栏判定 CoreML 缓存不可控）一律走 CPU EP，
+    无论配置里 ``rag_ocr_coreml`` 是什么——配置是「请求」，护栏是「否决」。
+    """
+    # getattr 的兜底必须与 AgentConfig.rag_ocr_coreml 的默认值（False）一致：
+    # _OCR_CONFIG 未注入时（如直接调用 _extract_with_docling 的脚本路径）
+    # 兜底 True 会把 CoreML 意外打开——实测 CoreML EP 比 CPU 慢约 2 倍
+    # （3 页 4.95s vs 2.43s），见 AgentConfig.rag_ocr_coreml 注释。
+    use_coreml = (bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", False))
+                  and not _OCR_FORCE_CPU)
     params = None
     try:
         from rapidocr import RapidOCR  # 3.x
@@ -597,11 +704,18 @@ def release_ocr_engine() -> None:
             logger.info("RapidOCR engine released (memory reclaimed)")
 
 
-def _ocr_image_cached(engine, image, page_num: int, filename: str) -> str:
-    """Run OCR using a pre-loaded engine instance.
+# ocrmac 输出低于该字符数视为「疑似识别困难」——繁体竖排、艺术字体等
+# Apple Vision 处理不好的版式往往只能零星识别几个字。正常正文页 ocrmac
+# 输出一般在 200 字以上；空白/封面/扉页低于阈值时会多跑一次 RapidOCR
+# （CPU 0.6-1.2s/页），可接受。
+_OCRMAC_LOW_OUTPUT = 80
+# RapidOCR 补跑结果需明显多于 ocrmac 才采用（避免把噪声当收益）。
+_OCRMAC_FALLBACK_GAIN = 1.2
 
-    ``image`` 可以是 PNG bytes（旧路径）或已预处理的 BGR ndarray——RapidOCR
-    的 LoadImage 两者都接受，ndarray 走零拷贝路径，省掉一次编解码往返。
+
+def _rapidocr_text(engine, image, page_num: int, filename: str) -> str:
+    """纯 RapidOCR 识别（ocrmac 补跑 / 整体回退共用）。
+
     兼容两代 API 的返回：3.x 返回 RapidOCROutput（行文本在 .txts）；
     1.x 返回 (result, elapse)，result 是 [box, text, score] 列表。
     """
@@ -623,6 +737,38 @@ def _ocr_image_cached(engine, image, page_num: int, filename: str) -> str:
     except Exception as e:
         logger.warning("OCR failed on page %d of '%s': %s", page_num, filename, e)
         return ""
+
+
+def _ocr_image_cached(engine, image, page_num: int, filename: str) -> str:
+    """统一 OCR 入口：Apple Vision（ocrmac）优先，困难页用 RapidOCR 补充。
+
+    ``image`` 可以是 PNG bytes（旧路径）或已预处理的 BGR ndarray。三段策略：
+
+    1. ocrmac（Apple Vision）识别——中文横排印刷体质量最高、ANE 推理；
+       引擎不可用或调用失败（返回 None）→ 该页整体走 RapidOCR。
+    2. 输出过少（< ``_OCRMAC_LOW_OUTPUT``）→ 疑似繁体竖排等 Vision 不擅长
+       的版式，**仅对该页**用 RapidOCR 重跑对比：结果明显更多
+       （> ``_OCRMAC_FALLBACK_GAIN`` 倍）才采用。是单页级补充——后续页面
+       仍然优先 ocrmac，不会因为某一页而整体切换引擎。
+    3. RapidOCR 识别本体见 :func:`_rapidocr_text`。
+
+    不做双引擎结果拼接：同一页两种引擎的行会大量重复/交错，模糊去重的
+    复杂度和出错面远大于收益，二选一（取文本明显更多者）更稳。
+    """
+    from .ocr_engine import ocr_with_ocrmac
+    ocr_text = ocr_with_ocrmac(image)
+    if ocr_text is None:
+        return _rapidocr_text(engine, image, page_num, filename)
+    if len(ocr_text.strip()) >= _OCRMAC_LOW_OUTPUT:
+        return ocr_text
+    rapid_text = _rapidocr_text(engine, image, page_num, filename)
+    if len(rapid_text) > len(ocr_text) * _OCRMAC_FALLBACK_GAIN:
+        logger.info(
+            "页 %d '%s': ocrmac 仅 %d 字（疑似竖排/特殊版式），"
+            "RapidOCR 得 %d 字 → 采用 RapidOCR 结果",
+            page_num, filename, len(ocr_text.strip()), len(rapid_text))
+        return rapid_text
+    return ocr_text
 
 
 def _extract_epub(path: Path) -> str:

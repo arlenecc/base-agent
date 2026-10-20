@@ -58,7 +58,7 @@ def test_parse_tool_calls_none():
 def test_think_splitter_incremental():
     sp = _ThinkSplitter()
     out = []
-    for delta in ["先看问题", "<think:6124c78e>让我想想", "中间推理", "</think:6124c78e>最终答案"]:
+    for delta in ["先看问题", "<think>让我想想", "中间推理", "</think>最终答案"]:
         for kind, seg in sp.feed(delta):
             out.append((kind, seg))
     out += sp.flush()

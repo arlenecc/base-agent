@@ -424,6 +424,8 @@ class Agent:
         # Invalidate cached prompt
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
+        # 会话历史清空 → 本地后端的跨轮 KV 缓存对应的 token 序列彻底作废。
+        self.invalidate_kv_cache()
 
     # ------------------------------------------------------------------
     # max_iterations：始终以 config 为唯一真源
@@ -466,6 +468,23 @@ class Agent:
         finally:
             if acquired:
                 lock.release()
+
+    def invalidate_kv_cache(self) -> None:
+        """丢弃本地后端的跨轮 KV 缓存。
+
+        缓存对应的 token 序列是「上一轮 prompt + 上一轮输出」。一旦历史被改写
+        （会话重置、L3 折叠把旧轮次换成摘要、本轮被取消只生成一半），下一轮的
+        prompt 就不再以它为前缀——此时若还拿旧 KV 续算，轻则白算、重则输出
+        错位内容。HTTP 后端没有这个方法，静默跳过。
+        """
+        for llm in (getattr(self, "llm", None), getattr(self, "aux_llm", None)):
+            fn = getattr(llm, "invalidate_kv_cache", None)
+            if not callable(fn):
+                continue
+            try:
+                fn()
+            except Exception as e:  # 防御：清理失败不该影响上层流程
+                logger.debug("Agent: invalidate_kv_cache failed: %s", e)
 
     def history(self) -> List[Dict[str, Any]]:
         """当前可见历史的扁平视图（折叠区 + 原文窗口）。

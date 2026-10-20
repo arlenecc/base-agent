@@ -171,6 +171,13 @@ class TestOcrRouting:
         mod3.RapidOCR = _R
         monkeypatch.setitem(sys.modules, "rapidocr", mod3)
         monkeypatch.setattr(parsers, "_is_apple_silicon", lambda: True)
+        # 显式给出本用例的输入：_OCR_CONFIG 是模块级状态，别的用例注入过
+        # rag_ocr_coreml=False 的 config 会残留到这里；AgentConfig 的默认值
+        # 也不能当断言依据（它是可调的产品决策）。_OCR_FORCE_CPU 同理——
+        # 内存护栏一旦置位，配置再怎么开都会被否决。
+        ns = __import__("types").SimpleNamespace
+        monkeypatch.setattr(parsers, "_OCR_CONFIG", ns(rag_ocr_coreml=True))
+        monkeypatch.setattr(parsers, "_OCR_FORCE_CPU", False)
         parsers._build_ocr_engine()
         assert seen["params"] == {"EngineConfig.onnxruntime.use_coreml": True}
 

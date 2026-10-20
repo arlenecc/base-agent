@@ -166,32 +166,53 @@ def test_plan_gate_reminds_before_acting(cfg):
     assert "update_plan" in anchor, "首轮应提醒先规划"
 
 
-def test_plan_gate_stops_after_a_few_turns(cfg):
-    """一直不规划也不能无限提醒（一句话任务不该被强制规划）。
+def test_plan_gate_skips_simple_input(cfg):
+    """一句话任务（问候 / 读个文件）不该被逼着建执行计划。
 
-    注意：提示一旦注入就成为该轮 user 消息的一部分，会在 raw 窗口里多留
-    几轮——这是历史模型的正常行为。所以要用足够多的轮次让窗口整个滚过，
-    才能验证「不再有新的注入」。
+    曾经无条件注入规划提示，于是「hi」也会被逼着 create 一个『询问用户需求』
+    的一步计划，而「询问」根本不是可执行的工具动作——模型随即卡在「立即开始
+    第 1 步」上反复发无意义调用。
+    """
+    mock = MockLLM([
+        [_evt("content", "好的"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent.kernel.run("读文件")
+
+    first = mock.calls[0]["messages"]
+    anchor = next((str(m.get("content") or "") for m in first
+                   if m.get("role") == "user"), "")
+    assert "开始执行前" not in anchor, "简单输入不应被注入规划提示"
+
+
+def test_plan_gate_stops_after_work_starts(cfg):
+    """多步任务：首轮提醒先规划，之后不再**新**注入。
+
+    提示一旦注入就成为该轮 user 消息的一部分，会在 raw 窗口里多留几轮——
+    所以判据是「最后一轮不再有」，而不是「第二轮就没有」。
     """
     n = 8
+    create = [{"id": "c1", "function": {"name": "update_plan",
+               "arguments": json.dumps(
+                   {"op": "create", "goal": "改代码", "steps": ["读文件", "改代码"]})}}]
     mock = MockLLM(
-        [[_evt("done", tool_calls=_tc("file_read", {"path": "a.txt"}), usage={"total_tokens": 1})]
-         for _ in range(n)]
+        [[_evt("done", tool_calls=create, usage={"total_tokens": 1})]]
+        + [[_evt("done", tool_calls=_tc("file_read", {"path": "a.txt"}),
+                 usage={"total_tokens": 1})] for _ in range(n)]
         + [[_evt("content", "读完"), _evt("done", usage={"total_tokens": 1})]]
     )
     with open(os.path.join(cfg.workspace, "a.txt"), "w") as f:
         f.write("A")
     agent = Agent(llm=mock, config=cfg, callbacks=Noop())
     agent.max_iterations = 20
-    agent.kernel.run("读文件")
+    agent.kernel.run("先读文件，然后帮我改代码")
 
     hinted = [
         i for i, c in enumerate(mock.calls, 1)
         if any("开始执行前" in str(m.get("content") or "") for m in c["messages"])
     ]
-    # 前 3 轮注入 + raw 窗口残留几轮，远小于总轮数
-    assert len(hinted) <= _PLAN_GATE_TURNS + 3, f"门控提醒没有上限: {hinted}"
-    assert hinted[-1] < n, "最后一轮仍被提醒，说明门控没有停止"
+    assert hinted, "多步任务首轮应提醒先规划"
+    assert hinted[-1] < n, f"最后一轮仍被注入新的规划提示: {hinted}"
 
 
 def test_reflection_gate_blocks_premature_finish(cfg):

@@ -81,6 +81,14 @@ def normalize_plan(data: Any) -> Optional[Dict[str, Any]]:
         return None
     goal = str(data.get("goal", "") or "").strip()[:_MAX_PLAN_GOAL]
     raw_steps = data.get("steps")
+    # 本地模型（Qwen XML 等文本工具调用）常把 steps 作为**JSON 字符串**传入
+    # （双重编码）；宽容解析，否则 update_plan 对本地模型必然返回 None。
+    if isinstance(raw_steps, str):
+        import json as _json
+        try:
+            raw_steps = _json.loads(raw_steps)
+        except (ValueError, TypeError):
+            raw_steps = None
     if not isinstance(raw_steps, list):
         return None
     steps: List[Dict[str, str]] = []
@@ -146,8 +154,10 @@ class Session:
         tool_calls: Optional[List[ToolCall]] = None,
         tool_results: Optional[List[Dict[str, Any]]] = None,
         summary: str = "",
+        raw_content: str = "",
     ) -> None:
         rec.assistant_text = assistant_text or ""
+        rec.raw_content = raw_content or ""
         rec.tool_calls = list(tool_calls or [])
         rec.tool_results = list(tool_results or [])
         rec.summary = summary
@@ -356,6 +366,10 @@ class Session:
         if not (t.assistant_text or t.tool_calls):
             return out
         assistant: Dict[str, Any] = {"role": "assistant", "content": t.assistant_text or None}
+        # 第二视图：模型原始输出。HTTP 后端不认识这个键（安全忽略），本地 MLX
+        # 后端会用它重建「生成时的逐 token 序列」去命中跨轮 KV 前缀。
+        if t.raw_content:
+            assistant["raw_content"] = t.raw_content
         if t.tool_calls:
             assistant["tool_calls"] = [
                 {

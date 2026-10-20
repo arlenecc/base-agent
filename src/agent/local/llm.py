@@ -20,7 +20,7 @@ import logging
 import os
 import re
 import threading
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +44,68 @@ _QWEEN_PARAM_RE = re.compile(
 )
 # Hermes / 通用 JSON: {"name": ..., "arguments": {...}}（arguments 可为字符串）
 _JSON_CALL_RE = re.compile(r"\{[^{}]*\"name\"\s*:.*?\}", re.DOTALL)
+# 残留的孤立 think 标签字面量（模型偶发不配对输出）——从正文里剔除。
+_STRAY_THINK_RE = re.compile(r"<think>|</think>")
 
 
 def _new_tool_call_id(n: int) -> str:
     return f"local_call_{n}"
+
+
+# ---------------------------------------------------------------------------
+# 双视图历史：raw_content → 忠实于生成的 prompt 序列
+# ---------------------------------------------------------------------------
+
+# assistant 轮次在 ChatML 里的起始标记。模板在它之后预置 think 片段
+# （enable_thinking=True 时 "<think>\n"，False 时空 think 块）。
+_ASSISTANT_MARK = "<|im_start|>assistant\n"
+
+# 跨轮 KV 缓存的 token 上限。缓存随会话线性增长（每层每 token 都要留 KV），
+# 超过就整体重建，避免长会话把内存吃穿。
+_KV_MAX_TOKENS = 32768
+
+
+def _assistant_prompt_prefix(prompt: str) -> str:
+    """取模板在最后一个 assistant 起始标记后预置的片段。
+
+    这段属于「生成序列」的头部：生成时它就在 prompt 里（不是模型吐出来的），
+    所以重建历史时必须一并带上，否则前缀会差这几个 token 而对不上。
+    """
+    idx = prompt.rfind(_ASSISTANT_MARK)
+    if idx < 0:
+        return ""
+    return prompt[idx + len(_ASSISTANT_MARK):]
+
+
+def _rebuild_raw_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把带 ``raw_content`` 的 assistant 消息重建为「忠实于生成」的形状。
+
+    Qwen 模板有个暗门：``message.reasoning_content`` 是**字符串**时跳过自动
+    拆分（否则它会把 content 里的 ``<think>…</think>`` 摘走）；而历史 assistant
+    分支直出 content。于是把 raw 放进 content、再塞一个字符串 reasoning_content，
+    模板就会原样吐出 raw——含 think 标签与工具调用 XML，与生成时的 token 序列
+    逐 token 一致（真实 tokenizer 实测 2600/2600 对齐）。
+
+    没有 raw_content 的消息（HTTP 后端历史、user/tool 消息）原样返回，
+    因此对 HTTP 后端零影响。
+    """
+    if not messages:
+        return messages
+    out: List[Dict[str, Any]] = []
+    changed = False
+    for m in messages:
+        raw = m.get("raw_content") if isinstance(m, dict) else None
+        if (isinstance(m, dict) and m.get("role") == "assistant"
+                and isinstance(raw, str) and raw):
+            nm = dict(m)
+            nm["content"] = raw
+            nm["reasoning_content"] = ""
+            nm.pop("raw_content", None)
+            out.append(nm)
+            changed = True
+        else:
+            out.append(m)
+    return out if changed else messages
 
 
 def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
@@ -121,16 +179,23 @@ def _dict_to_tool_call(obj: Any, idx: int) -> Dict[str, Any]:
 # think 标签增量拆分：把流式 delta 分为 reasoning / content
 # ---------------------------------------------------------------------------
 
-_THINK_OPEN = "<think:6124c78e>"
-_THINK_CLOSE = "</think:6124c78e>"
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
 _TAG_PREFIX_LEN = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1
 
 
 class _ThinkSplitter:
-    """增量地把文本流拆成 (kind, segment) 对，处理跨 chunk 的 ``<think:6124c78e>`` 边界。"""
+    """增量地把文本流拆成 (kind, segment) 对，处理跨 chunk 的 ``<`` 标签边界。
 
-    def __init__(self) -> None:
-        self._in_think = False
+    流式 delta 可能把标签（``<`` / ``</``）切碎（例如 ``<``、``<t``、``<thi``…）。
+    每个 feed 只「安全地」消费到最后一个**不足以构成半截标签**的位置，剩余尾部
+    留在 buffer 等下一个 delta——避免把半截标签当 content 发出、也避免漏判边界。
+    """
+
+    def __init__(self, start_in_think: bool = False) -> None:
+        # Qwen3 系模板在 add_generation_prompt 时把 <think> 预填进生成提示，
+        # 模型输出直接以推理正文开始、只含闭合标签——需以「已在 think 内」起步。
+        self._in_think = bool(start_in_think)
         self._buf = ""
 
     def feed(self, delta: str) -> List[Tuple[str, str]]:
@@ -139,44 +204,162 @@ class _ThinkSplitter:
         i = 0
         n = len(self._buf)
         while i < n:
-            if not self._in_think and self._buf.startswith(_THINK_OPEN, i):
-                self._in_think = True
-                i += len(_THINK_OPEN)
+            tag = _THINK_CLOSE if self._in_think else _THINK_OPEN
+            kind = "reasoning" if self._in_think else "content"
+            # 完整标签落在当前位置 → 切换状态并跳过标签本身
+            if self._buf.startswith(tag, i):
+                self._in_think = not self._in_think
+                i += len(tag)
                 continue
-            if self._in_think and self._buf.startswith(_THINK_CLOSE, i):
-                self._in_think = False
-                i += len(_THINK_CLOSE)
+            k = self._buf.find(tag, i)
+            if k != -1:
+                # 前方有完整标签：先把 [i, k) 作为当前 kind 发出，跳到标签处
+                seg = self._buf[i:k]
+                if seg:
+                    out.append((kind, seg))
+                i = k
                 continue
-            # 找下一个标签起点（或字符串末）
-            j = n if not self._in_think else self._buf.find(_THINK_CLOSE, i)
-            if not self._in_think:
-                k = self._buf.find(_THINK_OPEN, i)
-                j = k if k != -1 else n
-            if j == -1:
-                j = n
-            seg = self._buf[i:j]
+            # 前方无完整标签：只消费到安全边界，保留可能的半截标签尾部给下次
+            safe = n - (len(tag) - 1)
+            if safe <= i:
+                break
+            seg = self._buf[i:safe]
             if seg:
-                out.append(("reasoning" if self._in_think else "content", seg))
-            i = j
-        # 把可能构成标签前缀的尾部留在 buffer（避免把 "<thi" 当 content 发出去）
-        if len(self._buf) > _TAG_PREFIX_LEN:
-            cut = max(0, len(self._buf) - _TAG_PREFIX_LEN)
-            # 只在尾部不是标签起点时才前移游标；简化：保留最后 _TAG_PREFIX_LEN 字符
-            keep = self._buf[-_TAG_PREFIX_LEN:]
-            if keep in (_THINK_OPEN[:_TAG_PREFIX_LEN], _THINK_CLOSE[:_TAG_PREFIX_LEN]):
-                self._buf = self._buf[:-_TAG_PREFIX_LEN]
-            else:
-                self._buf = ""
-        else:
-            self._buf = ""
+                out.append((kind, seg))
+            i = safe
+            break
+        self._buf = self._buf[i:]
         return out
 
     def flush(self) -> List[Tuple[str, str]]:
-        if self._buf:
-            out = [("reasoning" if self._in_think else "content", self._buf)]
-            self._buf = ""
-            return out
-        return []
+        buf, self._buf = self._buf, ""
+        if not buf:
+            return []
+        return [("reasoning" if self._in_think else "content", buf)]
+
+
+# ---------------------------------------------------------------------------
+# 工具调用块增量剔除：把正文流里的 <tool_call>…
+
+
+_TOOL_OPEN = "<" + "tool_call>"
+_TOOL_CLOSE = "<" + "/tool_call>"
+
+
+class _ToolCallSplitter:
+    """增量剔除 content 流里的工具调用块（tool_call 标签对内）。"""
+
+    def __init__(self) -> None:
+        self._in_tool = False
+        self._buf = ""
+
+    def feed(self, delta: str) -> List[str]:
+        out: List[str] = []
+        self._buf += delta
+        i, n = 0, len(self._buf)
+        while i < n:
+            tag = _TOOL_CLOSE if self._in_tool else _TOOL_OPEN
+            if self._buf.startswith(tag, i):
+                self._in_tool = not self._in_tool
+                i += len(tag)
+                continue
+            k = self._buf.find(tag, i)
+            if k != -1:
+                if not self._in_tool:
+                    seg = self._buf[i:k]
+                    if seg:
+                        out.append(seg)
+                i = k
+                continue
+            safe = n - (len(tag) - 1)
+            if safe <= i:
+                break
+            if not self._in_tool:
+                seg = self._buf[i:safe]
+                if seg:
+                    out.append(seg)
+            i = safe
+            break
+        self._buf = self._buf[i:]
+        return out
+
+    def flush(self) -> str:
+        buf, self._buf = self._buf, ""
+        if not buf or self._in_tool:
+            return ""
+        return buf
+
+
+class _SummarySpanRouter:
+    """识别 content 流里的 summary 协议区间并分流。
+
+    yield ("content", text) —— 非摘要正文 + **完整标签区间**（content 通道
+    保留完整 ``<summary>…</summary>`` 给内核 l2_summary / has_summary_tag）；
+    yield ("summary", inner) —— 摘要**内文**（另发一份 reasoning 事件，让
+    「模型自摘要」显示在思考面板）。
+    跨 chunk 的部分标签按「消费到安全边界 + 尾部重扫」处理，任意切分都不会
+    错切或泄漏。
+    """
+
+    _OPEN = "<summary>"
+    _CLOSE = "</summary>"
+
+    def __init__(self) -> None:
+        self._inside = False
+        self._span_buf = ""      # 跨 feed 累计的完整区间（含标签）
+        self._buf = ""
+
+    def feed(self, delta: str):
+        self._buf += delta
+        i, n = 0, len(self._buf)
+        while i < n:
+            if self._inside:
+                j = self._buf.find(self._CLOSE, i)
+                if j >= 0:
+                    self._span_buf += self._buf[i:j + len(self._CLOSE)]
+                    yield ("summary", self._buf[i:j])
+                    yield ("content", self._span_buf)
+                    self._span_buf = ""
+                    i = j + len(self._CLOSE)
+                    self._inside = False
+                    continue
+                safe = n - (len(self._CLOSE) - 1)
+                if safe <= i:
+                    break
+                self._span_buf += self._buf[i:safe]
+                yield ("summary", self._buf[i:safe])    # 内文流式外发
+                i = safe
+                break
+            if self._buf.startswith(self._CLOSE, i):
+                i += len(self._CLOSE)
+                continue
+            j = self._buf.find(self._OPEN, i)
+            jc = self._buf.find(self._CLOSE, i)
+            if jc != -1 and (j == -1 or jc < j):
+                yield ("content", self._buf[i:jc])
+                i = jc + len(self._CLOSE)
+                continue
+            if j != -1:
+                yield ("content", self._buf[i:j])
+                self._span_buf = self._OPEN
+                self._inside = True
+                i = j + len(self._OPEN)
+                continue
+            # 无完整标签：消费到两种标签共用的安全边界，尾部留待重扫
+            safe = n - (max(len(self._OPEN), len(self._CLOSE)) - 1)
+            if safe <= i:
+                break
+            yield ("content", self._buf[i:safe])
+            i = safe
+            break
+        self._buf = self._buf[i:]
+
+    def flush(self):
+        buf, self._buf = self._buf, ""
+        if buf:
+            # 回合结束仍未闭合 → 不是协议标签，按正文还给 content 通道
+            yield ("content", (self._span_buf + buf) if self._inside else buf)
+            self._span_buf = ""
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +385,7 @@ class LocalLLMClient:
         top_k: int = 20,
         repetition_penalty: float = 1.0,
         dtype: str = "float16",
+        enable_thinking: bool = True,
     ):
         self._path = path
         self._backend = (backend or "mlx").strip().lower()
@@ -212,6 +396,9 @@ class LocalLLMClient:
         self._top_k = int(top_k)
         self._repetition_penalty = float(repetition_penalty)
         self._dtype = dtype
+        # Qwen3 系模板的 enable_thinking：False 时模板注入空 think 块，模型
+        # 直接作答（首字延迟大幅降低，复杂推理质量换速度）。
+        self._enable_thinking = bool(enable_thinking)
         self._model = None
         self._tokenizer = None
         self._session = None
@@ -220,6 +407,14 @@ class LocalLLMClient:
         # 主模型与辅助模型是各自独立的 LocalLLMClient 实例，因此这把锁互不阻塞
         # 二者，只防止辅助模型被「RAG 精简线程」与「事实抽取线程」等并发调用。
         self._gen_lock = threading.Lock()
+        # 跨轮 KV 缓存（仅 MLX 路径）：多轮对话复用 system+历史 的 KV 状态，
+        # 每轮只预填充本轮新增 token（对齐 Ollama 的 prompt cache 行为）。
+        self._mlx_cache = None
+        self._cache_token_ids: List[int] = []
+        # 创建该缓存的线程 ID。MLX 的 GPU stream 是**线程局部**的：cache 里的
+        # 数组绑定创建线程的 stream，换线程复用会直接
+        # RuntimeError: There is no Stream(gpu, N) in current thread。
+        self._kv_thread: Optional[int] = None
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -237,6 +432,9 @@ class LocalLLMClient:
                 self._load_onnx()
             else:
                 raise ValueError(f"未知 LLM 后端: {self._backend!r}")
+            # 模型（重）加载后旧 KV 缓存全部失效
+            self._mlx_cache = None
+            self._cache_token_ids = []
             self._loaded = True
 
     def _load_mlx(self) -> None:
@@ -302,6 +500,14 @@ class LocalLLMClient:
         temperature: float = 0.7,
     ) -> Iterator[StreamEvent]:
         self._ensure_model()
+        # 双视图历史的第二视图只有 MLX 后端读得懂；gguf/onnx 后端会把
+        # messages 原样交给底层引擎，多一个键有风险 → 先剥掉。
+        if self._backend != "mlx":
+            messages = [
+                {k: v for k, v in m.items() if k != "raw_content"}
+                if isinstance(m, dict) else m
+                for m in messages
+            ]
         # 串行化同实例的生成（MLX/GGUF 并发不安全）；主/辅实例各自独立互不阻塞。
         with self._gen_lock:
             if self._backend == "mlx":
@@ -312,21 +518,73 @@ class LocalLLMClient:
                 yield from self._stream_onnx(messages, tools, temperature)
 
     # ---- 通用：把 think 分段 + 收集全文（用于工具调用解析）----
-    def _stream_with_producer(self, deltas: Iterator[str]):
-        """消费 (text_delta) 迭代器，发出 content/reasoning，最后解析工具调用。"""
-        splitter = _ThinkSplitter()
+    def _stream_with_producer(self, deltas: Iterator[str],
+                              start_in_think: bool = False,
+                              raw_getter: Optional[Callable[[], str]] = None):
+        """消费 (text_delta) 迭代器，发出 content/reasoning，最后解析工具调用。
+
+        分流规则（本地模型把思考/工具调用/摘要都以文本写在正文里）：
+          * think 标签对 → reasoning（思考过程面板）；
+          * tool_call 标签对 → 抑制，不进正文（由 parse_tool_calls 从完整文本
+            另行解析成 tool_calls，避免原始标记重复显示到对话区）；
+          * 残留的孤立 think 字面量 → 从正文剔除；
+          * summary 标签对 → **保留**在 content 里（内核 l2_summary /
+            has_summary_tag 需要它；UI 侧 _SummaryStripper 负责展示时剥离）。
+        """
+        think = _ThinkSplitter(start_in_think=start_in_think)
+        tool = _ToolCallSplitter()
+        summary = _SummarySpanRouter()
         full: List[str] = []
+
+        def emit_content(seg: str):
+            # 正文通道：剔工具调用块（summary 完整标签保留给内核，由 UI 侧
+            # _SummaryStripper 负责展示时剥离）。
+            # summary 路由器只作**旁路观察者**：从同一输入流独立提取摘要内文
+            # 发往思考面板，其 content 输出丢弃——避免三个状态机串行缓冲时
+            # 的边界组合问题。
+            for piece in tool.feed(seg):
+                if not piece:
+                    continue
+                piece = _STRAY_THINK_RE.sub("", piece)
+                if piece:
+                    yield StreamEvent("content", content=piece)
+            for kind, piece in summary.feed(seg):
+                if kind == "summary" and piece:
+                    yield StreamEvent("reasoning", content=piece)
+
         for delta in deltas:
             full.append(delta)
-            for kind, seg in splitter.feed(delta):
-                if seg:
-                    yield StreamEvent(kind, content=seg)
-        for kind, seg in splitter.flush():
-            if seg:
-                yield StreamEvent(kind, content=seg)
+            for kind, seg in think.feed(delta):
+                if not seg:
+                    continue
+                if kind == "reasoning":
+                    yield StreamEvent("reasoning", content=seg)
+                else:
+                    yield from emit_content(seg)
+        for kind, seg in think.flush():
+            if not seg:
+                continue
+            if kind == "reasoning":
+                yield StreamEvent("reasoning", content=seg)
+            else:
+                yield from emit_content(seg)
+        residue = tool.flush()
+        if residue:
+            residue = _STRAY_THINK_RE.sub("", residue)
+            if residue:
+                yield StreamEvent("content", content=residue)
+        for kind, piece in summary.flush():
+            if kind == "summary" and piece:
+                yield StreamEvent("reasoning", content=piece)
         text = "".join(full)
         calls = parse_tool_calls(text)
-        yield StreamEvent("done", tool_calls=calls, usage={})
+        raw = ""
+        if raw_getter is not None:
+            try:
+                raw = raw_getter() or ""
+            except Exception as e:  # 防御：原始输出拿不到不该中断收尾
+                logger.debug("LLM: raw_content unavailable: %s", e)
+        yield StreamEvent("done", tool_calls=calls, usage={}, raw_content=raw)
 
     # ---- MLX ----
     def _stream_mlx(self, messages, tools, temperature):
@@ -336,15 +594,24 @@ class LocalLLMClient:
 
         tok = self._tokenizer
         hf = getattr(tok, "tokenizer", tok)
+        # 双视图历史：本地后端读 raw_content，把 assistant 消息还原成「生成时
+        # 的逐 token 序列」，跨轮 KV 前缀才对得上。HTTP 后端的历史没有该字段，
+        # messages 原样不动（零影响）。
+        messages = _rebuild_raw_messages(messages)
         try:
             prompt = tok.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
                 tools=tools if tools else None,
+                enable_thinking=self._enable_thinking,
             )
         except Exception:
             prompt = tok.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
             )
+        # 模板把 <think> 预填进生成提示时（enable_thinking 默认开），模型输出
+        # 直接以推理正文开始、只含闭合标签——按「已在 think 内」起步，否则
+        # 推理会全部落进正文（对话区）。
+        start_in_think = prompt.rstrip().endswith(_THINK_OPEN)
 
         sampler = make_sampler(
             temperature if temperature > 0 else 0.0,
@@ -355,17 +622,130 @@ class LocalLLMClient:
             repetition_context_size=20,
         ) if self._repetition_penalty and self._repetition_penalty != 1.0 else []
 
+        # ---- 跨轮 KV 缓存复用（对齐 Ollama 的 prompt cache）----
+        # 缓存只创建一次（实例级），之后每轮传入同一个 cache，只把**本轮新增
+        # 的 token**喂给 stream_generate，mlx 从缓存 offset 续算——实测同一份
+        # 上下文首字 3.18s → 0.19s。
+        #
+        # 命中判据是「缓存的 token 序列必须严格是新 prompt 的前缀」，两种形态：
+        #   ① 缓存更长/相等（缓存是前缀，新 prompt 在后追加）——常态，直接续算；
+        #   ② 新 prompt 更短（回退、上下文收缩后重试）——必须把缓存裁到公共
+        #      前缀，裁不动就整体重建。
+        # 中途分叉一律整体重建：绝不拿错位的缓存去续算（会输出乱码）。
+        from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+
+        prompt_ids = tok.encode(prompt)
+        cache = self._mlx_cache
+        cached_ids = self._cache_token_ids or []
+        reuse = 0
+        # 线程隔离：MLX 的 GPU stream 是线程局部的，cache 只能在创建它的线程
+        # 上复用。UI 每次发送都是新的 agent worker 线程（辅助模型的事实抽取/
+        # RAG 精简又是另外的线程），直接拿旧线程的 cache 会抛
+        # "There is no Stream(gpu, N) in current thread" —— 表现为生成中断、
+        # reasoning 已流出但正文为空。宁可重建（全量预填充）也不要崩溃。
+        if cache is not None and self._kv_thread != threading.get_ident():
+            if cached_ids:
+                logger.debug("LLM: KV cache 创建于其它线程，丢弃重建")
+            cache = None
+        if cache is None or not cached_ids:
+            cache = None
+        elif len(cached_ids) > _KV_MAX_TOKENS:      # 长会话内存护栏
+            cache = None
+        else:
+            lim = min(len(cached_ids), len(prompt_ids))
+            common = 0
+            while common < lim and cached_ids[common] == prompt_ids[common]:
+                common += 1
+            if common >= len(cached_ids):
+                # 形态①：缓存是严格前缀 → 只喂新增部分
+                reuse = len(cached_ids)
+            elif common >= len(prompt_ids) and len(prompt_ids) > 0:
+                # 形态②：新 prompt 是缓存的前缀 → 需要裁剪掉多余部分
+                need = len(cached_ids) - common
+                if need > 0 and trim_prompt_cache(cache, need) == need:
+                    reuse = common
+                else:
+                    cache = None      # 不可裁剪 → 重建
+            else:
+                # 形态③：中途分叉。分叉点通常在 user 消息的动态包装处
+                # （WORKING MEMORY / 锚点注入每轮都变），但公共前缀——几乎总是
+                # **整个 system prompt + 早期历史**——的 KV 仍然有效：裁到分叉
+                # 点复用，只重算分叉之后的一小段。全量丢弃的话，4500 token 的
+                # system prompt 每次调用都要重算一遍。
+                need = len(cached_ids) - common
+                if (common > 0 and need > 0
+                        and trim_prompt_cache(cache, need) == need):
+                    reuse = common
+                    logger.debug(
+                        "LLM: KV cache 分叉 @%d/%d → 裁剪复用公共前缀"
+                        "（suffix %d token）", common, len(cached_ids),
+                        len(prompt_ids) - common)
+                else:
+                    cache = None
+        if cache is None:
+            cache = make_prompt_cache(self._model)
+            reuse = 0
+        # 兜底：喂给 stream_generate 的 suffix **绝不能为空**。prompt 为空时
+        # mlx-lm 会抛 "Either input_embeddings or prompt (or both) must be
+        # provided"，整轮连同工具调用一起报废。
+        # 触发场景比想象中常见：本轮被 rollback 后重发同一段历史（工具参数
+        # 校验失败、上下文收缩重试都会 rollback），此时缓存恰好已完全覆盖
+        # prompt，reuse == len(prompt_ids)。退回一个 token 让它至少有事可做。
+        if prompt_ids and reuse >= len(prompt_ids):
+            reuse = len(prompt_ids) - 1
+        if not prompt_ids:
+            raise ValueError(
+                "渲染后的 prompt 为空（chat template 未产出任何 token）")
+        self._mlx_cache = cache
+        # 记下这条缓存的属主线程：下次调用若换了线程，上面会把它丢掉重建。
+        self._kv_thread = threading.get_ident()
+        suffix_ids = prompt_ids[reuse:]
+        logger.debug(
+            "MLX KV cache: cached=%d prompt=%d reuse=%d suffix=%d",
+            len(cached_ids), len(prompt_ids), reuse, len(suffix_ids))
+
+        # 模板在 assistant 起始标记后预置的片段（<think>\n 或空 think 块）。它
+        # 属于「生成序列」的头部而非模型输出，重建历史时必须一并带上，否则
+        # 前缀会差这几个 token 而对不上。
+        gen_prefix = _assistant_prompt_prefix(prompt)
+        gen_ref: List[List[int]] = []
+
         def _produce():
-            for resp in stream_generate(
-                self._model, tok, prompt=prompt,
-                max_tokens=self._max_tokens, sampler=sampler,
-                logits_processors=logits_processors,
-            ):
-                text = getattr(resp, "text", "") or ""
-                if text:
-                    yield text
-                mx.eval(resp.token) if hasattr(resp, "token") else None
-        yield from self._stream_with_producer(_produce())
+            gen_ids: List[int] = []
+            gen_ref.append(gen_ids)
+            try:
+                for resp in stream_generate(
+                    self._model, tok, prompt=suffix_ids,
+                    max_tokens=self._max_tokens, sampler=sampler,
+                    logits_processors=logits_processors,
+                    prompt_cache=cache,
+                ):
+                    text = getattr(resp, "text", "") or ""
+                    if text:
+                        yield text
+                    t = getattr(resp, "token", None)
+                    if t is not None:
+                        try:
+                            gen_ids.append(
+                                int(t.item()) if hasattr(t, "item") else int(t))
+                        except (ValueError, TypeError):
+                            pass
+            finally:
+                # 无论生成到哪一步（含中途取消）都如实记录缓存对应的 token
+                # 序列：命中的话缓存现在覆盖到整个 prompt + 已生成部分。
+                self._cache_token_ids = list(prompt_ids) + gen_ids
+
+        def _raw_getter() -> str:
+            ids = gen_ref[0] if gen_ref else []
+            if not ids:
+                return ""
+            try:
+                return gen_prefix + tok.decode(ids)
+            except Exception:
+                return ""
+
+        yield from self._stream_with_producer(
+            _produce(), start_in_think=start_in_think, raw_getter=_raw_getter)
 
     # ---- GGUF ----
     def _stream_gguf(self, messages, tools, temperature):
@@ -439,7 +819,9 @@ class LocalLLMClient:
         input_ids = np.array([ids], dtype=np.int64)
         full: List[str] = []
         generated: List[int] = []
-        splitter = _ThinkSplitter()
+        # 同 MLX：模板可能已把 <think> 预填进生成提示（见 _stream_mlx 注释）。
+        splitter = _ThinkSplitter(
+            start_in_think=prompt.rstrip().endswith(_THINK_OPEN))
         for _ in range(self._max_tokens):
             feeds = {"input_ids": input_ids}
             # 探测 past 输入名（不同导出差异大，尽力而为）
@@ -500,8 +882,24 @@ class LocalLLMClient:
         base = os.path.basename(self._path.rstrip("/")) or self._path
         return f"local:{self._backend}:{base}"
 
+    def invalidate_kv_cache(self) -> None:
+        """丢弃跨轮 KV 缓存。
+
+        缓存在这些时刻必须失效，否则会拿「对应旧历史」的 KV 去续算新 prompt
+        （前缀对不上时会被检测到并重建，但对得上的**错位**情形会静默生成乱码）：
+          * 会话重置 / 新建会话；
+          * 上下文收缩改写了历史（L3 折叠把旧轮次换成摘要）；
+          * 用户中途取消生成（本轮只生成了一半，历史与缓存中段不一致）。
+        """
+        if self._mlx_cache is not None or self._cache_token_ids:
+            logger.info("LLM: KV cache invalidated")
+        self._mlx_cache = None
+        self._cache_token_ids = []
+        self._kv_thread = None
+
     def close(self) -> None:
         # 释放大块权重：引用置空，等待 GC。会话级 ORT session 亦可析构。
+        self.invalidate_kv_cache()
         self._model = None
         self._session = None
         self._loaded = False

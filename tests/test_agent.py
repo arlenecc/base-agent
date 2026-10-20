@@ -694,11 +694,24 @@ def test_is_context_too_long_error_detects_common_patterns():
 
 
 def _loop_scripts(n, args=None, workspace=None):
-    """n 轮「调用 file_read」+ 1 轮最终答复。"""
+    """n 轮工具调用 + 1 轮最终答复。
+
+    每轮在 file_read 与 update_working_checkpoint 之间**轮换**：内核现在会检测
+    「同名 + 同参数的连续重复调用」并强制收尾（防模型空转），若每轮参数完全
+    相同会被判成卡住，跑不到 n 轮。
+    """
     args = args or {"path": "a.txt"}
-    tc = [{"id": "c1", "function": {"name": "file_read",
-                                    "arguments": json.dumps(args)}}]
-    scripts = [[_evt("done", tool_calls=tc, usage={"total_tokens": 5})] for _ in range(n)]
+    tc_read = [{"id": "c1", "function": {"name": "file_read",
+                                         "arguments": json.dumps(args)}}]
+    scripts = []
+    for i in range(n):
+        if i % 2:
+            tc = [{"id": f"c{i}", "function": {
+                "name": "update_working_checkpoint",
+                "arguments": json.dumps({"key_info": f"turn {i}"})}}]
+        else:
+            tc = tc_read
+        scripts.append([_evt("done", tool_calls=tc, usage={"total_tokens": 5})])
     scripts.append([_evt("content", "done"), _evt("done", usage={"total_tokens": 5})])
     return scripts
 

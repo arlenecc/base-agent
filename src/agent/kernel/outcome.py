@@ -81,6 +81,11 @@ class LLMResponse:
     usage: Dict[str, Any] = field(default_factory=dict)
     # 模型按协议输出的 <summary> 物理快照（L2 级摘要的原料）。
     summary: str = ""
+    # 模型原始输出（含 think 标签与工具调用 XML），来自 done 事件的
+    # raw_content。只有本地 MLX 后端会填；HTTP 后端恒为 ""。
+    # 它是双视图历史的第二视图：保存进 TurnRecord 后，MLX 后端用它把历史
+    # assistant 消息重建回生成时的逐 token 序列，跨轮 KV 才对得上前缀。
+    raw_content: str = ""
 
     @property
     def has_calls(self) -> bool:
@@ -99,6 +104,9 @@ class TurnRecord:
     index: int = 0
     prompt: str = ""                                  # 注入的 user 内容（已压缩）
     assistant_text: str = ""                          # 模型文本（已压缩）
+    # 双视图历史的第二视图：模型原始输出（含 think 标签与工具调用 XML）。
+    # 只有本地 MLX 后端有值；HTTP 后端为空，历史沿用 assistant_text 旧形状。
+    raw_content: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
     tool_results: List[Dict[str, Any]] = field(default_factory=list)   # {id, name, content}
     summary: str = ""                                 # L2 摘要（本轮一行）

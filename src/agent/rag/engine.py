@@ -41,7 +41,32 @@ def _is_stale_digest(old_digest: str) -> bool:
 # local-disk + CPU-bound parsing workloads (PDF OCR, docx parsing, etc.).
 # Embedding/vector-store writes stay serial because LanceDB's table lock is
 # not thread-safe and the embedding model instance can't be shared across threads.
-DEFAULT_PARALLEL_WORKERS = 4
+# 4 → 2（本地模式内存实测修订）：每个并行 worker 都持有完整解析结果（大
+# PDF/电子书可达数百 MB），叠加进程内常驻的本地模型（主 LLM 2.2GB + 辅助
+# 1.6GB + OCR 0.6GB + 嵌入 0.3GB），4 路并发在 16GB 机器上峰值逼近系统上限，
+# 长同步触发 macOS 内存压力（系统级卡死/崩溃）。解析是子进程/CPU 密集型，
+# 2 路已足够喂饱串行嵌入。
+DEFAULT_PARALLEL_WORKERS = 2
+
+
+def release_mlx_pool() -> None:
+    """把 MLX 统一内存池的空闲缓冲与解析器产生的引用循环还给系统。
+
+    MLX 的 buffer pool 只借不还：嵌入/OCR 的瞬时激活在池里留下碎片后 RSS
+    只升不降；marker/docling 等解析器会制造引用循环，仅靠引用计数不释放。
+    长知识库同步里两者叠加，RSS 单调爬升直到触发 macOS 内存压力（系统卡死
+    /崩溃）。在消费线程每处理完一个文件调用一次（串行、有界队列节拍）。
+    """
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
 
 # worker→主线程队列容量：限制 worker 最多超前产出多少文件的 chunks，
 # 超过后 worker 阻塞（背压），避免大知识库时 chunks 在内存堆积。
@@ -366,10 +391,14 @@ def _extract_with_docling(filepath: str) -> tuple:
     """
     ext = os.path.splitext(filepath)[1].lower()
     if ext in _PANDOC_FORMAT_EXTENSIONS:
-        from .ebook_parser import pandoc_to_markdown
+        from .ebook_parser import pandoc_to_markdown, clean_ebook_markdown
         md = pandoc_to_markdown(filepath)
         if md is not None:
-            return md, True
+            # pandoc gfm 会保留 raw HTML（pandoc 输出未清洗直接 return 是
+            # 入库文本带 HTML 标签的另一条泄漏路径）；统一过 ebook 清洗。
+            cleaned = clean_ebook_markdown(md)
+            if cleaned:
+                return cleaned, True
     primary, secondary = _pdf_engine, "docling"
     if primary not in ("docling", "marker"):
         primary = "docling"
@@ -1133,6 +1162,9 @@ class RAGEngine:
                             progress_callback(done, total_files, os.path.basename(filepath))
                         except Exception as e:
                             logger.warning("RAG: progress_callback error: %s", e)
+                    # 单文件消费完毕：释放解析器引用循环与 MLX 内存池空闲
+                    # 缓冲，防止长同步 RSS 单调爬升（见 release_mlx_pool 注释）。
+                    release_mlx_pool()
 
             def _on_batch(batch_added: int, total_added: int) -> None:
                 _log("  ├─ 向量化批次写入: +%d 切片 (累计 %d)", batch_added, total_added)

@@ -10,9 +10,10 @@ Design:
   * ``extract_markdown(filepath)`` — convert any supported document to Markdown
     via docling.  Returns ``None`` when docling is unavailable (callers fall
     back to the per-format parsers in :mod:`agent.rag.parsers`).
-  * Image-based PDF pages are OCR'd by RapidOCR (docling's OCR backend uses
-    RapidOCR under the hood; for pure-scan PDFs without a text layer we route
-    through the shared RapidOCR singleton in :mod:`agent.rag.parsers`).
+  * Image-based PDF pages are OCR'd by ocrmac (Apple Vision, zh-Hans first)
+    when available, RapidOCR otherwise; for pure-scan PDFs without a text
+    layer we route through the shared OCR entry in :mod:`agent.rag.parsers`
+    (same ocrmac-first policy).
 """
 from __future__ import annotations
 
@@ -116,6 +117,30 @@ def _get_converter():
                 pdf_opts.accelerator_options = AcceleratorOptions(
                     num_threads=4, device=AcceleratorDevice.CPU
                 )
+                # OCR 后端：Apple Vision（ocrmac）优先——中文印刷体识别质量
+                # 高于 RapidOCR，ANE 推理不占 CPU/内存；不可用（非 macOS /
+                # 未安装 ocrmac）回退 RapidOCR。lang 必须显式给中文：docling
+                # 的 OcrMacOptions 默认 ['en-US', 'es-ES', ...] 不含中文，
+                # 对中文扫描页会大面积漏识别。
+                from .ocr_engine import ocrmac_available
+                if ocrmac_available():
+                    try:
+                        from docling.datamodel.pipeline_options import OcrMacOptions
+                        pdf_opts.ocr_options = OcrMacOptions(
+                            lang=["zh-Hans", "en-US"], recognition="accurate")
+                        pdf_opts.do_ocr = True
+                        logger.info("docling OCR 后端: Apple Vision (ocrmac, zh-Hans 优先)")
+                    except Exception as e:
+                        # docling 版本差异导致 OcrMacOptions 不可用 → 回退。
+                        logger.info("OcrMacOptions 不可用（%s），回退 RapidOCR", e)
+                if getattr(pdf_opts, "ocr_options", None) is None:
+                    try:
+                        from docling.datamodel.pipeline_options import RapidOcrOptions
+                        pdf_opts.ocr_options = RapidOcrOptions()
+                        pdf_opts.do_ocr = True
+                        logger.info("docling OCR 后端: RapidOCR")
+                    except Exception:
+                        pass
                 converter = DocumentConverter(
                     format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
                 )

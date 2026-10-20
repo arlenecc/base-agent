@@ -457,7 +457,15 @@ class ToolRegistry:
         try:
             self._signature_of(tool).bind(**args)
         except TypeError as e:
-            return ToolResult(success=False, error=f"Invalid arguments for {name}: {e}")
+            # 参数错误最常见的后果是「模型原样重试 N 次」——它只看到
+            # "missing a required argument: 'op'"，并不知道该怎么填。工具可
+            # 选提供 usage_hint（一个能直接照抄的调用示例），在这里附上，
+            # 让小模型有机会一次就自纠。
+            msg = f"Invalid arguments for {name}: {e}"
+            hint = getattr(tool, "usage_hint", "") or ""
+            if hint:
+                msg += f"\n正确用法（照抄这个形状）：{hint}"
+            return ToolResult(success=False, error=msg)
 
         try:
             result = tool.run(**args)

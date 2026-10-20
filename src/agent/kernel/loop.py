@@ -98,6 +98,21 @@ _MAX_FAIL_SIGS = 8
 _MIN_ATTEMPTS_BEFORE_BLOCK = 3
 # 「未充分尝试就标记 blocked」的提醒上限（防无限循环）
 _BLOCK_NUDGE_MAX = 2
+# 重复调用检测：同名 + 同参数的调用连续出现到第 (N+1) 次时开始提醒；达到
+# 上限则直接结束本轮。注意这里管的是**成功**调用——失败调用由 _fail_sigs 负责。
+_REPEAT_CALL_WARN = 2      # 第 3 次相同调用 → 提醒换动作
+_REPEAT_CALL_LIMIT = 4     # 第 5 次 → 收尾，不再烧轮次
+
+# 「模型在向用户追问必要信息」的信号。只在任务未起步时作为放行依据，
+# 因此刻意收得比反思门的禁止清单更窄：只认真正索取信息的句式，不认
+# 「请问需要我继续吗」这类停车话术（后者由反思门继续拦）。
+_ASK_USER_RE = re.compile(
+    r"(请(提供|告诉|告知|说明|补充|指定|确认)|需要(你|您)(提供|告诉|确认|补充)|"
+    r"能否(提供|告诉|说明)|麻烦(提供|告诉)|"
+    r"(哪个|哪些)(文件|目录|路径|项目|模块|分支|环境)|"
+    r"想?要我(先)?(做|处理|修改|改)|希望我(做|先做)|你希望|你想要)",
+    re.I,
+)
 
 _PLAN_GATE_HINT = (
     "\n[System] 开始执行前，先用 update_plan(op=\"create\", goal=..., steps=[...]) "
@@ -194,6 +209,9 @@ class KernelLoop:
         # 补建提示计数：已开始执行但 plan 仍空时，最多提醒 _PLAN_NUDGE_MAX 次。
         self._plan_nudged = 0
         self._plan_finish_nudge = 0
+        # 重复调用检测（成功调用也会空转，见 ACT 态同名注释）；run() 会重置。
+        self._repeat_streak = 0
+        self._last_call_sigs: List[str] = []
         # 上层（Agent 自动续跑）注入的「上一段失败上下文」，run() 开始时消费一次。
         self._seed_failures: Optional[Dict[str, Any]] = None
 
@@ -270,6 +288,9 @@ class KernelLoop:
         self._did_work = False
         self._plan_nudged = 0
         self._plan_finish_nudge = 0
+        # 重复调用检测（成功调用同样空转，见 ACT 态的重复调用检测注释）
+        self._repeat_streak = 0
+        self._last_call_sigs: List[str] = []
         # 续跑段（Agent 自动续跑）跳过「规划前置门」：续跑由系统提示驱动，
         # 其 user_input 含「步骤 / 继续执行」等多步信号，不应被当成用户发起的
         # 多步任务而强制先建计划——否则会把续跑段的正常收尾也卡掉。
@@ -318,6 +339,11 @@ class KernelLoop:
                 # 周期性沉淀也必须真的折叠（旧代码这里传 0，force_fold 变成空操作），
                 # 否则 turns 只会增长、extra_digest 永远为空。
                 folded = session.force_fold(3 if over else 1)
+                if folded:
+                    # 历史被改写了（旧轮次摘掉、换成摘要行）→ 缓存里那几轮的
+                    # token 序列已不复存在，必须丢弃；否则下一轮会拿「对应旧
+                    # 历史」的 KV 去续算新 prompt。
+                    self._invalidate_kv()
                 self.log(f"[kernel] CONSOLIDATE ({reason}) folded={folded} {session.stats()}")
                 try:
                     self.hooks.consolidated(session, reason)
@@ -341,7 +367,12 @@ class KernelLoop:
             # 一旦开始干实际活（调过非 update_plan 的工具）就停止——一句话任务
             # （「读一下 a.txt」）不会被强制规划。多步任务真正要执行前，ACT 态
             # 的「规划前置门」还会硬拦一次（见下）。
-            if session.get_plan() is None and not self._did_work:
+            # 简单输入（一句问候 / 单个小问题）豁免：不要求先建执行计划。
+            # 否则「hi」也会被逼着 create 一个『询问用户需求』的一步计划，
+            # 而「询问」根本不是可执行的工具动作——模型随即卡在「立即开始第
+            # 1 步」上，表现为反复发无意义的工具调用。
+            if (session.get_plan() is None and not self._did_work
+                    and not self._is_simple_input(user_input)):
                 pending = (pending or "") + _PLAN_GATE_HINT
             user_text = session.anchor_prompt(extra=pending)
             rec = session.start_turn(user_text)
@@ -359,6 +390,8 @@ class KernelLoop:
                 if self._is_context_error(msg) and self._shrink_guard < 3:
                     self._shrink_guard += 1
                     self._rollback_turn(session)
+                    # 本轮被摘掉 → 缓存末尾对应的那一段已从历史消失。
+                    self._invalidate_kv()
                     shrunk = False
                     try:
                         shrunk = bool(self.hooks.consolidated(session, "fold-exhausted"))
@@ -389,6 +422,27 @@ class KernelLoop:
                 # 了，实际步骤没走完。提醒有限次，超过后尊重决定但在回复里附上
                 # 未完成清单（用户必须知道任务并没完成）。
                 open_steps = session.plan_open_steps()
+                # 任务尚未起步（既没执行计划、也没干过实际活）时，若模型是在向
+                # 用户追问必要信息（目标文件 / 路径 / 范围），必须放行：把提问
+                # 当作最终答复收下并结束本轮，用户才回答得了。
+                #
+                # 旧行为是无差别 rollback + 提醒「禁止问用户是否继续」：模型的
+                # 提问被整轮丢弃，用户一个字都看不到，内核又拿同一份上下文重问
+                # 一遍——表现为「一遍又一遍提示要用户输入任务，却完全不给输入
+                # 机会，然后循环起来」。任务还没开工时强推工具调用只会让它原地
+                # 打转，因为缺少的正是用户那句回答。
+                #
+                # 限定「未起步」是刻意的：一旦计划建好或已经干过活，模型就不能
+                # 再用「请问需要我继续吗」当停车借口（那正是反思门要防的行为）。
+                if (session.get_plan() is None and not self._did_work
+                        and self._looks_like_asking_user(resp.content)):
+                    final_text = resp.content
+                    session.finish_turn(rec, resp.content, [], [],
+                                        l2_summary(resp.content),
+                                        raw_content=resp.raw_content)
+                    self.log("[kernel] 任务未起步且模型在向用户追问必要信息 → 收下提问，交给用户回答")
+                    exit_reason = ExitReason.DONE
+                    break
                 # 多步任务却连执行计划都没写、也没真正动手就想收尾 —— 这正是
                 # 「思考里显示计划 + 声称开始第一个任务，然后就停住、什么也没干」
                 # 的失败模式。先拦：必须先把计划写入执行计划并立即发第一步工具。
@@ -496,12 +550,14 @@ class KernelLoop:
                     # session 摘掉，之后再 finish 写的是游离对象，等于丢轮。
                     final_text = resp.content
                     session.finish_turn(rec, resp.content, [], [],
-                                        l2_summary(resp.content))
+                                        l2_summary(resp.content),
+                                        raw_content=resp.raw_content)
                     exit_reason = ExitReason.DONE
                     break
                 final_text = resp.content
                 session.finish_turn(rec, resp.content, [], [],
-                                    l2_summary(resp.content))
+                                    l2_summary(resp.content),
+                                    raw_content=resp.raw_content)
                 exit_reason = ExitReason.DONE
                 break
 
@@ -553,13 +609,47 @@ class KernelLoop:
             if any(tc.name != "update_plan" for tc in tool_calls):
                 self._did_work = True
 
+            # ---- 重复调用检测（成功调用也要管）----
+            # 失败记账只覆盖「调用失败」，但卡死更常见的形态是**反复调用同一个
+            # 成功的工具**：模型不知道怎么推进，就一遍遍写同一个 checkpoint /
+            # 用同样的参数重试。每轮都成功 → 反思门的「无工具调用」分支永远不
+            # 触发，于是把 max_iterations 全耗在空转上（用户看到的就是一串一模
+            # 一样的工具调用）。
+            sigs = [self._call_sig(tc) for tc in tool_calls]
+            if sigs and sigs == self._last_call_sigs:
+                self._repeat_streak += 1
+            else:
+                self._repeat_streak = 0
+            self._last_call_sigs = sigs
+            if self._repeat_streak >= _REPEAT_CALL_WARN:
+                self.log(
+                    "[kernel] 连续 %d 次相同的工具调用（%s）→ 判定卡住"
+                    % (self._repeat_streak + 1, tool_calls[0].name if tool_calls else "?"))
+                if self._repeat_streak >= _REPEAT_CALL_LIMIT:
+                    # 提醒已经给过，仍在原地打转 → 收尾，别再烧轮次。
+                    self.log("[kernel] 重复调用达到上限，结束本轮")
+                    exit_reason = ExitReason.DONE
+                    break
+                pending = (
+                    f"[System] 你已经连续 {self._repeat_streak + 1} 次调用**完全相同**的"
+                    f"工具与参数（{tool_calls[0].name}）——这不会让任务前进哪怕一步。"
+                    "立刻换一个动作：\n"
+                    "1) 若这一步其实做不了/不需要工具，就用 update_plan(patch) 把它"
+                    "标为 done（写明结论）或 skipped，然后进入下一步；\n"
+                    "2) 若任务本身已经可以回答（例如只是问候/闲聊/缺少信息），"
+                    "直接用文字回复用户结束本轮；\n"
+                    "3) 若确实需要用户补充信息，用 ask_user 工具提问。\n"
+                    "不要再次发出与上一轮相同的调用。"
+                )
+
             outcomes = self._to_outcomes(tool_calls, raw_results)
             tool_results = [
                 {"id": tc.id, "name": tc.name, "content": str(o.data or "")}
                 for tc, o in zip(tool_calls, outcomes)
             ]
             summary = resp.summary or l2_summary(resp.content, [tc.name for tc in tool_calls])
-            session.finish_turn(rec, resp.content, tool_calls, tool_results, summary)
+            session.finish_turn(rec, resp.content, tool_calls, tool_results, summary,
+                                raw_content=resp.raw_content)
             # 这一轮被真正提交了（不是被回滚的重试轮）→ 重置空回复/重问守卫。
             # 旧实现让它们跨轮累积：长任务后期一次偶发空回复/只吐代码块，就会被
             # 过早判成 "done" 收尾。
@@ -656,11 +746,25 @@ class KernelLoop:
         """解析 LLM 客户端（允许运行时被整体替换）。"""
         return self.llm() if callable(self.llm) else self.llm
 
+    def _invalidate_kv(self) -> None:
+        """丢弃本地后端的跨轮 KV 缓存（历史被改写时）。
+
+        HTTP 后端没有该接口 → getattr 拿不到就静默跳过，零影响。
+        """
+        try:
+            fn = getattr(self._llm(), "invalidate_kv_cache", None)
+            if callable(fn):
+                fn()
+        except Exception as e:
+            self.log(f"[kernel] invalidate_kv failed: {e}")
+
     def _ask(self, messages: List[Dict[str, Any]]) -> Optional[LLMResponse]:
         content_buf: List[str] = []
         reasoning_buf: List[str] = []
         calls: List[Dict[str, Any]] = []
         usage: Dict[str, Any] = {}
+        # 模型原始输出（双视图历史的第二视图），只在 done 事件里出现一次。
+        raw_buf: str = ""
         ttfb: Optional[float] = None
         last_emit: Optional[float] = None
         live_est = 0
@@ -701,6 +805,7 @@ class KernelLoop:
                         seen_done = True
                         calls = getattr(ev, "tool_calls", None) or []
                         usage = getattr(ev, "usage", None) or {}
+                        raw_buf = getattr(ev, "raw_content", "") or ""
                         continue
                     if last_emit is None:
                         last_emit = now
@@ -772,6 +877,7 @@ class KernelLoop:
             reasoning=reasoning_text,
             tool_calls=[self._to_tool_call(c) for c in calls],
             usage=usage,
+            raw_content=raw_buf,
         )
         resp.summary = l2_summary(text, [tc.name for tc in resp.tool_calls]) if text else ""
         return resp
@@ -1027,6 +1133,36 @@ class KernelLoop:
     # ------------------------------------------------------------------
     # 无工具调用时的判定（对齐 GenericAgent 的 do_no_tool）
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_simple_input(user_input: str) -> bool:
+        """一句话任务判定：短、且不含多步信号。
+
+        与「规划前置门」里的 simple 判定同源（那里还要求首轮）。用于让问候、
+        闲聊、单个小问题跳过强制规划——它们本来也不需要执行计划。
+        """
+        t = (user_input or "").strip()
+        if not t:
+            return True
+        if len(t) > 60:
+            return False
+        return not (_MULTISTEP_HINT.search(t) or _MULTISTEP_VERB_RE.search(t))
+
+    def _looks_like_asking_user(self, content: str) -> bool:
+        """回复是否是在向用户追问完成任务所必需的信息。
+
+        判定偏保守（宁可漏判也不要误判）：漏判只是多走一轮提醒，误判会让模型
+        学会用「问一句」来逃避执行。两个信号任一命中即可：
+          1. 结尾 200 字里有问号；
+          2. 结尾命中索取信息的句式（_ASK_USER_RE）。
+        """
+        c = (content or "").strip()
+        if not c:
+            return False
+        tail = c[-200:]
+        if "？" in tail or "?" in tail:
+            return True
+        return bool(_ASK_USER_RE.search(tail))
+
     def _no_tool_event(self, resp: LLMResponse) -> str:
         content = (resp.content or "").strip()
         if not content and not (resp.reasoning or "").strip():

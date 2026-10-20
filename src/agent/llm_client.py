@@ -13,6 +13,21 @@ from typing import Any, Dict, Iterator, List, Optional
 import httpx
 
 
+def _strip_raw_content(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """剥掉双视图历史的第二视图（raw_content）后再发往远端。
+
+    ``raw_content`` 只服务本地 MLX 后端（用它重建 KV 前缀）。远端 API 不认识
+    这个键：严格实现会 400，宽松实现也会白烧一份 token（raw 通常比正文长）。
+    绝大多数历史本来就没有该字段 → 原样返回，零拷贝开销。
+    """
+    if not any(isinstance(m, dict) and "raw_content" in m for m in messages):
+        return messages
+    return [
+        {k: v for k, v in m.items() if k != "raw_content"} if isinstance(m, dict) else m
+        for m in messages
+    ]
+
+
 @dataclass
 class StreamEvent:
     """A single parsed streaming event.
@@ -27,6 +42,11 @@ class StreamEvent:
     content: str = ""
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Dict[str, int] = field(default_factory=dict)
+    # 模型**原始输出**（含 think 标签与工具调用 XML），只在 done 事件携带。
+    # 仅本地 MLX 后端填它：后端要用它把历史 assistant 消息重建回「生成时的
+    # 逐 token 序列」，跨轮 KV 缓存的前缀才对得上（见 local/llm.py）。
+    # HTTP 后端恒为 ""，历史沿用旧形状（只有 content），零影响。
+    raw_content: str = ""
 
 
 class LLMError(RuntimeError):
@@ -126,7 +146,7 @@ class LLMClient:
         url = f"{self.base_url}/chat/completions"
         payload: Dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": _strip_raw_content(messages),
             "temperature": temperature,
             "max_tokens": self.max_tokens,
             "top_p": self.top_p,

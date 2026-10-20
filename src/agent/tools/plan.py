@@ -50,6 +50,16 @@ class UpdatePlanTool(Tool):
         "The plan is re-injected into your context every turn — keep it accurate."
     )
     destructive = False
+    # 参数填错时回给模型的示例（见 ToolRegistry.execute 的 usage_hint 处理）。
+    # 本地小模型最常见的错误就是漏掉 op 直接调 update_plan({})，然后原样重试
+    # 若干次；给一个能照抄的形状，多数情况一次就能自纠。
+    usage_hint = (
+        'update_plan({"op": "patch", "step_id": "1", "status": "done", '
+        '"note": "结论"})\n'
+        '  · op 必填：create / patch / append / clear\n'
+        '  · create 另需 goal 与 steps（steps 每项形如 {"title": "..."}）\n'
+        '  · patch 需要 status 和/或 note；只改某一步时务必带 step_id'
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -100,6 +110,16 @@ class UpdatePlanTool(Tool):
     # ------------------------------------------------------------------
     def run(self, op: str, goal: str = "", steps: Any = None,
             step_id: str = "", status: str = "", note: str = "") -> ToolResult:
+        # 本地模型的文本工具调用会把 steps 作为 JSON 字符串传入（双重编码）；
+        # 统一在此解析成 list，create/append 都能正确消费。
+        if isinstance(steps, str):
+            _s = steps.strip()
+            if _s:
+                try:
+                    import json as _json
+                    steps = _json.loads(_s)
+                except (ValueError, TypeError):
+                    pass
         sess = _session(self.registry)
         if sess is None:
             return ToolResult(False, error="plan unavailable (no kernel session)")

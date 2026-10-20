@@ -300,19 +300,33 @@ def test_preprocess_handles_2d_and_4ch():
     assert r2 is not None
 
 
-def test_render_dpi_clamped(monkeypatch):
-    """render_dpi_for_page 必须落在 [150, 400]。"""
+def test_render_dpi_capped_and_long_side_bounded(monkeypatch):
+    """渲染 dpi 不超过 _MAX_RENDER_DPI，且长边反推后位图不超 _MAX_LONG_SIDE。
+
+    旧语义是 clamp 到 [150, 400]（短边凑 1600px，不足 150 时抬到 150）。现改为
+    「短边目标 1600 与长边上限 1500 取更严格者 + 硬上限 150」：竖版大开本不再
+    被下限抬回 150 去渲染 8.9MP 再缩掉，而是按长边反推一次渲染到位。走 OCR 的
+    都是扫描件（位图嵌入），实测 60/100/150dpi 归一到长边 1500 后识别结果一致。
+    """
 
     class Rect:
         def __init__(self, w, h):
             self.width, self.height = w, h
 
     class Page:
-        rect = Rect(72, 72)  # 1x1 inch → 目标 1600dpi，应被 clamp 到 400
+        def __init__(self, w, h):
+            self.rect = Rect(w, h)
 
-    assert oe.render_dpi_for_page(Page()) == 400
+    # 小页面：为凑够短边会解出极高 dpi → 必须被硬上限封住
+    assert oe.render_dpi_for_page(Page(72, 72)) == oe._MAX_RENDER_DPI
 
-    class Tiny:
-        rect = Rect(72 * 100, 72 * 100)  # 100 inch 短边 → 16 dpi，应被 clamp 到 150
+    # 超大页：按长边反推，不再被下限抬到 150（抬上去只是渲染一张要被缩掉的图）
+    tiny_dpi = oe.render_dpi_for_page(Page(72 * 100, 72 * 100))
+    assert 0 < tiny_dpi < oe._MAX_RENDER_DPI
 
-    assert oe.render_dpi_for_page(Tiny()) == 150
+    # 任意页面：dpi 恒 ≤ 上限，且按该 dpi 渲染后长边不超过 _MAX_LONG_SIDE
+    for w, h in ((1151, 1788), (595, 842), (612, 792), (2000, 3000), (300, 400)):
+        dpi = oe.render_dpi_for_page(Page(w, h))
+        assert dpi <= oe._MAX_RENDER_DPI
+        long_px = max(w, h) / 72.0 * dpi
+        assert long_px <= oe._MAX_LONG_SIDE + 1, (w, h, dpi, long_px)

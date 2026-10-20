@@ -76,12 +76,27 @@ class AgentConfig:
     # 件比 RapidOCR 慢 8 倍、依赖重（torch + 1.4GB VLM + datalab S3 模型）；
     # docling 对无 ToUnicode CMap 的中文文本 PDF 会输出乱码。两者取舍交给用户。
     rag_pdf_engine: str = "docling"
-    # OCR（图片型 PDF）：检测到 Apple M 系列且 onnxruntime >= 1.31.0 时，
-    # 让 RapidOCR 走 CoreML EP（CPU+GPU+ANE）。关掉则回退 onnxruntime 默认 EP。
-    rag_ocr_coreml: bool = True
+    # OCR（图片型 PDF）：Apple M 系列上让 RapidOCR 走 CoreML EP（CPU+GPU+ANE），
+    # 关掉则回退 onnxruntime 默认 EP。
+    #
+    # 默认 False（2026-10 实测修订）：CoreML EP 的原生缓存按**输入形状**保留，
+    # 真实扫描书实测 ~67MB/页——182 页扫描件单文件就把峰值推到 4.99GB，叠加
+    # 常驻的本地 LLM（MLX 统一内存不可换出）在 16GB 机器上触发系统级内存压力
+    # （整机卡死/崩溃）。而同一本书走 CPU EP：峰值 3.10GB、耗时 172.6s vs
+    # 282.0s（快 39%），输出字符数 58246 完全一致。即 CoreML 在本负载下既更慢
+    # 又更耗内存且无质量收益，故默认关闭。
+    # 仍保留开关：EP 实现改进、或小图/固定形状的大批量场景可能反转结论。
+    # 另见 parsers._OCR_RSS_BUDGET_GB——即使本项为 True，内存护栏也会在原生
+    # 缓存超预算时自动冲刷并永久降级到 CPU EP。
+    rag_ocr_coreml: bool = False
     # OCR 前的图像归一化与增强（尺寸归一化 + 灰度 CLAHE + 锐化）。
     # 关掉则把渲染出的原始位图直接送进引擎（旧行为）。
     rag_ocr_preprocess: bool = True
+    # OCR 前的二值化：灰度经锐化后用自适应阈值压成黑白。
+    # 默认开——实测白底黑字的扫描件上字符数完全一致且更快（单页 4.15s →
+    # 2.50s）。但二值化会丢掉灰度层次，对**有阴影/渐变/彩色插图**的页面可能
+    # 少识别字（全书实测 -0.45%）。这类文档可关掉本项退回灰度路径。
+    rag_ocr_binarize: bool = True
 
     # ---- 本地模型 provider 开关（应用内直接加载，不走网络）----
     # 每个模型用途一个开关：``api``（默认走网络实现）/ ``local``（加载本地权重）。
@@ -92,6 +107,10 @@ class AgentConfig:
     llm_provider: str = "local"
     local_llm_model: str = ""
     local_llm_backend: str = "mlx"
+    # 本地主模型是否启用思考模式（Qwen3 系模板的 enable_thinking）。False 时
+    # 模板注入空 <think></think> 块，模型直接作答——首字延迟显著降低，但
+    # 复杂任务的推理质量会下降。
+    local_llm_enable_thinking: bool = True
 
     # 辅助 LLM（本地专用，用于事实抽取等轻量子任务）：默认加载
     # models/Qwen3.5-2B-MLX-4bit。不带 OpenAI 模式（辅助任务始终本地）。
@@ -105,6 +124,12 @@ class AgentConfig:
     aux_top_k: int = 20
     aux_repetition_penalty: float = 1.0
     aux_request_timeout: float = 120.0
+    # 辅助模型思考模式（同 local_llm_enable_thinking，Qwen3 系模板专用）。
+    # 默认 **关闭**：辅助模型只干事实抽取、要点提炼这类轻量子任务——输入短、
+    # 输出短、要的是结构化结果而不是推理链。开思考会让它先吐一长串推理再给
+    # 结论，首字延迟成倍上升（主模型实测 3.49s → 0.38s 的差额就是这段），而
+    # 抽取质量并没有可观测收益。主模型默认仍开着（复杂任务需要推理）。
+    aux_local_llm_enable_thinking: bool = False
 
     embedding_provider: str = "local"
     local_embedding_model: str = ""
@@ -153,7 +178,8 @@ class AgentConfig:
                    "local_vlm_backend",
                    "aux_llm_provider", "aux_local_llm_model", "aux_local_llm_backend")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
-                    "rag_ocr_coreml", "rag_ocr_preprocess")
+                    "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
+                   "local_llm_enable_thinking", "aux_local_llm_enable_thinking")
 
     @classmethod
     def _coerce(cls, name: str, value):

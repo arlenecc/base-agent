@@ -48,6 +48,7 @@ def build_llm_client(config) -> Any:
             min_p=getattr(config, "min_p", 0.05),
             top_k=getattr(config, "top_k", 20),
             repetition_penalty=getattr(config, "repetition_penalty", 1.0),
+            enable_thinking=bool(getattr(config, "local_llm_enable_thinking", True)),
         )
     # 默认：网络 API
     from ..llm_client import LLMClient
@@ -83,6 +84,8 @@ def build_aux_llm_client(config) -> Any:
         min_p=getattr(config, "aux_min_p", 0.05),
         top_k=getattr(config, "aux_top_k", 20),
         repetition_penalty=getattr(config, "aux_repetition_penalty", 1.0),
+        # 兜底值必须与 AgentConfig 的字段默认值一致（辅助模型默认关闭思考）。
+        enable_thinking=bool(getattr(config, "aux_local_llm_enable_thinking", False)),
     )
 
 

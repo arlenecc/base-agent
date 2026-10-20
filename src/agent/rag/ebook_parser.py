@@ -159,17 +159,41 @@ def clean_ebook_markdown(md: str) -> str:
 
     md = strip_html_entities(md)
     md = _html.unescape(md)  # 残留的功能性实体（&amp; 等）还原为真实字符
-    # pandoc gfm 会输出 raw HTML（epub 内嵌 <img>、布局 <div> 等）——对 RAG
-    # 文本无意义，剥除标签只留内容
-    md = re.sub(r'<img[^>]*/?>', ' ', md, flags=re.IGNORECASE)
-    md = re.sub(r'</?(?:div|span|section|article|figure|figcaption|body|head|font|center)[^>]*>',
-                ' ', md, flags=re.IGNORECASE)
+    # pandoc gfm 会把无法用 Markdown 表达的元素原样保留为 raw HTML
+    # （ruby/rt/sup/sub/u/small/table/colgroup/svg/math… 白名单永远列不全
+    # ——这正是入库文本带大量 HTML 标签的根因）——统一剥除所有 HTML 标签
+    # 只留内容。代码块/行内代码与 autolink 先占位保护避免误伤。
+    stash: List[str] = []
+    _ph = chr(0) + "CODE"                     # 占位前缀（NUL 不会出现在正文）
+    _ph_re = re.compile(re.escape(chr(0)) + r"CODE(\d+)" + re.escape(chr(0)))
+
+    def _stash_code(m: "re.Match[str]") -> str:
+        stash.append(m.group(0))
+        return _ph + str(len(stash) - 1) + chr(0)
+
+    _fence = "`" * 3
+    md = re.sub(_fence + r"[\s\S]*?" + _fence + "|" + "`" + r"[^`\n]*" + "`",
+                _stash_code, md)
+    # pandoc 对 pre/code 常输出 **4 空格缩进代码块**（非围栏）——同样保护，
+    # 否则代码里的 <div>/<T> 等会被通用剥标签吃掉。
+    md = re.sub(r"(?m)^(?: {4}|\t).*(?:\n(?: {4}|\t).*)*", _stash_code, md)
+    # 转义括号 \[ \] \( \) \> 还原——必须在 autolink 保护和剥标签**之前**：
+    # pandoc 会把字面尖括号转义成 \<…\>，不先还原的话 autolink 保护不到，
+    # 会被下面的通用剥标签当成标签剥掉。
+    md = re.sub(r'\\([\[\]()#*_<>{}])', r'\1', md)
+    # gfm autolink <https://…> / <mailto:…> 还原成裸链接（否则被当标签剥掉）
+    md = re.sub(r"<(https?://[^>\s]+|mailto:[^>\s]+)>", r"\1", md)
+    md = re.sub(r"<!--[\s\S]*?-->", " ", md)      # 注释兜底（pandoc 已剥一轮）
+    md = re.sub(r"</?[a-zA-Z][^>]*>", " ", md)    # 所有 HTML/XML 标签（属性可跨行）
+    md = re.sub(r"<[!?][^>]*>", " ", md)          # DOCTYPE / 处理指令残留
+    md = _ph_re.sub(lambda m: stash[int(m.group(1))], md)
     # pandoc gfm 把源文档的 <br> 转成行尾反斜杠硬换行转义——同样按断行处理
     md = re.sub(r'\\\n', ' ', md)
     md = re.sub(r'\\$', ' ', md, flags=re.MULTILINE)
-    # 内联链接只保留链接文字（epub 内部 filepos/#anchor 跳转对检索无价值；
-    # 转义括号 \[ \] 还原）
-    md = re.sub(r'\\([\[\]()#*_{}>])', r'\1', md)
+    # 图片对 RAG 文本无意义（epub 内嵌图/数据 URI），整段去掉——必须先于
+    # 下面的链接解包，否则 ![](x.png) 会被解包成孤立的 "!" 残留。
+    md = re.sub(r'!\[[^\]]*\]\([^)]*\)', ' ', md)
+    # 内联链接只保留链接文字（epub 内部 filepos/#anchor 跳转对检索无价值）
     md = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', md)
     md = join_hard_wrapped_lines(md, preserve_markdown=True)
     md = re.sub(r'[ \t]+', ' ', md)           # 合并产生的连续空格
@@ -267,6 +291,145 @@ def _item_content(book, item_id: str) -> Optional[bytes]:
     if item is None:
         return None
     return getattr(item, "content", None)
+
+
+# ---------------------------------------------------------------------------
+# 扫描版 EPUB：整页图片 + 极少文本 → 逐页图片 OCR（ocrmac 优先 → RapidOCR）
+# ---------------------------------------------------------------------------
+
+# 扫描版判定阈值。判据按「文档分布」而不是「平均文本量」：扫描版 EPUB
+# 常带目录页/版权页/书商标签等文本大户（合计可达上万字），平均值会被拉高
+# 造成漏判；但含图的正文页自身几乎无文本——这个占比是稳健信号。
+_SCANNED_MIN_DOCS = 3           # spine 文档过少样本不可靠，不判扫描版
+_SCANNED_MIN_IMG_RATIO = 0.5    # 含图片的文档占比下限
+_SCANNED_TEXTLESS = 100         # 文档自身文本 < 100 字 = 「无实质文本」
+_SCANNED_TEXTLESS_RATIO = 0.6   # 含图文档中「无实质文本」的占比下限
+
+
+def _epub_scanned_stats(book, href_map: Dict[str, str]) -> Tuple[int, int, int, int]:
+    """遍历 spine：返回 (文档数, 含图文档数, 含图且无实质文本的文档数, 总文本字符)。
+
+    纯文本大部头（遍历 20 个文档仍一张图都没有）提前退出。
+    """
+    from bs4 import BeautifulSoup
+    docs = img_docs = textless_img_docs = text_chars = 0
+    for item_id, _href in _spine_items(book, href_map):
+        content = _item_content(book, item_id)
+        if not content:
+            continue
+        docs += 1
+        try:
+            soup = BeautifulSoup(content.decode("utf-8", errors="replace"),
+                                 "html.parser")
+        except Exception:
+            continue
+        text = soup.get_text(strip=True)
+        text_chars += len(text)
+        if soup.find_all("img"):
+            img_docs += 1
+            if len(text) < _SCANNED_TEXTLESS:
+                textless_img_docs += 1
+        if docs >= 20 and img_docs == 0:
+            break
+    return docs, img_docs, textless_img_docs, text_chars
+
+
+def _is_scanned_epub(book, href_map: Dict[str, str]) -> bool:
+    docs, img_docs, textless_img_docs, _chars = _epub_scanned_stats(book, href_map)
+    if docs < _SCANNED_MIN_DOCS:
+        return False
+    if img_docs < docs * _SCANNED_MIN_IMG_RATIO:
+        return False
+    return textless_img_docs / max(img_docs, 1) >= _SCANNED_TEXTLESS_RATIO
+
+
+def extract_scanned_epub(path: str, book=None) -> Optional[str]:
+    """扫描版 EPUB → 按 spine 顺序逐页图片 → 统一归一化 → OCR。
+
+    OCR 走 :func:`parsers._ocr_image_cached` 的统一入口（Apple Vision 优先、
+    RapidOCR 回退），图片先经 :func:`ocr_engine.preprocess_for_ocr` 归一化
+    （长边 ≤1500、Lanczos、灰度、二值化）。
+    非扫描版返回 ``None``（调用方走常规提取路径）。
+    """
+    import posixpath
+    from urllib.parse import unquote
+    from bs4 import BeautifulSoup
+    from .ocr_engine import decode_image, preprocess_for_ocr
+    from .parsers import _get_ocr_engine, _ocr_image_cached
+
+    href_map = _manifest_href_map(path)
+    if book is None:
+        book = _read_epub(path)
+    if not _is_scanned_epub(book, href_map):
+        return None
+    logger.info("EPUB '%s' 判定为扫描版（整页图片 + 极少文本），走逐页 OCR",
+                os.path.basename(path))
+
+    # engine 可能为 None（RapidOCR 未安装）：ocrmac 可用时仍能完整识别，
+    # 只有 ocrmac 也不可用时 _ocr_image_cached 内部才会失败并逐页返回 ""。
+    engine = _get_ocr_engine()
+    # 图片 item 收集：ebooklib 的 get_items_of_type(ITEM_IMAGE) 依赖 item 的
+    # type 属性，部分制作工具产出的图片 item 类型不全（实测 4 张图只回收 1
+    # 张）。以 media_type 为主 + type 兜底全量扫一遍并去重。
+    from ebooklib import epub as _epub_mod
+    item_image = getattr(_epub_mod, "ITEM_IMAGE", 4)
+    image_candidates = []
+    seen = set()
+    for it in book.get_items():
+        mt = (getattr(it, "media_type", "") or "")
+        if mt.startswith("image/") or getattr(it, "type", None) == item_image:
+            key = id(it)
+            if key not in seen:
+                seen.add(key)
+                image_candidates.append(it)
+    # href 的来源必须是 OPF manifest（_manifest_href_map 的 id→href），不能信
+    # item.href——实测 ebooklib read_epub 后 item.href 恒为 None。
+    img_items = {}
+    for it in image_candidates:
+        iid = getattr(it, "id", None)
+        href_key = unquote(href_map.get(iid, "")
+                           or getattr(it, "href", "") or "")
+        if not href_key:
+            continue
+        img_items[href_key] = it
+        img_items[os.path.basename(href_key)] = it
+
+    fname = os.path.basename(path)
+    parts: List[str] = []
+    page_no = 0
+    for item_id, href in _spine_items(book, href_map):
+        content = _item_content(book, item_id)
+        if not content:
+            continue
+        try:
+            soup = BeautifulSoup(content.decode("utf-8", errors="replace"),
+                                 "html.parser")
+        except Exception:
+            continue
+        base_dir = posixpath.dirname(href)
+        for img in soup.find_all("img"):
+            src = img.get("src") or img.get("xlink:href") or ""
+            if not src:
+                continue
+            rel = unquote(src.split("#")[0])
+            name = posixpath.normpath(posixpath.join(base_dir, rel))
+            it = img_items.get(name) or img_items.get(os.path.basename(rel))
+            if it is None:
+                continue
+            arr = decode_image(it.get_content())
+            if arr is None:
+                continue
+            page_no += 1
+            norm = preprocess_for_ocr(arr)
+            txt = _ocr_image_cached(engine, norm, page_no, fname)
+            if txt and txt.strip():
+                parts.append(txt)
+            if page_no % 25 == 0:
+                logger.info("扫描版 EPUB OCR 进度: %s 已识别 %d 页", fname, page_no)
+    if not parts:
+        return None
+    logger.info("扫描版 EPUB OCR 完成: %s 共 %d 页图片", fname, page_no)
+    return "\n\n".join(parts)
 
 
 def _href_matches(href: str, toc_hrefs: Dict[str, str]) -> str:
@@ -402,6 +565,24 @@ def extract_ebook(path: str) -> Optional[Dict[str, Any]]:
         except Exception as e:
             logger.warning("epub read failed for %s: %s", os.path.basename(path), e)
             return None
+
+        # 扫描版 EPUB：书页几乎无文本、由整页图片构成——pandoc/ebooklib 只会
+        # 产出空壳。逐页图片走统一 OCR（归一化 → ocrmac 优先 → RapidOCR 回退），
+        # 整本作为一个"章节"返回，交给通用切块器二次切分。
+        if ext == ".epub" or tmp_epub:
+            try:
+                scanned = extract_scanned_epub(epub_path, book)
+            except Exception as e:
+                logger.warning("扫描版 EPUB OCR 异常，回退常规路径: %s: %s",
+                               os.path.basename(path), e)
+                scanned = None
+            if scanned and scanned.strip():
+                return {
+                    "full_markdown": scanned,
+                    "toc_digest": "",
+                    "toc_chapters": [],
+                    "chapters": [scanned],
+                }
 
         book_title = ""
         try:
