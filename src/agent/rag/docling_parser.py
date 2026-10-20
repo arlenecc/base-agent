@@ -251,7 +251,7 @@ def _get_converter():
                 converter = DocumentConverter(
                     format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
                 )
-                logger.info("docling DocumentConverter initialized (PDF 管线强制 CPU 加速)")
+                logger.info("docling DocumentConverter initialized (布局/表格走 MPS，OCR 走 Apple Vision/ANE)")
             except Exception as e:
                 # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到
                 # 降配入口就用默认构造——正确性不受影响，只是 macOS 上

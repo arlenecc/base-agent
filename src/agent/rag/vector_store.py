@@ -784,6 +784,7 @@ class VectorStore:
         # Open the documents metadata table (if it already exists).
         if _DOCUMENTS_TABLE_NAME in self._db.table_names():
             self._documents_table = self._db.open_table(_DOCUMENTS_TABLE_NAME)
+            self._migrate_documents_schema()
 
         self._initialized = True
         count = self._table.count_rows() if self._table is not None else 0
@@ -2105,6 +2106,23 @@ class VectorStore:
         with self._documents_lock:
             return self._ensure_documents_table_locked()
 
+    def _migrate_documents_schema(self) -> None:
+        """旧 schema 迁移（#131）：补 md_path 列。
+
+        早期版本的 documents 表没有 md_path 列，而新代码的 delete 过滤
+        （``md_path != ...``）和 upsert 写入都引用它——不补列会报
+        ``field 'md_path' does not exist in table schema``，每个文件的
+        缩略版本（digest）写入都失败。add_columns 补空串默认值即可，
+        老行的 md_path 为空串、下次重解析时自然被 upsert 覆盖。
+        """
+        try:
+            col_names = [f.name for f in self._documents_table.schema]
+            if "md_path" not in col_names:
+                logger.info("documents 表缺 md_path 列，补列（schema 迁移）")
+                self._documents_table.add_columns({"md_path": "''"})
+        except Exception as e:
+            logger.warning("documents 表 md_path 迁移失败: %s", e)
+
     def _ensure_documents_table_locked(self):
         """``_ensure_documents_table`` 的实现，调用方必须已持有 _documents_lock。"""
         if self._documents_table is not None:
@@ -2112,6 +2130,7 @@ class VectorStore:
         self._ensure_initialized()
         if _DOCUMENTS_TABLE_NAME in self._db.table_names():
             self._documents_table = self._db.open_table(_DOCUMENTS_TABLE_NAME)
+            self._migrate_documents_schema()
         else:
             # 首次创建：空表（含占位空记录，后续 upsert 时清理）。
             # 注意：不建 markdown 列——全文已落在 rag/documents/*.md 缓存里，
