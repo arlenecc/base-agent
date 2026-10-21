@@ -76,6 +76,22 @@ class AgentConfig:
     # 件比 RapidOCR 慢 8 倍、依赖重（torch + 1.4GB VLM + datalab S3 模型）；
     # docling 对无 ToUnicode CMap 的中文文本 PDF 会输出乱码。两者取舍交给用户。
     rag_pdf_engine: str = "docling"
+    # 统一 PDF/office 解析引擎切换（#133 三选一）：
+    #   - "docling"（默认）：docling 统一管线（布局/表格模型走 MPS，OCR 走
+    #     Apple Vision/ANE），输出版面良好的 Markdown
+    #   - "marker"：marker-pdf 优先（需手动 pip install marker-pdf；未装时
+    #     静默回退 docling）
+    #   - "ovis"：OvisOCR2 VLM（PyMuPDF 取页/裁表 → OvisOCR2 转 Markdown），
+    #     作为 docling/marker 之外的第三选项与最后兜底（替换原 PyMuPDF+
+    #     RapidOCR 方案，后者只能出无版面纯文本）
+    # 回退链：主引擎 → 其余统一引擎 → ovis → PyMuPDF 纯文本兜底。
+    # OvisOCR2 VLM 模型配置（ovis 引擎用）：
+    #   rag_ocr_engine    实现后端：mlx-vlm（已实现）| onnx | gguf（后两者预留）
+    #   rag_ocr_model_name 模型目录名（默认 OvisOCR2-0.8B-MLX-4bit）
+    #   rag_ocr_model_path 显式本地路径（优先于 models/<name>，留空自动）
+    rag_ocr_engine: str = "mlx-vlm"
+    rag_ocr_model_name: str = "OvisOCR2-0.8B-MLX-4bit"
+    rag_ocr_model_path: str = ""
     # OCR（图片型 PDF）：Apple M 系列上让 RapidOCR 走 CoreML EP（CPU+GPU+ANE），
     # 关掉则回退 onnxruntime 默认 EP。
     #
@@ -171,6 +187,7 @@ class AgentConfig:
                      "aux_repetition_penalty", "aux_request_timeout")
     _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
                    "rag_embedding_model", "rag_rerank_model", "rag_pdf_engine",
+                   "rag_ocr_engine", "rag_ocr_model_name", "rag_ocr_model_path",
                    "browser_endpoint", "llm_provider", "local_llm_model",
                    "local_llm_backend", "embedding_provider", "local_embedding_model",
                    "local_embedding_backend", "reranker_provider", "local_reranker_model",

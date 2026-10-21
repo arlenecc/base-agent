@@ -374,8 +374,8 @@ def _escape_like(s: str) -> str:
     return s.replace("'", "''")
 
 
-# 统一 PDF/office 解析引擎（"docling" | "marker"）。经 set_pdf_engine 注入，
-# 默认 docling——与 rag_pdf_engine 配置项的默认值保持一致。
+# 统一 PDF/office 解析引擎（"docling" | "marker" | "ovis"）。经 set_pdf_engine
+# 注入，默认 docling——与 rag_pdf_engine 配置项的默认值保持一致。
 _pdf_engine = "docling"
 
 # pandoc 优先的格式集合（与 ebook_parser.PANDOC_EXTENSIONS 一致，模块级导入
@@ -391,7 +391,16 @@ def set_pdf_engine(engine: str) -> None:
     即对两条路径生效。非法值回退 "docling"（保守默认）。
     """
     global _pdf_engine
-    _pdf_engine = engine if engine in ("docling", "marker") else "docling"
+    _pdf_engine = engine if engine in ("docling", "marker", "ovis") else "docling"
+
+
+def set_ovis_model_config(engine: str, name: str, path: str) -> None:
+    """注入 OvisOCR2 模型配置（rag_ocr_engine/name/path）到 ovis 解析器。"""
+    try:
+        from .ovis_ocr_parser import set_ovis_model_config as _set
+        _set(engine, name, path)
+    except Exception:
+        pass
 
 
 def _extract_with_docling(filepath: str) -> tuple:
@@ -404,8 +413,9 @@ def _extract_with_docling(filepath: str) -> tuple:
     then to the per-format parsers.
 
     引擎选择：``rag_pdf_engine`` 配置（经 :func:`set_pdf_engine` 注入）。
-    默认 "docling"（现状）；"marker" 时 marker-pdf 优先——基准数据（2026-10）
-    显示 marker 对 CJK 文本层无乱码且输出结构化 Markdown，但依赖更重。
+    默认 "docling"；"marker" 时 marker-pdf 优先；"ovis" 时 OvisOCR2 VLM
+    优先（#133，PyMuPDF 取页/裁表 → VLM）。三者构成回退链，最后落到
+    PyMuPDF 纯文本兜底。
 
     例外：html/docx/tex 等 pandoc 支持格式优先走 pandoc（输出更干净的
     Markdown 且速度快一个量级），pandoc 不可用才回落 docling/按格式解析器。
@@ -420,18 +430,20 @@ def _extract_with_docling(filepath: str) -> tuple:
             cleaned = clean_ebook_markdown(md)
             if cleaned:
                 return cleaned, True
-    # 回退链（#131 用户定版）：主引擎（rag_pdf_engine 配置，默认 docling）
-    # → 另一个统一引擎（marker）→ PyMuPDF 轻量路径（最后兜底，只能出纯文本，
-    # 没有版面良好的 Markdown）。旧实现 secondary 与 primary 相同时直接置
-    # None——默认配置下 docling 失败会跳过 marker 直落 PyMuPDF。
-    primary = _pdf_engine if _pdf_engine in ("docling", "marker") else "docling"
-    secondary = "marker" if primary == "docling" else "docling"
-    for engine in (primary, secondary):
-        if not engine:
-            continue
+    # 回退链（#131/#133 用户定版）：主引擎（rag_pdf_engine 配置，默认 docling）
+    # → 其余统一引擎（marker/docling）→ ovis（OvisOCR2 VLM，#133 起取代
+    # PyMuPDF+RapidOCR 成为第三选项/兜底——输出带版面的 Markdown 而非纯文本）
+    # → PyMuPDF 纯文本（最后手段）。ovis 不可用/失败则静默落到纯文本。
+    order: List[str] = []
+    for e in (_pdf_engine, "docling", "marker", "ovis"):
+        if e and e not in order:
+            order.append(e)
+    for engine in order:
         try:
             if engine == "marker":
                 from .marker_parser import extract_markdown
+            elif engine == "ovis":
+                from .ovis_ocr_parser import extract_markdown
             else:
                 from .docling_parser import extract_markdown
             markdown = extract_markdown(filepath)
@@ -1765,6 +1777,12 @@ class RAGEngine:
             _release_marker()
         except Exception as e:
             logger.debug("RAG: release marker converter error: %s", e)
+        # ovis（OvisOCR2 VLM，#133）模型单例同步释放（~0.9GB MLX）。
+        try:
+            from .ovis_ocr_parser import release_model
+            release_model()
+        except Exception as e:
+            logger.debug("RAG: release ovis model error: %s", e)
 
     def reload(self) -> None:
         """Drop the cached table handle so the next search sees fresh data.

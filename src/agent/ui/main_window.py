@@ -967,9 +967,15 @@ class MainWindow(QMainWindow):
         # _OCR_CONFIG 是模块级全局，SyncKnowledgeWorker 同进程运行，全局注入一次即可生效。
         from agent.rag import parsers as _rag_parsers
         _rag_parsers.set_ocr_config(self.config)
-        # PDF 统一解析引擎选择（docling | marker），同上全局注入一次。
+        # PDF 统一解析引擎选择（docling | marker | ovis），同上全局注入一次。
         from agent.rag import engine as _rag_engine_mod
         _rag_engine_mod.set_pdf_engine(getattr(self.config, "rag_pdf_engine", "docling"))
+        # OvisOCR2 模型配置（#133，ovis 引擎用；docling/marker 模式下不加载）。
+        _rag_engine_mod.set_ovis_model_config(
+            getattr(self.config, "rag_ocr_engine", "mlx-vlm"),
+            getattr(self.config, "rag_ocr_model_name", "OvisOCR2-0.8B-MLX-4bit"),
+            getattr(self.config, "rag_ocr_model_path", ""),
+        )
         self._bridge = Bridge()
         self._callbacks = BridgeCallbacks(self._bridge)
         self._llm: Optional[LLMClient] = None
@@ -1260,6 +1266,23 @@ class MainWindow(QMainWindow):
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("工作目录")); r.addWidget(self.workspace_edit, 1); r.addWidget(self.workspace_btn)
         r.addWidget(QLabel("知识库")); r.addWidget(self.knowledge_base_edit, 1); r.addWidget(self.knowledge_base_btn)
+        klay.addLayout(r)
+
+        # row1.5: OCR 模型（OvisOCR2 VLM，#133——统一引擎回退链第三棒）
+        self.ocr_impl_combo = _combo(["mlx-vlm", "onnx", "gguf"], 110)
+        self.ocr_model_name_edit = _path("模型名", 200)
+        self.ocr_path_edit = _path("本地路径（留空自动用 models/ 下的模型名）", 160)
+        r = QHBoxLayout(); r.setSpacing(8)
+        r.addWidget(QLabel("OCR模型")); r.addWidget(self.ocr_impl_combo)
+        r.addWidget(self.ocr_model_name_edit, 2)
+        r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit))
+        self.ocr_impl_combo.setToolTip(
+            "OvisOCR2 VLM 后端：mlx-vlm（Apple Silicon 已实现）；"
+            "onnx / gguf 为预留配置位，暂未实现"
+        )
+        self.ocr_model_name_edit.setToolTip(
+            "默认 OvisOCR2-0.8B-MLX-4bit，自动从 models/ 目录加载"
+        )
         klay.addLayout(r)
 
         # row2: Embedding（实现下拉 + 模型名 + 本地路径选择 + 同步知识）
@@ -1671,6 +1694,13 @@ class MainWindow(QMainWindow):
             self.config.embedding_provider, self.config.local_embedding_backend))
         self.embedding_model_name_edit.setText(self.config.rag_embedding_model)
         self.embedding_path_edit.setText(self.config.local_embedding_model)
+        # OCR 模型（OvisOCR2，#133）
+        self.ocr_impl_combo.setCurrentText(
+            getattr(self.config, "rag_ocr_engine", "mlx-vlm") or "mlx-vlm")
+        self.ocr_model_name_edit.setText(
+            getattr(self.config, "rag_ocr_model_name", "OvisOCR2-0.8B-MLX-4bit"))
+        self.ocr_path_edit.setText(
+            getattr(self.config, "rag_ocr_model_path", ""))
         self.reranker_impl_combo.setCurrentText(_provider_backend_to_impl(
             self.config.reranker_provider, self.config.local_reranker_backend))
         self.reranker_model_name_edit.setText(self.config.rag_rerank_model)
@@ -1775,6 +1805,12 @@ class MainWindow(QMainWindow):
         if rname:
             self.config.rag_rerank_model = rname
         self.config.local_reranker_model = self.reranker_path_edit.text().strip()
+        # OCR 模型（OvisOCR2，#133）：实现/模型名/本地路径
+        self.config.rag_ocr_engine = self.ocr_impl_combo.currentText().strip() or "mlx-vlm"
+        ocr_name = self.ocr_model_name_edit.text().strip()
+        if ocr_name:
+            self.config.rag_ocr_model_name = ocr_name
+        self.config.rag_ocr_model_path = self.ocr_path_edit.text().strip()
 
     def _rebuild_agent(self) -> None:
         # 常驻 worker 持有旧 agent 引用：先让它退出循环，否则重建后用户再发
@@ -1791,6 +1827,19 @@ class MainWindow(QMainWindow):
                 old_worker.wait(2000)
             self._worker = None
         self._gather_config_from_widgets()
+        # 配置可能改了 PDF 引擎 / OvisOCR2 模型——重新注入 RAG 层（与 __init__
+        # 的同款调用保持一致，否则改设置要重启应用才生效）。
+        try:
+            from agent.rag import engine as _rag_engine_mod
+            _rag_engine_mod.set_pdf_engine(
+                getattr(self.config, "rag_pdf_engine", "docling"))
+            _rag_engine_mod.set_ovis_model_config(
+                getattr(self.config, "rag_ocr_engine", "mlx-vlm"),
+                getattr(self.config, "rag_ocr_model_name", "OvisOCR2-0.8B-MLX-4bit"),
+                getattr(self.config, "rag_ocr_model_path", ""),
+            )
+        except Exception:
+            pass
         # 重建会换掉主/辅模型，先把两个按钮复位为「加载模型」未就绪态，
         # 待各自后台预加载成功后再置绿（仅当按钮已创建时操作）。
         if getattr(self, "load_main_btn", None) is not None:
