@@ -54,7 +54,13 @@ logger = logging.getLogger(__name__)
 
 # OCR 渲染 scale 配置（#132，经 set_ocr_scale_config 注入）。默认固定
 # 2.0、动态策略关闭——位图内存 ∝ scale²，2.0 相比旧默认 3.0 省 56%。
+#
+# 动态策略关闭时（默认）：**完全不挂载**策略管线、不做预分析、不包装
+# OCR 模型——scale 只在 converter 构建时设进 OcrMacOptions 一次，默认
+# 路径零额外开销。动态开启时才构建带 ScalePolicyOcrModel 的管线。
 _ocr_scale_base = 2.0
+_ocr_scale_dynamic = False
+_ocr_scale_table = 2.5
 
 
 def set_ocr_scale_config(base: float = 2.0, dynamic: bool = False,
@@ -65,19 +71,27 @@ def set_ocr_scale_config(base: float = 2.0, dynamic: bool = False,
     dynamic 动态策略开关（rag_ocr_scale_dynamic，默认 False）
     table  动态策略下表格页的 scale（rag_ocr_scale_table）
 
-    base 值变化时释放已构建的 converter 单例——scale 在
-    OcrMacOptions 构造时固化进 converter，不重建的话改配置要重启
-    应用才生效。
+    任一值变化时释放已构建的 converter 单例——scale / 动态开关在 converter
+    构建时固化（OcrMacOptions 构造 + pipeline_cls 选择），不重建的话改配置
+    要重启应用才生效。
     """
-    global _ocr_scale_base
+    global _ocr_scale_base, _ocr_scale_dynamic, _ocr_scale_table
     new_base = float(base) if base else 2.0
-    changed = new_base != _ocr_scale_base
-    old_base = _ocr_scale_base
+    new_dynamic = bool(dynamic)
+    new_table = float(table) if table else 2.5
+    changed = (new_base != _ocr_scale_base
+               or new_dynamic != _ocr_scale_dynamic
+               or new_table != _ocr_scale_table)
     _ocr_scale_base = new_base
-    _set_scale_cfg(dynamic, new_base, table)
+    _ocr_scale_dynamic = new_dynamic
+    _ocr_scale_table = new_table
+    _set_scale_cfg(new_dynamic, new_base, new_table)
     if changed and _converter is not None:
-        logger.info("OCR scale 配置变化 %.1f → %.1f，释放 converter 以重建",
-                    old_base, new_base)
+        logger.info(
+            "OCR scale 配置变化（base=%.1f dynamic=%s table=%.1f），"
+            "释放 converter 以重建",
+            new_base, new_dynamic, new_table,
+        )
         release_converter()
 
 # Formats docling can handle natively.  Text/markdown/csv/html are handled by
@@ -298,17 +312,22 @@ def _get_converter():
                         logger.info("docling OCR 后端: RapidOCR")
                     except Exception:
                         pass
-                # OCR scale 动态策略管线（#132）：包装 OCR 模型，逐页改写
-                # scale（表格页 2.5 / 其他 2.0）。拿不到就退回标准管线
-                # （行为退化为全局 scale=2.0）。
+                # OCR scale 动态策略（#132）：**仅动态开关开启时**才挂载策略
+                # 管线（包装 OCR 模型逐页改写 scale）。默认关闭——标准管线 +
+                # 构建时固化 scale，默认路径零额外开销（无包装、无预分析）。
                 fmt_kwargs: dict = {"pipeline_options": pdf_opts}
-                policy_pipeline_cls = make_scale_policy_pipeline_cls()
-                if policy_pipeline_cls is not None:
-                    fmt_kwargs["pipeline_cls"] = policy_pipeline_cls
+                if _ocr_scale_dynamic:
+                    policy_pipeline_cls = make_scale_policy_pipeline_cls()
+                    if policy_pipeline_cls is not None:
+                        fmt_kwargs["pipeline_cls"] = policy_pipeline_cls
+                        logger.info(
+                            "OCR scale 动态策略启用（表格页 %.1f / 其余 %.1f）",
+                            _ocr_scale_table, _ocr_scale_base,
+                        )
                 converter = DocumentConverter(
                     format_options={InputFormat.PDF: PdfFormatOption(**fmt_kwargs)}
                 )
-                logger.info("docling DocumentConverter initialized (布局/表格走 MPS，OCR 走 Apple Vision/ANE)")
+                logger.info("docling DocumentConverter initialized (布局/表格走 MPS，OCR 走 Apple Vision/ANE，scale=%.1f)", _ocr_scale_base)
             except Exception as e:
                 # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到
                 # 降配入口就用默认构造——正确性不受影响，只是 macOS 上
@@ -359,11 +378,12 @@ def extract_markdown(filepath: str) -> Optional[str]:
     if converter is None:
         return None
 
-    # OCR scale 动态策略（#132，可配置）：rag_ocr_scale_dynamic 开启时
+    # OCR scale 动态策略（#132，可配置）：仅 rag_ocr_scale_dynamic 开启时
     # convert 前预分析 PDF（文本层/原生 DPI/表格启发式），表格页逐页渲染
-    # 提到 rag_ocr_scale_table，其余用 rag_ocr_scale_base。开关默认关闭
-    # （analyze_pdf 内部直接返回 None）——固定 scale、零分析开销。
-    _scale_policy = _analyze_ocr_scale(path) if suffix == ".pdf" else None
+    # 提到 rag_ocr_scale_table，其余用 rag_ocr_scale_base。默认关闭——此处
+    # 直接跳过，convert 前零开销（scale 已在 converter 构建时固化）。
+    _scale_policy = (_analyze_ocr_scale(path)
+                     if suffix == ".pdf" and _ocr_scale_dynamic else None)
 
     global _converter_in_use
     with _converter_lock:
