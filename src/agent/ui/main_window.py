@@ -419,6 +419,8 @@ class Bridge(QObject):
     plan = pyqtSignal(object)
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    # 通用状态栏提示（worker / 预加载线程 → 主线程底部状态栏，跨线程安全入队）。
+    status = pyqtSignal(str)
     # blocking requests (worker -> UI)
     confirm_request = pyqtSignal(str)
     ask_request = pyqtSignal(str)
@@ -450,6 +452,14 @@ class BridgeCallbacks(AgentCallbacks):
         self.bridge.tool_end.emit(name, result)
     def on_log(self, line: str) -> None:
         self.bridge.log.emit(line)
+        # 诊断开关：BASE_AGENT_KERNEL_LOG=1 时把内核每轮决策日志落盘，
+        # 便于复现「问候语卡在反思门循环」类问题（不会进 stdout，不影响正常 UI）。
+        if os.environ.get("BASE_AGENT_KERNEL_LOG"):
+            try:
+                with open("/tmp/base-agent-kernel.log", "a", encoding="utf-8") as _fk:
+                    _fk.write(line + "\n")
+            except Exception:
+                pass
     def on_usage(self, usage: Dict[str, int]) -> None:
         self.bridge.usage.emit(usage)
     def on_token_speed(self, total_tokens: int, speed: float) -> None:
@@ -585,6 +595,16 @@ class AgentWorker(QThread):
             bridge.disconnect()
 
     def run(self) -> None:  # type: ignore[override]
+        # 在 worker 线程内预填系统提示 KV（与真实生成同线程，缓存不被线程隔离
+        # 丢弃）。worker 在模型加载完成后即启动，用户打字前本线程处于空闲，预填
+        # 完成后首句直接命中缓存、跳过数千 token 全量预填充。失败不致命。
+        try:
+            self._callbacks.bridge.status.emit(
+                "系统提示预热中（预填上下文，请稍候）")
+            self._agent.preload_kv()
+            self._callbacks.bridge.status.emit("系统提示已预热，可开始对话")
+        except Exception:
+            self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
         while True:
             text = self._queue.get()
             if text is None:
@@ -968,10 +988,15 @@ class SendEditor(QPlainTextEdit):
 class MainWindow(QMainWindow):
     # 本地模型后台预加载完成（跨线程）→ UI 线程更新按钮态：key=「main」/「aux」，success=是否成功。
     model_loaded = pyqtSignal(str, bool)
+    # 预热阶段的状态提示：后台预加载线程 → 主线程底部状态栏。
+    # 预热在子线程阻塞跑，不能直接碰 QWidgets（跨线程崩溃），统一走信号
+    # queued 投到 UI 线程更新 status_label。
+    warmup_status = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self.model_loaded.connect(self._on_model_loaded)
+        self.warmup_status.connect(self._on_warmup_status)
         self.setWindowTitle("Base Augment Agent")
         self.resize(1280, 820)
 
@@ -999,6 +1024,9 @@ class MainWindow(QMainWindow):
         )
         self._bridge = Bridge()
         self._callbacks = BridgeCallbacks(self._bridge)
+        # bridge.status 复用 warmup 状态入口：worker 线程预填系统提示 KV 时，
+        # 跨线程把「系统提示预热中…/已预热」投到状态栏 + 进度条不确定态。
+        self._bridge.status.connect(self._on_warmup_status)
         self._llm: Optional[LLMClient] = None
         self._agent: Optional[Agent] = None
         self._worker: Optional[AgentWorker] = None
@@ -1391,6 +1419,36 @@ class MainWindow(QMainWindow):
         else:
             self._mark_model_unloaded(key)
 
+    def _on_warmup_status(self, msg: str) -> None:
+        """预热/加载阶段的状态提示（warmup_status / bridge.status 信号，跨线程安全入队）。
+
+        模型加载完成后会在后台跑两次预热：aux 预热（触发 MLX 首次推理编译）与
+        系统提示 KV 预填（预填数千 token 上下文）。这段时间把提示投到状态栏，
+        并让进度条进入不确定态，用户能明确看到「在预热」而不是以为卡死。
+        """
+        self.status_label.setText(msg)
+        # 含「请稍候」= 进行中 → 进度条不确定态；否则（完成/失败）复位。
+        if "请稍候" in msg:
+            self.progress.setRange(0, 0)
+        else:
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+
+    def _start_worker(self) -> None:
+        """启动常驻 worker 线程（空闲期预填系统提示 KV，首句直接命中缓存）。
+
+        必须在模型已加载、agent 就绪后调用。旧实现在用户首次点发送时才创建
+        worker，导致 preload_kv() 作为首句处理的一部分执行、首句仍需全量预填充。
+        改为加载完成后立即启动，预填发生在用户打字前的空闲期——worker 线程与真实
+        生成同线程，缓存不被线程隔离丢弃。重复调用幂等（已在跑则跳过）。
+        """
+        if self._worker is not None and self._worker.isRunning():
+            return
+        if self._agent is None:
+            return
+        self._worker = AgentWorker(self._agent, self._callbacks)
+        self._worker.start()
+
     def _preload_client(self, client, label: str, key: str) -> None:
         """后台预加载本地模型权重（LocalLLMClient._ensure_model），不阻塞 UI。
 
@@ -1405,7 +1463,27 @@ class MainWindow(QMainWindow):
             try:
                 ensure()
                 logger.info("%s 权重已预加载", label)
+                # 先置绿：加载成功即标记为「已就绪」（变绿），用户可立即开始对话。
                 self.model_loaded.emit(key, True)
+                # 主模型加载完成后**后台**预热一次：用完整 system prompt + 一条
+                # 'hi' 触发一次真实形状的推理，本地模型首次 generate 的编译/图优化
+                # 就在这一步完成——用户第一条消息无需再等 20-30s 冷启动。仅在已
+                # 就绪（按钮变绿）后再跑，不阻塞按钮态；失败不致命。
+                if key == "main" and not self._busy:
+                    agent = getattr(self, "_agent", None)
+                    if agent is not None:
+                        try:
+                            self.warmup_status.emit(
+                                "主模型预热中（首次推理编译，约 20-30s，请稍候）")
+                            agent.warm_up()
+                            self.warmup_status.emit("主模型预热完成，可开始对话")
+                        except Exception as e:
+                            logger.warning("主模型预热失败(忽略): %s", e)
+                            self.warmup_status.emit(
+                                "预热失败，但仍可对话（首句会偏慢）")
+                        # 模型已就绪：立即启动常驻 worker（空闲期预填系统提示 KV），
+                        # 让首句直接命中缓存、无需全量预填充。worker 在首句前就跑起来。
+                        self._start_worker()
             except Exception as e:  # 预加载失败不影响主流程，首次用时再报错
                 logger.warning("%s 预加载失败: %s", label, e)
                 self.model_loaded.emit(key, False)
@@ -2368,7 +2446,9 @@ class MainWindow(QMainWindow):
     def _on_send(self) -> None:
         if self._busy:
             # 旧实现静默丢弃：用户按了 Enter 却毫无反应，像「输入框坏了」。
-            self.status_label.setText("正在运行中…（等待当前回合结束）")
+            # Agent 运行中不能发新消息（输入框可编辑但回车无效），但「终止对话」
+            # 按钮此刻是启用的——卡住/跑太久时直接点它即可，不必干等。
+            self.status_label.setText("正在运行中…（如需中断请点「终止对话」）")
             return
         text = self.send_editor.toPlainText().strip()
         if not text:

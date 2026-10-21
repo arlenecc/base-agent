@@ -1097,7 +1097,8 @@ class SkillRetriever:
             "Reply with only the candidate index number (e.g. '0'), or 'none'."
         )
         try:
-            events = list(llm.chat_stream([{"role": "user", "content": prompt}]))
+            events = list(llm.chat_stream([{"role": "user", "content": prompt}],
+                                          kv_group="aux"))
             answer = ""
             for ev in events:
                 # StreamEvent 是 dataclass，不是 dict —— ev.get() 必然抛

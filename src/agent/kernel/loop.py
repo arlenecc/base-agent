@@ -102,6 +102,12 @@ _BLOCK_NUDGE_MAX = 2
 # 上限则直接结束本轮。注意这里管的是**成功**调用——失败调用由 _fail_sigs 负责。
 _REPEAT_CALL_WARN = 2      # 第 3 次相同调用 → 提醒换动作
 _REPEAT_CALL_LIMIT = 4     # 第 5 次 → 收尾，不再烧轮次
+# 失败调用「原样重试」的熔断：与成功调用的 _REPEAT_CALL_LIMIT 对等。
+# 模型对同一无效参数反复重试（如 update_working_checkpoint({}) 缺 key_info）
+# 只提示不收敛会烧满 max_iterations。连续相同失败签名达到上限 → 强制结束本轮。
+# 设为 3：允许「失败→失败→改而回复」的正常模式完整跑完（第三轮才收尾），
+# 而对「持续相同失败」的问候场景在第 4 轮熔断（远优于烧满 max_iterations）。
+_FAIL_REPEAT_LIMIT = 3      # 连续 3 次相同失败签名（第 4 次出现）→ 收尾
 
 # 「模型在向用户追问必要信息」的信号。只在任务未起步时作为放行依据，
 # 因此刻意收得比反思门的禁止清单更窄：只认真正索取信息的句式，不认
@@ -157,6 +163,7 @@ class KernelLoop:
         callbacks: Any,
         config: Any,
         system_prompt: Callable[[], str],
+        volatile_context: Callable[[], str],
         session: Optional[Session] = None,
         hooks: Optional[KernelHooks] = None,
         log: Optional[Callable[[str], None]] = None,
@@ -169,13 +176,14 @@ class KernelLoop:
         self.callbacks = callbacks
         self.config = config
         self.system_prompt = system_prompt
+        self.volatile_context = volatile_context
         self.hooks = hooks or KernelHooks()
         self.log = log or (lambda *_a, **_k: None)
         self.session = session or Session(
             budget=ContextBudget(
                 int(getattr(config, "kernel_max_context_tokens", 30_000) or 30_000)
             ),
-            raw_turns=int(getattr(config, "kernel_raw_turns", 2) or 2),
+            raw_turns=int(getattr(config, "kernel_raw_turns", 20) or 20),
             max_digest_lines=int(getattr(config, "kernel_max_digest_lines", 40) or 40),
         )
         # 必须与 Session 共用同一个预算对象，否则内核记的账和 Session 折叠时
@@ -212,6 +220,12 @@ class KernelLoop:
         # 重复调用检测（成功调用也会空转，见 ACT 态同名注释）；run() 会重置。
         self._repeat_streak = 0
         self._last_call_sigs: List[str] = []
+        # 失败调用「原样重试」熔断计数（连续相同失败签名次数）；run() 会重置。
+        self._fail_repeat_streak = 0
+        # 同一工具连续失败计数（不论参数是否相同）；run() 会重置。用于问候
+        # 场景快速收尾（弱模型死磕同一工具只换参数）。
+        self._same_tool_fail_streak = 0
+        self._same_tool_fail_name: Optional[str] = None
         # 上层（Agent 自动续跑）注入的「上一段失败上下文」，run() 开始时消费一次。
         self._seed_failures: Optional[Dict[str, Any]] = None
 
@@ -291,6 +305,9 @@ class KernelLoop:
         # 重复调用检测（成功调用同样空转，见 ACT 态的重复调用检测注释）
         self._repeat_streak = 0
         self._last_call_sigs: List[str] = []
+        self._fail_repeat_streak = 0
+        self._same_tool_fail_streak = 0
+        self._same_tool_fail_name = None
         # 续跑段（Agent 自动续跑）跳过「规划前置门」：续跑由系统提示驱动，
         # 其 user_input 含「步骤 / 继续执行」等多步信号，不应被当成用户发起的
         # 多步任务而强制先建计划——否则会把续跑段的正常收尾也卡掉。
@@ -313,6 +330,10 @@ class KernelLoop:
             self._empty_retry = int(seed.get("empty_retry", 0) or 0)
             self._reask_guard = int(seed.get("reask_guard", 0) or 0)
             self._plan_nudged = int(seed.get("plan_nudged", 0) or 0)
+            self._fail_repeat_streak = int(seed.get("fail_repeat_streak", 0) or 0)
+            self._same_tool_fail_streak = int(
+                seed.get("same_tool_fail_streak", 0) or 0)
+            self._same_tool_fail_name = seed.get("same_tool_fail_name")
             self._did_work = bool(seed.get("did_work", False))
         # max_turns 是「本次 run() 的轮次上限」，不是「整个会话的累计轮次」。
         # Session.turn_index 跨 run() 单调递增（它就是历史编号），拿它当循环
@@ -347,10 +368,12 @@ class KernelLoop:
                 keep = session.raw_turns + 1
                 folded = session.force_fold(max(1, len(session.turns) - keep))
                 if folded:
-                    # 历史被改写了（旧轮次摘掉、换成摘要行）→ 缓存里那几轮的
-                    # token 序列已不复存在，必须丢弃；否则下一轮会拿「对应旧
-                    # 历史」的 KV 去续算新 prompt。
-                    self._invalidate_kv()
+                    # 历史被改写了（旧轮次摘掉、换成摘要行）。不必整体丢弃 KV
+                    # 缓存——_stream_mlx 的「中途分叉」复用逻辑(form ③)会在下一
+                    # 轮按 token 比对裁到公共前缀(系统提示 + 幸存早期轮次)，只
+                    # 重算被折叠的那一小段；整体丢弃反而让折叠后整轮退回全量
+                    # 预填充(十几秒)。这里故意不再调用 _invalidate_kv()。
+                    pass
                 self.log(f"[kernel] CONSOLIDATE ({reason}) folded={folded} {session.stats()}")
                 try:
                     self.hooks.consolidated(session, reason)
@@ -382,6 +405,13 @@ class KernelLoop:
                     and not self._is_simple_input(user_input)):
                 pending = (pending or "") + _PLAN_GATE_HINT
             user_text = session.anchor_prompt(extra=pending)
+            # 每轮易变上下文（工作记忆 / 当天事实 / 匹配技能）从系统提示移到用户
+            # 消息：本模型 KV 缓存（ArraysCache）不可裁剪，多轮只认完整前缀匹配，
+            # 系统提示每轮漂移会令缓存整体失效。移入用户消息后系统提示恒定，多轮
+            # 稳定命中缓存；模型每轮仍可见这些即时上下文（见 agent.volatile_context）。
+            vc = self.volatile_context()
+            if vc:
+                user_text = user_text + "\n\n" + vc
             rec = session.start_turn(user_text)
             # rollback 路径不减计数：重试由各自的 guard 兜底，这里只保证终止性。
             self._turns_used += 1
@@ -397,8 +427,9 @@ class KernelLoop:
                 if self._is_context_error(msg) and self._shrink_guard < 3:
                     self._shrink_guard += 1
                     self._rollback_turn(session)
-                    # 本轮被摘掉 → 缓存末尾对应的那一段已从历史消失。
-                    self._invalidate_kv()
+                    # 本轮被摘掉 → 缓存末尾对应段从历史消失。同样不必整体丢弃：
+                    # 下一轮 form ③ 会按 token 比对裁到新末尾(新 prompt 是旧缓存
+                    # 的前缀)，只重算被回滚掉的那一轮。保留缓存优于全量重建。
                     shrunk = False
                     try:
                         shrunk = bool(self.hooks.consolidated(session, "fold-exhausted"))
@@ -709,6 +740,34 @@ class KernelLoop:
             # 重复调用提醒放在最后拼入（必须在 pending 赋值之前 append）。
             if repeat_warn:
                 parts.append(repeat_warn)
+            # 失败调用原样重试熔断：与成功调用的 _REPEAT_CALL_LIMIT 对等。
+            # 模型对同一无效参数反复重试（如 update_working_checkpoint({}) 缺
+            # key_info）只提示不收敛会烧满 max_iterations。连续相同失败签名
+            # 达到上限 → 强制结束本轮（避免空转、用户久等）。
+            fr = batch.get("fail_repeat_streak", 0)
+            ft = batch.get("same_tool_fail_streak", 0)
+            if fr >= _FAIL_REPEAT_LIMIT:
+                self.log("[kernel] 连续 %d 次相同失败调用，结束本轮（避免空转）"
+                         % (fr + 1))
+                if not final_text:
+                    final_text = (resp.content
+                                  or "（工具调用持续失败，已停止当前回合）")
+                exit_reason = ExitReason.DONE
+                break
+            elif (self._is_greeting(user_input)
+                  and not (resp.content or "").strip()):
+                # 严格问候（hi/你好/在吗…）却没有任何文字答复：本地弱模型常无视
+                # 「寒暄禁止调工具」的指令，先成功写一次 checkpoint（work_memory
+                # set）把失败计数 ft 重置为 0，再发 work_memory({}) 空参空转。原
+                # 阈值要 ft>=2 才触发，被这次「成功→失败」恰好绕过。问候本身不需要
+                # 任何工具，与其烧轮等它「自觉」，不如只要严格问候 + 无文字答复就直接
+                # 构造一句礼貌文字回复并结束本轮（不论工具成功/失败）。注意用
+                # _is_greeting（严格寒暄）而非 _is_simple_input（任何短输入），否则
+                # 「读文件」等短任务会被误杀、丧失自我恢复机会。
+                self.log("[kernel] 问候无文字答复，直接文字收尾（避免空转）")
+                final_text = resp.content or "你好！有什么可以帮你的吗？"
+                exit_reason = ExitReason.DONE
+                break
             pending = "\n".join(parts)
             self.state = next_state(KernelState.ACT, "continue")
         else:
@@ -744,12 +803,11 @@ class KernelLoop:
     # 转移判定
     # ------------------------------------------------------------------
     def _needs_consolidate(self) -> bool:
-        t = self.session.current_turn
-        if self.budget.raw_over:
-            return True
-        if t > 0 and t % self.consolidate_every == 0 and t != self._last_consolidated_turn:
-            return True
-        return False
+        # 仅当原文区真的越过预算才折叠。周期性折叠（每 N 轮）会重写历史 token
+        # 序列，破坏多轮 KV 缓存前缀 → 每 N 轮退回全量预填充。预算充裕时保持
+        # 历史追加式，KV 缓存稳定命中；预算溢出由 force_fold 成块折叠兜底
+        # （两次折叠之间摘要块恒定，缓存可命中）。
+        return bool(self.budget.raw_over)
 
     @staticmethod
     def _rollback_turn(session: Session) -> None:
@@ -1011,6 +1069,9 @@ class KernelLoop:
             "empty_retry": self._empty_retry,
             "reask_guard": self._reask_guard,
             "plan_nudged": self._plan_nudged,
+            "fail_repeat_streak": self._fail_repeat_streak,
+            "same_tool_fail_streak": self._same_tool_fail_streak,
+            "same_tool_fail_name": self._same_tool_fail_name,
             # 上一段是否已经真正干过活。不传的话续跑段 _did_work=False，
             # 反思门文案会变成「你还一次工具都没调用」（对已经干过活的段是错的，
             # 会误导模型），失败感知预算也会从 6 掉回 2。
@@ -1055,6 +1116,10 @@ class KernelLoop:
         failed: List[Tuple[ToolCall, str]] = []
         repeats: List[Tuple[str, str]] = []
         plan_mutated = False
+        batch_fail_sigs: List[str] = []
+        # 上一轮最后记录的失败签名：用于判断「连续相同失败签名」（原样重试）。
+        # 必须在循环前取，循环内 self._fail_sigs 会被不断 append / 截断。
+        prev_fail_sig = self._fail_sigs[-1] if self._fail_sigs else None
         for tc, res in zip(tool_calls, raw_results):
             ok, err = self._result_ok(res)
             if tc.name == "update_plan":
@@ -1069,15 +1134,47 @@ class KernelLoop:
             self._last_fail = (tc.name, err)
             self._step_fails += 1
             sig = self._call_sig(tc)
+            batch_fail_sigs.append(sig)
             if sig in self._fail_sigs:
                 repeats.append((tc.name, err))
             self._fail_sigs.append(sig)
             del self._fail_sigs[:-_MAX_FAIL_SIGS]
         if not failed:
             self._fail_streak = 0
+            self._fail_repeat_streak = 0
+            self._same_tool_fail_streak = 0
+            self._same_tool_fail_name = None
+        else:
+            # 原「连续相同失败签名」计数（原样重试 → 必须熔断以免烧满
+            # max_iterations）：仅签名完全一致的连续重试才累加；换参数/换
+            # 工具探索不算，避免误伤自主任务的多方法尝试。
+            if prev_fail_sig is not None and all(
+                    s == prev_fail_sig for s in batch_fail_sigs):
+                self._fail_repeat_streak += 1
+            else:
+                self._fail_repeat_streak = 1
+            # 「同一工具连续失败」计数（不限参数是否相同）：弱模型在问候等
+            # 简单场景常死磕同一个工具、只换参数（work_memory({}) →
+            # work_memory({key_info}) 退化），签名每次略变但始终失败。这与
+            # 「换工具/换方法探索」不同，应在问候场景尽快收尾。本轮失败若
+            # 都来自同一个工具名且与上轮失败工具相同 → 累加；否则清零。
+            names = {tc.name for tc, _ in failed}
+            if len(names) == 1:
+                tname = next(iter(names))
+                if self._same_tool_fail_name == tname:
+                    self._same_tool_fail_streak += 1
+                else:
+                    self._same_tool_fail_streak = 1
+                    self._same_tool_fail_name = tname
+            else:
+                self._same_tool_fail_streak = 0
+                self._same_tool_fail_name = None
         if plan_mutated:
             self._step_fails = 0
-        return {"failed": failed, "repeats": repeats, "plan_mutated": plan_mutated}
+        return {"failed": failed, "repeats": repeats,
+                "plan_mutated": plan_mutated,
+                "fail_repeat_streak": self._fail_repeat_streak,
+                "same_tool_fail_streak": self._same_tool_fail_streak}
 
     def _recovery_hints(self, tool_calls: List[ToolCall], raw_results: List[Any],
                         batch: Dict[str, Any], step_fails_before: int) -> List[str]:
@@ -1169,6 +1266,27 @@ class KernelLoop:
         if len(t) > 60:
             return False
         return not (_MULTISTEP_HINT.search(t) or _MULTISTEP_VERB_RE.search(t))
+
+    # 严格问候集合：只认真正的寒暄，与「任何短输入」的 _is_simple_input 区分开。
+    # 熔断的「问候快速收尾」只能用它，否则会把「读文件」等短任务也误杀。
+    _GREETING_SET = {
+        "hi", "hello", "hey", "hiya", "yo", "sup", "howdy",
+        "你好", "您好", "您好呀", "嗨", "在吗", "在么", "在不在", "在的",
+        "有人吗", "在不在呀",
+    }
+
+    @staticmethod
+    def _is_greeting(user_input: str) -> bool:
+        """严格问候判定（区别于 _is_simple_input 的『任何短输入』）。
+
+        只为真正的寒暄打断强制收尾，不误伤「读文件」等短任务——它们失败两次
+        也应给模型自我恢复的机会（换路径 / 问用户），不应被一句话回复截胡。
+        """
+        t = (user_input or "").strip().lower()
+        if not t:
+            return True
+        t = t.rstrip("。！？!?，,.、；; \t\n")
+        return t in KernelLoop._GREETING_SET
 
     def _looks_like_asking_user(self, content: str) -> bool:
         """回复是否是在向用户追问完成任务所必需的信息。

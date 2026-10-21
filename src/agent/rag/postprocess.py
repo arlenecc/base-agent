@@ -38,7 +38,8 @@ def _stream_collect(llm: Any, system: str, prompt: str, temperature: float = 0.2
         {"role": "user", "content": prompt},
     ]
     out: List[str] = []
-    for ev in llm.chat_stream(messages, tools=None, temperature=temperature):
+    for ev in llm.chat_stream(messages, tools=None, temperature=temperature,
+                              kv_group="aux"):
         if ev.type == "content":
             out.append(ev.content)
         elif ev.type == "done":

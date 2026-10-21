@@ -161,6 +161,9 @@ class LLMClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: float = 0.7,
+        # 与 LocalLLMClient.chat_stream 同接口：网络后端 KV 缓存在服务端，
+        # 本参数仅占位兼容，不影响行为。
+        kv_group: str = "main",
     ) -> Iterator[StreamEvent]:
         url = f"{self.base_url}/chat/completions"
         payload: Dict[str, Any] = {

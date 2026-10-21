@@ -20,12 +20,38 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 # StreamEvent 数据类与 LLMClient 同源，保证内核解析一致。
 from ..llm_client import StreamEvent  # noqa: E402
+
+
+def _kv_diag(group, cached, prompt, reuse, suffix, ttft, total,
+             common, thread_mismatch, first_cached, first_prompt,
+             div_cached, div_prompt):
+    """诊断：每轮 KV 复用情况写到 /tmp/base-agent-kv.log，排查「时快时慢」。
+
+    UI 日志桥接的 Filter 只放行 RAG 模块，且 root 级别是 WARNING，故 KV 行
+    到不了界面/主日志。单独落盘，事后可直接读取各轮复用与首字延迟。
+    """
+    try:
+        import datetime as _dt
+        with open(os.path.join("/tmp", "base-agent-kv.log"), "a",
+                  encoding="utf-8") as _f:
+            _f.write(
+                "%s group=%-4s cached=%d prompt=%d reuse=%d suffix=%d "
+                "common=%d thread_mismatch=%s ttft=%.2fs total=%.2fs\n"
+                "    cached[0:16]=%r\n    prompt[0:16]=%r\n"
+                "    >>> fork@%d cached:~%r\n    >>> fork@%d prompt:~%r\n" % (
+                    _dt.datetime.now().strftime("%H:%M:%S"), group, cached,
+                    prompt, reuse, suffix, common, thread_mismatch, ttft,
+                    total, first_cached, first_prompt, common, div_cached,
+                    common, div_prompt))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +533,11 @@ class LocalLLMClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: float = 0.7,
+        # KV 缓存调用组：主对话用 "main"（持久、跨轮复用，避免每句全量预填充）；
+        # 辅助调用（知识图谱抽取 / RAG 重排 / 技能检索 / 工具描述 / 预热）用
+        # "aux"（一次性本地缓存，不写实例状态）。两者共享同一模型权重但缓存
+        # 隔离，aux 调用再也不会冲掉主对话的 KV 缓存。
+        kv_group: str = "main",
     ) -> Iterator[StreamEvent]:
         self._ensure_model()
         # 双视图历史的第二视图只有 MLX 后端读得懂；gguf/onnx 后端会把
@@ -520,11 +551,11 @@ class LocalLLMClient:
         # 串行化同实例的生成（MLX/GGUF 并发不安全）；主/辅实例各自独立互不阻塞。
         with self._gen_lock:
             if self._backend == "mlx":
-                yield from self._stream_mlx(messages, tools, temperature)
+                yield from self._stream_mlx(messages, tools, temperature, kv_group)
             elif self._backend == "gguf":
-                yield from self._stream_gguf(messages, tools, temperature)
+                yield from self._stream_gguf(messages, tools, temperature, kv_group)
             else:
-                yield from self._stream_onnx(messages, tools, temperature)
+                yield from self._stream_onnx(messages, tools, temperature, kv_group)
 
     # ---- 通用：把 think 分段 + 收集全文（用于工具调用解析）----
     def _stream_with_producer(self, deltas: Iterator[str],
@@ -596,7 +627,7 @@ class LocalLLMClient:
         yield StreamEvent("done", tool_calls=calls, usage={}, raw_content=raw)
 
     # ---- MLX ----
-    def _stream_mlx(self, messages, tools, temperature):
+    def _stream_mlx(self, messages, tools, temperature, kv_group: str = "main"):
         import mlx.core as mx
         from mlx_lm import stream_generate
         from mlx_lm.sample_utils import make_sampler, make_logits_processors
@@ -644,18 +675,27 @@ class LocalLLMClient:
         from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 
         prompt_ids = tok.encode(prompt)
-        cache = self._mlx_cache
-        cached_ids = self._cache_token_ids or []
+        # KV 缓存按「调用组」隔离：主对话(kv_group="main")用持久缓存跨轮复用；
+        # 辅助调用(知识图谱抽取/RAG 重排/技能检索/工具描述等)走一次性本地缓存，
+        # 绝不污染主对话的实例级缓存——否则辅助调用会改写 self._mlx_cache /
+        # _kv_thread / _cache_token_ids，导致下一轮主对话被判「跨线程 / 前缀不符」
+        # 而整体重建，退回每句全量预填充（约 20s）。
+        persist = (kv_group == "main")
+        cache = self._mlx_cache if persist else None
+        cached_ids = self._cache_token_ids if persist else []
         reuse = 0
+        thread_mismatch = [False]
         # 线程隔离：MLX 的 GPU stream 是线程局部的，cache 只能在创建它的线程
         # 上复用。UI 每次发送都是新的 agent worker 线程（辅助模型的事实抽取/
         # RAG 精简又是另外的线程），直接拿旧线程的 cache 会抛
         # "There is no Stream(gpu, N) in current thread" —— 表现为生成中断、
         # reasoning 已流出但正文为空。宁可重建（全量预填充）也不要崩溃。
-        if cache is not None and self._kv_thread != threading.get_ident():
+        # （仅对持久主缓存做线程校验；aux 本地缓存无所谓。）
+        if persist and cache is not None and self._kv_thread != threading.get_ident():
             if cached_ids:
                 logger.debug("LLM: KV cache 创建于其它线程，丢弃重建")
             cache = None
+            thread_mismatch[0] = True
         if cache is None or not cached_ids:
             cache = None
         elif len(cached_ids) > _KV_MAX_TOKENS:      # 长会话内存护栏
@@ -705,13 +745,15 @@ class LocalLLMClient:
         if not prompt_ids:
             raise ValueError(
                 "渲染后的 prompt 为空（chat template 未产出任何 token）")
-        self._mlx_cache = cache
-        # 记下这条缓存的属主线程：下次调用若换了线程，上面会把它丢掉重建。
-        self._kv_thread = threading.get_ident()
         suffix_ids = prompt_ids[reuse:]
         logger.debug(
-            "MLX KV cache: cached=%d prompt=%d reuse=%d suffix=%d",
-            len(cached_ids), len(prompt_ids), reuse, len(suffix_ids))
+            "MLX KV cache: cached=%d prompt=%d reuse=%d suffix=%d group=%s",
+            len(cached_ids), len(prompt_ids), reuse, len(suffix_ids), kv_group)
+        # 仅主对话持久化 KV 缓存；aux 调用用一次性本地缓存，不写实例状态，
+        # 避免覆盖主对话缓存导致下一轮全量重 prefill。
+        if persist:
+            self._mlx_cache = cache
+            self._kv_thread = threading.get_ident()
 
         # 模板在 assistant 起始标记后预置的片段（<think>\n 或空 think 块）。它
         # 属于「生成序列」的头部而非模型输出，重建历史时必须一并带上，否则
@@ -722,6 +764,8 @@ class LocalLLMClient:
         def _produce():
             gen_ids: List[int] = []
             gen_ref.append(gen_ids)
+            _t0 = time.time()
+            _first_ts: List[Optional[float]] = [None]
             try:
                 for resp in stream_generate(
                     self._model, tok, prompt=suffix_ids,
@@ -731,6 +775,8 @@ class LocalLLMClient:
                 ):
                     text = getattr(resp, "text", "") or ""
                     if text:
+                        if _first_ts[0] is None:
+                            _first_ts[0] = time.time() - _t0
                         yield text
                     t = getattr(resp, "token", None)
                     if t is not None:
@@ -740,9 +786,40 @@ class LocalLLMClient:
                         except (ValueError, TypeError):
                             pass
             finally:
+                _total = time.time() - _t0
+                _ttft = _first_ts[0] if _first_ts[0] is not None else _total
+                # 诊断：重算公共前缀长度 + 解码两端前几个 token，定位 reuse=0 的根因
+                # （缓存对象丢失 vs prompt 前缀对不上）。
+                _lim = min(len(cached_ids), len(prompt_ids))
+                _common = 0
+                while _common < _lim and cached_ids[_common] == prompt_ids[_common]:
+                    _common += 1
+                try:
+                    _fc = tok.decode(cached_ids[:16])
+                except Exception:
+                    _fc = str(cached_ids[:16])
+                try:
+                    _fp = tok.decode(prompt_ids[:16])
+                except Exception:
+                    _fp = str(prompt_ids[:16])
+                _lo = max(0, _common - 8)
+                _hi = min(_lim, _common + 60)
+                try:
+                    _div_c = tok.decode(cached_ids[_lo:_hi])
+                except Exception:
+                    _div_c = str(cached_ids[_lo:_hi])
+                try:
+                    _div_p = tok.decode(prompt_ids[_lo:_hi])
+                except Exception:
+                    _div_p = str(prompt_ids[_lo:_hi])
+                _kv_diag(kv_group, len(cached_ids), len(prompt_ids), reuse,
+                         len(suffix_ids), _ttft, _total, _common,
+                         thread_mismatch[0], _fc, _fp, _div_c, _div_p)
                 # 无论生成到哪一步（含中途取消）都如实记录缓存对应的 token
                 # 序列：命中的话缓存现在覆盖到整个 prompt + 已生成部分。
-                self._cache_token_ids = list(prompt_ids) + gen_ids
+                # 仅主对话持久化；aux 调用不写，避免污染主对话缓存。
+                if persist:
+                    self._cache_token_ids = list(prompt_ids) + gen_ids
 
         def _raw_getter() -> str:
             ids = gen_ref[0] if gen_ref else []
@@ -769,7 +846,7 @@ class LocalLLMClient:
             yield ev
 
     # ---- GGUF ----
-    def _stream_gguf(self, messages, tools, temperature):
+    def _stream_gguf(self, messages, tools, temperature, kv_group: str = "main"):
         create = getattr(self._model, "create_chat_completion", None)
         if create is None:
             raise RuntimeError("llama-cpp-python 版本过旧，缺少 create_chat_completion")
@@ -826,7 +903,7 @@ class LocalLLMClient:
         yield StreamEvent("done", tool_calls=calls_acc_list, usage={})
 
     # ---- ONNX ----
-    def _stream_onnx(self, messages, tools, temperature):
+    def _stream_onnx(self, messages, tools, temperature, kv_group: str = "main"):
         import numpy as np
         tok = self._tokenizer
         hf = getattr(tok, "tokenizer", tok)
@@ -918,6 +995,56 @@ class LocalLLMClient:
     def name(self) -> str:
         base = os.path.basename(self._path.rstrip("/")) or self._path
         return f"local:{self._backend}:{base}"
+
+    def preload_system_kv(self, system_prompt: str, tools=None) -> None:
+        """在生成线程内预填系统提示 KV，使首句只需预填短用户消息。
+
+        必须在**真实生成所在的线程**调用（MLX 缓存按创建线程的 GPU stream 隔离）：
+        缓存创建线程与首句生成线程一致，首句才不会因「跨线程」被判丢弃、退回
+        全量预填充。只做前向、不解码，因此缓存精确等于系统提示 token 序列；
+        首句 prompt = 系统提示 + 用户消息 时 form ① 命中（need=0，无需裁剪）。
+        仅 MLX 后端有效；失败不致命（退化成首句全量预填充）。
+        """
+        if self._backend != "mlx":
+            return
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+        with self._gen_lock:
+            self._ensure_model()
+            if self._model is None:
+                return
+            # 同线程已预填过则跳过，避免重复前向。
+            if self._mlx_cache is not None and self._kv_thread == threading.get_ident():
+                return
+            try:
+                tok = self._tokenizer
+                messages = [{"role": "system", "content": system_prompt}]
+                try:
+                    prompt = tok.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False,
+                        tools=tools if tools else None,
+                        enable_thinking=self._enable_thinking,
+                    )
+                except Exception:
+                    prompt = tok.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False,
+                    )
+                prompt_ids = tok.encode(prompt)
+                cache = make_prompt_cache(self._model)
+                # 仅前向、不解码：把系统提示的 KV 写进 cache，不追加生成 token。
+                out = self._model(mx.expand_dims(mx.array(prompt_ids), 0), cache)
+                if isinstance(out, tuple) and len(out) >= 2:
+                    cache = out[1]
+                self._mlx_cache = cache
+                self._cache_token_ids = list(prompt_ids)
+                self._kv_thread = threading.get_ident()
+                logger.info("LLM: 系统提示 KV 已预热（%d token，线程 %d）",
+                            len(prompt_ids), self._kv_thread)
+            except Exception as e:
+                logger.warning("系统提示 KV 预热失败(忽略): %s", e)
+                self._mlx_cache = None
+                self._cache_token_ids = []
+                self._kv_thread = None
 
     def invalidate_kv_cache(self) -> None:
         """丢弃跨轮 KV 缓存。

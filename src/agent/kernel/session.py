@@ -328,18 +328,15 @@ class Session:
             return [], []
         cur = self.turns[-1]
         completed = self.turns[:-1]
-        keep = min(self.raw_turns, len(completed))
-        # 收缩阈值必须与越界判定同一口径：``remaining_for_raw()`` 还要再扣掉
-        # system/earlier/tools 的超支（overspent）。旧实现只跟 quota.raw 比，
-        # 长系统提示 + 25 个工具 schema 很容易让那两个区超配额，此时原文窗
-        # 不收缩 → 实际发送量越过 30k，只能等 API 报 context_length 再兜底。
-        raw_ceiling = self.budget.quota.raw - self.budget.overspent()
-        while keep > 0 and estimate_tokens(
-            self._render_raw(completed[-keep:] + [cur])
-        ) > raw_ceiling:
-            keep -= 1
-        old = completed[:-keep] if keep else list(completed)
-        raw = (completed[-keep:] if keep else []) + [cur]
+        # 历史保持「追加式」：保留全部已完成轮为原文，多轮 KV 缓存（本模型
+        # ArraysCache 不可裁剪，只认完整前缀匹配）才能稳定命中。压缩改由
+        # force_fold 在预算溢出时成块折叠负责——它一次性把最老的多轮摘进
+        # extra_digest，摘要块在两次折叠之间保持恒定，不会每轮改写 token 序列。
+        # 去掉 raw_turns 硬上限与「超预算就收缩 keep」的滑动窗口：那会让历史
+        # 每轮都变，导致每轮退回全量预填充（十几秒）。
+        keep = len(completed)
+        old = completed[:-keep]
+        raw = completed[-keep:] + [cur]
         return old, raw
 
     @staticmethod

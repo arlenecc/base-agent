@@ -93,12 +93,15 @@ SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the us
 - `web_scan` / `web_execute_js` 用于浏览器。
 - `rag_search` / `rag_outline` / `rag_ingest`：本地知识库（可学习、可进化）。
 - `skill_semantic_search` / `skill_search` / `skill_load` / `skill_save`：外置经验与能力。
-- `memory_search` / `memory_graph` / `work_memory`：长期经验与短期草稿。
-- `update_working_checkpoint`：把非显然、后续必须知道的状态写进工作记忆（每轮自动回注）。
+- `work_memory`（短期草稿，**参数固定为 `op`/`key`/`value`**）：只在多步任务里记中间结论／决策／偏好；单次够用的不要记。
+- `update_working_checkpoint`（**参数固定为 `key_info` 字符串**）：把「非显然、后续必须知道」的状态写进工作记忆（每轮自动回注）。
+- `memory_search` / `memory_graph`：长期经验检索与知识图谱。
+- ⚠ 上述记忆类工具**只在有真实任务状态要记录时**才调用；**问候／寒暄／简单问答禁止调用**。
 - `update_plan`：任务级「目标 + 路径」的规划与进度更新（每轮自动回注；有计划时未完成步骤不得收尾）。
 - `start_long_term_update`：任务完成/检查点时触发经验蒸馏。
 
 Rules:
+- **问候 / 寒暄 / 简单问答（如「hi」「你好」「在吗」等）**：直接用一句话文字回复用户即可。**禁止调用任何工具，禁止建计划，禁止写记忆**（work_memory / update_working_checkpoint）。即使误调了工具并看到报错，也不要据此继续重试或换参数——直接给出文字回复。
 1. Plan, then call tools. After each result, decide the next step.
 2. Prefer the least destructive path. Risky/irreversible actions need confirmation.
 3. Missing info → `ask_user`, never guess.
@@ -379,6 +382,7 @@ class Agent:
             callbacks=self.callbacks,
             config=self.config,
             system_prompt=self._system_prompt,
+            volatile_context=self.volatile_context,
             session=self.session,
             hooks=_AgentKernelHooks(self),
             log=self._log,
@@ -518,7 +522,8 @@ class Agent:
             {"role": "user", "content": prompt},
         ]
         out: List[str] = []
-        for ev in client.chat_stream(messages, tools=None, temperature=0.2):
+        for ev in client.chat_stream(messages, tools=None, temperature=0.2,
+                                     kv_group="aux"):
             if ev.type == "content":
                 out.append(ev.content)
             elif ev.type == "done":
@@ -833,6 +838,53 @@ class Agent:
             return "", []
 
     # ------------------------------------------------------------------
+    def warm_up(self, client=None) -> None:
+        """模型加载完成后预热一次：用完整 system prompt + 一条 'hi' 触发一次真实
+        形状的推理（本地模型首次 generate 要编译/预热，常需 20-30s），让用户的
+        首条消息无需再等冷启动。
+
+        只做推理、不执行工具、不写 session、不触发任何 UI 回调——纯预热。失败
+        不影响主流程：真对话时还会再调，且可能是权重/网络问题。
+        """
+        client = client or self.llm
+        if client is None:
+            return
+        try:
+            messages = [
+                {"role": "system", "content": self._system_prompt()},
+                {"role": "user", "content": "hi"},
+            ]
+            # 消费完整流（含思考/重试），触发首次编译/图优化。
+            for _ in client.chat_stream(messages, kv_group="aux"):
+                pass
+            # 注意：此处**不再** invalidate 主缓存。aux 预热走独立缓存、不写实例级
+            # self._mlx_cache，原 invalidate 本就是 no-op；而真正的系统提示预热改由
+            # AgentWorker 线程在空闲期调用 agent.preload_kv() 完成（同线程建缓存、
+            # 首句直接命中）。若在此清缓存，会误删 worker 刚预填好的系统提示 KV。
+        except Exception as e:  # 预热失败不致命
+            self._log(f"[warmup] 预热失败（忽略）: {e}")
+
+    # ------------------------------------------------------------------
+    def preload_kv(self) -> None:
+        """在 worker 线程内预填系统提示 KV，让首句无需全量预填充。
+
+        只 MLX 本地后端有效（网络/其他后端无 KV 缓存概念，忽略）。必须在真实
+        生成线程调用——由 AgentWorker.run() 在空闲期触发，缓存创建线程与首句
+        生成线程一致，首句 form ① 命中。失败不致命。
+        """
+        client = self.llm
+        if client is None:
+            return
+        preload = getattr(client, "preload_system_kv", None)
+        if preload is None:
+            return
+        try:
+            system_prompt = self._system_prompt()
+            schemas = self.kernel.schemas() if self.kernel else []
+            preload(system_prompt, schemas)
+        except Exception as e:
+            self._log(f"[warmup] 系统提示 KV 预热失败(忽略): {e}")
+
     def run(self, user_input: str) -> str:
         """Process one user turn. Returns the final assistant content.
 
@@ -1259,25 +1311,61 @@ class Agent:
 
         base = SYSTEM_PROMPT
 
+        # 注意：工作记忆 / 当天事实 / 匹配技能 / 知识库状态等「每轮易变」内容一律
+        # 不进系统提示，改由 volatile_context() 注入用户消息（见 kernel/loop.py）。
+        # 原因：本模型 KV 缓存是 ArraysCache（不可裁剪），多轮复用只认「完整前缀
+        # 匹配」（form ①）；系统提示哪怕只加一个会变的 token，前缀整体对不上 →
+        # 每轮退回全量预填充（十几秒）。系统提示恒定后，多轮可稳定命中缓存，而
+        # 模型每轮仍能在用户消息里看到这些即时上下文。
+
+        self._cached_prompt_turn = self._turn_idx
+        self._cached_prompt = base
+        return base
+
+    # ------------------------------------------------------------------
+    def volatile_context(self) -> str:
+        """每轮易变的即时上下文：知识库状态 + 工作记忆 scratchpad + 当天自动抽取
+        事实 + 按当前用户输入匹配到的技能。
+
+        这些原本拼进系统提示，但本模型 KV 缓存（ArraysCache）不可裁剪，多轮只认
+        完整前缀匹配；系统提示哪怕加一个会变的 token 都会让前缀整体对不上 → 每轮
+        全量预填充。统一移到用户消息后，系统提示 = 恒定 SYSTEM_PROMPT，多轮稳定
+        命中缓存；模型每轮仍能在用户消息里看到这些即时上下文（与 anchor_prompt
+        回注的 key_info/plan 同源）。
+        """
+        parts: List[str] = []
+        # 知识库状态：30s TTL 缓存，但 reload / 背景索引都会改它，放进用户消息
+        # 就不会再污染系统提示前缀。
+        try:
+            rag_engine = self.tools.get_rag_engine() if self.tools else None
+            if rag_engine is not None:
+                status = self._rag_status_cached(rag_engine)
+                chunks = status.get("chunks_stored", 0)
+                sources = status.get("sources", [])
+                if chunks > 0:
+                    source_list = ", ".join(
+                        os.path.basename(s) for s in sources[:8]
+                    )
+                    if len(sources) > 8:
+                        source_list += f" (and {len(sources) - 8} more)"
+                    parts.append(
+                        f"# Knowledge base\n{chunks} chunks in {len(sources)} "
+                        f"file(s): {source_list}. Answer from these via `rag_search`.")
+                else:
+                    parts.append(
+                        "# Knowledge base\nConfigured but empty. "
+                        "Use `rag_ingest` to index.")
+        except Exception:  # pragma: no cover
+            pass
+        # 工作记忆 + 当天事实
         try:
             from .tools.memory import _work_memory
-
-            # Work memory: inject only the keys the model explicitly set
-            # (its scratchpad), PLUS today's auto-extracted facts.  Long-term
-            # memory is NOT injected here — it is recalled on demand via the
-            # memory_search tool.
             wm = _work_memory(self.config).list()
             compact_wm = {}
             today_facts: List[str] = []
-            # 工作记忆同样必须有**总量**上限：key 由模型经
-            # update_working_checkpoint 自由创建，单 key 200 字符的旧约束
-            # 拦不住 key 数量与总长度单调膨胀——系统提示不在五级压缩作用
-            # 范围内，放任不管会随会话时长挤爆 30k 预算。
             wm_used = 0
             for k, v in wm.items():
                 if k == "__auto_facts__":
-                    # 短期记忆里的自动抽取事实：只注入当天桶（历史已在长期
-                    # 记忆 graph 中，靠 memory_search 检索）。
                     _, facts = self._parse_daily_facts(str(v))
                     today_facts = facts
                     continue
@@ -1288,11 +1376,8 @@ class Agent:
                 compact_wm[k] = s
                 wm_used += len(k) + len(s)
             if compact_wm or today_facts:
-                parts = []
+                sub = []
                 if today_facts:
-                    # 当天事实用列表形式注入，更易读（而非嵌套 JSON）。
-                    # 必须加条数/长度上限：事实每轮累积且系统提示不在上下文
-                    # 收缩范围内，放任不管会随会话时长单调膨胀直至挤爆窗口。
                     capped = []
                     used = 0
                     for f in today_facts:
@@ -1305,17 +1390,16 @@ class Agent:
                     fact_block = "\n".join(f"- {f}" for f in capped)
                     if dropped > 0:
                         fact_block += f"\n- (…{dropped} more omitted)"
-                    parts.append("# Today's facts (auto-extracted)\n" + fact_block)
+                    sub.append("# Today's facts (auto-extracted)\n" + fact_block)
                 if compact_wm:
-                    parts.append("# Work memory (scratchpad)\n" +
-                                 json.dumps(compact_wm, ensure_ascii=False, separators=(",", ":")))
-                base += "\n\n" + "\n\n".join(parts)
+                    sub.append("# Work memory (scratchpad)\n" +
+                               json.dumps(compact_wm, ensure_ascii=False,
+                                          separators=(",", ":")))
+                parts.append("\n\n".join(sub))
         except Exception:  # pragma: no cover
             pass
-        # inject matched skill prompt
+        # 匹配到的技能（按当前用户输入）
         try:
-            # 技能匹配的是用户意图：用本轮用户输入（历史所有权已在 Session，
-            # 这里不再扫描它）。
             user_text = self._last_user_text
             matched = self.skills.match(user_text) if user_text else None
             if matched:
@@ -1325,46 +1409,10 @@ class Agent:
                 if len(sp) > _MAX_SKILL_PROMPT_CHARS:
                     sp = (sp[:_MAX_SKILL_PROMPT_CHARS] +
                           "\n…（已截断，用 skill_load 读取完整技能内容）")
-                base += f"\n\n# Active skill: {matched.name}\n{sp}"
+                parts.append(f"# Active skill: {matched.name}\n{sp}")
         except Exception:  # pragma: no cover
             pass
-
-        # Dynamically inject knowledge base status so the agent knows RAG
-        # tools are available and whether the KB has indexed content.  Without
-        # this the agent has no way to discover that a local KB exists and
-        # will never proactively call rag_search / rag_status.
-        try:
-            rag_engine = self.tools.get_rag_engine() if self.tools else None
-            if rag_engine is not None:
-                # status() 会连 LanceDB 并可能触发 lancedb 的惰性导入（冷启动
-                # 数秒）。它每轮都被调用一次，缓存起来——知识库状态本就以分钟级
-                # 变化，同步后由 reload_rag() 显式失效。
-                status = self._rag_status_cached(rag_engine)
-                chunks = status.get("chunks_stored", 0)
-                sources = status.get("sources", [])
-                if chunks > 0:
-                    # 仅注入文档名（不含路径），最多 8 个，超出省略。
-                    source_list = ", ".join(
-                        os.path.basename(s) for s in sources[:8]
-                    )
-                    if len(sources) > 8:
-                        source_list += f" (and {len(sources) - 8} more)"
-                    base += (
-                        f"\n\n# Knowledge base\n"
-                        f"{chunks} chunks in {len(sources)} file(s): {source_list}. "
-                        f"Answer from these via `rag_search`."
-                    )
-                else:
-                    base += (
-                        f"\n\n# Knowledge base\n"
-                        f"Configured but empty. Use `rag_ingest` to index."
-                    )
-        except Exception:  # pragma: no cover
-            pass
-
-        self._cached_prompt_turn = self._turn_idx
-        self._cached_prompt = base
-        return base
+        return "\n\n".join(parts)
 
     # ------------------------------------------------------------------
     def invalidate_rag_status(self) -> None:
@@ -1523,7 +1571,8 @@ class Agent:
                 # `ev.get(...)` 会抛 AttributeError 并被下面的 except 吞掉，
                 # 导致 LLM 兜底永远是死代码、只能退回通用描述。这里按属性访问。
                 answer_parts = []
-                for ev in llm.chat_stream([{"role": "user", "content": prompt}]):
+                for ev in llm.chat_stream([{"role": "user", "content": prompt}],
+                                          kv_group="aux"):
                     if ev.type == "content":
                         answer_parts.append(ev.content)
                     elif ev.type == "done":

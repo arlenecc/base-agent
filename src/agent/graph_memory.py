@@ -973,7 +973,8 @@ def extract_facts_via_llm(
     ]
     try:
         out: List[str] = []
-        for ev in llm.chat_stream(messages, tools=None, temperature=0.1):
+        for ev in llm.chat_stream(messages, tools=None, temperature=0.1,
+                                  kv_group="aux"):
             if ev.type == "content":
                 out.append(ev.content)
             elif ev.type == "done":
