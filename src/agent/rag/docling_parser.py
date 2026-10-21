@@ -43,6 +43,12 @@ try:
 except Exception:
     pass
 
+from .ocr_scale_policy import (
+    analyze_pdf as _analyze_ocr_scale,
+    make_scale_policy_pipeline_cls,
+    set_current_policy as _set_scale_policy,
+)
+
 logger = logging.getLogger(__name__)
 
 # Formats docling can handle natively.  Text/markdown/csv/html are handled by
@@ -104,6 +110,9 @@ def _start_idle_reaper() -> None:
         _reaper_started = True
 
     def _reap() -> None:
+        global _converter  # 下面要赋值 None——不加 global 会让 _converter
+        # 变成局部变量，读取即 UnboundLocalError（2026-10-21 实测：reaper
+        # 线程从上线起每轮必崩，空闲释放从未真正生效过）。
         while True:
             time.sleep(_IDLE_CHECK_INTERVAL)
             with _converter_lock:
@@ -233,8 +242,14 @@ def _get_converter():
                 if ocrmac_available():
                     try:
                         from docling.datamodel.pipeline_options import OcrMacOptions
+                        # OCR 渲染 scale（#132）：默认 2.0（原 3.0）。整页位图
+                        # 内存 ∝ scale²，3.0→2.0 省 56%——实测 25GB 尖峰的
+                        # 主要来源。表格页由 ocr_scale_policy 在逐页渲染前
+                        # 动态提到 2.5（见 extract_markdown 的策略注入）。
                         pdf_opts.ocr_options = OcrMacOptions(
-                            lang=["zh-Hans", "en-US"], recognition="accurate")
+                            lang=["zh-Hans", "en-US"], recognition="accurate",
+                            scale=2.0,
+                        )
                         pdf_opts.do_ocr = True
                         logger.info("docling OCR 后端: Apple Vision (ocrmac, zh-Hans 优先)")
                     except Exception as e:
@@ -248,8 +263,15 @@ def _get_converter():
                         logger.info("docling OCR 后端: RapidOCR")
                     except Exception:
                         pass
+                # OCR scale 动态策略管线（#132）：包装 OCR 模型，逐页改写
+                # scale（表格页 2.5 / 其他 2.0）。拿不到就退回标准管线
+                # （行为退化为全局 scale=2.0）。
+                fmt_kwargs: dict = {"pipeline_options": pdf_opts}
+                policy_pipeline_cls = make_scale_policy_pipeline_cls()
+                if policy_pipeline_cls is not None:
+                    fmt_kwargs["pipeline_cls"] = policy_pipeline_cls
                 converter = DocumentConverter(
-                    format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
+                    format_options={InputFormat.PDF: PdfFormatOption(**fmt_kwargs)}
                 )
                 logger.info("docling DocumentConverter initialized (布局/表格走 MPS，OCR 走 Apple Vision/ANE)")
             except Exception as e:
@@ -302,6 +324,12 @@ def extract_markdown(filepath: str) -> Optional[str]:
     if converter is None:
         return None
 
+    # OCR scale 动态策略（#132）：convert 前预分析 PDF（文本层/原生 DPI/
+    # 表格启发式），表格页在逐页渲染时提到 2.5，其余 2.0。analyze 结果按
+    # (path, mtime, size) 缓存；非 PDF 或分析失败 → None（全局默认 2.0）。
+    # 策略读取发生在 _converter_lock 保护的 convert 内（串行），无并发。
+    _scale_policy = _analyze_ocr_scale(path) if suffix == ".pdf" else None
+
     global _converter_in_use
     with _converter_lock:
         _converter_in_use += 1
@@ -326,10 +354,14 @@ def extract_markdown(filepath: str) -> Optional[str]:
         # DocumentConverter 没有声明线程安全，而 ingest 用 4 个 worker 线程
         # 并行解析。旧实现只对「创建单例」加锁，convert() 本身完全不设防，
         # 并发转换会互相踩踏（状态污染/崩溃）。这里用同一把锁串行化转换。
-        with _converter_lock:
-            result = converter.convert(str(path))
-            doc = result.document
-            markdown = doc.export_to_markdown()
+        _set_scale_policy(_scale_policy)
+        try:
+            with _converter_lock:
+                result = converter.convert(str(path))
+                doc = result.document
+                markdown = doc.export_to_markdown()
+        finally:
+            _set_scale_policy(None)
         # 及时释放大对象引用，避免整棵文档树在切片前一直常驻。
         del result, doc
         if not markdown or not markdown.strip():
