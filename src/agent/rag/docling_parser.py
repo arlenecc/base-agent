@@ -47,9 +47,38 @@ from .ocr_scale_policy import (
     analyze_pdf as _analyze_ocr_scale,
     make_scale_policy_pipeline_cls,
     set_current_policy as _set_scale_policy,
+    set_scale_config as _set_scale_cfg,
 )
 
 logger = logging.getLogger(__name__)
+
+# OCR 渲染 scale 配置（#132，经 set_ocr_scale_config 注入）。默认固定
+# 2.0、动态策略关闭——位图内存 ∝ scale²，2.0 相比旧默认 3.0 省 56%。
+_ocr_scale_base = 2.0
+
+
+def set_ocr_scale_config(base: float = 2.0, dynamic: bool = False,
+                         table: float = 2.5) -> None:
+    """注入 OCR scale 配置（UI 保存设置 / 应用配置时调用）。
+
+    base   固定 scale（rag_ocr_scale_base）
+    dynamic 动态策略开关（rag_ocr_scale_dynamic，默认 False）
+    table  动态策略下表格页的 scale（rag_ocr_scale_table）
+
+    base 值变化时释放已构建的 converter 单例——scale 在
+    OcrMacOptions 构造时固化进 converter，不重建的话改配置要重启
+    应用才生效。
+    """
+    global _ocr_scale_base
+    new_base = float(base) if base else 2.0
+    changed = new_base != _ocr_scale_base
+    old_base = _ocr_scale_base
+    _ocr_scale_base = new_base
+    _set_scale_cfg(dynamic, new_base, table)
+    if changed and _converter is not None:
+        logger.info("OCR scale 配置变化 %.1f → %.1f，释放 converter 以重建",
+                    old_base, new_base)
+        release_converter()
 
 # Formats docling can handle natively.  Text/markdown/csv/html are handled by
 # the lightweight parsers (docling is overkill and slower for them).
@@ -242,13 +271,14 @@ def _get_converter():
                 if ocrmac_available():
                     try:
                         from docling.datamodel.pipeline_options import OcrMacOptions
-                        # OCR 渲染 scale（#132）：默认 2.0（原 3.0）。整页位图
-                        # 内存 ∝ scale²，3.0→2.0 省 56%——实测 25GB 尖峰的
-                        # 主要来源。表格页由 ocr_scale_policy 在逐页渲染前
-                        # 动态提到 2.5（见 extract_markdown 的策略注入）。
+                        # OCR 渲染 scale（#132）：可配置（rag_ocr_scale_base，
+                        # 默认 2.0，原 3.0）。整页位图内存 ∝ scale²，
+                        # 3.0→2.0 省 56%——实测 25GB 尖峰的主要来源。动态
+                        # 策略（默认关）开启时表格页会在逐页渲染前提到
+                        # rag_ocr_scale_table（见 extract_markdown 的策略注入）。
                         pdf_opts.ocr_options = OcrMacOptions(
                             lang=["zh-Hans", "en-US"], recognition="accurate",
-                            scale=2.0,
+                            scale=_ocr_scale_base,
                         )
                         pdf_opts.do_ocr = True
                         logger.info("docling OCR 后端: Apple Vision (ocrmac, zh-Hans 优先)")
@@ -258,7 +288,12 @@ def _get_converter():
                 if getattr(pdf_opts, "ocr_options", None) is None:
                     try:
                         from docling.datamodel.pipeline_options import RapidOcrOptions
-                        pdf_opts.ocr_options = RapidOcrOptions()
+                        try:
+                            pdf_opts.ocr_options = RapidOcrOptions(
+                                scale=_ocr_scale_base)
+                        except Exception:
+                            # 老版本 RapidOcrOptions 无 scale 参数
+                            pdf_opts.ocr_options = RapidOcrOptions()
                         pdf_opts.do_ocr = True
                         logger.info("docling OCR 后端: RapidOCR")
                     except Exception:
@@ -324,10 +359,10 @@ def extract_markdown(filepath: str) -> Optional[str]:
     if converter is None:
         return None
 
-    # OCR scale 动态策略（#132）：convert 前预分析 PDF（文本层/原生 DPI/
-    # 表格启发式），表格页在逐页渲染时提到 2.5，其余 2.0。analyze 结果按
-    # (path, mtime, size) 缓存；非 PDF 或分析失败 → None（全局默认 2.0）。
-    # 策略读取发生在 _converter_lock 保护的 convert 内（串行），无并发。
+    # OCR scale 动态策略（#132，可配置）：rag_ocr_scale_dynamic 开启时
+    # convert 前预分析 PDF（文本层/原生 DPI/表格启发式），表格页逐页渲染
+    # 提到 rag_ocr_scale_table，其余用 rag_ocr_scale_base。开关默认关闭
+    # （analyze_pdf 内部直接返回 None）——固定 scale、零分析开销。
     _scale_policy = _analyze_ocr_scale(path) if suffix == ".pdf" else None
 
     global _converter_in_use

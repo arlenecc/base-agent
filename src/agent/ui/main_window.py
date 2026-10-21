@@ -976,6 +976,13 @@ class MainWindow(QMainWindow):
             getattr(self.config, "rag_ocr_model_name", "OvisOCR2-0.8B-MLX-4bit"),
             getattr(self.config, "rag_ocr_model_path", ""),
         )
+        # docling OCR scale 配置（#132：固定值默认 2.0，动态策略默认关）。
+        from agent.rag.docling_parser import set_ocr_scale_config
+        set_ocr_scale_config(
+            base=getattr(self.config, "rag_ocr_scale_base", 2.0),
+            dynamic=getattr(self.config, "rag_ocr_scale_dynamic", False),
+            table=getattr(self.config, "rag_ocr_scale_table", 2.5),
+        )
         self._bridge = Bridge()
         self._callbacks = BridgeCallbacks(self._bridge)
         self._llm: Optional[LLMClient] = None
@@ -1837,6 +1844,12 @@ class MainWindow(QMainWindow):
                 getattr(self.config, "rag_ocr_engine", "mlx-vlm"),
                 getattr(self.config, "rag_ocr_model_name", "OvisOCR2-0.8B-MLX-4bit"),
                 getattr(self.config, "rag_ocr_model_path", ""),
+            )
+            from agent.rag.docling_parser import set_ocr_scale_config
+            set_ocr_scale_config(
+                base=getattr(self.config, "rag_ocr_scale_base", 2.0),
+                dynamic=getattr(self.config, "rag_ocr_scale_dynamic", False),
+                table=getattr(self.config, "rag_ocr_scale_table", 2.5),
             )
         except Exception:
             pass

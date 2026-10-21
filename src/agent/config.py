@@ -92,6 +92,14 @@ class AgentConfig:
     rag_ocr_engine: str = "mlx-vlm"
     rag_ocr_model_name: str = "OvisOCR2-0.8B-MLX-4bit"
     rag_ocr_model_path: str = ""
+    # docling OCR 渲染 scale（#132）：
+    #   rag_ocr_scale_base    固定 scale 值（默认 2.0；原 3.0，位图内存 ∝ scale²）
+    #   rag_ocr_scale_dynamic 动态策略开关（默认 False=固定用 base 值）
+    #   rag_ocr_scale_table   动态策略下表格页的 scale（默认 2.5）
+    # 动态策略开启时：convert 前预分析 PDF，表格页用 table 值、其余用 base 值。
+    rag_ocr_scale_base: float = 2.0
+    rag_ocr_scale_dynamic: bool = False
+    rag_ocr_scale_table: float = 2.5
     # OCR（图片型 PDF）：Apple M 系列上让 RapidOCR 走 CoreML EP（CPU+GPU+ANE），
     # 关掉则回退 onnxruntime 默认 EP。
     #
@@ -188,6 +196,8 @@ class AgentConfig:
     _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
                    "rag_embedding_model", "rag_rerank_model", "rag_pdf_engine",
                    "rag_ocr_engine", "rag_ocr_model_name", "rag_ocr_model_path",
+                   "rag_ocr_scale_base", "rag_ocr_scale_dynamic",
+                   "rag_ocr_scale_table",
                    "browser_endpoint", "llm_provider", "local_llm_model",
                    "local_llm_backend", "embedding_provider", "local_embedding_model",
                    "local_embedding_backend", "reranker_provider", "local_reranker_model",

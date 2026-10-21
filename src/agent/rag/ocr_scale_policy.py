@@ -28,9 +28,10 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# 策略常量
+# 策略常量（可经 set_scale_config 配置注入；默认动态关闭、固定 2.0）
 BASE_SCALE = 2.0      # 普通页 / 文本页 / 低 DPI 扫描页
 TABLE_SCALE = 2.5     # 检测到表格的扫描页
+_DYNAMIC_ENABLED = False   # 动态策略开关（默认关：固定用 BASE_SCALE）
 LOW_DPI_THRESHOLD = 150.0
 TEXT_LAYER_MIN_CHARS = 50     # 页面文本层超过该字数视为「有文本层」
 _TABLE_MIN_LINES = 2          # 横/竖规则线各至少 N 条才算有线表格
@@ -45,6 +46,19 @@ _TABLE_MIN_COLS = 3           # 词网格至少 N 列
 # extract_markdown 的 try/finally 里。
 _current_policy: Optional[Dict[int, float]] = None
 _policy_lock = threading.Lock()
+
+
+def set_scale_config(enabled: bool, base: float = 2.0,
+                     table: float = 2.5) -> None:
+    """配置注入（UI 保存设置时调用）。
+
+    enabled=False 时 analyze_pdf 直接返回 None——docling 固定用
+    base 值，不做任何预分析。
+    """
+    global BASE_SCALE, TABLE_SCALE, _DYNAMIC_ENABLED
+    BASE_SCALE = float(base) if base else 2.0
+    TABLE_SCALE = float(table) if table else 2.5
+    _DYNAMIC_ENABLED = bool(enabled)
 
 
 def set_current_policy(policy: Optional[Dict[int, float]]) -> None:
@@ -211,8 +225,11 @@ def analyze_pdf(path) -> Optional[Dict[int, float]]:
     """预分析 PDF，返回 {page_no: TABLE_SCALE}（仅表格页）。
 
     返回 None = 无需动态策略（全部按默认 BASE_SCALE）。结果按
-    (path, mtime, size) 缓存，重复同步不重分析。
+    (path, mtime, size) 缓存，重复同步不重分析。动态开关关闭时直接
+    返回 None（默认行为：固定 scale，零分析开销）。
     """
+    if not _DYNAMIC_ENABLED:
+        return None
     key = None
     try:
         key = _cache_key(path)
