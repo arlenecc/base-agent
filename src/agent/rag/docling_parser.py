@@ -256,8 +256,8 @@ def _get_converter():
                 # 不返回）。docling 原生支持 document_timeout，超时抛错 →
                 # extract_markdown 捕获 → 回退轻量解析器，同步不中断。
                 # 3600s：图片书逐页 OCR（Apple Vision）+ 布局 + TableFormer
-                # 很慢（数百页要 20-60 分钟），超时只是防永久挂死的最后防线，
-                # 不能误杀慢而正常的转换。
+                # 较慢（数百页大书约 10-20 分钟），超时只是防永久挂死的最后
+                # 防线，不能误杀慢而正常的转换。
                 try:
                     pdf_opts.document_timeout = 3600.0
                 except Exception:
@@ -370,16 +370,18 @@ def extract_markdown(filepath: str) -> Optional[str]:
         _converter_in_use += 1
         _touch_converter()
 
-    # 看门狗心跳：图片书走 docling 全量管线要 20-60 分钟且期间无任何输出，
-    # UI 只能看到「解析文件: xxx」一条日志挂着不动，会被误判为卡死（#131）。
-    # 守护线程每 60s 报一次已耗时；convert 返回/异常时自动停止。
+    # 看门狗心跳：图片书走 docling 全量管线耗时数分钟到十几分钟且期间无任何
+    # 输出，UI 只能看到「解析文件: xxx」一条日志挂着不动，会被误判为卡死
+    # （#131）。守护线程每 60s 报一次已耗时；convert 返回/异常时自动停止。
+    # 2026-10-21：MPS 布局 + ANE OCR + scale 2.0 后单本书实测 ~6-10 分钟，
+    # 文案改 10-20 分钟（留足大书/复杂版面余量）。
     _convert_done = threading.Event()
 
     def _heartbeat() -> None:
         t0 = time.monotonic()
         while not _convert_done.wait(60.0):
             logger.info(
-                "docling 仍在转换 %s（已 %.0f 分钟，图片书 20-60 分钟属正常）",
+                "docling 仍在转换 %s（已 %.0f 分钟，图片书 10-20 分钟属正常）",
                 path.name, (time.monotonic() - t0) / 60.0,
             )
 
