@@ -205,9 +205,9 @@ def is_docling_available() -> bool:
     """Return True if docling can be imported.
 
     用 ``find_spec`` 探测而**不是真实 import**：import docling 会连带加载
-    torch 全家桶（~1-2GB）。这条探测在每个 PDF/EPUB 的解析入口都会走到——
-    扫描 PDF 本来就会在下一步被路由到 PyMuPDF+OCR 轻量路径，为探测而加载
-    torch 纯属浪费（2026-10 实测：同步中 2 秒内 +3.7GB 的元凶之一）。
+    torch 全家桶（~1-2GB）。这条探测在每个 PDF/EPUB 的解析入口都会走到，
+    为探测而加载 torch 纯属浪费（2026-10 实测：同步中 2 秒内 +3.7GB 的
+    元凶之一）。
     """
     global _converter_unavailable
     if _converter_unavailable:
@@ -226,11 +226,12 @@ def is_supported(ext: str) -> bool:
 def _get_converter():
     """Lazily build and cache the docling DocumentConverter singleton.
 
-    管线降配（版本兼容，全部包在 try/except 中，任何失败都回退默认构造）：
-    accelerator 强制 CPU + 限 4 线程。docling 2.x 在 macOS 上默认
-    device='auto' → MPS（torch Metal 后端），其缓存分配器只增不放——
-    实测同步图多的书时 RSS 可涨到 30GB+ 且不回落（#116 根因之一）。
-    CPU 模式下布局/表格模型对文本为主的文档足够快，且内存有界。
+    管线配置（版本兼容，全部包在 try/except 中，任何失败都回退默认构造）：
+    accelerator = MPS（torch Metal）+ 4 线程。2026-10-20 A/B：布局/表格
+    模型走 MPS 比 CPU 快 ~35% 且峰值内存更低，#116 的 36GB 失控（MPS 缓存
+    只增不放）由三道闸兜住：convert 后 torch.mps.empty_cache() 归还缓存、
+    document_timeout 硬超时、MLX 缓存上限。注意不要设
+    PYTORCH_MPS_HIGH_WATERMARK_RATIO（docling 内部 low=1.4 会直接报错）。
     """
     global _converter, _converter_unavailable
     if _converter is not None:

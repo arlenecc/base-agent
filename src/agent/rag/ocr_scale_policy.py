@@ -299,6 +299,10 @@ class ScalePolicyOcrModel:
         return out
 
     def __getattr__(self, name: str) -> Any:
+        # _inner 自身走__getattr__ 会无限递归（__init__ 未跑完/被 del 时），
+        # 直接抛 AttributeError 走正常失败路径。
+        if name == "_inner":
+            raise AttributeError(name)
         return getattr(self._inner, name)
 
 

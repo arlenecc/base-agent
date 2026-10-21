@@ -392,6 +392,22 @@ def set_pdf_engine(engine: str) -> None:
     """
     global _pdf_engine
     _pdf_engine = engine if engine in ("docling", "marker", "ovis") else "docling"
+    # 一次性提示（#133）：marker / ovis 是重依赖，不进 deps.py 的自动安装
+    # 列表（auto_install 会装全部 optional，marker-pdf 拖 torch+1.4GB VLM）。
+    # 用户手选却没装时回退链会静默落到 docling——这里显式告警。
+    if _pdf_engine in ("marker", "ovis"):
+        try:
+            import importlib.util
+            pkg = "marker" if _pdf_engine == "marker" else "mlx_vlm"
+            pip_name = "marker-pdf" if _pdf_engine == "marker" else "mlx-vlm"
+            if importlib.util.find_spec(pkg) is None:
+                logger.warning(
+                    "rag_pdf_engine=%s 但 %s 未安装，将回退 docling"
+                    "（如需启用：pip install %s）",
+                    _pdf_engine, pkg, pip_name,
+                )
+        except Exception:
+            pass
 
 
 def set_ovis_model_config(engine: str, name: str, path: str) -> None:

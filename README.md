@@ -50,11 +50,13 @@
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、FastEmbed Reranker（bge-reranker-v2-m3-int8 重排序，INT8 量化 ~570MB）、opencv-python-headless（OCR 预处理）等可选增强也会一并检测与自动安装
-- **OCR 加速与预处理** — 图片型 PDF 优先使用 rapidocr 3.x（模型目录与 docling 共享、懒加载省内存），在 **Apple M 系列 Mac** 上启用 onnxruntime **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+**ANE** 神经网络引擎，需 onnxruntime≥1.31）；CoreML 初始化失败自动回退 CPU EP，Intel/非 Apple 平台直接用 CPU EP（避免必然失败的 CoreML 初始化）。未装 3.x 时回退 rapidocr-onnxruntime 1.x（同样注入 CoreML EP）。引擎构造兼容 1.1/1.2 两代 kwargs 体系（1.2.x 缺 `det_model_path` 会抛 `KeyError`，已做降级链兜底）。识别前对每页做**尺寸归一化（自适应 DPI + 短边放大）+ 灰度 + 暗色主题自动反色 + CLAHE 对比度增强 + 锐化**预处理，提升小字、低对比度与暗色主题扫描件的识别率；纯色/空白页直接跳过。引擎每 50 页周期重建（冲刷 CoreML/ORT 按形状保留的原生缓存，真实扫描页 ~35MB/页）。以上行为均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭
+- **统一解析引擎三选一** — PDF/office 文档走统一引擎回退链：`docling`（默认）→ `marker` → `ovis`（OvisOCR2 VLM）→ PyMuPDF 纯文本兜底。docling 全量管线：布局/表格模型走 **MPS**（torch Metal，比 CPU 快 ~35%），OCR 走 **Apple Vision（ocrmac，ANE 推理）**；单本图片书实测 ~6-10 分钟（MPS + scale 2.0 调优后，比早期 CPU 配置快约 10 倍）。OvisOCR2（`OvisOCR2-0.8B-MLX-4bit`，mlx-vlm）作为第三配置项：PyMuPDF 取页/裁表 → VLM 转 Markdown（文本页的表格区域自动裁剪回填），配置窗口「OCR模型」行可选模型与路径。三引擎实测（M4，10 页中文扫描书）：docling 18-25s / ovis 50-51s / marker 215s
+- **OCR scale 可配置** — docling 的 OCR 渲染 scale 默认固定 **2.0**（原 3.0；位图内存 ∝ scale²，实测转换快 34%、质量不变）；`rag_ocr_scale_dynamic` 开启后按页动态决策（表格页 2.5、低 DPI/文本页 2.0，预分析带缓存）
+- **OCR 兜底路径与内存护栏** — 引擎链末端是 PyMuPDF+RapidOCR 轻量路径（仅出纯文本）：引擎全局单例 + 信号量串行，每 5 页检查原生缓存增量（超 1.2GB 自动冲刷并降级 CPU EP），CoreML 模式下每 50 页周期重建；识别前做尺寸归一化 + 灰度 CLAHE + 锐化预处理（均可配置关闭）。以上行为可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` / `rag_ocr_binarize` 中调整
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、FastEmbed Reranker 精排过程和最终结果排名
 - **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→8 次、引用最近错误**和已试过且失败的方案**、明确禁止「停下来问用户是否继续」）；**首次失败**即要求换方法（禁止原样重发、禁止把错误念给用户）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 3 次就把步骤标 `blocked` 会被守卫拦回。失败上下文跨自动续跑段传递，续跑段仍知道上一段卡在哪
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性；「终止对话」会立即中断并回收 `code_run`/`shell_run` 子进程（旧实现子进程要跑到自身超时，最长 600s）
-- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + FastEmbed reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler
+- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + FastEmbed reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler。**MLX 缓存上限显式压到 1GB**（默认可达统一内存的 75%，16GB 机器上实测把同步进程 footprint 顶到 19GB 的元凶）；docling converter 空闲 90 秒自动释放 + 每次转换后 `torch.mps.empty_cache()` 归还 MPS 缓冲；HuggingFace 全程离线（`HF_HUB_OFFLINE=1`，根治 convert 期间联网 connect 挂死）；单文档转换 1 小时硬超时兜底；日志/思考/计划面板均有行数上限防无限增长
 - **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
@@ -68,6 +70,8 @@
 │ [Base URL] [API Key] [模型] [获取模型]                    Row 0  │
 │ [上下文长度] [温度] [top_p] [min_p] [top_k] [重复惩罚] [超时] [应用配置] │
 │ [工作目录] [知识库] [同步知识] [停止同步]                   Row 2  │
+│ [OCR模型] [mlx-vlm▾] [模型名] [本地路径]                   Row 1.5 │
+│ [Embedding] [impl▾] [模型名] [本地路径]                    Row 3  │
 ├──────────────────────────────┬───────────────────────────────────┤
 │ [对话] — [清空对话] [终止对话] │ 思考过程 / 日志                    │
 │                              │                                   │
@@ -154,13 +158,23 @@ python main.py
 
 配置自动持久化到 `~/.base-agent/config.json`。
 
-RAG 相关配置（写在同一个 `config.json` 里，界面未暴露的项可手工编辑）：
+RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置窗口「知识同步配置」区有对应控件，其余可手工编辑）：
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `rag_embedding_model` | 嵌入模型（FastEmbed 模型名） | `nomic-ai/nomic-embed-text-v1.5-Q` |
 | `rag_rerank_model` | 重排序模型（FastEmbed cross-encoder） | `BAAI/bge-reranker-v2-m3-int8` |
 | `rag_rerank_enabled` | 是否启用重排序；关闭后不加载 reranker 权重 | `true` |
+| `rag_pdf_engine` | 统一 PDF/office 解析引擎首选：`docling` / `marker` / `ovis` | `docling` |
+| 🌐 `rag_ocr_engine` | OvisOCR2 后端：`mlx-vlm`（已实现）/ `onnx` / `gguf`（预留） | `mlx-vlm` |
+| 🌐 `rag_ocr_model_name` | OvisOCR2 模型目录名（自动从 `models/` 加载） | `OvisOCR2-0.8B-MLX-4bit` |
+| 🌐 `rag_ocr_model_path` | OvisOCR2 显式本地路径（优先于 `models/<name>`） | 空 |
+| 🌐 `rag_ocr_scale_base` | docling OCR 渲染固定 scale（位图内存 ∝ scale²） | `2.0` |
+| 🌐 `rag_ocr_scale_dynamic` | OCR scale 动态策略开关（表格页用 `table` 值、其余用 `base`） | `false` |
+| 🌐 `rag_ocr_scale_table` | 动态策略下表格页的 scale | `2.5` |
+| `rag_ocr_coreml` | RapidOCR（兜底路径）是否启用 CoreML EP | `false` |
+| `rag_ocr_preprocess` | RapidOCR 图像预处理（归一化 + CLAHE + 锐化） | `true` |
+| `rag_ocr_binarize` | RapidOCR 二值化 | `true` |
 
 > 注意 fastembed 的**模型名**与它实际拉取的 HuggingFace 仓库不是一回事：
 > `nomic-ai/nomic-embed-text-v1.5-Q` → 仓库 `nomic-ai/nomic-embed-text-v1.5`；

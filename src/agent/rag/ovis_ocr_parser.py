@@ -332,8 +332,41 @@ def _vlm_ocr_pil(pil_image, out_dir: str = "") -> Optional[str]:
 # 表格区域检测（文本页用：矢量线 + 词网格）
 # ---------------------------------------------------------------------------
 
+def _cluster_rects(boxes: List, gap: float = 24.0) -> List[List]:
+    """把线段/词组的 bbox 按 proximity 聚成连通组（并查集）。
+
+    旧实现把所有表格线求并集成一个整页大 bbox——一页有多张表（或表+
+    插图）时会并成一张送给 VLM，输出必坏。这里按「bbox 外扩 gap 后
+    相交即同组」聚类，每组独立成一个表格区域。
+    """
+    n = len(boxes)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = boxes[i], boxes[j]
+            if (a[0] - gap <= b[2] and b[0] - gap <= a[2]
+                    and a[1] - gap <= b[3] and b[1] - gap <= a[3]):
+                union(i, j)
+    groups: dict = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(boxes[i])
+    return list(groups.values())
+
+
 def _detect_table_rects(page) -> List:
-    """返回页面上表格区域的 fitz.Rect 列表（合并重叠）。
+    """返回页面上各表格区域的 fitz.Rect 列表（按连通性聚类，多表不合并）。
 
     文本页（born-digital）有矢量线和词坐标可用；扫描页没有文本层，走
     整页 VLM，不需要这个。
@@ -343,8 +376,8 @@ def _detect_table_rects(page) -> List:
         import fitz
 
         page_rect = page.rect
-        # 1) 矢量线聚类
-        h_lines, v_lines = [], []
+        # 1) 矢量线：每条线一个 bbox，连通聚类后每组 ≥2 横 + ≥2 竖才算表格
+        h_boxes, v_boxes = [], []
         try:
             drawings = page.get_drawings()
         except Exception:
@@ -354,28 +387,31 @@ def _detect_table_rects(page) -> List:
                 if item[0] == "l":
                     p1, p2 = item[1], item[2]
                     if abs(p1.y - p2.y) < 1.0 and abs(p1.x - p2.x) > 30:
-                        h_lines.append((min(p1.x, p2.x), p1.y,
-                                        max(p1.x, p2.x)))
+                        h_boxes.append((min(p1.x, p2.x), p1.y - 0.5,
+                                        max(p1.x, p2.x), p1.y + 0.5))
                     elif abs(p1.x - p2.x) < 1.0 and abs(p1.y - p2.y) > 30:
-                        v_lines.append((p1.x, min(p1.y, p2.y),
-                                        max(p1.y, p2.y)))
+                        v_boxes.append((p1.x - 0.5, min(p1.y, p2.y),
+                                        p1.x + 0.5, max(p1.y, p2.y)))
                 elif item[0] == "re":
                     r = item[1]
                     if r.width > 30 and r.height < 2:
-                        h_lines.append((r.x0, (r.y0 + r.y1) / 2, r.x1))
+                        h_boxes.append((r.x0, r.y0, r.x1, r.y1))
                     elif r.height > 30 and r.width < 2:
-                        v_lines.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
-        if len(h_lines) >= 2 and len(v_lines) >= 2:
-            xs = [x for x0, _y, x1 in h_lines for x in (x0, x1)] + \
-                 [x for x, _y0, _y1 in v_lines for x in (x, x)]
-            ys = [y for _x0, y, _x1 in h_lines for y in (y, y)] + \
-                 [y for _x, y0, y1 in v_lines for y in (y0, y1)]
-            r = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
-            r = r & page_rect
-            if not r.is_empty and r.width > 60 and r.height > 40:
-                rects.append(r)
+                        v_boxes.append((r.x0, r.y0, r.x1, r.y1))
+        if h_boxes and v_boxes:
+            for group in _cluster_rects(h_boxes + v_boxes):
+                n_h = sum(1 for b in group
+                          if any(b == hb for hb in h_boxes))
+                n_v = len(group) - n_h
+                if n_h >= 2 and n_v >= 2:
+                    r = fitz.Rect(
+                        min(b[0] for b in group), min(b[1] for b in group),
+                        max(b[2] for b in group), max(b[3] for b in group),
+                    ) & page_rect
+                    if not r.is_empty and r.width > 60 and r.height > 40:
+                        rects.append(r)
 
-        # 2) 词网格（无框线表格）：≥3 行 × ≥3 列对齐
+        # 2) 词网格（无框线表格）：多词行按 y 相邻聚类，每组 ≥3 行 × ≥3 列
         try:
             words = page.get_text("words")
         except Exception:
@@ -386,25 +422,34 @@ def _detect_table_rects(page) -> List:
                 rows.setdefault(int(w[1] // 4), []).append(w)
             table_rows = [ws for ws in rows.values() if len(ws) >= 3]
             if len(table_rows) >= 3:
-                xs = sorted({int(w[0] // 10) for ws in table_rows for w in ws})
-                cols = 0
-                last = None
-                for x in xs:
-                    if last is None or x - last > 1:
-                        cols += 1
-                    last = x
-                if cols >= 3:
-                    all_w = [w for ws in table_rows for w in ws]
+                row_boxes = [(min(w[0] for w in ws), min(w[1] for w in ws),
+                              max(w[2] for w in ws), max(w[3] for w in ws))
+                             for ws in table_rows]
+                for group in _cluster_rects(row_boxes, gap=40.0):
+                    if len(group) < 3:
+                        continue
+                    gw = [w for ws in table_rows
+                          if (min(w[0] for w in ws), min(w[1] for w in ws),
+                              max(w[2] for w in ws), max(w[3] for w in ws)) in group]
+                    xs = sorted({int(w[0] // 10) for w in gw})
+                    cols = 0
+                    last = None
+                    for x in xs:
+                        if last is None or x - last > 1:
+                            cols += 1
+                        last = x
+                    if cols < 3:
+                        continue
                     r = fitz.Rect(
-                        min(w[0] for w in all_w), min(w[1] for w in all_w),
-                        max(w[2] for w in all_w), max(w[3] for w in all_w),
-                    )
-                    r = r & page_rect
-                    if not r.is_empty and r.width > 60 and r.height > 40:
-                        # 与矢量线结果重叠则跳过（同一张表）
-                        if not any((r & e).get_area() > 0.5 * r.get_area()
-                                   for e in rects):
-                            rects.append(r)
+                        min(w[0] for w in gw), min(w[1] for w in gw),
+                        max(w[2] for w in gw), max(w[3] for w in gw),
+                    ) & page_rect
+                    if r.is_empty or r.width <= 60 or r.height <= 40:
+                        continue
+                    # 与矢量线结果重叠则跳过（同一张表）
+                    if not any((r & e).get_area() > 0.5 * r.get_area()
+                               for e in rects):
+                        rects.append(r)
     except Exception as e:
         logger.debug("表格区域检测失败: %s", e)
     return rects
