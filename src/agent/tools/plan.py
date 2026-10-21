@@ -282,11 +282,20 @@ class UpdatePlanTool(Tool):
 
     # ------------------------------------------------------------------
     def _notify(self, sess: Session) -> None:
-        """把计划变更推给 UI（面板实时刷新）。失败不影响计划本身已写入。"""
+        """把计划变更推给 UI（面板实时刷新）。失败不影响计划本身已写入。
+
+        必须传 **deepcopy**：update_plan 在工作线程执行，UI 的
+        ``_on_plan_updated`` 在 UI 线程遍历 ``plan["steps"]``——直接传活字典
+        会让面板渲染出半新半旧的中间态，遍历中遇到增删 step 还会抛
+        ``RuntimeError: dictionary changed size during iteration``（被
+        except 吞掉后面板静默变空）。session.py / agent.py 的同类 hook
+        都已用 deepcopy，这里补齐。
+        """
         try:
             cb = getattr(self.registry, "callbacks", None)
             hook = getattr(cb, "on_plan_updated", None)
             if callable(hook):
-                hook(sess.get_plan())
+                from copy import deepcopy
+                hook(deepcopy(sess.get_plan()))
         except Exception:
             pass

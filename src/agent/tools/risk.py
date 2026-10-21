@@ -33,10 +33,15 @@ _PATH_TOKEN_RE = re.compile(r"(?:[~/]|\.\./)[^\s'\"`|;&<>()\[\]{}]+")
 # os.symlink/os.rename/os.link/os.replace/shutil.move 这些同样能改文件系统
 # 拓扑的调用，导致 `os.rename("/etc/hosts", ...)` 这类改写系统文件的写法
 # 既零确认也不被任何护栏覆盖。
+# 2026-10-21 再修：pathlib / io / os 的文件 API 全部不在表内——
+# `Path("/etc/hosts").write_text(...)`、`io.open("/etc/hosts","w")`、
+# `os.open("/etc/hosts", os.O_WRONLY)` 三条路同时绕过确认门与写护栏
+# （code_run 的 open 护栏只替换了 builtins.open）。补齐这些记号。
 _PY_CALL_RE = re.compile(
     r"\b(os\.system|os\.popen|os\.remove|os\.unlink|os\.rmdir|os\.removedirs"
     r"|os\.chmod|os\.chown|os\.symlink|os\.link|os\.rename|os\.replace"
-    r"|os\.truncate|os\.makedirs|os\.mkdir"
+    r"|os\.truncate|os\.makedirs|os\.mkdir|os\.open|os\.fdopen"
+    r"|io\.open|pathlib\.Path|Path\.open|write_text|write_bytes|touch"
     r"|shutil\.rmtree|shutil\.chown|shutil\.move|shutil\.copy|shutil\.copy2"
     r"|shutil\.copytree|subprocess)\b"
 )
@@ -45,6 +50,8 @@ _PY_CALL_RE = re.compile(
 # 同时收录 Python 侧调用名：`python3 -c "shutil.rmtree('/Users/x')"` 这类写法
 # 不走任何 shell 动词，只靠解释器名是拦不住的（与危险路径同现才判风险，
 # 因此 `python3 script.py` 这种正常开发用法不会误报）。
+# 2026-10-21：补 pathlib / io / os 文件 API——`python3 -c
+# "from pathlib import Path; Path('/etc/hosts').write_text('x')"` 旧表完全不命中。
 _SHELL_VERB_RE = re.compile(
     r"\b(rm|rmdir|mv|cp|chmod|chown|ln|truncate|shred|tee|install|mkfile"
     r"|hdiutil|defaults"
@@ -53,7 +60,9 @@ _SHELL_VERB_RE = re.compile(
     # Python 侧等价的破坏性调用
     r"|rmtree|removedirs|unlink|os\.system|os\.popen|os\.remove|os\.unlink"
     r"|os\.rmdir|os\.removedirs|os\.chmod|os\.chown|os\.rename|os\.replace"
-    r"|os\.symlink|os\.link|os\.truncate|shutil\.rmtree|shutil\.move"
+    r"|os\.symlink|os\.link|os\.truncate|os\.open|os\.fdopen"
+    r"|io\.open|pathlib\.Path|write_text|write_bytes"
+    r"|shutil\.rmtree|shutil\.move"
     r"|shutil\.copy|shutil\.copy2|shutil\.copytree"
     r"|subprocess\.(run|call|check_call|check_output|Popen))\b"
 )

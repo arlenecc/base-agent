@@ -53,18 +53,37 @@ class LLMError(RuntimeError):
     pass
 
 
-def _tool_call_index(tc: Dict[str, Any]) -> int:
+def _tool_call_index(tc: Dict[str, Any], state: List[int]) -> int:
     """归一化 tool_call 的 ``index`` 为 int。
 
     少数兼容服务把 index 发成字符串（或并发多工具时省略）。原样当 key 会让
     两个后果二选一：同一次回复的多个 tool_call 因 key 不同而被合并进同一
     slot，或末尾 ``sorted(tool_acc)`` 抛 ``TypeError: '<' not supported
     between instances of 'str' and 'int'``。统一转 int，转不了按 0 归并。
+
+    省略 index 时（``state`` = [next_seq, last_slot]）：
+    * 带 ``id`` 或 ``function.name`` 的 delta 视为**新调用** → 分配递增
+      index（旧实现一律归 0，同一 delta 里多个无 index 调用的 arguments
+      被拼进同一 slot，产出非法 JSON）；
+    * 只有 ``function.arguments`` 的 delta 视为**参数片段** → 归并到上一
+      个 slot（连续流式输出的常态）。
     """
+    raw = tc.get("index")
+    if raw is None or raw == "":
+        fn = tc.get("function", {}) or {}
+        if tc.get("id") or fn.get("name"):
+            idx = state[0]
+            state[0] += 1
+        else:
+            idx = state[1]
+        state[1] = idx
+        return idx
     try:
-        return int(tc.get("index") or 0)
+        idx = int(raw)
     except (TypeError, ValueError):
-        return 0
+        idx = 0
+    state[1] = idx
+    return idx
 
 
 class LLMClient:
@@ -164,62 +183,77 @@ class LLMClient:
 
         tool_acc: Dict[int, Dict[str, Any]] = {}
         final_usage: Dict[str, int] = {}
+        # 无 index 兼容路径的状态：[next_seq, last_slot]，见 _tool_call_index
+        _tc_state: List[int] = [0, 0]
 
-        with self._http.stream("POST", url, headers=self._headers(), content=json.dumps(payload)) as resp:
-            if resp.status_code >= 400:
-                try:
-                    body = resp.read().decode("utf-8", errors="replace")
-                except Exception:
-                    body = ""
-                raise LLMError(f"chat_stream failed: HTTP {resp.status_code} {body[:300]}")
+        try:
+            with self._http.stream("POST", url, headers=self._headers(),
+                                   content=json.dumps(payload)) as resp:
+                if resp.status_code >= 400:
+                    try:
+                        body = resp.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        body = ""
+                    raise LLMError(
+                        f"chat_stream failed: HTTP {resp.status_code} {body[:300]}")
 
-            for raw in resp.iter_lines():
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else raw
-                if not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+                for raw in resp.iter_lines():
+                    if not raw:
+                        continue
+                    line = (raw.decode("utf-8", errors="replace")
+                            if isinstance(raw, (bytes, bytearray)) else raw)
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
 
-                if obj.get("usage"):
-                    final_usage = obj["usage"]
+                    if obj.get("usage"):
+                        final_usage = obj["usage"]
 
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                delta = choice.get("delta", {}) or {}
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta", {}) or {}
 
-                rc = delta.get("reasoning_content")
-                if rc:
-                    yield StreamEvent("reasoning", content=rc)
+                    rc = delta.get("reasoning_content")
+                    if rc:
+                        yield StreamEvent("reasoning", content=rc)
 
-                ct = delta.get("content")
-                if ct:
-                    yield StreamEvent("content", content=ct)
+                    ct = delta.get("content")
+                    if ct:
+                        yield StreamEvent("content", content=ct)
 
-                for tc in delta.get("tool_calls", []) or []:
-                    idx = _tool_call_index(tc)
-                    slot = tool_acc.setdefault(idx, {"id": "", "type": "function",
-                                                    "function": {"name": "", "arguments": ""}})
-                    if tc.get("id"):
-                        slot["id"] = tc["id"]
-                    if tc.get("type"):
-                        slot["type"] = tc["type"]
-                    fn = tc.get("function", {}) or {}
-                    if fn.get("name"):
-                        slot["function"]["name"] += fn["name"]
-                    if fn.get("arguments"):
-                        slot["function"]["arguments"] += fn["arguments"]
+                    for tc in delta.get("tool_calls", []) or []:
+                        idx = _tool_call_index(tc, _tc_state)
+                        slot = tool_acc.setdefault(
+                            idx, {"id": "", "type": "function",
+                                  "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        if tc.get("type"):
+                            slot["type"] = tc["type"]
+                        fn = tc.get("function", {}) or {}
+                        if fn.get("name"):
+                            slot["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            slot["function"]["arguments"] += fn["arguments"]
+        except httpx.HTTPError as e:
+            # 网络中断（ReadTimeout / ConnectError / RemoteProtocolError）在
+            # iter_lines 中途抛出的是 httpx.* 而不是 LLMError——调用方只捕
+            # LLMError 时会漏判真实断网，错误冒泡成难懂的原始异常。统一归一，
+            # 保留原文。
+            raise LLMError(f"chat_stream 网络错误: {type(e).__name__}: {e}") from e
 
         # sorted() 要求 key 可比：_tool_call_index 已保证全为 int。
-        yield StreamEvent("done", tool_calls=[tool_acc[k] for k in sorted(tool_acc)], usage=final_usage)
+        yield StreamEvent("done",
+                          tool_calls=[tool_acc[k] for k in sorted(tool_acc)],
+                          usage=final_usage)
 
     # ------------------------------------------------------------------
     def close(self) -> None:

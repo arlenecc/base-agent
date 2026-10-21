@@ -192,12 +192,14 @@ class AgentConfig:
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
                      "aux_temperature", "aux_top_p", "aux_min_p",
-                     "aux_repetition_penalty", "aux_request_timeout")
+                     "aux_repetition_penalty", "aux_request_timeout",
+                     # 这些是 float/bool 却被错分进 _STR_FIELDS —— config.json
+                     # 里手写成 "2.0" 或 2 后，运行期 set_ocr_scale_config 会
+                     # 把 str 当 truthy（bool）或对 float 比较报错。
+                     "rag_ocr_scale_base", "rag_ocr_scale_table")
     _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
                    "rag_embedding_model", "rag_rerank_model", "rag_pdf_engine",
                    "rag_ocr_engine", "rag_ocr_model_name", "rag_ocr_model_path",
-                   "rag_ocr_scale_base", "rag_ocr_scale_dynamic",
-                   "rag_ocr_scale_table",
                    "browser_endpoint", "llm_provider", "local_llm_model",
                    "local_llm_backend", "embedding_provider", "local_embedding_model",
                    "local_embedding_backend", "reranker_provider", "local_reranker_model",
@@ -206,7 +208,8 @@ class AgentConfig:
                    "aux_llm_provider", "aux_local_llm_model", "aux_local_llm_backend")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
-                   "local_llm_enable_thinking", "aux_local_llm_enable_thinking")
+                    "rag_ocr_scale_dynamic",
+                    "local_llm_enable_thinking", "aux_local_llm_enable_thinking")
 
     @classmethod
     def _coerce(cls, name: str, value):

@@ -155,7 +155,8 @@ def test_create_ocr_engine_injects_coreml_on_apple_silicon(monkeypatch):
         def __init__(self, **kw):
             captured.update(kw)
 
-    monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeRapidOCR)
+    # 显式指定 1.x 参数体系（与安装的是哪一版无关，保证测试确定性）
+    monkeypatch.setattr(oe, "_rapid_ocr_cls", lambda: (FakeRapidOCR, "1.x"))
     cls = oe._ort_infer_session_class()
     oe._patch_coreml_ep(cls)  # 模拟注入
     try:
@@ -168,6 +169,25 @@ def test_create_ocr_engine_injects_coreml_on_apple_silicon(monkeypatch):
         oe._unpatch_coreml_ep(cls)
 
 
+def test_create_ocr_engine_3x_params_path(monkeypatch):
+    """rapidocr 3.x 布局：用 params 点分键传 det 调优，失败降级裸构造。"""
+    captured = []
+
+    class FakeRapidOCR3x:
+        def __init__(self, config_path=None, params=None):
+            captured.append(params)
+            if params:
+                raise TypeError("simulated 3.x params rejection")
+
+    monkeypatch.setattr(oe, "_rapid_ocr_cls", lambda: (FakeRapidOCR3x, "3.x"))
+    eng = oe.create_ocr_engine(use_coreml=False)
+    assert isinstance(eng, FakeRapidOCR3x)
+    # 第一次带 Det.limit_side_len 调优失败，第二次裸构造兜底
+    assert len(captured) >= 2
+    assert captured[0]["Det.limit_side_len"] == oe._DET_LIMIT_SIDE_LEN
+    assert captured[-1] == {}
+
+
 def test_create_ocr_engine_no_coreml_when_disabled(monkeypatch):
     """use_coreml=False → 不注入、不报错，且仍带 det_limit_side_len 参数。"""
     captured = {}
@@ -176,7 +196,7 @@ def test_create_ocr_engine_no_coreml_when_disabled(monkeypatch):
         def __init__(self, **kw):
             captured.update(kw)
 
-    monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeRapidOCR)
+    monkeypatch.setattr(oe, "_rapid_ocr_cls", lambda: (FakeRapidOCR, "1.x"))
     cls = oe._ort_infer_session_class()
     if hasattr(cls, "_get_ep_list"):
         was_patched = getattr(cls._get_ep_list, "_coreml_patched", False)
@@ -216,7 +236,7 @@ def test_create_ocr_engine_survives_kwargs_incompatibility(monkeypatch):
             if any(k.startswith("det_") for k in kw) and "det_model_path" not in kw:
                 raise KeyError("model_path")
 
-    monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeRapidOCR12x)
+    monkeypatch.setattr(oe, "_rapid_ocr_cls", lambda: (FakeRapidOCR12x, "1.x"))
     eng = oe.create_ocr_engine(use_coreml=False)
     assert isinstance(eng, FakeRapidOCR12x)
     # 第一次带完整调优参数失败，第二次补 det_model_path 成功
@@ -233,7 +253,7 @@ def test_create_ocr_engine_falls_back_to_bare(monkeypatch):
             if kw:
                 raise TypeError("unexpected keyword argument")
 
-    monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeRapidOCRStrict)
+    monkeypatch.setattr(oe, "_rapid_ocr_cls", lambda: (FakeRapidOCRStrict, "1.x"))
     eng = oe.create_ocr_engine(use_coreml=False)
     assert isinstance(eng, FakeRapidOCRStrict)
 

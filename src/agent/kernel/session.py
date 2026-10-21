@@ -329,9 +329,14 @@ class Session:
         cur = self.turns[-1]
         completed = self.turns[:-1]
         keep = min(self.raw_turns, len(completed))
+        # 收缩阈值必须与越界判定同一口径：``remaining_for_raw()`` 还要再扣掉
+        # system/earlier/tools 的超支（overspent）。旧实现只跟 quota.raw 比，
+        # 长系统提示 + 25 个工具 schema 很容易让那两个区超配额，此时原文窗
+        # 不收缩 → 实际发送量越过 30k，只能等 API 报 context_length 再兜底。
+        raw_ceiling = self.budget.quota.raw - self.budget.overspent()
         while keep > 0 and estimate_tokens(
             self._render_raw(completed[-keep:] + [cur])
-        ) > self.budget.quota.raw:
+        ) > raw_ceiling:
             keep -= 1
         old = completed[:-keep] if keep else list(completed)
         raw = (completed[-keep:] if keep else []) + [cur]

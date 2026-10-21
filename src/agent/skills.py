@@ -66,6 +66,15 @@ class Skill:
 
     def score(self, text: str) -> int:
         toks = set(_keywords_of(text))
+        return self.score_tokens(toks)
+
+    def score_tokens(self, toks: set) -> int:
+        """用**已分词**的 token 集合打分（match() 的对多技能快速路径）。
+
+        ``score(text)`` 内部每次都对同一 text 重新分词（中文还要展开二元组），
+        ``match()`` 对每个技能调一次 → 同一 query 被分词 N 次。技能量大时
+        每轮对话都是明显 CPU 浪费。保留 ``score(text)`` 作兼容入口。
+        """
         return sum(1 for k in self.keywords if k.lower() in toks)
 
 
@@ -239,8 +248,10 @@ class SkillManager:
     def match(self, text: str) -> Optional[Skill]:
         best: Optional[Skill] = None
         best_score = 0
+        # 分词一次，全部技能共用（旧实现每技能内部各分词一遍）
+        toks = set(_keywords_of(text))
         for s in self.list():
-            sc = s.score(text)
+            sc = s.score_tokens(toks)
             if sc > best_score:
                 best_score = sc
                 best = s

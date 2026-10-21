@@ -305,18 +305,28 @@ def _unregister_proc(proc: subprocess.Popen) -> None:
 
 
 def kill_all_running_procs() -> int:
-    """回收所有仍在跑的 shell_run 子进程（进程退出 / shutdown 时调用）。"""
-    with _LIVE_PROCS_LOCK:
-        procs = list(_LIVE_PROCS)
-        _LIVE_PROCS.clear()
+    """回收所有仍在跑的 shell_run 子进程（进程退出 / shutdown 时调用）。
+
+    收敛多轮 + 逐个 discard：旧实现 ``list()`` 快照后立刻 ``clear()``，
+    快照与 clear 之间新登记的进程会被静默丢弃（永不回收 → 孤儿）。
+    现在每轮只快照不清集合，杀完一个 discard 一个；最多 3 轮收敛，
+    处理「杀的过程中又有新进程登记」的极端竞态（正常 teardown 不会发生）。
+    """
     killed = 0
-    for proc in procs:
-        try:
-            if proc.poll() is None:
-                _kill_process_group(proc)
-                killed += 1
-        except Exception:
-            pass
+    for _ in range(3):
+        with _LIVE_PROCS_LOCK:
+            procs = list(_LIVE_PROCS)
+        if not procs:
+            break
+        for proc in procs:
+            try:
+                if proc.poll() is None:
+                    _kill_process_group(proc)
+                    killed += 1
+            except Exception:
+                pass
+            finally:
+                _unregister_proc(proc)
     return killed
 
 
@@ -390,8 +400,16 @@ def _run_capture(command: str, cwd: str, timeout: float,
                     pass
 
         # Give the reader threads a moment to drain whatever is left in the pipes.
-        t_out.join(timeout=2.0)
-        t_err.join(timeout=2.0)
+        out_done = t_out.join(timeout=2.0)
+        err_done = t_err.join(timeout=2.0)
+        if not out_done or not err_done:
+            # reader 还没读完（孙进程仍持有管道写端）：命令尾部输出会进不了
+            # collector。旧实现静默丢弃——模型以为看到的是完整输出。明确标注。
+            note = "\n… [子进程仍在写入，输出可能不完整]"
+            if not out_done:
+                out.feed(note)
+            if not err_done:
+                err.feed(note)
         # 只有 reader 真的结束了才关管道：孙进程仍持有管道写端时，reader 阻塞
         # 在 read() 里并占着 TextIOWrapper 的内部锁，此时 close()→flush() 会
         # **永久挂起**工具线程（旧实现无条件 close）。reader 活着就交给它自己

@@ -73,6 +73,10 @@ EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
     ".tsv": [],
     ".html": [DepSpec("bs4", "beautifulsoup4", "HTML 解析")],
     ".htm":  [DepSpec("bs4", "beautifulsoup4", "HTML 解析")],
+    # LaTeX：优先 pandoc 外部命令（ebook_parser），无 pandoc 时 parsers 走
+    # 纯文本兜底，无 Python 依赖。列空条目保持与 SUPPORTED_EXTENSIONS 对齐。
+    ".tex": [],
+    ".latex": [],
 }
 
 # Core RAG infrastructure (always checked, always required)
@@ -210,7 +214,7 @@ class DependencyReport:
 
         if self.has_image_pdf and not self.ocr_installed:
             lines.append("知识库包含图片版 PDF，但 OCR 引擎未安装：")
-            lines.append("  - rapidocr-onnxruntime (pip install rapidocr-onnxruntime)")
+            lines.append("  - rapidocr (pip install rapidocr)")
         if self.missing_optional:
             lines.append("缺少可选依赖（部分功能受限）：")
             for d in self.missing_optional:

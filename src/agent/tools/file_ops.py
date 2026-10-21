@@ -172,12 +172,21 @@ class FileWriteTool(_FileTool):
                     "shell_run with a heredoc / streaming write for large files."
                 ),
             )
+        parent = os.path.dirname(full) or "."
         try:
             # makedirs 也放进 try：磁盘满/只读目录/权限不足都表现为 OSError，
             # 应作为工具失败返回而不是让 registry 兜底成裸异常。
-            os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+            os.makedirs(parent, exist_ok=True)
             _atomic_write(full, content)
         except OSError as e:
+            # makedirs 成功但写入失败时，别把新建的空目录留在磁盘上
+            # （下次 list 会看到幽灵目录，模型也会被误导）。
+            try:
+                if (parent != "." and os.path.isdir(parent)
+                        and not os.listdir(parent)):
+                    os.rmdir(parent)
+            except OSError:
+                pass
             return ToolResult(False, error=f"Write failed: {e}")
         return ToolResult(True, output=f"Wrote {len(content)} chars to {path}")
 

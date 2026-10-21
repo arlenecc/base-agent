@@ -146,10 +146,13 @@ _patch_lock = threading.Lock()
 def _ort_infer_session_class():
     """Locate RapidOCR's ``OrtInferSession`` across package layouts.
 
-    Different rapidocr_onnxruntime releases place it in different modules:
+    覆盖三套布局：
 
-    * 1.2.x（当前最新版）→ ``rapidocr_onnxruntime.utils``，且 EP 列表在
-      ``__init__`` 里内联构建，**没有** ``_get_ep_list`` 方法；
+    * rapidocr 3.x（统一包名）→ ``rapidocr.inference_engine.onnxruntime.main``
+      （EP 列表由 ``ProviderConfig.get_ep_list()`` 产出，经模块级
+      ``InferenceSession`` 工厂注入，见路径 2）；
+    * rapidocr_onnxruntime 1.2.x → ``rapidocr_onnxruntime.utils``，且 EP 列表
+      在 ``__init__`` 里内联构建，**没有** ``_get_ep_list`` 方法；
     * 其它发布 → 各推理引擎子模块，多数暴露 ``_get_ep_list``。
 
     只按「模块里有 OrtInferSession」判定，不要求 ``_get_ep_list`` ——
@@ -157,7 +160,10 @@ def _ort_infer_session_class():
     静默失效（日志只打「找不到 OrtInferSession」）。
     """
     candidates = (
-        "rapidocr_onnxruntime.utils",                          # 1.2.x（实际布局）
+        "rapidocr.inference_engine.onnxruntime.main",       # 3.x（实际布局）
+        "rapidocr.inference_engine.onnxruntime",            # 3.x（包级再导出）
+        "rapidocr.inference_engine.base",                   # 3.x（再导出兜底）
+        "rapidocr_onnxruntime.utils",                       # 1.2.x（实际布局）
         "rapidocr_onnxruntime.utils.infer_engine",
         "rapidocr_onnxruntime.utils.ort_infer_engine",
         "rapidocr_onnxruntime.inference_engine.ort_inference_engine",
@@ -295,31 +301,62 @@ def _engine_kwargs(**overrides) -> Dict[str, Any]:
     return kwargs
 
 
-def _build_rapid_ocr(engine_kwargs: Dict[str, Any]):
-    """构造 RapidOCR 引擎，兼容各版本的 kwargs 体系。
+def _rapid_ocr_cls():
+    """返回 ``(RapidOCR 类, 版本代次)``：3.x 优先，1.x 回退。
 
-    rapidocr 1.2.x 的 ``UpdateParameters`` 在收到**任何** ``det_*``
-    kwargs 时都会无条件读 ``det_dict['model_path']`` —— 只传
-    ``det_limit_side_len`` 而不传 ``det_model_path`` 会直接
-    ``KeyError: 'model_path'``（上游缺陷），引擎根本建不起来，表现为
-    「明明装了 rapidocr 却提示未安装」。旧版（1.1.x）的 argparse 体系
-    则不认 ``det_model_path`` 这个多余参数。
+    版本代次 ``"3.x"`` / ``"1.x"`` 决定构造参数体系（见
+    :func:`_build_rapid_ocr`）。集中在一个函数里解析，测试可对它打补丁，
+    无需关心环境里装的是哪一版。
+    """
+    try:
+        from rapidocr import RapidOCR  # 3.x 统一包名
+        return RapidOCR, "3.x"
+    except ImportError:
+        from rapidocr_onnxruntime import RapidOCR  # 1.x 旧包名
+        return RapidOCR, "1.x"
+
+
+def _build_rapid_ocr(engine_kwargs: Dict[str, Any]):
+    """构造 RapidOCR 引擎，兼容 3.x 的 params 体系与 1.x 的 kwargs 体系。
+
+    3.x：``RapidOCR(params={...})``，点分键（``Det.limit_side_len``）。
+    1.x：``RapidOCR(**kwargs)``，扁平键（``det_limit_side_len``）——其
+    ``UpdateParameters`` 在收到**任何** ``det_*`` kwargs 时都会无条件读
+    ``det_dict['model_path']``，只传 ``det_limit_side_len`` 而不传
+    ``det_model_path`` 会直接 ``KeyError: 'model_path'``（上游缺陷），引擎
+    根本建不起来，表现为「明明装了 rapidocr 却提示未安装」。
 
     因此按顺序降级重试，任一成功即返回：
-    1. 完整 kwargs（保留 1024 分辨率调优）；
-    2. 补 ``det_model_path=""`` —— 空值让 1.2.x 回退到自带模型路径；
+    1. 完整参数（保留 1024 分辨率调优）；
+    2. 1.x 补 ``det_model_path=""``（空值回退自带模型路径）；
     3. 裸构造 —— 放弃调优也要保证 OCR 可用。
     """
-    from rapidocr_onnxruntime import RapidOCR
+    cls, gen = _rapid_ocr_cls()
+    if gen == "3.x":
+        attempts = [
+            {"Det.limit_side_len": engine_kwargs["det_limit_side_len"],
+             "Det.limit_type": engine_kwargs.get("det_limit_type", "min")},
+            {},
+        ]
+        last_exc: Optional[BaseException] = None
+        for params in attempts:
+            try:
+                return cls(params=params)
+            except (KeyError, TypeError) as e:
+                last_exc = e
+                logger.debug("OCR: RapidOCR(params=%s) 失败，降级重试: %s",
+                             sorted(params), e)
+        assert last_exc is not None
+        raise last_exc
 
     with_model_path = dict(engine_kwargs)
     with_model_path.setdefault("det_model_path", "")
     attempts = [engine_kwargs, with_model_path, {}]
 
-    last_exc: Optional[BaseException] = None
+    last_exc = None
     for kw in attempts:
         try:
-            return RapidOCR(**kw)
+            return cls(**kw)
         except (KeyError, TypeError) as e:
             # kwargs 体系不兼容 → 换下一组更保守的参数。
             # 其它异常（模型下载失败等）直接上抛，重试没有意义。

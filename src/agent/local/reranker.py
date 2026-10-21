@@ -54,6 +54,15 @@ class LocalReranker:
         self._loaded = False
         self._is_logits: Optional[bool] = None   # 首次打分时探测
 
+    def close(self) -> None:
+        """释放后端权重 / ONNX InferenceSession（单例淘汰与测试清理用）。"""
+        with self._load_lock:
+            self._model = None
+            self._tokenizer = None
+            self._session = None
+            self._loaded = False
+            self._is_logits = None
+
     # ------------------------------------------------------------------
     def _ensure_model(self) -> None:
         if self._loaded:

@@ -120,6 +120,11 @@ class GraphMemoryStore:
         self._pending_lock = threading.Lock()
         self._entities: Dict[str, dict] = {}  # name → entity
         self._relations: List[dict] = []
+        # 关系判重索引（source.lower, target.lower, label.lower) → set：
+        # create_relation 旧实现每次全表线性扫描判重并持全局锁，关系密集时
+        # 写入退化为 O(N²)（上限 _MAX_RELATIONS=20000）。列表只在 prune /
+        # delete / clear / load 这些**整体重排**的路径上变更，届时重建索引。
+        self._relation_keys: set = set()
         self._db = None
         self._table = None
         self._ef = None
@@ -190,11 +195,28 @@ class GraphMemoryStore:
                 })
             self._entities = entities
             self._relations = relations
+            self._rebuild_relation_keys_locked()
         except (OSError, json.JSONDecodeError, ValueError) as e:
             logger.warning("graph_memory: failed to load %s: %s", self._path, e)
             backup_corrupt(self._path)
             self._entities = {}
             self._relations = []
+            self._relation_keys = set()
+
+    def _rebuild_relation_keys_locked(self) -> None:
+        """重建关系判重索引。必须在 ``_lock`` 内调用。
+
+        只在 load / prune / delete_entity / clear 这些整体重排路径上调用；
+        create_relation 走 O(1) 增量维护，不做全表重建。
+        """
+        self._relation_keys = {
+            (r["source"].lower(), r["target"].lower(), r["label"].lower())
+            for r in self._relations
+        }
+
+    @staticmethod
+    def _relation_key(source: str, target: str, label: str) -> tuple:
+        return (source.lower(), target.lower(), label.lower())
 
     def _save(self, force: bool = False) -> None:
         """Atomic write (debounced unless ``force``). Must be called under _lock.
@@ -265,6 +287,7 @@ class GraphMemoryStore:
                     r for r in self._relations
                     if r["source"].lower() not in dead and r["target"].lower() not in dead
                 ]
+                self._rebuild_relation_keys_locked()
             logger.info(
                 "graph_memory: evicted %d oldest entities (cap=%d)",
                 excess, _MAX_ENTITIES)
@@ -272,6 +295,7 @@ class GraphMemoryStore:
         if len(self._relations) > _MAX_RELATIONS:
             drop = len(self._relations) - _MAX_RELATIONS
             del self._relations[:drop]
+            self._rebuild_relation_keys_locked()
             logger.info("graph_memory: pruned %d oldest relations (cap=%d)",
                         drop, _MAX_RELATIONS)
 
@@ -331,6 +355,16 @@ class GraphMemoryStore:
                 # Non-fatal: semantic search just falls back to keyword.
                 logger.debug("graph_memory: vector index unavailable: %s", e)
                 self._vec_ready = False
+                # 已 connect 成功但后续（EF 获取 / open_table）失败时，
+                # self._db 是悬挂引用——旧实现留着它走到 keyword 分支，
+                # 连接在 close() 前一直开着。这里回滚，避免句柄泄漏。
+                if self._db is not None:
+                    try:
+                        self._db = None
+                    except Exception:
+                        pass
+                self._table = None
+                self._ef = None
             finally:
                 # 只尝试一次：lancedb/fastembed 缺失的环境下，旧的
                 # 「失败不记忆」会让每次 search() 都重新 connect + import
@@ -609,6 +643,7 @@ class GraphMemoryStore:
                 r for r in self._relations
                 if r["source"].lower() != key and r["target"].lower() != key
             ]
+            self._rebuild_relation_keys_locked()
             self._save(force=True)
         # 向量删除移到锁外：_deindex_observations 内部是全表物化 + 逐条 delete，
         # 锁内执行会阻塞所有图读取（同 _index_observations_batch 的设计理由）。
@@ -683,17 +718,17 @@ class GraphMemoryStore:
                         "observations": [],
                         "created_at": _now(),
                     }
-            # Dedup: same source+target+label = same relation
-            for r in self._relations:
-                if (r["source"].lower() == source.lower()
-                        and r["target"].lower() == target.lower()
-                        and r["label"].lower() == label.lower()):
-                    return False
+            # Dedup: same source+target+label = same relation（O(1) 索引判定，
+            # 旧实现每次全表线性扫描并持全局锁，关系密集时写入退化 O(N²)）
+            rk = self._relation_key(source, target, label)
+            if rk in self._relation_keys:
+                return False
             self._relations.append({
                 "source": source,
                 "target": target,
                 "label": label,
             })
+            self._relation_keys.add(rk)
             self._prune_locked()
             self._save()
             result_ok = True
@@ -822,6 +857,7 @@ class GraphMemoryStore:
         with self._lock:
             self._entities = {}
             self._relations = []
+            self._relation_keys = set()
             self._save(force=True)
         # Drop vector table
         if self._db is not None:

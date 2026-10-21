@@ -338,7 +338,14 @@ class KernelLoop:
                 reason = "预算告罄" if over else f"每 {self.consolidate_every} 轮"
                 # 周期性沉淀也必须真的折叠（旧代码这里传 0，force_fold 变成空操作），
                 # 否则 turns 只会增长、extra_digest 永远为空。
-                folded = session.force_fold(3 if over else 1)
+                #
+                # 折叠量必须匹配原文窗口：consolidate_every 默认 4（每 4 轮
+                # 触发一次），旧实现恒折 1 轮 → 净增长 +3 轮/4 轮，turns
+                # （每条都带 raw_content / prompt / tool_results，推理模型
+                # 单轮几十 KB）无界增长，与「L2+L3 历史 O(1)」的设计直接
+                # 矛盾。现在一律压到 raw_turns + 1（原文窗口 + 当前轮）。
+                keep = session.raw_turns + 1
+                folded = session.force_fold(max(1, len(session.turns) - keep))
                 if folded:
                     # 历史被改写了（旧轮次摘掉、换成摘要行）→ 缓存里那几轮的
                     # token 序列已不复存在，必须丢弃；否则下一轮会拿「对应旧
@@ -399,6 +406,10 @@ class KernelLoop:
                         pass
                     if shrunk:
                         self.log(f"[kernel] 上下文超长，兜底收缩后重试 ({self._shrink_guard})")
+                        # 重置 pending：否则重试循环会在下一轮把规划门提示
+                        # **再次**追加到已含提示的 pending 上（最多 3 份相同
+                        # 段落重复进 prompt，纯浪费 token）。
+                        pending = user_input
                         continue
                     # 没东西可压了 —— 再发一次同样的超长 prompt 没有意义。
                 self.log(f"[kernel] LLM error: {e}")
@@ -621,6 +632,7 @@ class KernelLoop:
             else:
                 self._repeat_streak = 0
             self._last_call_sigs = sigs
+            repeat_warn: Optional[str] = None
             if self._repeat_streak >= _REPEAT_CALL_WARN:
                 self.log(
                     "[kernel] 连续 %d 次相同的工具调用（%s）→ 判定卡住"
@@ -630,7 +642,11 @@ class KernelLoop:
                     self.log("[kernel] 重复调用达到上限，结束本轮")
                     exit_reason = ExitReason.DONE
                     break
-                pending = (
+                # 只收集、不直接赋值 pending：pending 会在下面被
+                # `pending = "\n".join(parts)` 整体覆盖（_to_outcomes 对每个
+                # outcome 恒设 next_prompt="\n"，`if not next_prompts` 分支
+                # 永不成立），直接赋值等于提醒被静默丢弃、模型从未被告知。
+                repeat_warn = (
                     f"[System] 你已经连续 {self._repeat_streak + 1} 次调用**完全相同**的"
                     f"工具与参数（{tool_calls[0].name}）——这不会让任务前进哪怕一步。"
                     "立刻换一个动作：\n"
@@ -690,6 +706,9 @@ class KernelLoop:
                     "之后每完成一步用 update_plan(op='patch', step_id=..., "
                     "status='done', note='结论') 更新进度。计划每轮回注，是跟踪推进的依据。"
                 )
+            # 重复调用提醒放在最后拼入（必须在 pending 赋值之前 append）。
+            if repeat_warn:
+                parts.append(repeat_warn)
             pending = "\n".join(parts)
             self.state = next_state(KernelState.ACT, "continue")
         else:
@@ -775,6 +794,10 @@ class KernelLoop:
 
         while True:
             content_buf, reasoning_buf, calls, usage = [], [], [], {}
+            # raw_buf 也必须随重试重置：旧实现漏了它。当前不会出错（got_any=False
+            # 时不可能收到 done 事件），但属于脆弱点——一旦重试路径提前 break，
+            # 上一轮的 raw_content 会污染本轮的双视图历史。
+            raw_buf = ""
             ttfb = last_emit = None
             live_est = 0
             got_any = False

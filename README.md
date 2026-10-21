@@ -651,7 +651,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启清理残留等。
 
-当前共 640 个用例全部通过（`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`；未安装这些可选依赖时报环境错误，不影响其余测试）。
+当前共 682 个用例全部通过（`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`；未安装这些可选依赖时报环境错误，不影响其余测试）。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 
@@ -996,6 +996,56 @@ rapidocr 模块上验证 CoreML providers 真的排到最前、CPU 保留作回�
 回归测试：`tests/test_kernel.py` 新增「一次性提示必须活过 rollback」用例；
 `tests/test_confirm_policy.py` 覆盖新增的绕过向量；`tests/test_rag_manifest.py`
 覆盖 `delete_document` 双键删除。
+
+### 第十四轮：全量代码重审（正确性 / 内存泄漏 / 性能 / 体验）
+
+对全部源码再次逐文件重审（内核 / 工具 / RAG / 本地模型 / UI 分层审查），按
+严重度修复。核心是四类：**控制流与上下文治理的静默失效**、**资源泄漏**、
+**并发竞态**、**性能与体验**。详见 [软件设计文档 §16](docs/软件设计文档.md)。
+
+| # | 问题 | 影响 | 修复 |
+|---|------|------|------|
+| 220 | `Agent.run()` 无 try/finally | 内核任一未覆盖异常路径让 `on_finished` 不触发，UI 永久停在「思考中」 | 整段包 try/finally，正常/取消/异常/空回复四类出口都触发 finished + 按原因给可见文案 |
+| 221 | 周期性 CONSOLIDATE 恒折 1 轮 | `turns` 净增长 +3 轮/4 轮，与「L2+L3 历史 O(1)」矛盾，长跑线性膨胀 | 折叠量匹配 `raw_turns+1` 窗口，每轮沉淀把 turns 压回窗口 |
+| 222 | `_windows` 收缩阈值只跟 `quota.raw` 比 | system/earlier/tools 超支时原文窗不收缩 → 实际发送量越过 30k | 阈值改 `quota.raw - overspent()`，与越界判定同一口径 |
+| 223 | `l3_fold` 同类项合并是死代码 | 每行带唯一 `[T{n}]` 前缀，整行比较永不相等，`cnt` 永不递增 | 按「剥掉前缀后的正文」比较，输出保留原行可追溯 |
+| 224 | `l1_trim` HTML 降噪正则啃坏代码 | `std::vector<int>`→`std::vector `、`if a<b && c>d` 被改写，file_read/shell 返回的源码静默变形 | 改为 HTML 标签白名单正则，非白名单尖括号原样保留 |
+| 225 | `plan._notify` 传活字典给 UI 线程 | 面板渲染半新半旧中间态，遍历中增删 step 抛 RuntimeError | 传 deepcopy（与 session/agent 同类 hook 对齐） |
+| 226 | 空回复按原因给错文案 | 用户点「终止对话」却被告知「模型返回空响应」；LLM 报错时看不到真实错误 | 按 ExitReason 分流：CANCELLED/ERROR/其它各给对应文案 |
+| 227 | `_estimate_tokens` 与 `budget.estimate_tokens` 两套口径 | tok/s 显示与预算记账对同段文本算出两个数 | 统一复用 `budget.estimate_tokens` |
+| 228 | 并行工具执行双重起线程 + 忙等 | 池 worker 再调 `_execute_tool` 各起一根 10Hz 轮询线程，8 并发 = 16 线程其中 8 纯忙等 | 新增 `_exec_tool_blocking` 供池内直接调用，取消语义由 dispatcher 兜底 |
+| 229 | 工作记忆注入无总量上限 | key 由模型自由创建，系统提示不在压缩范围，随会话挤爆 30k | 加 `_MAX_WM_KEYS=20` / `_MAX_WM_CHARS=2000` 双重钳制 |
+| 230 | 上下文收缩重试时规划门提示重复附加 | 同一段 `_PLAN_GATE_HINT` 进 prompt 最多 3 份 | 重试 `continue` 前重置 `pending=user_input` |
+| 231 | `_ask` 重试时 `raw_buf` 未随重置 | 当前不出错但属脆弱点，重试路径提前 break 会污染双视图历史 | 每轮重置 `raw_buf=""` |
+| 232 | `web_scan` `follow_redirects=True` 只禁跨协议 | 公网 URL 可被 302 引到云元数据/loopback/内网（SSRF） | 手动逐跳跟随 + 目标网段判定（`_is_blocked_host`） |
+| 233 | bs4 缺失时 `web_scan` 回退正则 ReDoS | `<script.*?</script>` 配 re.S 在超长未闭合 HTML 上大量回溯 | 改用 `str.find` 线性扫描（`_strip_blocks_linear`），任何输入 O(n) |
+| 234 | `web_scan` 20000 截断无标记 | 静默硬切让模型把半截输出当全文 | 统一 `_truncate_marked` 加「已截断」标注 |
+| 235 | `webexec_js` 非合法 JSON body 抛 JSONDecodeError 逃逸 | 被外层 except 误报成无上下文的裸异常 | content-type 声称 JSON 但解析失败时回退原文 + note |
+| 236 | MCP reader 循环每轮读 `self._process` | stop() 置 None 后已通过检查的 readline 抛 ValueError，正常停止被误报成「连接丢失」并触发误重连 | 局部持有 pipe 引用 |
+| 237 | MCP server 注册 0 工具仍留在 `_mcp_clients` | 全重名/空列表的 server 子进程 + 3 线程纯白占 | 注册数为 0 时立即 stop 并移出列表 |
+| 238 | `ToolRegistry._signature_cache` 普通dict只增不减 | 测试/cli 动态生成的工具子类回收后仍留一条 Signature | 改 `WeakKeyDictionary` |
+| 239 | `shell_run` reader join 超时静默丢迟到输出 | 模型以为看到的是完整输出 | 超时给 collector 注入「子进程仍在写入，输出可能不完整」标记 |
+| 240 | `_BoundedIO.write` 截断返回 0 | 违反 write 契约，print/第三方代码误判写入失败 | 截断后返回 `len(s)` |
+| 241 | `memory_graph`/`memory_search` 输出无体积上限 | 单实体累积数十 KB observation 全塞上下文 | `get_entity` 观察按 50 条/4000 字符截断；统一 `_cap_output` 200K 兜底 |
+| 242 | `tools.memory._long_memory` 每轮一条 deprecation warning | agent 每轮调一次，日志被洪水刷掉 | 只警告一次（`_long_memory_warned` 标志） |
+| 243 | `rag_ingest` 同步管线不可取消 | 用户点「终止对话」要等整库跑完 | 用 `progress_callback` 轮询终止标志，命中即 `engine.cancel()`（引擎签名不接受该参数时自动跳过） |
+| 244 | `rag_search`/`rag_outline` 回退输出无截断 | 一次检索撑爆上下文 | 统一 `_cap_output` 200K + 文档列表截到 100 |
+| 245 | `file_write` makedirs 成功但写入失败留空目录 | 下次 list 看到幽灵目录，模型被误导 | 失败时清理新建的空目录 |
+| 246 | `llm_client` `chat_stream` 网络中断抛 httpx.* 非 LLMError | 调用方只捕 LLMError 时漏判真实断网 | `except httpx.HTTPError` 归一为 `LLMError` |
+| 247 | 并行 tool_calls 无 index 时全归 slot 0 | 多个无 index 调用的 arguments 拼进同一 slot，产出非法 JSON | 按 id/name 判定新调用分配递增 index，纯参数片段归并上一 slot |
+| 248 | MLX/ONNX 后端 `usage` 恒空 | tok/s 显示与计量全失效 | MLX/ONNX done 事件填 prompt/completion/total tokens |
+| 249 | GGUF `n_ctx` 硬编码 4096 与 `max_tokens` 不匹配 | 长上下文生成早停/报错，max_tokens 形同虚设 | `n_ctx` 由 max_tokens 推导（+1k 余量，下限 8192） |
+| 250 | `Skill.match` 对每技能重新分词 | 同一 query 被分词 N 次，技能多时每轮浪费 CPU | 分词一次共用（`score_tokens`） |
+| 251 | `graph_memory.create_relation` 全表线性判重 | 关系密集时写入退化 O(N²)，持全局锁 | 维护 `_relation_keys` set，O(1) 判重 + 各变更点重建 |
+| 252 | `_ensure_vectors` 异常后 `_db` 悬挂 | EF 获取/open_table 失败时连接不关 | except 分支回滚 `_db/_table/_ef` |
+| 253 | `config` 把 `rag_ocr_scale_*` 错分进 `_STR_FIELDS` | config.json 手写成 "2.0"/2 后运行期 `set_ocr_scale_config` 把 str 当 truthy | 移到 `_FLOAT_FIELDS`/`_BOOL_FIELDS` |
+| 254 | `_on_unload_main_model` 只关 client 不收尾 agent | MCP 子进程/httpx/ONNX/LanceDB 全泄漏，常驻 worker 仍引用旧 agent | 一并 `agent.close()` + `tools.shutdown()` |
+| 255 | `_rebuild_agent` `wait(2000)` 无成功检查 | 未结束的 worker 引用归零触发 sip 析构 → qFatal | 超时挂 `_orphan_workers`，closeEvent 统一 wait |
+| 256 | `_preload_client` daemon 线程无跟踪 | 连点「加载模型」起 N 个加载线程抢 GPU 内存 | 同 key 前一个未结束不再起新；引用归 `_preload_threads` |
+| 257 | 知识同步与 agent 运行无互斥 | ingest 与检索抢同一向量表，「table modified during query」 | `_on_sync_knowledge` 在 `_busy` 时拒绝并提示先终止对话 |
+| 258 | `_set_controls_busy` 重置同步控件 | agent 一跑同步按钮变回可点，与 agent 检索抢表 | `_sync_active` 期间跳过对同步控件/进度条的重置 |
+| 259 | `add_streaming` 后续批次「先删后嵌」拉长空窗 | embed 耗时数秒内该 source 在库中被删空，并发检索返回空 | 改为「先嵌后删+写」（与首批同序），空窗缩到一次 add |
+| 260 | `reload()` 无脑清 FTS 标志 | 同步后首次检索全库重建 BM25（秒级到分钟级），索引其实在磁盘 | 探测磁盘索引存在则直接 `_fts_ready=True`，不存在才回落重建 |
 
 ## 部署
 

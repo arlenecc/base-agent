@@ -1,19 +1,20 @@
 """code_run tool: execute arbitrary Python in a sandboxed namespace.
 
 Executes with the workspace as cwd. File writes outside the workspace are
-blocked by a guarded builtins.open wrapper, while still allowing pip installs
-and network access (the whole point of code_run). A timeout prevents infinite
-loops from hanging the agent.
+blocked by guarded open wrappers (builtins.open + 进程级 io.open / os.open
+线程局部包装，后者覆盖 pathlib.Path.write_text 等走 io.open 的路径），while
+still allowing pip installs and network access (the whole point of code_run).
+A timeout prevents infinite loops from hanging the agent.
 
-写入护栏只是**提示性的**，不是沙箱：它替换了命名空间里的 ``open``，
-``io.open`` / ``pathlib.Path.write_text`` / ``os.remove`` / ``shutil`` /
-``subprocess`` 都不受约束，``__import__`` 也可绕过。真正的隔离只能靠
-容器或独立进程。
+写入护栏只是**提示性的**，不是沙箱：``os.remove`` / ``shutil`` /
+``subprocess`` 等非 open 系 API 不受约束，``__import__`` 也可绕过。真正的
+隔离只能靠容器或独立进程。
 
 因此**风险分级**（``tools/risk.py``）才是第一道防线：凡是可能改写文件系统
-拓扑的调用（``os.symlink/os.rename/os.link/os.replace/shutil.move`` …）与
-工作区之外的路径字面量同现，就必须弹人工确认。写护栏在这里只负责兜住「忘了
-弹确认」的漏网情况，而不是唯一依赖。
+拓扑的调用（``os.symlink/os.rename/os.link/os.replace/shutil.move`` /
+``pathlib.Path`` / ``io.open`` / ``os.open`` …）与工作区之外的路径字面量
+同现，就必须弹人工确认。写护栏在这里只负责兜住「忘了弹确认」的漏网情况，
+而不是唯一依赖。
 
 Timeout handling: Python threads cannot be forcefully killed, but we use a
 threading.Event-based cooperative cancellation to signal the worker thread
@@ -65,6 +66,98 @@ _leaked_threads_lock = threading.Lock()
 _MAX_TRACKED_LEAKED = 10
 
 # ---------------------------------------------------------------------------
+# io.open / os.open 写护栏（2026-10-21 修复护栏绕过）
+#
+# 旧护栏只替换 exec 命名空间里的 builtins.open，但 ``io.open`` 与 ``os.open``
+# 是**模块属性**——用户代码 ``import io; io.open("/etc/hosts", "w")`` 从
+# sys.modules 拿真模块，命名空间替换完全管不到；``pathlib.Path.write_text``
+# 内部走的正是 io.open。三条路都能零确认、无护栏地写工作区之外。
+#
+# 实现约束：模块属性只能进程级包装，因此包装函数通过**线程局部**标志判断
+# 当前调用是否来自 code_run worker——只有该线程过护栏，其它线程（并发执行
+# 的另一场 code_run、UI 线程的正常文件 IO）原样直通，行为不变。
+# ---------------------------------------------------------------------------
+_IO_OS_GUARD_TLS = threading.local()
+_io_os_guard_installed = False
+_io_os_guard_lock = threading.Lock()
+
+
+def _mode_is_write(mode) -> bool:
+    """判断 open() 模式串或 os.open flags 位图是否包含写语义。"""
+    if isinstance(mode, int):  # os.open 的 flags
+        return bool(mode & (os.O_WRONLY | os.O_RDWR | os.O_CREAT
+                            | os.O_APPEND | os.O_TRUNC))
+    return any(m in str(mode) for m in ("w", "a", "x", "+"))
+
+
+def _make_write_guard(ws: str, real_open, reject_int_fd: bool = True):
+    """构造「工作区外禁写」护栏（builtins.open / io.open / os.open 共用）。
+
+    ``real_open`` 是被包装的原函数：builtins.open 与 io.open 是同一对象，
+    os.open 签名不同（flags 位图），由 ``_mode_is_write`` 统一判定。
+
+    ``reject_int_fd``：builtins.open 的命名空间护栏拒绝 int fd（旧行为，
+    防止 ``open(3)`` 绕过路径检查）；io.open/os.open 的线程局部护栏必须
+    **放行** int fd——``subprocess.Popen`` 内部就是
+    ``io.open(os.pipe()[0], 'rb')`` 包装管道描述符，拒了它 code_run 里
+    所有 subprocess 调用直接崩。可用的 int fd 只能来自本进程已创建的
+    管道/socket/继承的 0/1/2，不构成工作区外写入通道。
+    """
+
+    def _guard(file, mode="r", *a, **kw):
+        if isinstance(file, int):
+            if reject_int_fd:
+                raise PermissionError(
+                    "File descriptor access is not allowed in code_run")
+            return real_open(file, mode, *a, **kw)
+        if not isinstance(file, (str, os.PathLike)):
+            raise TypeError(
+                f"open() expects a path (str/PathLike), got {type(file).__name__}"
+            )
+        # 用 realpath 而不是 abspath：workspace 里的 symlink 指向外部文件时
+        # （如 os.symlink("/etc/cron.d/x", "pwn") 后 open("pwn","w")），
+        # abspath 仍落在 workspace 前缀内，防护被绕过。
+        path = os.path.realpath(file)
+        if _mode_is_write(mode):
+            if not (path == ws or path.startswith(ws + os.sep)):
+                raise PermissionError(f"Refusing to write outside workspace: {file}")
+        return real_open(file, mode, *a, **kw)
+
+    return _guard
+
+
+def _install_io_os_write_guard() -> None:
+    """进程级安装一次 io.open / os.open 包装（幂等，线程安全）。"""
+    global _io_os_guard_installed
+    if _io_os_guard_installed:
+        return
+    with _io_os_guard_lock:
+        if _io_os_guard_installed:
+            return
+        _real_io_open = io.open
+        _real_os_open = os.open
+
+        def _guarded_io_open(file, mode="r", *a, **kw):
+            guard = getattr(_IO_OS_GUARD_TLS, "guard", None)
+            if guard is not None:
+                return guard(file, mode, *a, **kw)
+            return _real_io_open(file, mode, *a, **kw)
+
+        def _guarded_os_open(path, flags, mode=0o777, *a, **kw):
+            guard = getattr(_IO_OS_GUARD_TLS, "guard", None)
+            if guard is not None:
+                return guard(path, flags, mode, *a, **kw)
+            return _real_os_open(path, flags, mode, *a, **kw)
+
+        for fn in (_guarded_io_open, _guarded_os_open):
+            fn._code_run_guard = True  # type: ignore[attr-defined]
+        io.open = _guarded_io_open          # type: ignore[assignment]
+        os.open = _guarded_os_open          # type: ignore[assignment]
+        _io_os_guard_installed = True
+        # 注意：不包装 os.fdopen——fd 只能来自已护栏的 os.open / socket /
+        # 继承的 0/1/2，路径级检查对它无意义；fdopen(1, "w") 是合法网络惯用法。
+
+# ---------------------------------------------------------------------------
 # 进程级「真实 stdout/stderr」缓存（延迟恢复用）
 # ---------------------------------------------------------------------------
 
@@ -81,15 +174,19 @@ class _BoundedIO(io.StringIO):
         self._truncated = False
 
     def write(self, s) -> int:
-        # 必须显式检查 closed：截断后的快速路径（_truncated → return 0）
-        # 先于 io.StringIO.write 的 closed 检查执行，close() 对已截断的
-        # 缓冲完全不生效——超时/取消路径靠 close 让泄漏线程的下一次
-        # print 撞 ValueError 自行退出，绕过即意味着泄漏线程永不退出
-        # （往真实 stdout 无限写，解释器退出时持 stdout 锁 → 进程 abort）。
+        # 必须显式检查 closed：截断后的快速路径先于 io.StringIO.write 的
+        # closed 检查执行，close() 对已截断的缓冲完全不生效——超时/取消
+        # 路径靠 close 让泄漏线程的下一次 print 撞 ValueError 自行退出，
+        # 绕过即意味着泄漏线程永不退出（往真实 stdout 无限写，解释器退出
+        # 时持 stdout 锁 → 进程 abort）。
         if self.closed:
             raise ValueError("I/O operation on closed file")
+        # 截断后返回 **len(s)** 而不是 0：sys.stdout.write 的契约是「已写入
+        # 字符数」，返回 0 会让 print() 认为写入失败并重试/走异常路径
+        # （CPython 的 print 对 0 返回值不重试，但第三方代码与 io 协议
+        # 检查会误解为「什么都没写」）。
         if self._truncated:
-            return 0
+            return len(s) if s else 0
         if self.tell() + len(s) > self._limit:
             super().write("\n… [输出超限，已截断]")
             self._truncated = True
@@ -230,25 +327,13 @@ class CodeRunTool(Tool):
 
         ws = os.path.realpath(self.config.workspace)
         _real_open = _b.open
-
-        def _guard_open(file, mode="r", *a, **kw):
-            if isinstance(file, int):
-                raise PermissionError("File descriptor access is not allowed in code_run")
-            if not isinstance(file, (str, os.PathLike)):
-                # 非 str/PathLike（bytes 之外的奇怪类型）：realpath("") 会返回
-                # cwd（= workspace）并绕过前缀检查，随后 _real_open 抛出与
-                # 根因无关的 TypeError。这里给出明确错误。
-                raise TypeError(
-                    f"open() expects a path (str/PathLike), got {type(file).__name__}"
-                )
-            # 用 realpath 而不是 abspath：workspace 里的 symlink 指向外部文件时
-            # （如 os.symlink("/etc/cron.d/x", "pwn") 后 open("pwn","w")），
-            # abspath 仍落在 workspace 前缀内，防护被绕过。
-            path = os.path.realpath(file)
-            if any(m in str(mode) for m in ("w", "a", "x", "+")):
-                if not (path == ws or path.startswith(ws + os.sep)):
-                    raise PermissionError(f"Refusing to write outside workspace: {file}")
-            return _real_open(file, mode, *a, **kw)
+        # 进程级 io.open / os.open 包装（只装一次）；本线程的护栏经 TLS 生效，
+        # 见 _install_io_os_write_guard 注释。int fd 放行（subprocess 管道）。
+        _install_io_os_write_guard()
+        # 命名空间 builtins.open 护栏：拒绝 int fd（旧行为，防 open(3) 绕过）
+        _guard_open = _make_write_guard(ws, _real_open, reject_int_fd=True)
+        # 线程局部护栏（io.open / os.open 用）：int fd 放行
+        _write_guard = _make_write_guard(ws, _real_open, reject_int_fd=False)
 
         namespace: dict = {"__name__": "__code_run__", "__file__": "<code_run>"}
 
@@ -273,6 +358,10 @@ class CodeRunTool(Tool):
         result: dict = {"exc": None, "done": False}
 
         def _worker():
+            # 线程局部护栏：只对本 worker 线程生效——io.open / os.open 的
+            # 进程级包装据此决定是否拦截（见 _install_io_os_write_guard）。
+            # 必须在 worker 线程内设置：TLS 是线程绑定的，主线程设了不算。
+            _IO_OS_GUARD_TLS.guard = _write_guard
             try:
                 # os.chdir / sys.stdout 替换是**进程级**全局状态，不是线程级的：
                 # 执行期间其它线程的相对路径与 print 都会受影响。这里接受这段

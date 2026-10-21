@@ -30,7 +30,18 @@ _TAG_RE = re.compile(r"<(thinking|think|tool_use|tool_result)>[\s\S]*?</\1>", re
 _NOISE_HTML = re.compile(
     r"<(script|style|noscript|svg|head)\b[\s\S]*?</\1>", re.I
 )
-_HTML_TAG = re.compile(r"<[^>]{1,200}>")
+# HTML 标签白名单：只剥**真正的 HTML 标签**。旧正则 ``<[^>]{1,200}>`` 命中
+# 任何尖括号对——``std::vector<int>`` → ``std::vector ``、``Map<String,Object>``
+# → ``Map ``、``if a < b && c > d`` → ``if a b``：file_read / shell_run /
+# code_run 返回的源码、配置、日志被静默改写后注入上下文，模型读到的是错误
+# 内容（且不会报错）。这里限定标签名 + 允许属性，非白名单尖括号原样保留。
+_HTML_TAG = re.compile(
+    r"</?(?:div|span|p|a|br|img|table|tr|td|th|script|style|noscript|svg|head"
+    r"|body|html|ul|ol|li|h[1-6]|pre|code|blockquote|em|strong|b|i|u|font"
+    r"|form|input|button|label|section|article|header|footer|nav|main"
+    r"|dl|dt|dd|caption|col|colgroup|thead|tbody|tfoot)\b[^>]{0,200}>?",
+    re.I,
+)
 _MULTI_BLANK = re.compile(r"(\r?\n){3,}")
 
 
@@ -155,20 +166,32 @@ def l3_fold(lines: List[str], max_lines: int = 40,
 
     连续相同的摘要合并为 ``（N turns）`` —— 这是长任务里最有效的一招：
     模型反复重试同一动作时，几十轮会塌缩成一行。
+
+    「相同」按**剥掉 ``[T{n}]`` 索引前缀后的正文**比较：每一行都来自
+    ``TurnRecord.digest_line()``，恒带唯一轮次前缀，直接比整行永远不相等
+    （旧实现如此，``cnt`` 永不递增，合并是死代码）。输出仍保留原行，
+    可追溯性不受影响。
     """
     if not lines:
         return ""
+
+    def _key(line: str) -> str:
+        return line.split("] ", 1)[-1] if line.startswith("[T") else line
+
     lines = lines[-dedupe_window:]
     folded: List[str] = []
     cnt = 0
     last = ""
+    last_key = ""
     for line in lines:
-        if line == last:
+        k = _key(line)
+        if k == last_key and k:
             cnt += 1
             continue
-        if cnt:
+        if last:
             folded.append(f"{last}（{cnt + 1} turns）" if cnt else last)
         last = line
+        last_key = k
         cnt = 0
     if last:
         folded.append(f"{last}（{cnt + 1} turns）" if cnt else last)

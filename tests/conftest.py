@@ -79,6 +79,20 @@ def vector_store_factory(fake_ef):
     return _make
 
 
+@pytest.fixture(autouse=True)
+def _reset_global_model_providers():
+    """每个测试前后复位 vector_store 的进程级 embedding/reranker provider 开关。
+
+    不 reset 的话，任何调用过 ``configure_local_models`` 的测试（如构造
+    MainWindow 的 test_bridge）会把开关切到 ``local`` 并泄漏到后续测试——
+    显式使用 fastembed 的用例会拿到 LocalReranker/FastEmbed 之外的实现而失败。
+    """
+    from agent.rag import vector_store as _vs
+    _vs.reset_local_providers()
+    yield
+    _vs.reset_local_providers()
+
+
 @pytest.fixture()
 def tmp_workspace(tmp_path):
     """An isolated working directory used as the agent's filesystem root."""

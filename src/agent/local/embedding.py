@@ -91,6 +91,19 @@ class LocalEmbeddingFunction:
             from .registry import resolve_model_max_length
             self._max_length = resolve_model_max_length(path)
 
+    def close(self) -> None:
+        """释放后端权重 / ONNX InferenceSession。
+
+        单例淘汰（provider 配置变更）与测试清理走这里显式释放；只靠
+        字典摘引用的话，ORT session 的 C++ 析构要等 GC，切换配置的瞬间
+        内存仍是两份权重并存。
+        """
+        with self._load_lock:
+            self._model = None
+            self._tokenizer = None
+            self._session = None
+            self._loaded = False
+
     # ------------------------------------------------------------------
     # lazy loading
     # ------------------------------------------------------------------

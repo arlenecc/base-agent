@@ -10,6 +10,7 @@ import logging
 import queue
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,12 @@ logger = logging.getLogger(__name__)
 # 但工具调用本身可能是构建、批量处理、爬取等长任务——共用 30s 会让长任务
 # 必然超时，且服务端还在跑，结果被当迟到响应丢弃。
 _TOOL_CALL_TIMEOUT = 300.0
+
+# 连接断开后自动重连的冷却（秒）。瞬时故障（server 崩溃、写失败、reader
+# 退出）不应让该 server 的工具在本次 Agent 生命周期内全部不可用；但持续
+# 崩溃的 server 也不能每个工具调用都拉起一次进程。冷却期内 ensure_connected
+# 直接返回 False，调用方以 "not running" 失败（错误信息里带上了原因）。
+_RESTART_COOLDOWN_SECS = 30.0
 
 # 单次 MCP 工具返回保留的最大字符数。MCP 工具是外部代码，输出体积不受我们
 # 控制（例如让它 dump 一个大文件/数据库表），而这段文本会原样进入模型上下文
@@ -90,6 +97,12 @@ class MCPClient:
         self._reader_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
         self._running = False
+        # 主动停止标志（stop()）：与「连接自己断」区分开——后者下次使用前
+        # 自动重连（见 ensure_connected），前者是用户/registry 的拆除意图，
+        # 永不重启。
+        self._stopped = False
+        # 自动重连冷却截止（monotonic）：持续崩溃的 server 不会被反复拉起。
+        self._restart_after = 0.0
         self._server_info: Dict[str, Any] = {}
         self._tools: List[Dict[str, Any]] = []
 
@@ -101,6 +114,8 @@ class MCPClient:
         """Launch the MCP server subprocess and perform the initialize handshake."""
         if self._running:
             return
+        # 显式 start = 用户意图：清掉「已主动停止」，允许重新拉起。
+        self._stopped = False
 
         # 上一次连接的残留状态必须先清掉：
         # * _fail_pending / stop() 可能已在 _write_queue 里留下 None 哨兵，
@@ -175,10 +190,18 @@ class MCPClient:
                 self.name, len(self._tools),
             )
         except Exception:
-            self.stop()
+            # 握手失败只做**局部清理**（不停牌 _stopped）：这次失败可能是瞬时
+            # 的（模型下载中断、端口竞争），之后的 ensure_connected 还应能
+            # 自动重试。stop() 是「永久拆除」语义，不能用于这里。
+            self._teardown()
             raise
 
     def stop(self) -> None:
+        """永久停止（用户 / registry 拆除意图）：之后不会自动重连。"""
+        self._stopped = True
+        self._teardown()
+
+    def _teardown(self) -> None:
         """Terminate the MCP server subprocess and wait for threads.
 
         Cleanup is driven by ``self._process``, NOT by ``self._running``.
@@ -291,8 +314,46 @@ class MCPClient:
         """Return the list of tools exposed by this MCP server."""
         return list(self._tools)
 
+    def ensure_connected(self) -> bool:
+        """连接不在时尝试自动重连（瞬时故障自愈）。
+
+        旧实现：``_fail_pending`` / reader 退出把 ``_running`` 置 False 后，
+        ``_send`` 恒抛 "not running"，该 server 的全部工具在本次 Agent
+        生命周期内不可用，且用户无从得知。现在区分两种死亡：
+
+        * ``stop()`` 主动拆除 → ``_stopped=True``，永不重启；
+        * 连接自己断（server 崩溃 / stdin 写失败 / reader 退出）→ 下次
+          工具调用前重启一次，带 30s 冷却（持续崩溃不反复拉起进程）。
+
+        重启前必须 ``_teardown()``：旧 writer 线程还阻塞在旧写队列的
+        ``get()`` 上，不换队列的话新旧两个 writer 会共食同一队列，旧 writer
+        往已置 None 的 stdin 写 → 又把新连接判死。
+        """
+        with self._lock:
+            if self._running:
+                return True
+            if self._stopped:
+                return False
+        now = time.monotonic()
+        if now < self._restart_after:
+            return False
+        self._restart_after = now + _RESTART_COOLDOWN_SECS
+        logger.info("MCP server '%s' 连接已断开，尝试自动重连…", self.name)
+        try:
+            self._teardown()
+            self.start()
+            logger.info("MCP server '%s' 自动重连成功", self.name)
+            return True
+        except Exception as e:
+            logger.warning("MCP server '%s' 自动重连失败: %s", self.name, e)
+            return False
+
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
         """Call a tool on the MCP server and return the text content."""
+        # 连接断开过（瞬时故障）→ 先自动重连再调用，避免整个会话期内该
+        # server 的工具全部不可用。重连失败则继续走原路径，以明确的
+        # "not running" 错误失败（好过静默丢弃）。
+        self.ensure_connected()
         # tools/call 与 initialize/tools/list 不能共用同一个 30s 超时：构建、
         # 批量处理、爬取这类工具跑几分钟是常态。旧实现让它们共用初始化超时，
         # 长任务必然超时失败——而服务端还在继续跑，结果被当迟到响应丢弃。
@@ -440,8 +501,13 @@ class MCPClient:
     def _read_loop(self) -> None:
         """Continuously read JSON-RPC responses from the subprocess stdout."""
         try:
-            while self._running and self._process and self._process.stdout:
-                line = self._process.stdout.readline()
+            # 局部持有 pipe 引用：旧实现每轮读 ``self._process``——stop() 会把
+            # 它置 None，reader 已通过检查后 stop() 关闭 stdout，readline()
+            # 抛 ValueError 被 except 吞掉并走 _fail_pending，把一次**正常停止**
+            # 误报成「连接丢失」（还会借机触发自动重连，白拉起一个 server）。
+            process = self._process
+            while self._running and process and process.stdout:
+                line = process.stdout.readline()
                 if not line:
                     break
                 line = line.strip()

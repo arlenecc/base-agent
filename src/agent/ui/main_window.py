@@ -570,6 +570,20 @@ class AgentWorker(QThread):
         self._dead = True
         self._queue.put(None)
 
+    def disconnect_bridge(self) -> None:
+        """断开 ``_callbacks.bridge`` 的所有信号连接。
+
+        AgentWorker 自身**不定义任何 pyqtSignal**——``run()`` 里 emit 的是
+        ``self._callbacks.bridge.*``（Bridge 的信号）。``QObject.disconnect()``
+        只断本对象自身的连接，对 worker 调用恒为 no-op。强杀 / 关窗口时若
+        worker 线程还在跑并 emit bridge 信号，会打到已删除的 C++ 对象
+        （``RuntimeError: wrapped C/C++ object has been deleted``，PyQt6 下
+        可能直接 qFatal）。要断的必须是 bridge。
+        """
+        bridge = getattr(getattr(self, "_callbacks", None), "bridge", None)
+        if bridge is not None:
+            bridge.disconnect()
+
     def run(self) -> None:  # type: ignore[override]
         while True:
             text = self._queue.get()
@@ -1001,6 +1015,9 @@ class MainWindow(QMainWindow):
         # wait 超时的 QThread 孤儿：最后一个 Python 引用归零会触发 sip 析构
         # → qFatal。保留引用到进程退出，closeEvent 时再统一 wait 一次。
         self._orphan_workers: list = []
+        self._preload_threads: dict = {}  # key(main/aux) → 预加载线程，见 _preload_client
+        # 同步进行中标志：供 _set_controls_busy 判定是否跳过对同步控件的重置。
+        self._sync_active = False
         self._stop_watchdog: Optional[QTimer] = None
         # 流式输出缓冲（配合 _stream_timer 合并刷新）
         self._pending_content: List[str] = []
@@ -1393,7 +1410,18 @@ class MainWindow(QMainWindow):
                 logger.warning("%s 预加载失败: %s", label, e)
                 self.model_loaded.emit(key, False)
 
-        threading.Thread(target=_run, daemon=True, name=f"preload-{label}").start()
+        # 旧实现 daemon 线程不跟踪：连续点「加载模型」会同时起 N 个加载线程
+        # 抢 GPU 内存，各自独立 _ensure_model → 同一进程里 MLX/Llama 加载
+        # N 次，内存翻倍。同 key 的前一个没结束就不再起新的；线程引用归
+        # _preload_threads 持有，closeEvent 时 join 一遍避免 daemon 在退出
+        # 时被强杀、丢落盘写入。
+        prev = self._preload_threads.get(key)
+        if prev is not None and prev.is_alive():
+            logger.info("%s 预加载已在进行，跳过本次", label)
+            return
+        t = threading.Thread(target=_run, daemon=True, name=f"preload-{label}")
+        self._preload_threads[key] = t
+        t.start()
 
     def _on_load_main_model(self) -> None:
         if self._busy:
@@ -1414,6 +1442,20 @@ class MainWindow(QMainWindow):
         if old is not None:
             try:
                 old.close()
+            except Exception:
+                pass
+        # 必须收尾 agent：旧实现只把 self._agent 置 None，旧 agent 持有的
+        # MCP 子进程 / httpx / 本地模型句柄 / ONNX session / LanceDB 连接
+        # 全部泄漏，且常驻 worker 仍引用它、下次还会把消息打进已 close 的
+        # agent（各种「AttributeError on closed client」）。
+        old_agent = getattr(self, "_agent", None)
+        if old_agent is not None:
+            try:
+                old_agent.close()
+            except Exception:
+                pass
+            try:
+                old_agent.tools.shutdown()
             except Exception:
                 pass
         self._llm = None
@@ -1448,6 +1490,10 @@ class MainWindow(QMainWindow):
         self.status_label.setText("辅助模型加载中…")
 
     def _on_unload_aux_model(self) -> None:
+        if self._busy:
+            QMessageBox.warning(
+                self, "正在运行", "Agent 正在运行，请先「终止对话」再卸载模型。")
+            return
         old = getattr(self, "_aux_llm", None)
         if old is not None:
             try:
@@ -1832,6 +1878,13 @@ class MainWindow(QMainWindow):
                 pass
             if self._is_worker_running(old_worker):
                 old_worker.wait(2000)
+                # wait 返回 False 表示 2s 内未结束（agent 正卡在一个长工具
+                # 调用里）。旧实现直接置 None：QThread 对象的 Python 引用消失，
+                # 但底层线程仍在跑，下次「应用配置」又 spawn 一个——积累成
+                # 孤儿线程列表，每个都持旧 agent 句柄。收进 _orphan_workers，
+                # closeEvent 时再统一 wait（见 __init__ 注释）。
+                if old_worker.isRunning():
+                    self._orphan_workers.append(old_worker)
             self._worker = None
         self._gather_config_from_widgets()
         # 配置可能改了 PDF 引擎 / OvisOCR2 模型——重新注入 RAG 层（与 __init__
@@ -1972,6 +2025,16 @@ class MainWindow(QMainWindow):
         if self._is_worker_running(self._deps_worker):
             logger.warning("Deps check already running, ignoring duplicate request")
             return
+        # 与 agent 运行互斥：ingest 与 agent 的 rag_search 共享同一 LanceDB
+        # 向量表，并发时一边写一边读会撞上「table modified during query」
+        # 的 RuntimeError；engine 的 _ingest_lock 只串行化 ingest 之间，挡
+        # 不住 agent 的检索。agent 繁忙时直接拒绝并提示先终止对话。
+        if self._busy:
+            QMessageBox.warning(
+                self, "Agent 运行中",
+                "Agent 正在执行（可能正在检索知识库）。请先「终止对话」后再"
+                "同步，避免 ingest 与检索同时操作向量表。")
+            return
         kb = self.knowledge_base_edit.text().strip()
         ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
         if not kb:
@@ -1987,6 +2050,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning("同步前应用 Embedding/Reranker 设置失败: %s", e)
         logger.info("Knowledge sync triggered: kb=%s workspace=%s force=%s", kb, ws, force)
+        self._sync_active = True
         # Step 1: check dependencies before starting sync
         self.sync_knowledge_btn.setEnabled(False)
         self.sync_knowledge_btn.setText("检查依赖…")
@@ -2106,6 +2170,7 @@ class MainWindow(QMainWindow):
 
     def _on_sync_finished(self, stats: dict) -> None:
         logger.info("UI: _on_sync_finished called")
+        self._sync_active = False
         self._log_poll_timer.stop()
         # 恢复 QSignalLogHandler 的 RAG 日志过滤
         if hasattr(self, '_log_handler') and self._log_handler is not None:
@@ -2222,6 +2287,7 @@ class MainWindow(QMainWindow):
 
     def _on_sync_failed(self, error: str) -> None:
         logger.info("UI: _on_sync_failed called: %s", error[:200])
+        self._sync_active = False
         self._log_poll_timer.stop()
         if hasattr(self, '_log_handler') and self._log_handler is not None:
             self._log_handler._sync_active = False
@@ -2365,7 +2431,8 @@ class MainWindow(QMainWindow):
             logger.warning("UI: 终止请求超时，强制结束 agent 工作线程")
             self._append_log("[ui] 终止请求超时，强制结束工作线程")
             try:
-                worker.disconnect()
+                # 断的是 bridge（worker 自身没有信号，disconnect() 是 no-op）
+                worker.disconnect_bridge()
             except (TypeError, RuntimeError):
                 pass
             try:
@@ -2480,8 +2547,14 @@ class MainWindow(QMainWindow):
         self.clear_btn.setEnabled(not busy)
         self.workspace_btn.setEnabled(not busy)
         self.knowledge_base_btn.setEnabled(not busy)
-        self.sync_knowledge_btn.setEnabled(not busy)
-        self.progress.setRange(0, 0 if busy else 1)
+        # 知识库同步控件**不能**随 agent 忙闲翻转：sync_knowledge_btn 的使能
+        # 由 _on_sync_knowledge / _on_sync_finished / deps 流程独立管理（运行
+        # 中禁用、结束才恢复）。旧实现这里一律置 enabled=not busy，agent 一
+        # 跑就把同步按钮变回可点，用户点了之后与 agent 检索抢同一向量表。
+        # 进度条也不归这里管（同步用 0..N 范围，agent 用不定范围 busy 态）。
+        if not getattr(self, "_sync_active", False):
+            self.sync_knowledge_btn.setEnabled(not busy)
+            self.progress.setRange(0, 0 if busy else 1)
 
     # ------------------------------------------------------------------
     # streaming slots
@@ -2886,7 +2959,9 @@ class MainWindow(QMainWindow):
         # will emit into the already-destroyed Bridge → RuntimeError.
         if self._worker is not None:
             try:
-                self._worker.disconnect()
+                # 断的是 bridge（worker 自身没有信号，disconnect() 是 no-op，
+                # 见 AgentWorker.disconnect_bridge 注释）
+                self._worker.disconnect_bridge()
             except (TypeError, RuntimeError):
                 pass
             # Cooperative cancel: set the _cancelled flag so the agent loop

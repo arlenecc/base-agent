@@ -109,12 +109,31 @@ def _long_memory(config: AgentConfig) -> LongTermMemory:
     保留仅为兼容旧调用方；正常路径一律用 ``_get_long_memory``——单例才能被
     ``ToolRegistry.shutdown()`` 回收（每个漏 close 的实例泄漏 ~137MB ONNX）。
     """
-    logger.warning("tools.memory._long_memory is deprecated; use _get_long_memory")
+    # 只警告一次：agent.py 的 _system_prompt 每轮都调这个函数，旧实现每次
+    # 一条 warning，日志直接被洪水刷掉。
+    global _long_memory_warned
+    if not _long_memory_warned:
+        _long_memory_warned = True
+        logger.warning("tools.memory._long_memory is deprecated; use _get_long_memory")
     emb = getattr(config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q")
     return LongTermMemory(
         path=os.path.join(config.workspace, ".agent", "long_memory.json"),
         embedding_model=emb,
     )
+
+
+_long_memory_warned = False
+
+# 工具输出体积兜底：与 mcp_client 的 _cap_output 同策略（200K + 截断标记）。
+_MAX_TOOL_OUTPUT_CHARS = 200_000
+
+
+def _cap_output(text: str) -> str:
+    """把工具输出钳到 _MAX_TOOL_OUTPUT_CHARS，超长部分截断并明确标注。"""
+    if len(text) <= _MAX_TOOL_OUTPUT_CHARS:
+        return text
+    return (text[:_MAX_TOOL_OUTPUT_CHARS]
+            + f"\n… [输出超过 {_MAX_TOOL_OUTPUT_CHARS} 字符，已截断]")
 
 
 # ---------------------------------------------------------------------------
@@ -274,12 +293,32 @@ class MemoryGraphTool(Tool):
             if len(entities) > _MAX_LIST:
                 summary.append(f"… (共 {len(entities)} 个实体，仅显示前 {_MAX_LIST} 个；"
                                f"用 get_entity 查询具体实体)")
-            return ToolResult(True, output=json.dumps(summary, ensure_ascii=False))
+            return ToolResult(True, output=_cap_output(json.dumps(summary, ensure_ascii=False)))
         if op == "get_entity":
             if not name:
                 return ToolResult(False, error="op 'get_entity' requires 'name'")
             e = g.get_entity(name)
-            return ToolResult(True, output=json.dumps(e, ensure_ascii=False) if e else "not found")
+            # 单个实体的 observations 是累积写入的，几十次 add 后可达数十 KB，
+            # 直接全量返回会把上下文撑爆。按条数 + 总长双重截断。
+            if isinstance(e, dict) and isinstance(e.get("observations"), list):
+                _MAX_OBS = 50
+                _MAX_OBS_CHARS = 4000
+                kept, used = [], 0
+                for o in e["observations"]:
+                    if len(kept) >= _MAX_OBS or used >= _MAX_OBS_CHARS:
+                        break
+                    s = str(o)
+                    if len(s) > 400:
+                        s = s[:400] + "…"
+                    kept.append(s)
+                    used += len(s)
+                dropped = len(e["observations"]) - len(kept)
+                if dropped > 0:
+                    kept.append(f"… (其余 {dropped} 条观察已省略)")
+                e = dict(e)
+                e["observations"] = kept
+            return ToolResult(True, output=_cap_output(
+                json.dumps(e, ensure_ascii=False)) if e else "not found")
         if op == "snapshot":
             snap = g.snapshot(max_items=10)
             return ToolResult(True, output=snap or "(empty)")
@@ -330,4 +369,6 @@ class MemorySearchTool(Tool):
         top_k = max(1, min(top_k, 20))
         lm = _get_long_memory(self.registry, self.config)
         results = lm.graph.search(query, top_k=top_k)
-        return ToolResult(True, output=json.dumps(results, ensure_ascii=False))
+        # 统一体积兜底：单个观察可达数十 KB，20 条巨块全塞进上下文会挤爆
+        # 窗口（与 mcp_client 的 200K 策略一致）。
+        return ToolResult(True, output=_cap_output(json.dumps(results, ensure_ascii=False)))

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -94,7 +95,12 @@ class AliasTool(Tool):
 class ToolRegistry:
     # run 的 Signature 缓存（按工具类）：工具集注册后固定，没必要每次
     # execute() 都重新构造 Signature 对象。
-    _signature_cache: Dict[type, "inspect.Signature"] = {}
+    # WeakKeyDictionary：类键弱引用——测试套件/cli 动态生成的工具子类被
+    # 回收时缓存条目随之消失（旧实现是普通 dict，只增不减，长跑进程里
+    # 每个临时子类泄露一条 Signature）。
+    _signature_cache: "weakref.WeakKeyDictionary[type, inspect.Signature]" = (
+        weakref.WeakKeyDictionary()
+    )
 
     def __init__(self, config: AgentConfig, callbacks: "Any", aux_llm_getter: "Any" = None):
         self.config = config
@@ -203,11 +209,13 @@ class ToolRegistry:
                 client.start()
                 self._mcp_clients.append(client)
 
+                registered = 0
                 for tool_def in client.list_tools():
                     t = MCPTool(client, tool_def)
                     if t.name and t.name not in self._tools:
                         t.bind(self.config, self)
                         self._tools[t.name] = t
+                        registered += 1
                         logger.info("MCP tool registered: %s (server: %s)", t.name, name)
                     elif t.name:
                         # 重名工具静默吞掉第二个：用户以为两个 server 的工具
@@ -217,6 +225,19 @@ class ToolRegistry:
                             "registered (another server or builtin tool wins)",
                             t.name, name,
                         )
+                if registered == 0:
+                    # 一个工具都没注册上（全重名 / server 暴露空列表）→ 这个
+                    # server 的子进程 + 3 个线程纯属白占。立刻停掉并不留在
+                    # _mcp_clients 里，否则要挂到 shutdown 才回收。
+                    logger.warning(
+                        "MCP server '%s' 未注册任何工具（重名或空列表），停止该 server",
+                        name,
+                    )
+                    self._mcp_clients.remove(client)
+                    try:
+                        client.stop()
+                    except Exception:
+                        pass
             except MCPError as e:
                 logger.warning("MCP server '%s' init failed: %s", name, e)
             except Exception as e:
@@ -360,6 +381,18 @@ class ToolRegistry:
 
     def shutdown(self) -> None:
         """Stop all MCP server subprocesses and release RAG engine resources."""
+        # 先回收在跑的 shell_run 子进程：start_new_session=True 让它们脱离
+        # 主进程组，终端信号与 atexit 之外的路径都感知不到。旧实现只靠
+        # atexit——「应用配置」重建 agent 时旧 registry 被 shutdown 丢弃，
+        # 正在执行的 shell_run（默认 120s、上限 600s）子进程变成无人看管的
+        # 孤儿，继续占 CPU/磁盘/端口直到自身超时。
+        try:
+            from .shell_run import kill_all_running_procs
+            killed = kill_all_running_procs()
+            if killed:
+                logger.info("ToolRegistry.shutdown: 回收 %d 个在跑的 shell_run 子进程", killed)
+        except Exception as e:
+            logger.warning("ToolRegistry.shutdown: 回收 shell_run 子进程失败: %s", e)
         for client in self._mcp_clients:
             try:
                 client.stop()

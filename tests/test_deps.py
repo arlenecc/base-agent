@@ -103,14 +103,18 @@ class TestCheckDependencies:
             assert dep.import_name not in {d.import_name for d in report.all_missing}
 
     def test_check_ocr_is_optional(self, tmp_path):
+        """#111 设计决策：OCR 不进 EXTENSION_DEPS，普通 PDF 不报 OCR 缺失。
+
+        「未装 OCR」与「装了但加载失败」在依赖层无法区分，统一列 optional
+        只会产出无差别提示；真正的安装提示由 check_dependencies 在检测到
+        图片版 PDF 时动态升级为必需依赖给出（见
+        test_ocr_upgraded_to_required_for_image_pdf）。
+        """
         (tmp_path / "doc.pdf").write_text("x")
         report = check_dependencies(str(tmp_path), include_core=False)
-        ocr_deps = [d for d in report.missing_optional if d.import_name == "rapidocr_onnxruntime"]
-        if not _is_importable("rapidocr_onnxruntime"):
-            assert len(ocr_deps) == 1
-            assert not ocr_deps[0].required
-        else:
-            assert len(ocr_deps) == 0
+        ocr_deps = [d for d in report.missing_optional
+                    if d.pip_spec in ("rapidocr", "rapidocr-onnxruntime")]
+        assert ocr_deps == []
 
     def test_check_multiple_formats(self, tmp_path):
         (tmp_path / "doc.pdf").write_text("x")

@@ -13,6 +13,17 @@ from ..rag.postprocess import (
 
 logger = logging.getLogger(__name__)
 
+# 工具输出体积兜底（与 mcp_client / tools.memory 同策略）：引擎侧未对内部分片
+# 截断时，一次检索就能把上下文撑爆。
+_MAX_TOOL_OUTPUT_CHARS = 200_000
+
+
+def _cap_output(text: str) -> str:
+    if len(text) <= _MAX_TOOL_OUTPUT_CHARS:
+        return text
+    return (text[:_MAX_TOOL_OUTPUT_CHARS]
+            + f"\n… [输出超过 {_MAX_TOOL_OUTPUT_CHARS} 字符，已截断]")
+
 if TYPE_CHECKING:
     from ..rag.engine import RAGEngine
 
@@ -92,7 +103,7 @@ class RagSearchTool(Tool):
             results = self._engine.search_formatted(
                 query, top_k=top_k, source=source or None,
             )
-            return ToolResult(success=True, output=results)
+            return ToolResult(success=True, output=_cap_output(results))
         except Exception as e:
             logger.error("❌ RAG 搜索失败: %s", e, exc_info=True)
             return ToolResult(success=False, error=f"知识库搜索失败: {e}")
@@ -135,10 +146,13 @@ class RagOutlineTool(Tool):
             docs = self._engine.list_documents()
             if not docs:
                 return ToolResult(success=False, error="知识库中暂无已建立缩略版本的文档")
-            return ToolResult(
-                success=True,
-                output="知识库中已建立缩略版本的文档：\n" + "\n".join(f"  - {d}" for d in docs),
-            )
+            # 千级文档全量列出会挤爆上下文：截断并提示总数。
+            _MAX_DOCS = 100
+            lines = [f"知识库中已建立缩略版本的文档（共 {len(docs)} 个）："]
+            lines.extend(f"  - {d}" for d in docs[:_MAX_DOCS])
+            if len(docs) > _MAX_DOCS:
+                lines.append(f"  … （其余 {len(docs) - _MAX_DOCS} 个省略）")
+            return ToolResult(success=True, output=_cap_output("\n".join(lines)))
 
         logger.info("📖 RAG 工具调用: rag_outline(book_name=%r)", book_name[:80])
         try:
@@ -221,11 +235,12 @@ class RagIngestTool(Tool):
     }
     destructive = False
 
-    def __init__(self, engine: "RAGEngine"):
+    def __init__(self, engine: "RAGEngine", registry: "ToolRegistry" = None):
         self._engine = engine
+        self._registry = registry
 
     def bind(self, config: Any, registry: ToolRegistry) -> None:
-        pass
+        self._registry = registry
 
     def run(self, force: bool = False, **kwargs) -> ToolResult:
         # 严格布尔解析：模型（或 JSON 序列化）可能把 force 传成字符串
@@ -237,8 +252,29 @@ class RagIngestTool(Tool):
         else:
             force = bool(force)
         logger.info("📥 RAG 工具调用: rag_ingest(force=%s)", force)
+
+        # 取消桥：ingest 是同步全量管线（大库数分钟），旧实现在 agent 线程里
+        # 跑且循环内无取消检查——用户点「终止对话」也要等它整个跑完。这里用
+        # progress_callback 轮询「终止对话」标志，命中即 engine.cancel()，
+        # 引擎在文件/批次边界协作式退出（已入库数据不丢、manifest 一致）。
+        def _progress(done: int, total: int, name: str) -> None:
+            cb = getattr(self._registry, "callbacks", None) if self._registry else None
+            fn = getattr(cb, "is_cancelled", None)
+            if callable(fn) and fn():
+                self._engine.cancel()
+
+        # 仅当引擎签名接受 progress_callback 时才传（测试替身/旧版引擎可能
+        # 不接受该参数，强传会 TypeError）。
+        import inspect as _inspect
+        _ingest_kwargs: Dict[str, Any] = {"force": force}
         try:
-            stats = self._engine.ingest(force=force)
+            if "progress_callback" in _inspect.signature(self._engine.ingest).parameters:
+                _ingest_kwargs["progress_callback"] = _progress
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            stats = self._engine.ingest(**_ingest_kwargs)
             if "error" in stats:
                 logger.warning("rag_ingest returned error: %s", stats["error"])
                 return ToolResult(success=False, error=stats["error"])

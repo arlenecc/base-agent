@@ -416,6 +416,10 @@ class LocalLLMClient:
         # RuntimeError: There is no Stream(gpu, N) in current thread。
         self._kv_thread: Optional[int] = None
         self._loaded = False
+        # ONNX 后端的 KV 缓存（past_key_values.*）：__init__ 必须显式初始化——
+        # 旧实现只在 _stream_onnx 循环内懒创建，首轮读 self._past 直接
+        # AttributeError，整个 ONNX 后端不可用。
+        self._past: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     def _ensure_model(self) -> None:
@@ -464,8 +468,13 @@ class LocalLLMClient:
                 "GGUF LLM 后端不可用：未安装 llama-cpp-python。\n"
                 f"原始错误: {type(e).__name__}: {e}"
             ) from e
+        # n_ctx 必须由 max_tokens 推导：旧实现硬编码 4096，而 max_tokens 默认
+        # 32768——llama.cpp 的生成受上下文长度限制，长上下文场景下生成早停/
+        # 报错，max_tokens 形同虚设且静默发生。预留 1k 给 prompt 余量，
+        # 下限 8192（短 max_tokens 时也有基本的多轮空间）。
+        n_ctx = max(8192, min(self._max_tokens + 1024, 131072))
         self._model = Llama(
-            model_path=gguf, n_ctx=4096, n_gpu_layers=-1, verbose=False
+            model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False
         )
 
     def _load_onnx(self) -> None:
@@ -744,8 +753,20 @@ class LocalLLMClient:
             except Exception:
                 return ""
 
-        yield from self._stream_with_producer(
-            _produce(), start_in_think=start_in_think, raw_getter=_raw_getter)
+        # 本地后端也要报 usage：旧实现三个后端全部发空 dict——HTTP 后端有真实
+        # final_usage，本地模型的 tok/s 显示与任何依赖 usage 的计量全部失效。
+        # prompt_tokens 用整段 prompt 的 token 数（含 KV 复用部分，语义是
+        # 「本轮的输入规模」），completion_tokens 用实际生成数。
+        for ev in self._stream_with_producer(
+                _produce(), start_in_think=start_in_think, raw_getter=_raw_getter):
+            if ev.type == "done":
+                n_gen = len(gen_ref[0]) if gen_ref else 0
+                ev.usage = {
+                    "prompt_tokens": len(prompt_ids),
+                    "completion_tokens": n_gen,
+                    "total_tokens": len(prompt_ids) + n_gen,
+                }
+            yield ev
 
     # ---- GGUF ----
     def _stream_gguf(self, messages, tools, temperature):
@@ -822,17 +843,29 @@ class LocalLLMClient:
         # 同 MLX：模板可能已把 <think> 预填进生成提示（见 _stream_mlx 注释）。
         splitter = _ThinkSplitter(
             start_in_think=prompt.rstrip().endswith(_THINK_OPEN))
+        # past / present 输入名在会话生命周期内不变，循环外探测一次即可
+        # （旧实现每轮 get_inputs()，纯浪费）。
+        kv_inputs = [i.name for i in self._session.get_inputs()
+                     if i.name.startswith("past_key_values")]
+        # EOS 归一：tokenizer 可能给 None（无 EOS）或 list（多个 EOS）。
+        # 旧写法 `next_id in (hf.eos_token_id,)` 在 None/list 下永假——
+        # 生成只能靠 max_tokens 截断，尾部接无关 token。
+        _eos = hf.eos_token_id
+        _eos_ids = (set(_eos) if isinstance(_eos, (list, tuple))
+                    else ({_eos} if _eos is not None else set()))
         for _ in range(self._max_tokens):
             feeds = {"input_ids": input_ids}
             # 探测 past 输入名（不同导出差异大，尽力而为）
-            kv_inputs = [i.name for i in self._session.get_inputs()
-                         if i.name.startswith("past_key_values")]
             if kv_inputs:
                 feeds.update({n: self._past[n] for n in kv_inputs if n in self._past})
-            outs = dict(zip(self._session.get_outputs(), self._session.run(None, feeds)))
-            logits = outs.get("logits", next(iter(outs.values())))
+            # 输出必须按 **name** 建键：旧实现 dict(zip(get_outputs(), run()))
+            # 的 key 是 NodeArg 对象，outs.get("logits") 恒落空、退化成取第一个
+            # 输出——若导出把 present.* 排在 logits 前，采样直接拿到 KV 张量。
+            outs = {o.name: v for o, v in
+                    zip(self._session.get_outputs(), self._session.run(None, feeds))}
+            logits = outs.get("logits") or next(iter(outs.values()))
             next_id = self._sample(np.asarray(logits)[0, -1])
-            if next_id in (hf.eos_token_id,):
+            if next_id in _eos_ids:
                 break
             # 解码增量 token
             piece = hf.decode([next_id])
@@ -845,12 +878,16 @@ class LocalLLMClient:
             # present → 下一轮 past
             for o in self._session.get_outputs():
                 if o.name.startswith("present"):
-                    self._past = getattr(self, "_past", {})
                     self._past[o.name.replace("present", "past_key_values", 1)] = outs[o.name]
         for kind, seg in splitter.flush():
             if seg:
                 yield StreamEvent(kind, content=seg)
-        yield StreamEvent("done", tool_calls=parse_tool_calls("".join(full)), usage={})
+        # 本地后端补 usage（见 _stream_mlx 同款注释）
+        n_prompt = int(len(ids))
+        yield StreamEvent("done", tool_calls=parse_tool_calls("".join(full)),
+                          usage={"prompt_tokens": n_prompt,
+                                 "completion_tokens": len(generated),
+                                 "total_tokens": n_prompt + len(generated)})
 
     def _sample(self, logits_np: "np.ndarray") -> int:
         import numpy as np
@@ -896,6 +933,8 @@ class LocalLLMClient:
         self._mlx_cache = None
         self._cache_token_ids = []
         self._kv_thread = None
+        # ONNX 的 past_key_values 同样必须失效（会话重置/取消后不能拿旧 KV 续算）
+        self._past = {}
 
     def close(self) -> None:
         # 释放大块权重：引用置空，等待 GC。会话级 ORT session 亦可析构。

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -21,6 +22,8 @@ from .kernel import (
 from .kernel.compressor import DISTILL_PROMPT, DISTILL_SYSTEM
 from .tools.checkpoint import restore_checkpoint
 from .atomic_io import atomic_write_text
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -113,45 +116,14 @@ Paths are relative to the workspace. Only `code_run`, `shell_run` and external M
 # Used for real-time speed display during reasoning streaming (where we don't
 # yet have the API's usage figure) and as a fallback when the API's usage
 # omits reasoning tokens entirely.
+#
+# 直接复用 kernel.budget.estimate_tokens：旧实现在本文件维护了一份常数不同
+# （ASCII 4 / CJK 1.5 vs 3.5 / 1.3）的副本——预算记账与 tok/s 显示对同一段
+# 文本算出两个数，且两边各自演化容易进一步分叉。保留 _estimate_tokens 作为
+# 本模块的导入名，调用点无需改动。
 # ---------------------------------------------------------------------------
 
-# CJK 码点 → None 的删除表，供 str.translate 一次性统计 CJK 字符数（C 层实现）。
-# 覆盖统一表意文字、扩展 A、CJK 符号/日文假名、全角字符。
-_CJK_DELETE_TABLE = {
-    cp: None
-    for cp in list(range(0x4E00, 0xA000))      # CJK 统一表意文字
-    + list(range(0x3400, 0x4DC0))              # CJK 扩展 A
-    + list(range(0x3000, 0x3100))              # CJK 符号 + 日文假名
-    + list(range(0xFF00, 0xFFF0))              # 全角字符
-}
-
-
-def _estimate_tokens(text: str) -> int:
-    """Rough token-count estimate from text.
-
-    Heuristic: ASCII text averages ~4 chars/token; CJK characters are denser
-    (~1.5 chars/token). We split the text into CJK and non-CJK runs and apply
-    the appropriate ratio. This is only for live speed display and as a
-    fallback when the API underreports -- the exact count is not critical.
-    """
-    if not text:
-        return 0
-    # Fast path: if the text is pure ASCII (common for English/code/JSON),
-    # skip the per-character CJK check entirely — str.isascii() is O(1)-ish
-    # (implemented as a single memcmp on CPython).
-    if text.isascii():
-        return max(1, len(text) // 4)
-
-    # Mixed/CJK text: count CJK characters via str.translate for speed.
-    # Building the translation table is O(1) and translate is O(n) in C,
-    # much faster than a Python-level per-character loop for long text
-    # (旧实现是纯 Python 逐字符循环，长文本下明显偏慢，与上面的注释不符)。
-    # translate() 删除的是 CJK 字符，所以剩下的是非 CJK —— 用总长度相减
-    # 得到 CJK 数量（比逐字符 Python 循环快一个数量级）。
-    cjk = len(text) - len(text.translate(_CJK_DELETE_TABLE))
-    other = len(text) - cjk
-    # CJK: ~1.5 chars/token; ASCII/other: ~4 chars/token
-    return max(1, int(cjk / 1.5 + other / 4.0))
+from .kernel.budget import estimate_tokens as _estimate_tokens
 
 
 # 系统提示动态注入段的上限。
@@ -160,6 +132,8 @@ def _estimate_tokens(text: str) -> int:
 _MAX_INJECTED_FACTS = 20        # 当天事实最多注入条数
 _MAX_FACTS_CHARS = 2000         # 事实段总字符上限
 _MAX_FACT_CHARS = 120           # 单条事实字符上限
+_MAX_WM_KEYS = 20               # 工作记忆最多注入的 key 数
+_MAX_WM_CHARS = 2000            # 工作记忆段总字符上限（key + value）
 _MAX_SKILL_PROMPT_CHARS = 1500  # 命中技能 prompt 的字符上限
 _MAX_DAILY_FACTS = 200          # 当天事实桶的持久化条数上限
 
@@ -316,6 +290,12 @@ class _AgentKernelHooks(KernelHooks):
         except Exception as e:
             agent._log(f"[kernel] fact extraction error: {e}")
         # 新增能力：L4 经验蒸馏（模型显式调用 start_long_term_update，或长任务）
+        #
+        # 阈值用 ``session.current_turn``（真实轮数 = start_turn 次数，不含
+        # 反思门 reask / 上下文收缩重试）：后者会让「3 真实轮 + 8 次 reask
+        # 被拦」的用例误判为长任务触发蒸馏。current_turn 跨 run() 单调递增、
+        # 只在 reset() 清零——长会话累计 6 真实轮后每次 run 触发一次蒸馏是
+        # 可接受的（蒸馏本身有 _fact_extract_lock 串行 + 跳过上次未完成的）。
         if agent.kernel.distill_requested or session.current_turn >= agent._distill_min_turns:
             agent._distill_experience_async(session)
 
@@ -918,105 +898,133 @@ class Agent:
         # 后台 LLM 调用）。自动续跑可能有多段，每段都触发会让单次用户输入跑最多
         # 4×2 次冗余后台调用、并向知识图谱重复写入近似实体。统一挪到本方法末尾
         # 只触发一次（见下方 `self._fire_finished_hook`）。
-        result: KernelResult = self.kernel.run(user_input, emit_finished=False)
-        # 首段的失败上下文：续跑段要靠它接着上一段的错误找方案。
-        carry: Optional[Dict[str, Any]] = self.kernel.failure_snapshot()
+        result: Optional[KernelResult] = None
+        try:
+            result = self.kernel.run(user_input, emit_finished=False)
+            # 首段的失败上下文：续跑段要靠它接着上一段的错误找方案。
+            carry: Optional[Dict[str, Any]] = self.kernel.failure_snapshot()
 
-        # ---- 自动续跑：消灭「必须人工输入继续才能往下走」----
-        # 两类停车都不该甩回给用户：
-        #   1. MAX_TURNS：长任务在轮次上限处被硬截断；
-        #   2. DONE 但计划仍有未完成步骤（反思门提醒额度用尽）：模型反复给出
-        #      文字总结，而计划面板显示还有 open 步骤——用户看到的正是
-        #      「实际已完成却一直显示有未完成项，必须打继续」。
-        # 每段续跑都是完整的内核 run（轮次预算/反思门/取消/失败恢复全部生效，
-        # _finish_nudge 等记账也随 run 重置）；最多续 _AUTO_CONTINUE_MAX 段，
-        # 期间用户点「终止」立即停。额度用尽才真正交回用户。
-        segments = 0
-        while (segments < _AUTO_CONTINUE_MAX
-               and self._auto_continue
-               and result.reason in (ExitReason.MAX_TURNS, ExitReason.DONE)
-               and not self._cancelled()
-               and self._should_auto_continue(result)):
-            segments += 1
-            # 把上一段的失败上下文带进本段：否则 run() 重置记账后，续跑段既不
-            # 知道上一段卡在哪，也拿不到失败感知的反思门预算 —— 表现为「续跑
-            # 之后就不再针对报错找办法，而是原地打转然后停住」。
-            if carry:
-                self.kernel.seed_failures(carry)
-            open_ids = "; ".join(
-                f"{s.get('id')}.{s.get('title')}"
-                for s in self.session.plan_open_steps()[:5]
-            )
-            # 失败信息必须跟着续跑一起走（两条续跑路径都要）：续跑段最需要的
-            # 就是「上一段卡在哪」，否则它只能从头瞎试、然后再次停住。
-            fail_txt = ""
-            if carry and carry.get("last_fail"):
-                fname, ferr = carry["last_fail"]
-                fail_txt = (
-                    f"\n上一段最后一次失败：`{fname}` → {ferr[:200]}。"
-                    "请先读完整错误定位原因，再换一种**没试过**的方法"
-                    "（换工具 / 换参数 / 用 code_run 写最小诊断脚本验证假设）。"
-                    "不要原样重试，也不要只回答文字。"
+            # ---- 自动续跑：消灭「必须人工输入继续才能往下走」----
+            # 两类停车都不该甩回给用户：
+            #   1. MAX_TURNS：长任务在轮次上限处被硬截断；
+            #   2. DONE 但计划仍有未完成步骤（反思门提醒额度用尽）：模型反复给出
+            #      文字总结，而计划面板显示还有 open 步骤——用户看到的正是
+            #      「实际已完成却一直显示有未完成项，必须打继续」。
+            # 每段续跑都是完整的内核 run（轮次预算/反思门/取消/失败恢复全部生效，
+            # _finish_nudge 等记账也随 run 重置）；最多续 _AUTO_CONTINUE_MAX 段，
+            # 期间用户点「终止」立即停。额度用尽才真正交回用户。
+            segments = 0
+            while (segments < _AUTO_CONTINUE_MAX
+                   and self._auto_continue
+                   and result.reason in (ExitReason.MAX_TURNS, ExitReason.DONE)
+                   and not self._cancelled()
+                   and self._should_auto_continue(result)):
+                segments += 1
+                # 把上一段的失败上下文带进本段：否则 run() 重置记账后，续跑段既不
+                # 知道上一段卡在哪，也拿不到失败感知的反思门预算 —— 表现为「续跑
+                # 之后就不再针对报错找办法，而是原地打转然后停住」。
+                if carry:
+                    self.kernel.seed_failures(carry)
+                open_ids = "; ".join(
+                    f"{s.get('id')}.{s.get('title')}"
+                    for s in self.session.plan_open_steps()[:5]
                 )
+                # 失败信息必须跟着续跑一起走（两条续跑路径都要）：续跑段最需要的
+                # 就是「上一段卡在哪」，否则它只能从头瞎试、然后再次停住。
+                fail_txt = ""
+                if carry and carry.get("last_fail"):
+                    fname, ferr = carry["last_fail"]
+                    fail_txt = (
+                        f"\n上一段最后一次失败：`{fname}` → {ferr[:200]}。"
+                        "请先读完整错误定位原因，再换一种**没试过**的方法"
+                        "（换工具 / 换参数 / 用 code_run 写最小诊断脚本验证假设）。"
+                        "不要原样重试，也不要只回答文字。"
+                    )
+                if result.reason is ExitReason.MAX_TURNS:
+                    self._log(f"[agent] 达到轮次上限，自动续跑 {segments}/{_AUTO_CONTINUE_MAX}")
+                    self.session.working["__truncated__"] = (
+                        f"[系统提示] 上一段在达到轮次上限（{self.max_iterations}）后被自动续跑。"
+                        "请先用一句话总结当前进展，然后**立即继续执行**计划中的剩余步骤；"
+                        f"若全部步骤已完成，用 update_plan 收尾并给出最终答复。{fail_txt}"
+                    )
+                    result = self.kernel.run(
+                        "[System] 任务在上一段达到轮次上限被截断，已自动续跑。"
+                        "请继续执行计划中的剩余步骤；不要询问用户是否继续。",
+                        resume=True,
+                        emit_finished=False,
+                    )
+                else:
+                    self._log(f"[agent] 模型提前收尾但计划未完成（{open_ids}），自动续跑 "
+                              f"{segments}/{_AUTO_CONTINUE_MAX}")
+                    self.session.working["__plan_boundary__"] = (
+                        f"你上一条回复被判为提前收尾，但计划中仍有未完成步骤：{open_ids}。{fail_txt}\n"
+                        "若这些步骤的工作**实际已经完成**，立即用 update_plan"
+                        "(op=\"patch\", step_id=..., status=\"done\", note=\"结论\") 逐一收尾，"
+                        "然后给出最终答复；若尚未完成，继续执行；"
+                        "只有至少 3 种不同方法都确认不可行，才标为 blocked/skipped "
+                        "并写明原因后再给出最终答复。"
+                        "不要再次只给出文字总结就停止。"
+                    )
+                    result = self.kernel.run(
+                        "[System] 上一条回复被判定为提前收尾，已自动续跑。"
+                        "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。",
+                        resume=True,
+                        emit_finished=False,
+                    )
+                carry = self.kernel.failure_snapshot()
             if result.reason is ExitReason.MAX_TURNS:
-                self._log(f"[agent] 达到轮次上限，自动续跑 {segments}/{_AUTO_CONTINUE_MAX}")
-                self.session.working["__truncated__"] = (
-                    f"[系统提示] 上一段在达到轮次上限（{self.max_iterations}）后被自动续跑。"
-                    "请先用一句话总结当前进展，然后**立即继续执行**计划中的剩余步骤；"
-                    f"若全部步骤已完成，用 update_plan 收尾并给出最终答复。{fail_txt}"
-                )
-                result = self.kernel.run(
-                    "[System] 任务在上一段达到轮次上限被截断，已自动续跑。"
-                    "请继续执行计划中的剩余步骤；不要询问用户是否继续。",
-                    resume=True,
-                    emit_finished=False,
-                )
-            else:
-                self._log(f"[agent] 模型提前收尾但计划未完成（{open_ids}），自动续跑 "
-                          f"{segments}/{_AUTO_CONTINUE_MAX}")
-                self.session.working["__plan_boundary__"] = (
-                    f"你上一条回复被判为提前收尾，但计划中仍有未完成步骤：{open_ids}。{fail_txt}\n"
-                    "若这些步骤的工作**实际已经完成**，立即用 update_plan"
-                    "(op=\"patch\", step_id=..., status=\"done\", note=\"结论\") 逐一收尾，"
-                    "然后给出最终答复；若尚未完成，继续执行；"
-                    "只有至少 3 种不同方法都确认不可行，才标为 blocked/skipped "
-                    "并写明原因后再给出最终答复。"
-                    "不要再次只给出文字总结就停止。"
-                )
-                result = self.kernel.run(
-                    "[System] 上一条回复被判定为提前收尾，已自动续跑。"
-                    "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。",
-                    resume=True,
-                    emit_finished=False,
-                )
-            carry = self.kernel.failure_snapshot()
-        if result.reason is ExitReason.MAX_TURNS:
-            if segments:
-                # 续跑额度用尽仍被截断：如实告知用户，等待指示。
-                self._log("[agent] 轮次上限且自动续跑额度用尽，停车等待用户指示。")
-                self.session.working["__truncated__"] = (
-                    f"[系统提示] 任务已连续 {segments + 1} 段达到最大轮次上限"
-                    f"（每段 {self.max_iterations} 轮），已自动停止。"
-                    "请先总结已完成的进展与剩余工作，等待用户指示后再继续。"
-                )
-            else:
-                self._log("[agent] max turns reached, stopping.")
-                # 让下一轮知道上一轮是被截断的：否则模型会以为任务已完成。
-                self.session.working["__truncated__"] = (
-                    f"[系统提示] 上一轮在达到最大轮次上限（{self.max_iterations}）后被中断，"
-                    "任务可能尚未完成。请先总结已完成的进展，再继续执行剩余步骤。"
-                )
-        # 连续空回复把重试额度用尽后，内核会以 DONE 退出但 final_text 为空串；
-        # 直接返回 "" 会让用户看到一个完全空白的回复，不知道出了什么。
-        if not (result.text or "").strip():
-            result.text = (
-                "（模型连续多次返回空响应，已停止重试。请检查网络/API 状态后重试，"
-                "或换个说法再问一次。）"
-            )
-            self._log("[agent] 空回复：已向用户返回可见提示")
-        self._fire_finished_hook(result.text)
-        self.callbacks.on_finished()
-        return result.text
+                if segments:
+                    # 续跑额度用尽仍被截断：如实告知用户，等待指示。
+                    self._log("[agent] 轮次上限且自动续跑额度用尽，停车等待用户指示。")
+                    self.session.working["__truncated__"] = (
+                        f"[系统提示] 任务已连续 {segments + 1} 段达到最大轮次上限"
+                        f"（每段 {self.max_iterations} 轮），已自动停止。"
+                        "请先总结已完成的进展与剩余工作，等待用户指示后再继续。"
+                    )
+                else:
+                    self._log("[agent] max turns reached, stopping.")
+                    # 让下一轮知道上一轮是被截断的：否则模型会以为任务已完成。
+                    self.session.working["__truncated__"] = (
+                        f"[系统提示] 上一轮在达到最大轮次上限（{self.max_iterations}）后被中断，"
+                        "任务可能尚未完成。请先总结已完成的进展，再继续执行剩余步骤。"
+                    )
+        except Exception as e:
+            # 兜底：内核内部的异常保护不可能覆盖 session.build_messages /
+            # 工具 __str__ / json.dumps 等所有路径。旧实现没有这一层——一旦
+            # 抛出，on_finished 与 _fire_finished_hook 都不执行，UI 永远停在
+            # 「思考中」，用户既看不到错误也没有输入入口，只能重启。
+            self._log(f"[agent] run() 未捕获异常: {type(e).__name__}: {e}")
+            try:
+                self.callbacks.on_error(f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
+            result = None
+        finally:
+            # 无论正常结束 / 取消 / 异常，都必须触发 finished——UI 的 _busy
+            # 复位全靠它（见 AgentWorker.run 与 _on_finished）。
+            text = ""
+            if result is not None and (result.text or "").strip():
+                text = result.text
+            elif result is not None and not (result.text or "").strip():
+                # 空回复要按退出原因分流：旧实现一律显示「模型连续多次返回
+                # 空响应」——用户点了「终止对话」却被告知模型返回空响应，
+                # LLM 报错时也看不到真实错误（真实错误只走了一条 on_error）。
+                reason = getattr(result, "reason", None)
+                if reason is ExitReason.CANCELLED:
+                    text = "（已取消本次对话。）"
+                elif reason is ExitReason.ERROR:
+                    text = "（本轮因模型/网络异常中断，请查看上方错误信息后重试。）"
+                else:
+                    text = (
+                        "（模型连续多次返回空响应，已停止重试。请检查网络/API 状态后重试，"
+                        "或换个说法再问一次。）"
+                    )
+                self._log("[agent] 空回复：已向用户返回可见提示")
+            elif result is None:
+                text = "（本轮异常中断，请查看上方错误信息后重试。）"
+            self._fire_finished_hook(text)
+            self.callbacks.on_finished()
+        return text
 
     def _fire_finished_hook(self, text: str) -> None:
         """整个用户轮次（含全部自动续跑段）结束后，触发一次 finished 钩子。
@@ -1190,6 +1198,22 @@ class Agent:
                 return ToolResult(False, error="用户取消了对话，工具未执行完")
         return box.get("res") or ToolResult(False, error="工具无返回值")
 
+    def _exec_tool_blocking(self, name: str, args: Dict[str, Any]):
+        """纯执行版：无取消轮询线程，供**已在工作线程中**的调用方使用。
+
+        旧实现让 ThreadPoolExecutor 的 worker 再调 ``_execute_tool``——每个
+        并行任务实际占 2 个线程（池 worker + 内部轮询线程），且内部那个以
+        10Hz 忙等轮询取消。并行 8 个工具 = 16 个线程，其中 8 个纯忙等。
+        取消语义由 dispatcher 的工具间检查 + 池本身的协作保证，不再需要
+        （也不应该）在每个 worker 里再起一根轮询线程。
+        """
+        from .tools import ToolResult
+
+        try:
+            return self.tools.execute(name, args)
+        except Exception as e:  # pragma: no cover - defensive
+            return ToolResult(False, error=f"{type(e).__name__}: {e}")
+
     def _run_parallel_tools(
         self,
         jobs: List[Tuple[int, str, Dict[str, Any]]],
@@ -1208,7 +1232,7 @@ class Agent:
             futures = {}
             for idx, name, args in jobs:
                 self.callbacks.on_tool_start(name, args)
-                futures[ex.submit(self._execute_tool, name, args)] = (idx, name)
+                futures[ex.submit(self._exec_tool_blocking, name, args)] = (idx, name)
             for fut in as_completed(futures):
                 idx, name = futures[fut]
                 try:
@@ -1245,6 +1269,11 @@ class Agent:
             wm = _work_memory(self.config).list()
             compact_wm = {}
             today_facts: List[str] = []
+            # 工作记忆同样必须有**总量**上限：key 由模型经
+            # update_working_checkpoint 自由创建，单 key 200 字符的旧约束
+            # 拦不住 key 数量与总长度单调膨胀——系统提示不在五级压缩作用
+            # 范围内，放任不管会随会话时长挤爆 30k 预算。
+            wm_used = 0
             for k, v in wm.items():
                 if k == "__auto_facts__":
                     # 短期记忆里的自动抽取事实：只注入当天桶（历史已在长期
@@ -1252,8 +1281,12 @@ class Agent:
                     _, facts = self._parse_daily_facts(str(v))
                     today_facts = facts
                     continue
+                if len(compact_wm) >= _MAX_WM_KEYS or wm_used >= _MAX_WM_CHARS:
+                    break
                 s = str(v)
-                compact_wm[k] = s[:200] + "…" if len(s) > 200 else s
+                s = s[:200] + "…" if len(s) > 200 else s
+                compact_wm[k] = s
+                wm_used += len(k) + len(s)
             if compact_wm or today_facts:
                 parts = []
                 if today_facts:

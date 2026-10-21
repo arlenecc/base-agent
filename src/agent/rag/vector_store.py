@@ -211,6 +211,14 @@ class FastEmbedEmbeddingFunction:
     def name(self) -> str:
         return f"fastembed:{self._model_name}"
 
+    def close(self) -> None:
+        """释放 FastEmbed TextEmbedding（ONNX session ~137MB）。
+
+        单例淘汰（embedding 模型配置变更）走这里显式释放；只摘字典引用
+        的话要等 GC 才析构 C++ session，切换配置瞬间内存双份并存。
+        """
+        self._model = None
+
 
 # ---------------------------------------------------------------------------
 # Process-level embedding function singleton
@@ -519,14 +527,57 @@ _EMBED_PROVIDER: Dict[str, Any] = {"provider": "api", "path": "", "backend": "ml
 _RERANK_PROVIDER: Dict[str, Any] = {"provider": "api", "path": "", "backend": "mlx"}
 
 
+def _evict_local_singletons(key_prefix: str) -> int:
+    """淘汰并释放某一类本地模型单例（provider 配置变更时调用）。
+
+    ``set_*_provider`` 改变进程级开关后，旧 path/backend 对应的本地实例
+    （ONNX InferenceSession ~137MB / MLX 权重 GB 级）会永久滞留
+    ``_EF_SINGLETONS`` 直到进程退出——旧实现如此，用户每次在「应用配置」
+    里换 embedding/reranker 模型就泄漏一份权重。本地单例语义上是「当前
+    配置」的进程级共享实例，配置变更即应全部淘汰。
+    """
+    with _EF_SINGLETONS_LOCK:
+        keys = [k for k in list(_EF_SINGLETONS)
+                if isinstance(k, tuple) and k and k[0] == key_prefix]
+        for k in keys:
+            obj = _EF_SINGLETONS.pop(k, None)
+            closer = getattr(obj, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
+    return len(keys)
+
+
 def set_embedding_provider(provider: str, path: str = "", backend: str = "mlx") -> None:
     """配置 embedding provider：``api``（fastembed 网络）或 ``local``（本地权重）。"""
-    _EMBED_PROVIDER.update(provider=provider or "api", path=path or "", backend=backend or "mlx")
+    new = {"provider": provider or "api", "path": path or "", "backend": backend or "mlx"}
+    if new != _EMBED_PROVIDER:
+        # 配置真的变了 → 旧本地单例（GB 级权重）立即淘汰，不留给进程退出
+        _evict_local_singletons("__local_embed__")
+    _EMBED_PROVIDER.update(new)
 
 
 def set_reranker_provider(provider: str, path: str = "", backend: str = "mlx") -> None:
     """配置 reranker provider：``api``（fastembed cross-encoder）或 ``local``。"""
-    _RERANK_PROVIDER.update(provider=provider or "api", path=path or "", backend=backend or "mlx")
+    new = {"provider": provider or "api", "path": path or "", "backend": backend or "mlx"}
+    if new != _RERANK_PROVIDER:
+        _evict_local_singletons("__local_rerank__")
+    _RERANK_PROVIDER.update(new)
+
+
+def reset_local_providers() -> None:
+    """把 embedding / reranker provider 复位到默认（``api``）。
+
+    ``set_*_provider`` 写的是**进程级模块状态**：GUI 初始化（或任何调用
+    ``configure_local_models`` 的代码路径）一旦切到 ``local``，后续所有
+    ``VectorStore`` 实例——包括测试里显式用 fastembed 的实例——都会拿到
+    ``LocalEmbeddingFunction`` / ``LocalReranker``。本函数供测试夹具与
+    「恢复默认配置」路径调用，避免全局开关跨上下文泄漏。
+    """
+    _EMBED_PROVIDER.update(provider="api", path="", backend="mlx")
+    _RERANK_PROVIDER.update(provider="api", path="", backend="mlx")
 
 
 def get_or_create_embedding_function(
@@ -1121,6 +1172,11 @@ class VectorStore:
                     return total
                 batch_num += 1
                 logger.info("  ├─ 向量化: 第 %d 批 (%d 切片) 正在嵌入...", batch_num, len(batch_buf))
+                # 先 embed 再 delete+add（与首批同序）：旧实现先 delete 旧数据
+                # 再 embed 再 add——embed 耗时数秒到数分钟，这段时间里该
+                # source 在库里被删空，并发检索会返回空（「文档凭空消失」）。
+                # 调整后，删旧与写新背靠背执行，空窗缩到一次 table.add 的耗时。
+                records = self._embed_chunks(batch_buf, chunk_idx)
                 if table is not None:
                     new_sources = {c["source"] for c in batch_buf} - deleted_sources
                     if new_sources:
@@ -1131,7 +1187,6 @@ class VectorStore:
                             except Exception:
                                 pass
                         deleted_sources.update(new_sources)
-                records = self._embed_chunks(batch_buf, chunk_idx)
                 try:
                     table.add(records)
                     total += len(records)
@@ -2036,13 +2091,35 @@ class VectorStore:
         self._table_checked = False
         # documents 元数据表与其缓存同样持有打开时的快照：同步新增/更新了
         # 文档后，agent 侧的 rag_outline 必须丢弃旧句柄与旧缓存才能看到
-        # 新 digest；FTS 标记同理，否则新写入的切片在 BM25 通道不可见。
+        # 新 digest。
         with self._documents_lock:
             self._documents_table = None
             self._documents_cache = None
-        self._fts_ready = False
+        # FTS 标志：reload 只丢弃**内存句柄快照**，磁盘上的索引与数据都没动。
+        # 旧实现把 _fts_ready/_fts_checked 一并清 False → 下次检索走
+        # _ensure_fts_index 的 replace=True 全库重建（秒级到分钟级），而索引
+        # 其实早在磁盘上、本就可用。这里探测一次磁盘索引是否仍在：在就在
+        # _fts_ready=True（检索直接用），不在才回落到重建路径。
+        # _fts_failed 保留旧值：曾经建失败的实例，reload 也不该自愈（避免
+        # 每次检索都重试一次必败的建索引）。
         self._fts_checked = False
-        self._fts_failed = False
+        self._fts_ready = False
+        try:
+            tbl = self._ensure_table()
+            if tbl is not None:
+                indices = tbl.list_indices()
+                names = set()
+                for it in indices:
+                    n = getattr(it, "name", None) or (it.get("name") if isinstance(it, dict) else None)
+                    if n:
+                        names.add(str(n))
+                # 命中已知列名或任意 FTS 索引名（不同 lancedb 版本命名不同）。
+                if _FTS_COLUMN in names or any("fts" in n.lower() for n in names):
+                    self._fts_ready = True
+                    self._fts_checked = True
+                    logger.debug("VectorStore: reload 探测到磁盘 FTS 索引，跳过重建")
+        except Exception as e:
+            logger.debug("VectorStore: reload FTS 探测失败，回落到重建: %s", e)
         logger.debug("VectorStore: table handles dropped for reload")
 
     @_store_op
