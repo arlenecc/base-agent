@@ -393,8 +393,78 @@ def _clean_md_segment(seg: str) -> str:
     seg = seg.replace('\xa0', ' ')
     for i, code in enumerate(stash):
         seg = seg.replace(chr(0) + str(i) + chr(0), code)
+    # 密度压缩（在表格占位还原前跑——复杂表 HTML 块保持 stash 状态不被压）
+    seg = _compress_density_segment(seg)
     seg = restore_table_stash(seg, tbl_stash)
     return seg
+
+
+# ---------------------------------------------------------------------------
+# 密度压缩（2026-10-22 用户定版：压缩不必要的空行/空格，保留格式提密度）
+# ---------------------------------------------------------------------------
+
+def _compress_density_segment(seg: str) -> str:
+    """压缩单个栅栏外片段的多余空白（栅栏/行内代码/缩进代码块内不动）。
+
+    规则：
+    - 行内连续 2+ 空格/制表符 → 单个（PDF 两端对齐的 ``word    word``
+      是主要来源；管道表格单元格内的对齐空格同样受益，结构不受影响）；
+    - 行尾空白剥掉；纯空白行 → 空行；
+    - 连续 2+ 空行 → 恰好 1 个空行（Markdown 段落分隔一个就够）；
+    - 段首空行去掉；4+ 空格/tab 缩进的行视为代码块，整行不碰；
+    - 行内代码（`` `x  y` ``）内容零改动。
+    """
+    stash: List[str] = []
+
+    def _stash(m: "re.Match") -> str:
+        stash.append(m.group(0))
+        return chr(0) + str(len(stash) - 1) + chr(0)
+
+    seg = _INLINE_CODE_RE.sub(_stash, seg)
+    result: List[str] = []
+    prev_blank = False
+    for line in seg.split("\n"):
+        m = re.match(r"([ \t]*)(.*)$", line)
+        leading, rest = m.group(1), m.group(2).rstrip()
+        if not rest:
+            # 纯空白行 → 空行。必须先判空白再判缩进代码——否则 tab 组成的
+            # 空白行会被下面的缩进规则当成代码块原样留下。
+            if not prev_blank and result:
+                result.append("")
+            prev_blank = True
+            continue
+        if len(leading) >= 4 or "\t" in leading:
+            # 缩进代码块（Markdown 语义：4+ 空格/tab）整行保留
+            result.append(line)
+            prev_blank = False
+            continue
+        rest = re.sub(r"[ \t]{2,}", " ", rest)
+        result.append(leading + rest)
+        prev_blank = False
+    seg = "\n".join(result)
+    for i, code in enumerate(stash):
+        seg = seg.replace(chr(0) + str(i) + chr(0), code)
+    return seg
+
+
+def compress_markdown_density(text: str) -> str:
+    """压缩 Markdown 中不必要的空行与空格，提升信息密度（保留格式）。
+
+    对外入口（供 pandoc 电子书清洗等外部路径调用）；
+    :func:`clean_docling_markdown` 内部走 ``_compress_density_segment``
+    （与其它清洗同段完成）。栅栏/行内代码/缩进代码块内容零改动；
+    标题/列表/表格/引用等 Markdown 结构原样保留。
+    """
+    if not text:
+        return ""
+    out: List[str] = []
+    pos = 0
+    for m in _FENCE_BLOCK_RE.finditer(text):
+        out.append(_compress_density_segment(text[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_compress_density_segment(text[pos:]))
+    return "".join(out)
 
 
 def clean_docling_markdown(text: str) -> str:
@@ -413,6 +483,10 @@ def clean_docling_markdown(text: str) -> str:
       语义不强行摊平（2026-10-22 用户定版）；
     - `<br>`/块级标签 → 换行，行内残标剥除、留内容；
     - DOCTYPE / 处理指令；`&amp;` 等实体还原为真实字符；
+    - **密度压缩**（2026-10-22 用户定版）：行内连续 2+ 空格 → 单个（PDF
+      两端对齐的 ``word    word``）、行尾空白剥掉、纯空白行 → 空行、
+      连续 2+ 空行 → 恰好一个（段落分隔一个就够）——标题/列表/表格/
+      引用/缩进代码块/行内代码零改动；
     - 折叠 3+ 连续空行。
     """
     if not text:
@@ -426,8 +500,9 @@ def clean_docling_markdown(text: str) -> str:
         out.append(m.group(0))          # 栅栏整块原样保留
         pos = m.end()
     out.append(_clean_md_segment(text[pos:]))
-    cleaned = re.sub(r'\n{3,}', '\n\n', "".join(out))
-    return cleaned.strip()
+    # 段内已完成密度压缩（空行/空格收敛），**不再做全局 \n{3,} 折叠**——
+    # 那会穿透栅栏改掉代码块内容（与「栅栏内一字不动」矛盾）。
+    return "".join(out).strip()
 
 
 def normalize_markdown(text: str) -> str:

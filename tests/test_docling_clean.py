@@ -4,6 +4,11 @@
 标题/表格语法），导致 docling 输出的 ``<!-- image -->`` 图片占位注释从未
 被清洗、原样进切片。这里验证轻清洗只除注释类噪声、保留 Markdown 结构。
 """
+import sys
+import types
+
+import pytest
+
 from agent.rag.cleaner import clean_docling_markdown, clean_text
 
 
@@ -214,3 +219,91 @@ def test_ebook_path_table_handling():
     out = clean_ebook_markdown(complex_md)
     # 复杂表原样保留（不被剥标签销毁）
     assert "<table>" in out and 'colspan="2"' in out and "合并" in out
+
+
+# ---------------------------------------------------------------------------
+# 密度压缩（2026-10-22 用户定版：压掉不必要的空行/空格，保留格式）
+# ---------------------------------------------------------------------------
+
+def test_collapses_internal_multiple_spaces():
+    # PDF 两端对齐产生的 word    word 是主要来源
+    out = clean_docling_markdown("这   是    一段     正文。")
+    assert out == "这 是 一段 正文。"
+
+
+def test_strips_trailing_whitespace():
+    out = clean_docling_markdown("第一行   \n第二行\t\n")
+    assert out == "第一行\n第二行"
+
+
+def test_whitespace_only_lines_become_blank():
+    out = clean_docling_markdown("A\n   \n\t\nB")
+    assert out == "A\n\nB"
+
+
+def test_blank_runs_collapse_to_single():
+    out = clean_docling_markdown("A\n\n\n\nB\n\n\nC")
+    assert out == "A\n\nB\n\nC"
+
+
+def test_no_leading_blank_lines():
+    out = clean_docling_markdown("\n\n\n正文")
+    assert out == "正文"
+
+
+def test_preserves_list_indentation():
+    out = clean_docling_markdown("- 一级\n  - 二级\n    - 三级")
+    assert out == "- 一级\n  - 二级\n    - 三级"
+
+
+def test_fenced_code_fully_untouched():
+    md = ("正文\n\n```python\n"
+          "def  f( a,  b ):    # 双空格与行尾空白都在代码里\n"
+          "    return   a  +  b    \n\n\n"
+          "```\n\n后续。")
+    out = clean_docling_markdown(md)
+    assert "def  f( a,  b ):    # 双空格与行尾空白都在代码里" in out
+    assert "    return   a  +  b    " in out      # 行尾空白也保留
+    assert "return   a  +  b    \n\n\n" in out   # 块内空行保留
+    assert "后续。" in out
+
+
+def test_indented_code_block_untouched():
+    md = "示例：\n\n    def  f():\n        return    1\n\n后续。"
+    out = clean_docling_markdown(md)
+    assert "    def  f():" in out
+    assert "        return    1" in out
+
+
+def test_table_row_spaces_collapsed_structure_kept():
+    md = "| 名称   | 值 |\n| --- | --- |\n| 甲   | 1 |"
+    out = clean_docling_markdown(md)
+    assert "| 名称 | 值 |" in out and "| 甲 | 1 |" in out
+    assert "| --- | --- |" in out
+
+
+def test_inline_code_spaces_preserved():
+    out = clean_docling_markdown("用法：`a   b` 结束")
+    assert "`a   b`" in out
+
+
+def test_markdown_structure_preserved():
+    md = ("# 标题   \n\n> 引用  内容\n\n---\n\n1. 第一  项\n2. 第二  项")
+    out = clean_docling_markdown(md)
+    assert out == "# 标题\n\n> 引用 内容\n\n---\n\n1. 第一 项\n2. 第二 项"
+
+
+def test_compress_markdown_density_helper_direct():
+    from agent.rag.cleaner import compress_markdown_density
+    assert compress_markdown_density("a   b\n\n\n\nc") == "a b\n\nc"
+    assert compress_markdown_density("") == ""
+
+
+def test_ebook_path_density():
+    from agent.rag.ebook_parser import clean_ebook_markdown
+    # 纯空白行（空格/tab 组成）与连续空行被收口成单个段落分隔
+    md = "第一段。   \n   \n\n\n第二段。"
+    out = clean_ebook_markdown(md)
+    assert "第一段。" in out and "第二段。" in out
+    assert "\n   \n" not in out
+    assert "\n\n\n" not in out

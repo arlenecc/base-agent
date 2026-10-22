@@ -155,8 +155,9 @@ def clean_ebook_markdown(md: str) -> str:
     """
     if not md:
         return ""
-    from .cleaner import (join_hard_wrapped_lines, restore_table_stash,
-                          stash_complex_tables, strip_html_entities)
+    from .cleaner import (compress_markdown_density, join_hard_wrapped_lines,
+                          restore_table_stash, stash_complex_tables,
+                          strip_html_entities)
 
     md = strip_html_entities(md)
     md = _html.unescape(md)  # 残留的功能性实体（&amp; 等）还原为真实字符
@@ -204,6 +205,10 @@ def clean_ebook_markdown(md: str) -> str:
     md = join_hard_wrapped_lines(md, preserve_markdown=True)
     md = re.sub(r'[ \t]+', ' ', md)           # 合并产生的连续空格
     md = re.sub(r'\n{3,}', '\n\n', md)        # 收敛连续空行
+    # 密度压缩（2026-10-22 用户定版）：上面的全局空格合并会把纯空白行变成
+    # 单空格行（挡住空行收敛），这里统一收口——行尾空白剥掉、纯空白行 → 空行、
+    # 连续空行 → 恰好一个（Markdown 段落分隔一个就够）。栅栏/行内代码不动。
+    md = compress_markdown_density(md)
     md = re.sub(r'(^|\n)\s*((?:!\[[^\]]*\]\([^)]*\)\s*)+)\s*(?=\n|$)',
                 r'\1', md)                    # 连续裸图片占位行折叠
     return md.strip()
