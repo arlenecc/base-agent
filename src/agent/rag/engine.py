@@ -681,6 +681,35 @@ class RAGEngine:
             )
         return removed
 
+    def dedup_vectors(
+        self,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> Dict[str, int]:
+        """排查并清理向量库内内容完全相同的重复向量（保留每组最早入库的一份）。
+
+        「入库时间」以 markdown 缓存文件的 mtime 为代理——缓存写入时刻即
+        解析入库时刻（ingest 处理后立即写盘）；无缓存的源（缓存被清/文档
+        已删）记 0，按 (source, chunk_index) 字典序兜底，保证结果确定性。
+
+        内容一字不差才算重复（归一化空白后哈希）；不同文档的相同样板文字
+        （如纯「目录」页）同样只留一份——降低检索噪声。近似重复不处理。
+        """
+        def _order_key(rec: Dict[str, Any]) -> tuple:
+            src = rec.get("source") or ""
+            ts = 0.0
+            try:
+                rel = os.path.relpath(src, self._knowledge_base)
+                md_path = os.path.join(
+                    self._markdown_dir, _safe_filename(rel) + ".md")
+                ts = os.path.getmtime(md_path)
+            except OSError:
+                ts = 0.0
+            return (ts, src, rec.get("chunk_index") or 0)
+
+        store = self._get_store()
+        return store.deduplicate_vectors(order_key=_order_key,
+                                         progress_callback=progress_callback)
+
     def ingest(
         self,
         force: bool = False,

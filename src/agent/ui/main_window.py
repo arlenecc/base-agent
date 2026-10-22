@@ -40,7 +40,7 @@ from ..llm_client import LLMClient, LLMError
 from ..skills import Skill
 from ..tools import ToolRegistry
 from ..rag.engine import RAGEngine
-from ..rag.vector_store import DEFAULT_RERANK_MODEL
+from ..rag.vector_store import DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL
 
 
 CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
@@ -665,6 +665,47 @@ class FetchModelsWorker(QThread):
                     pass
 
 
+class VectorDedupWorker(QThread):
+    """后台执行向量库去重：清理内容完全相同的重复向量。
+
+    每组同文本只保留「入库时间早」的一份（markdown 缓存 mtime 为代理），
+    其余删除，降低同段内容在检索里的双倍召回。全程只读 id/text/source/
+    chunk_index 四列（不加载向量），分批删除。
+
+    自定义信号统一 ``dedup_`` 前缀——绝不声明 ``finished``：那会 shadow
+    QThread 内建 finished，挂在上面的 deleteLater 会在 run() 执行途中
+    销毁线程对象（见 SyncKnowledgeWorker 的同款警告）。
+    """
+
+    dedup_log = pyqtSignal(str)
+    dedup_progress = pyqtSignal(int, int, str)   # cur, total, msg
+    dedup_finished = pyqtSignal(dict)            # {"scanned","groups","removed"}
+    dedup_failed = pyqtSignal(str)
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self._config = config
+
+    def run(self):
+        try:
+            from ..rag.engine import RAGEngine
+            eng = RAGEngine(
+                workspace=self._config.workspace,
+                knowledge_base=self._config.knowledge_base,
+                embedding_model=getattr(self._config, "rag_embedding_model",
+                                        DEFAULT_EMBEDDING_MODEL),
+            )
+            self.dedup_log.emit("[dedup] 开始扫描向量库（只读文本列，不加载向量）…")
+            stats = eng.dedup_vectors(progress_callback=self._on_progress)
+            self.dedup_finished.emit(stats)
+        except Exception as e:
+            logger.warning("VectorDedupWorker failed: %s", e)
+            self.dedup_failed.emit(str(e))
+
+    def _on_progress(self, cur: int, total: int, msg: str) -> None:
+        self.dedup_progress.emit(cur, total, msg)
+
+
 class SyncKnowledgeWorker(QThread):
     """Background worker for RAG knowledge base ingestion.
 
@@ -1055,6 +1096,7 @@ class MainWindow(QMainWindow):
         self._worker: Optional[AgentWorker] = None
         self._fetch_worker: Optional[FetchModelsWorker] = None
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
+        self._dedup_worker: Optional[VectorDedupWorker] = None
         self._deps_worker: Optional[InstallDepsWorker] = None
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
@@ -1373,6 +1415,13 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("Embedding")); r.addWidget(self.embedding_impl_combo)
         r.addWidget(self.embedding_model_name_edit, 2)
         r.addWidget(self.embedding_path_edit, 2); r.addWidget(_pick_btn(self.embedding_path_edit))
+        self.dedup_vectors_btn = QPushButton("向量去重")
+        self.dedup_vectors_btn.setToolTip(
+            "扫描向量库，清理内容完全相同的重复向量\n"
+            "（每组只保留最早入库的一份，降低检索噪声）"
+        )
+        self.dedup_vectors_btn.clicked.connect(self._on_dedup_vectors)
+        r.addWidget(self.dedup_vectors_btn)
         self.sync_knowledge_btn = QPushButton("同步知识")
         self.sync_knowledge_btn.setToolTip(
             "解析知识库文档、建立向量索引，支持 RAG 检索\n"
@@ -2156,6 +2205,86 @@ class MainWindow(QMainWindow):
             return bool(worker.isRunning())
         except RuntimeError:
             return False
+
+    # ------------------------------------------------------------------
+    # 向量去重（清理内容完全相同的重复向量，保留每组最早入库的一份）
+    # ------------------------------------------------------------------
+    def _on_dedup_vectors(self) -> None:
+        if self._is_worker_running(self._dedup_worker):
+            logger.warning("向量去重正在进行，忽略重复请求")
+            return
+        if self._is_worker_running(self._sync_worker):
+            QMessageBox.information(self, "提示", "知识同步正在进行，请先完成或停止同步再执行向量去重。")
+            return
+        ret = QMessageBox.question(
+            self, "向量去重",
+            "将扫描向量库中内容完全相同的向量，每组只保留最早入库的一份，"
+            "其余删除。\n\n用于清理不同目录下同一本书等原因造成的重复向量，"
+            "降低检索噪声。\n\n此操作不可撤销，确定继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self._dedup_worker = VectorDedupWorker(self.config)
+        self._dedup_worker.dedup_log.connect(self._on_dedup_log)
+        self._dedup_worker.dedup_progress.connect(self._on_dedup_progress)
+        self._dedup_worker.dedup_finished.connect(self._on_dedup_finished)
+        self._dedup_worker.dedup_failed.connect(self._on_dedup_failed)
+        # deleteLater 必须挂 QThread 内建 finished（run() 返回后触发），
+        # 挂在自定义信号上会在 run() 执行途中销毁线程对象。
+        self._dedup_worker.finished.connect(self._dedup_worker.deleteLater)
+        self.dedup_vectors_btn.setEnabled(False)
+        self.sync_knowledge_btn.setEnabled(False)
+        self.progress.setRange(0, 0)      # busy 态（总数未知）
+        self.progress.setFormat("向量去重扫描中…")
+        self._dedup_worker.start()
+        logger.info("向量去重已启动: kb=%s", self.config.knowledge_base)
+
+    def _on_dedup_log(self, line: str) -> None:
+        self._append_log(line)
+
+    def _on_dedup_progress(self, cur: int, total: int, msg: str) -> None:
+        if total > 0:
+            self.progress.setRange(0, total)
+            self.progress.setValue(cur)
+        self.status_label.setText(msg)
+
+    def _on_dedup_finished(self, stats: dict) -> None:
+        self.dedup_vectors_btn.setEnabled(True)
+        self.sync_knowledge_btn.setEnabled(True)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setFormat("%p%")
+        # 清引用：worker 已挂 deleteLater，C++ 对象随后被销毁，继续持有
+        # 会让 closeEvent 里的 isRunning() 抛 RuntimeError。
+        self._dedup_worker = None
+        scanned = int(stats.get("scanned", 0))
+        groups = int(stats.get("groups", 0))
+        removed = int(stats.get("removed", 0))
+        self.status_label.setText("向量去重完成")
+        logger.info("向量去重完成: 扫描 %d 条, %d 组重复, 删除 %d 条",
+                    scanned, groups, removed)
+        if removed:
+            QMessageBox.information(
+                self, "向量去重完成",
+                f"扫描 {scanned} 条向量，发现 {groups} 组内容完全相同的重复，\n"
+                f"已删除 {removed} 条（每组保留最早入库的一份）。")
+        else:
+            QMessageBox.information(
+                self, "向量去重完成",
+                f"扫描 {scanned} 条向量，未发现内容完全相同的重复。")
+
+    def _on_dedup_failed(self, error: str) -> None:
+        self.dedup_vectors_btn.setEnabled(True)
+        self.sync_knowledge_btn.setEnabled(True)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setFormat("%p%")
+        self._dedup_worker = None
+        self.status_label.setText("向量去重失败")
+        logger.warning("向量去重失败: %s", error[:300])
+        QMessageBox.critical(self, "向量去重失败", error[:500])
 
     def _on_sync_knowledge(self, force: bool = False) -> None:
         if self._is_worker_running(self._sync_worker):
@@ -3190,6 +3319,20 @@ class MainWindow(QMainWindow):
                     self._sync_worker.terminate()
                     self._sync_worker.wait(2000)
             self._sync_worker = None
+        # --- VectorDedupWorker: no cancel mechanism (scan+delete is fast),
+        # just wait briefly so its signals don't fire into destroyed widgets.
+        if self._dedup_worker is not None:
+            try:
+                self._dedup_worker.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            if self._is_worker_running(self._dedup_worker):
+                self._dedup_worker.wait(3000)
+                if self._is_worker_running(self._dedup_worker):
+                    logger.warning("UI: dedup worker did not finish in 3s, terminating")
+                    self._dedup_worker.terminate()
+                    self._dedup_worker.wait(2000)
+            self._dedup_worker = None
         # --- InstallDepsWorker: no cancel mechanism, just wait.
         if self._deps_worker is not None:
             try:

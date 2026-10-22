@@ -9,9 +9,11 @@ Vectors are stored in LanceDB (Lance columnar format on local disk).
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import math
 import os
+import re
 import threading
 import time
 import warnings
@@ -1057,6 +1059,100 @@ class VectorStore:
             # 失败文件被无条件 pop，向量永久残留且下次同步没有重试机会。
             logger.warning("VectorStore: delete_by_source '%s' failed: %s", source, e)
             raise
+
+    @_store_op
+    def deduplicate_vectors(
+        self,
+        order_key: Optional[Any] = None,
+        progress_callback: Optional[Any] = None,
+    ) -> Dict[str, int]:
+        """清理内容完全相同的重复向量：每组只保留一份，其余删除。
+
+        分组键 = 归一化文本（strip + 内部空白折叠）的 sha256——**内容一字
+        不差**才算重复（不同文档里的相同样板文字，如纯「目录」页，同样只留
+        一份，降低检索噪声）；近似重复不处理，避免误删。
+
+        组内胜者由 ``order_key(record)`` 取最小决定：引擎侧传入
+        「markdown 缓存 mtime → source → chunk_index」，即保留**入库时间早**
+        的一份；order_key 缺省时按 (source, chunk_index) 字典序兜底。
+
+        Args:
+            order_key: 可选 ``record -> tuple``，值越小越优先保留。
+            progress_callback: 可选 ``(cur, total, msg) -> None`` 扫描进度。
+
+        Returns:
+            ``{"scanned": 扫描条数, "groups": 有重复的组数, "removed": 删除条数}``
+        """
+        self._ensure_initialized()
+        table = self._ensure_table()
+        if table is None:
+            return {"scanned": 0, "groups": 0, "removed": 0}
+        try:
+            total = table.count_rows()
+        except Exception:
+            total = 0
+        if total == 0:
+            return {"scanned": 0, "groups": 0, "removed": 0}
+        # key -> [best_order, best_id, 所有见过的 id]。胜者可能后出现（入库
+        # 更早的文档扫描序不保证在前），所以每组记住全部 id，最后统一删。
+        groups: Dict[str, list] = {}
+        _BATCH = 2000
+        _COLS = ["id", "text", "source", "chunk_index"]
+        scanned = 0
+        while scanned < total:
+            # 只投影四列（不加载 768 维向量）：search(None) 是全表扫描，
+            # select 做列裁剪，limit/offset 分页（lancedb 0.40 的
+            # to_arrow() 不接受任何参数，只能走 query builder）。
+            rows = table.search(None).select(_COLS).limit(_BATCH).offset(
+                scanned).to_arrow().to_pylist()
+            if not rows:
+                break
+            for r in rows:
+                text = re.sub(r"\s+", " ", (r.get("text") or "")).strip()
+                if not text:
+                    continue
+                key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                ok = (order_key(r) if order_key is not None
+                      else (r.get("source") or "", r.get("chunk_index") or 0))
+                g = groups.get(key)
+                if g is None:
+                    groups[key] = [ok, r["id"], [r["id"]]]
+                else:
+                    g[2].append(r["id"])
+                    if ok < g[0]:
+                        g[0], g[1] = ok, r["id"]
+            scanned += len(rows)
+            if progress_callback is not None:
+                try:
+                    progress_callback(scanned, total,
+                                      f"已扫描 {scanned}/{total} 条向量")
+                except Exception as e:
+                    logger.warning("VectorStore: dedup progress error: %s", e)
+        to_delete: List[str] = []
+        dup_groups = 0
+        for g in groups.values():
+            if len(g[2]) > 1:
+                dup_groups += 1
+                to_delete.extend(i for i in g[2] if i != g[1])
+        removed = 0
+        if to_delete:
+            # 分批 IN 删除。id 形如 "{md5}_{idx}"（十六进制+下划线+数字），
+            # 无引号注入面；只做单引号翻倍，**不能**用 _escape_like（它会转义
+            # 下划线，在 IN 列表里反而匹配不上）。
+            def _lit(x: Any) -> str:
+                return "'" + str(x).replace("'", "''") + "'"
+
+            for i in range(0, len(to_delete), 500):
+                batch = to_delete[i:i + 500]
+                table.delete("id IN (" + ", ".join(_lit(x) for x in batch) + ")")
+                removed += len(batch)
+            # BM25 倒排索引里的 term 还在——失效重建，否则已删内容仍会被
+            # 关键词检索召回（与 delete_by_source 同一理由）。
+            self._fts_ready = False
+            self._ensure_fts_index(self._table)
+            logger.info("VectorStore: 向量去重完成: %d 组重复, 删除 %d 条",
+                        dup_groups, removed)
+        return {"scanned": scanned, "groups": dup_groups, "removed": removed}
 
     @_store_op
     def add_streaming(
