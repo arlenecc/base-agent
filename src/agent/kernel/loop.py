@@ -373,6 +373,9 @@ class KernelLoop:
                     # 轮按 token 比对裁到公共前缀(系统提示 + 幸存早期轮次)，只
                     # 重算被折叠的那一小段；整体丢弃反而让折叠后整轮退回全量
                     # 预填充(十几秒)。这里故意不再调用 _invalidate_kv()。
+                    # 注意：Qwen3.5 的线性注意力层用 ArraysCache（不可裁剪），
+                    # form ③ 的裁剪会失败、退化为全量重建——折叠/回滚后的那一
+                    # 轮仍会慢（llm.py 有 info 级日志），属预期而非回归。
                     pass
                 self.log(f"[kernel] CONSOLIDATE ({reason}) folded={folded} {session.stats()}")
                 try:

@@ -704,13 +704,15 @@ class LocalLLMClient:
                 logger.debug("LLM: KV cache 创建于其它线程，丢弃重建")
             cache = None
             thread_mismatch[0] = True
+        over_limit = False
+        common = 0
         if cache is None or not cached_ids:
             cache = None
         elif len(cached_ids) > _KV_MAX_TOKENS:      # 长会话内存护栏
             cache = None
+            over_limit = True
         else:
             lim = min(len(cached_ids), len(prompt_ids))
-            common = 0
             while common < lim and cached_ids[common] == prompt_ids[common]:
                 common += 1
             if common >= len(cached_ids):
@@ -739,6 +741,15 @@ class LocalLLMClient:
                         len(prompt_ids) - common)
                 else:
                     cache = None
+        if cache is None and cached_ids:
+            # 整体重建的原因必须 info 级可见——「中间突然很慢」时看日志即可
+            # 定位是护栏命中还是分叉裁剪失败（而非盲目怀疑工具调用）。
+            reason = ("缓存创建于其它线程" if thread_mismatch[0]
+                      else "超 _KV_MAX_TOKENS 长会话护栏" if over_limit
+                      else "分叉/回退裁剪失败（Qwen3.5 ArraysCache 不可裁剪）")
+            logger.info(
+                "LLM: KV 缓存整体重建（%s）: cached=%d, prompt=%d, fork@%d",
+                reason, len(cached_ids), len(prompt_ids), common)
         if cache is None:
             cache = make_prompt_cache(self._model)
             reuse = 0
