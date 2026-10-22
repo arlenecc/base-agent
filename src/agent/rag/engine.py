@@ -629,6 +629,9 @@ class RAGEngine:
         - 未修改文件：完全跳过（不 parse、不 chunk、不 embed、不 upsert）
         - 新增/修改文件：完整处理（parse → clean → chunk → embed → upsert）
         - 已删除文件：清理对应向量和 manifest 条目（无论 force 与否）
+        - 中途取消：已完整入库的文件记入 manifest（下次跳过，不重做解析/
+          清洗/切片/嵌入）；进行中或只入库一半的文件不记录，下次同步从断点
+          续传（幂等 upsert，不留「记录完成却只入库一半」的永久缺失）
 
         流式架构：worker 池并行解析+chunk，主线程通过有界队列消费并增量写入
         vector store。内存占用 = O(parallel_workers * 单文件 chunks) + O(batch_size)，
@@ -1218,6 +1221,19 @@ class RAGEngine:
 
             def _on_batch(batch_added: int, total_added: int) -> None:
                 _log("  ├─ 向量化批次写入: +%d 切片 (累计 %d)", batch_added, total_added)
+                # 记录「已完整写入向量库」的文件：按 pending 顺序累加各文件
+                # chunk_count，一旦某文件累计 chunk 数 <= total_added，说明它的
+                # 全部切片都已落库，可安全记入同步记录（取消时仅提交这些）。
+                # 一旦某文件累计 > total_added（尚未完整写入），其后所有文件也
+                # 必然未完整写入，直接 break（保持有序、提前结束）。
+                cum = 0
+                for fp, entry in pending_manifest.items():
+                    cum += entry.get("chunk_count", 0)
+                    if cum <= total_added:
+                        if fp not in committed_manifest:
+                            committed_manifest[fp] = entry
+                    else:
+                        break
                 if progress_callback is not None:
                     try:
                         progress_callback(stats["files_extracted"] + stats["files_skipped"],
@@ -1227,6 +1243,11 @@ class RAGEngine:
 
             write_failed = False
             pending_manifest: Dict[str, Dict[str, Any]] = {}
+            # 已「完整写入向量库」的文件（取消时只提交这些，避免半截记录）。
+            # 与 pending_manifest 不同：pending 记录「已产出 chunks 的文件」，
+            # committed 记录「chunks 已实际落库的文件」——取消时二者之差就是
+            # 正在处理 / 只写入一半的文件，不记入同步记录，下次同步重新处理即可。
+            committed_manifest: Dict[str, Dict[str, Any]] = {}
             try:
                 # 批量 200（旧值 20）：LanceDB 每次 add 都会产生一个新
                 # fragment，小批量在大库上留下海量碎片，检索要逐段扫描。
@@ -1264,8 +1285,18 @@ class RAGEngine:
                 _log("  ⚠ 写入失败，本次处理的 %d 个文件将不在同步记录中（下次同步会重新处理）",
                      stats["files_extracted"])
             elif self._is_cancelled():
+                # 取消时不丢弃已完成的工作：只提交「已完整写入向量库」的文件
+                # （committed_manifest），其余（正在处理 / 仅写入一半）不记录，
+                # 下次同步会被重新处理（幂等 upsert，不重复留垃圾）。这样已完成
+                # 的解析/清洗/切片/入库不会被浪费，也未完成的不留「记录完成却只
+                # 入库一半」的永久性内容缺失。
+                new_manifest.update(committed_manifest)
                 pending_manifest.clear()
-                _log("  ⚠ 同步被取消，本次处理的文件不写入同步记录")
+                _log(
+                    "  ⚠ 同步被取消: %d 个文件已完整入库并记入同步记录（下次从中断处续传）, "
+                    "%d 个文件待下次续传",
+                    len(committed_manifest), len(pending_manifest),
+                )
             else:
                 new_manifest.update(pending_manifest)
 
