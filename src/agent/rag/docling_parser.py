@@ -108,13 +108,14 @@ _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"
 # 非线程安全（不能单实例并发 convert），但**多实例各自转换是安全的**。
 #
 # 大小分流（2026-10-22 用户定版：实际内存压力与 PDF 大小相关）：
-# - 小 PDF（< _large_file_bytes）：≤ _max_parallel 路并行转换——小文件工作集
-#   小，多实例内存叠加可控；
+# - 小 PDF（< _large_file_bytes，默认 20MB）：≤ _max_parallel 路并行转换——
+#   20MB 以下大概率是文本 PDF（文本层内存开销小），即便是扫描件页数也不
+#   多，并行安全；
 # - 大 PDF（≥ 阈值）：独占全部槽位——大页渲染位图 ∝ scale²，两份大书并行
 #   就能撑爆内存；
 # - 排队的大文件优先：有大文件等待时小文件不再新增并行（防饿死）。
 _max_parallel = 2
-_large_file_bytes = 8 * 1024 * 1024
+_large_file_bytes = 20 * 1024 * 1024
 
 
 def set_docling_concurrency(max_parallel: int, large_file_mb: float) -> None:

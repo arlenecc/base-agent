@@ -90,9 +90,11 @@ class AgentConfig:
     #   rag_parse_parallel  docling 转换器实例上限 = 小文件并行转换路数
     #                       （每实例布局/表格模型 ~1.6GB，16GB 机器别超 2）
     #   rag_parse_large_mb  ≥ 此大小的 PDF 独占全部实例（一次只转一个），
-    #                       防大页渲染位图（∝ scale²）叠加撑爆内存
+    #                       防大页渲染位图（∝ scale²）叠加撑爆内存。默认
+    #                       20MB：以下大概率是文本 PDF（文本层内存开销小），
+    #                       即便是扫描件页数也不多，并行安全。
     rag_parse_parallel: int = 2
-    rag_parse_large_mb: int = 8
+    rag_parse_large_mb: int = 20
     # OvisOCR2 VLM 模型配置（ovis 引擎用）：
     #   rag_ocr_engine    实现后端：mlx-vlm（safetensors 目录）| gguf（主模型
     #                     .gguf + mmproj*.gguf，llama-cpp 多模态）| onnx

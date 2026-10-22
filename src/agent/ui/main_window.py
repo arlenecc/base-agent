@@ -751,7 +751,7 @@ class SyncKnowledgeWorker(QThread):
                 from ..rag.docling_parser import set_docling_concurrency
                 set_docling_concurrency(
                     getattr(self._config, "rag_parse_parallel", 2),
-                    getattr(self._config, "rag_parse_large_mb", 8),
+                    getattr(self._config, "rag_parse_large_mb", 20),
                 )
             except Exception as e:
                 logger.debug("SyncKnowledgeWorker: parse concurrency inject failed: %s", e)
