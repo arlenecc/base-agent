@@ -601,6 +601,78 @@ class RAGEngine:
     def _is_cancelled(self) -> bool:
         return self._cancelled.is_set()
 
+    def _dedup_manifest_by_content(
+        self, manifest: Dict[str, Dict[str, Any]]
+    ) -> int:
+        """按 content_hash 清理重复副本的向量（B 方案后半程，2026-10-22 定版）。
+
+        覆盖两类存量问题：
+        1. 去重功能上线**前**，不同目录的同一本书已各自入库（两套向量、
+           documents 表两行）——检索时同段内容双倍召回；
+        2. 预扫描阶段漏掉的（如同一同步里两个副本都未变、走了跳过路径，
+           或历史 manifest 条目没有 source_hash 没进 seen 表）。
+
+        每组同 content_hash 保留一个 owner（无 duplicate_of 且路径字典序
+        最小，确定性选择），其余副本：删除向量 + documents 表记录（rel_path /
+        basename / 完整路径三种 id 都删，兼容旧版），manifest 条目标记
+        ``duplicate_of=owner``——下次同步直接走跳过路径，不重新解析。
+        已标记过的副本幂等跳过。另外把 owner 缺失/解析失败（无 content_hash）
+        的僵尸副本提升为正常条目，下轮同步重新入库。返回删除向量的副本数。
+        """
+        # 1) 僵尸副本提升：duplicate_of 指向的条目没了/没入库成功。
+        # 曾真实入库（有 content_hash，向量还在）→ 只摘标记，内容继续可检索；
+        # 从没入过库（content_hash 为空）→ 整条删除，下轮同步重新完整入库。
+        promoted = []
+        for _fp, entry in manifest.items():
+            owner = entry.get("duplicate_of")
+            if not owner:
+                continue
+            owner_entry = manifest.get(owner)
+            if owner_entry is None or not owner_entry.get("content_hash"):
+                if entry.get("content_hash"):
+                    entry.pop("duplicate_of", None)
+                else:
+                    promoted.append(_fp)      # 迭代后删（避免边遍历边删）
+        for _fp in promoted:
+            manifest.pop(_fp, None)
+        # 2) 按 content_hash 分组清理
+        groups: Dict[str, List[str]] = {}
+        for fp, entry in manifest.items():
+            if entry.get("duplicate_of"):
+                continue
+            ch = entry.get("content_hash")
+            if ch:
+                groups.setdefault(ch, []).append(fp)
+        removed = 0
+        store = None
+        for _ch, paths in groups.items():
+            if len(paths) < 2:
+                continue
+            paths.sort()                      # 确定性：字典序最小者为 owner
+            owner = paths[0]
+            for dup_path in paths[1:]:
+                entry = manifest[dup_path]
+                if entry.get("duplicate_of") == owner:
+                    continue                  # 上轮已清理（幂等）
+                if store is None:
+                    store = self._get_store()
+                try:
+                    store.delete_by_source(dup_path)
+                    # documents 表同样清（三种 id 兼容，见 _cleanup_deleted_files）
+                    store.delete_document(
+                        os.path.relpath(dup_path, self._knowledge_base))
+                    store.delete_document(os.path.basename(dup_path))
+                except Exception as e:
+                    logger.warning("RAG: 清理副本向量失败 %s: %s", dup_path, e)
+                entry["duplicate_of"] = owner
+                removed += 1
+        if promoted or removed:
+            logger.info(
+                "RAG: 内容去重清理: %d 个副本向量已删, %d 个僵尸副本已处理",
+                removed, len(promoted),
+            )
+        return removed
+
     def ingest(
         self,
         force: bool = False,
@@ -684,6 +756,7 @@ class RAGEngine:
             "files_extracted": 0,
             "files_skipped": 0,
             "files_deleted": 0,
+            "files_duplicated": 0,
             "total_chars": 0,
             "chunks": 0,
             "errors": [],
@@ -706,6 +779,9 @@ class RAGEngine:
                 ext_counts[ext] = ext_counts.get(ext, 0) + 1
         total_files = len(all_files)
         stats["files_found"] = total_files
+        # 排序让全管线确定性：内容去重的 owner（首个副本）、worker 分片、
+        # 日志顺序都不再随文件系统 inode 顺序波动。
+        all_files.sort()
         ext_summary = ", ".join(f"{ext}({cnt})" for ext, cnt in sorted(ext_counts.items()))
         _log("  扫描完成: 共发现 %d 个文件 [%s]", total_files, ext_summary if ext_summary else "无")
         if progress_callback is not None:
@@ -720,6 +796,10 @@ class RAGEngine:
             removed = self._cleanup_deleted_files(all_files, stats, stats_lock,
                                                   old_manifest=dict(new_manifest),
                                                   new_manifest=new_manifest)
+            try:
+                self._dedup_manifest_by_content(new_manifest)
+            except Exception as e:
+                logger.warning("RAG: content dedup failed: %s", e)
             try:
                 _save_manifest(self._rag_dir, new_manifest, removed=removed)
             except OSError as e:
@@ -740,6 +820,11 @@ class RAGEngine:
         files_to_process: List[str] = []  # new/modified files needing full pipeline
         skipped_detail: List[str] = []
         new_detail: List[str] = []
+        dup_detail: List[str] = []
+        # 内容去重（B 方案，2026-10-22 用户定版）：采样指纹 → 首个副本路径。
+        # 同一本书放在不同子目录/改名，只解析入库第一个，其余记 duplicate_of
+        # 跳过——省一遍解析+切片+嵌入，也避免同段内容在检索里双倍召回。
+        seen_fp: Dict[str, str] = {}
         for filepath in all_files:
             sig = _file_signature(filepath)
             if sig is None:
@@ -751,13 +836,28 @@ class RAGEngine:
                     stats["errors"].append(msg)
                 continue
             prev = manifest.get(filepath)
+            # 僵尸副本提升：记录里的主文件已不在（删除/移走）。分两种：
+            # - 曾真实入库（有 content_hash，向量还在）：只摘 duplicate_of，
+            #   条目保留走「未修改」跳过，内容继续可检索；
+            # - 从没入过库（预扫描标记的副本，content_hash 为空）：必须整条
+            #   丢掉历史记录让它重新走完整管线——只摘标记的话，mtime/size/
+            #   指纹未变，下面就被当「未修改」跳过，内容永远回不到知识库。
+            dup_owner = (prev or {}).get("duplicate_of")
+            if dup_owner and not os.path.exists(dup_owner):
+                if prev.get("content_hash"):
+                    prev = dict(prev)
+                    prev.pop("duplicate_of", None)
+                    manifest[filepath] = prev
+                else:
+                    manifest.pop(filepath, None)
+                    prev = None
+            prev_hash = (prev or {}).get("source_hash")
             # mtime+size 未变时还要再看一眼内容指纹：只看 mtime+size 会
             # **永久**漏同步 —— `cp -p` / `rsync -t` / 解压保留 mtime /
             # git checkout / 云盘回滚都会造成「内容换了但 mtime+size 不变」；
             # HFS+/SMB 挂载的 mtime 粒度只有 1~2 秒，同一秒内改一个字也识别
             # 不出来。指纹只在「本来要跳过」时才读盘算，正常路径零额外开销。
             # 旧记录没有 source_hash 时按旧逻辑判定（不影响已同步的库）。
-            prev_hash = (prev or {}).get("source_hash")
             if (not force
                     and prev is not None
                     and prev.get("mtime") == sig["mtime"]
@@ -769,6 +869,11 @@ class RAGEngine:
                 with stats_lock:
                     stats["files_skipped"] += 1
                 skipped_detail.append(f"  ✓ 跳过(未修改): {os.path.basename(filepath)}")
+                # 去重种子：已入库文件的指纹也要进 seen 表——否则本同步里
+                # 新出现的同内容副本检测不到「库里已经有一个」。
+                fp = prev_hash or _source_fingerprint(filepath, sig["size"])
+                if fp:
+                    seen_fp.setdefault(fp, filepath)
                 if progress_callback is not None:
                     try:
                         progress_callback(stats["files_extracted"] + stats["files_skipped"],
@@ -776,7 +881,29 @@ class RAGEngine:
                     except Exception as e:
                         logger.warning("RAG: progress_callback error: %s", e)
             else:
+                # 待处理前先做内容去重：指纹 ≤4MB 全量 / 大文件头中尾三段
+                # 64KB（192KB 读盘）——远小于解析成本，与跳过路径同源。
+                fp = _source_fingerprint(filepath, sig["size"])
+                owner = seen_fp.get(fp) if fp else None
+                if owner is not None and owner != filepath:
+                    # 同一内容的另一个副本（不同目录/改名）：不解析、不切片、
+                    # 不入库，只记一条 duplicate_of；下次同步继续走跳过路径。
+                    new_manifest[filepath] = {
+                        **sig,
+                        "source_hash": fp,
+                        "duplicate_of": owner,
+                        "content_hash": None,
+                        "chunk_count": 0,
+                    }
+                    with stats_lock:
+                        stats["files_duplicated"] += 1
+                    dup_detail.append(
+                        f"  ⧗ 跳过(内容重复): {os.path.basename(filepath)}"
+                        f" ≡ {os.path.basename(owner)}")
+                    continue
                 files_to_process.append(filepath)
+                if fp:
+                    seen_fp.setdefault(fp, filepath)
                 reason = "新增" if prev is None else "已修改"
                 new_detail.append(f"  → 待处理({reason}): {os.path.basename(filepath)}")
         # 汇总输出
@@ -786,9 +913,13 @@ class RAGEngine:
         if new_detail:
             for line in new_detail:
                 _log(line)
+        if dup_detail:
+            for line in dup_detail:
+                _log(line)
         _log(
-            "  对比结果: 总计%d 文件, %d 个待处理, %d 个跳过(未修改)",
+            "  对比结果: 总计%d 文件, %d 个待处理, %d 个跳过(未修改), %d 个内容重复",
             total_files, len(files_to_process), stats["files_skipped"],
+            stats["files_duplicated"],
         )
         if progress_callback is not None:
             try:
@@ -1338,6 +1469,15 @@ class RAGEngine:
 
         # Step 6: 保存 manifest
         _log("━━━ Step 6/6: 保存同步记录 ━━━")
+        # 内容去重收尾（B 方案后半程）：清理存量重复副本的向量 + 标记
+        # duplicate_of，避免检索时同段内容双倍召回。
+        try:
+            deduped = self._dedup_manifest_by_content(new_manifest)
+            if deduped:
+                _log("  ⧗ 内容去重: 清理 %d 个重复副本的向量（content_hash 相同）",
+                     deduped)
+        except Exception as e:
+            logger.warning("RAG: content dedup failed: %s", e)
         try:
             # 读改写合并 + 跨进程锁：并存的另一个 RAGEngine（agent 侧自动
             # ingest）刚写入的条目不能被这份旧快照抹掉。

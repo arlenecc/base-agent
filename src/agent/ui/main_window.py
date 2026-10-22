@@ -770,9 +770,10 @@ class SyncKnowledgeWorker(QThread):
                 log_callback=self._emit_log,
             )
             logger.info(
-                "SyncKnowledgeWorker done: found=%d extracted=%d skipped=%d deleted=%d chunks=%d errors=%d cancelled=%s",
+                "SyncKnowledgeWorker done: found=%d extracted=%d skipped=%d deleted=%d duplicated=%d chunks=%d errors=%d cancelled=%s",
                 stats.get("files_found", 0), stats.get("files_extracted", 0),
                 stats.get("files_skipped", 0), stats.get("files_deleted", 0),
+                stats.get("files_duplicated", 0),
                 stats.get("chunks", 0), len(stats.get("errors", [])),
                 stats.get("cancelled", False),
             )
