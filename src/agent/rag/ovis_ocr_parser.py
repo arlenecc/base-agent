@@ -33,7 +33,6 @@ import logging
 import os
 import re
 import threading
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import List, Optional
 
@@ -291,62 +290,11 @@ def release_model() -> None:
 
 # ---------------------------------------------------------------------------
 # HTML → Markdown（4-bit 量化版模型倾向输出 HTML 表格，README 已说明）
+# 转换器已上移到 cleaner.html_tables_to_markdown（clean_docling_markdown 与
+# pandoc 电子书清洗共用），这里保留别名兼容既有引用。
 # ---------------------------------------------------------------------------
 
-class _TableToMarkdown(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.rows: List[List[str]] = []
-        self._row: Optional[List[str]] = None
-        self._cell: Optional[List[str]] = None
-
-    def handle_starttag(self, tag: str, attrs) -> None:
-        if tag == "tr":
-            self._row = []
-        elif tag in ("td", "th"):
-            self._cell = []
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "tr" and self._row is not None:
-            if self._row:
-                self.rows.append(self._row)
-            self._row = None
-        elif tag in ("td", "th") and self._cell is not None:
-            if self._row is None:
-                self._row = []
-            self._row.append(" ".join("".join(self._cell).split()))
-            self._cell = None
-
-    def handle_data(self, data: str) -> None:
-        if self._cell is not None:
-            self._cell.append(data)
-
-
-def _html_tables_to_markdown(text: str) -> str:
-    """把输出里的 <table> 块转成 Markdown 管道表格，其余文本原样保留。"""
-    if "<table" not in text.lower():
-        return text
-
-    def _convert(m: "re.Match") -> str:
-        block = m.group(0)
-        p = _TableToMarkdown()
-        try:
-            p.feed(block)
-        except Exception:
-            return block
-        rows = [r for r in p.rows if any(c.strip() for c in r)]
-        if not rows:
-            return ""
-        width = max(len(r) for r in rows)
-        rows = [r + [""] * (width - len(r)) for r in rows]
-        out = ["| " + " | ".join(rows[0]) + " |",
-               "| " + " | ".join(["---"] * width) + " |"]
-        for r in rows[1:]:
-            out.append("| " + " | ".join(r) + " |")
-        return "\n".join(out)
-
-    return re.sub(r"<table.*?</table>", _convert, text,
-                  flags=re.IGNORECASE | re.DOTALL)
+from .cleaner import html_tables_to_markdown as _html_tables_to_markdown
 
 
 def _clean_vlm_output(text: str) -> str:

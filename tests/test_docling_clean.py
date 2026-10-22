@@ -57,3 +57,89 @@ def test_empty_input():
 def test_clean_text_still_strips_comments():
     # clean_text（轻量解析器路径）的注释剥离行为不回归
     assert "<!--" not in clean_text("x <!-- image --> y")
+
+
+# ---------------------------------------------------------------------------
+# 扩展清理项：script/style/svg、HTML 表格、<br>、残标、实体、栅栏保护
+# ---------------------------------------------------------------------------
+
+def test_drops_script_style_svg_blocks():
+    md = "正文A\n<script>alert(1)</script>\n<style>p{color:red}</style>\n" \
+         "<svg><circle r=\"1\"/></svg>\n正文B"
+    out = clean_docling_markdown(md)
+    assert "alert" not in out and "color:red" not in out and "circle" not in out
+    assert "正文A" in out and "正文B" in out
+
+
+def test_converts_html_table_to_markdown():
+    md = "前文。\n<table><tr><th>名称</th><th>值</th></tr>" \
+         "<tr><td>甲</td><td>1</td></tr></table>\n后文。"
+    out = clean_docling_markdown(md)
+    assert "<table" not in out
+    assert "| 名称 | 值 |" in out
+    assert "| 甲 | 1 |" in out
+    assert "前文。" in out and "后文。" in out
+
+
+def test_br_becomes_newline():
+    out = clean_docling_markdown("第一行<br>第二行<br/>第三行")
+    assert "第一行\n第二行\n第三行" in out
+    assert "<br" not in out
+
+
+def test_strips_tags_keeps_text():
+    md = "普通<u>下划线</u>与<sup>上标</sup>，<div>块内文字</div>结束。"
+    out = clean_docling_markdown(md)
+    assert "<" not in out
+    # 行内标签剥除不插字符（HTML 渲染语义）；块级 <div> 隐含换行
+    assert "普通下划线与上标，" in out
+    assert "块内文字" in out and "结束。" in out
+
+
+def test_unescapes_entities():
+    out = clean_docling_markdown("AT&amp;T 与 A&nbsp;B")
+    assert "AT&T" in out
+    assert "&nbsp;" not in out and "&amp;" not in out
+
+
+def test_inline_code_tags_survive():
+    md = "写法：`<div class=\"x\">` 是标签。"
+    out = clean_docling_markdown(md)
+    assert "`<div class=\"x\">`" in out
+
+
+def test_code_fence_fully_protected():
+    md = (
+        "说明：\n\n```html\n<!-- 注释也算内容 -->\n<table><tr><td>示例</td>"
+        "</tr></table>\n<script>keep()</script>\n```\n\n<!-- image -->\n尾注。"
+    )
+    out = clean_docling_markdown(md)
+    # 栅栏内一字不动（含注释/标签/script）
+    assert "```html\n<!-- 注释也算内容 -->" in out
+    assert "keep()" in out
+    assert "<td>示例</td>" in out
+    # 栅栏外的占位注释被清掉
+    assert out.count("<!-- image -->") == 0
+    assert "尾注。" in out
+
+
+def test_unclosed_fence_protected_to_eof():
+    md = "前文 <!-- image -->\n\n```\n<!-- 注释 --> <u>未闭合栅栏</u>"
+    out = clean_docling_markdown(md)
+    assert "<!-- 注释 -->" in out and "<u>未闭合栅栏</u>" in out
+    assert "<!-- image -->" not in out
+
+
+def test_html_table_conversion_helper():
+    from agent.rag.cleaner import html_tables_to_markdown
+    out = html_tables_to_markdown("<table><tr><td>A</td><td>B</td></tr></table>")
+    assert out == "| A | B |\n| --- | --- |"
+    # 无表格时原样返回
+    assert html_tables_to_markdown("纯文本") == "纯文本"
+
+
+def test_tilde_fence_protected():
+    md = "~~~\n<!-- 保真 -->\n~~~\n<!-- image -->"
+    out = clean_docling_markdown(md)
+    assert "<!-- 保真 -->" in out
+    assert "<!-- image -->" not in out

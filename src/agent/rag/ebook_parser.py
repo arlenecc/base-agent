@@ -155,7 +155,8 @@ def clean_ebook_markdown(md: str) -> str:
     """
     if not md:
         return ""
-    from .cleaner import join_hard_wrapped_lines, strip_html_entities
+    from .cleaner import (html_tables_to_markdown, join_hard_wrapped_lines,
+                          strip_html_entities)
 
     md = strip_html_entities(md)
     md = _html.unescape(md)  # 残留的功能性实体（&amp; 等）还原为真实字符
@@ -183,6 +184,9 @@ def clean_ebook_markdown(md: str) -> str:
     md = re.sub(r'\\([\[\]()#*_<>{}])', r'\1', md)
     # gfm autolink <https://…> / <mailto:…> 还原成裸链接（否则被当标签剥掉）
     md = re.sub(r"<(https?://[^>\s]+|mailto:[^>\s]+)>", r"\1", md)
+    # HTML 表格先转 Markdown 管道表（代码块已被上方 stash 保护）——否则下面
+    # 的通用剥标签会把 <td> 单元格文本粘连成一行，表格结构信息全丢。
+    md = html_tables_to_markdown(md)
     md = re.sub(r"<!--[\s\S]*?-->", " ", md)      # 注释兜底（pandoc 已剥一轮）
     md = re.sub(r"</?[a-zA-Z][^>]*>", " ", md)    # 所有 HTML/XML 标签（属性可跨行）
     md = re.sub(r"<[!?][^>]*>", " ", md)          # DOCTYPE / 处理指令残留
