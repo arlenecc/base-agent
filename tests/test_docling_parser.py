@@ -4,6 +4,17 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _fresh_converter_pool():
+    """实例池会跨测试缓存旧工厂（monkeypatch 的假工厂）的实例——每个测试
+    前后清空，避免上一个测试的假 converter 泄漏到下一个测试的断言里。"""
+    from agent.rag import docling_parser as dp
+
+    dp._pool.release_all()
+    yield
+    dp._pool.release_all()
+
+
 def test_extract_markdown_returns_none_when_docling_missing(monkeypatch):
     """Without docling, extract_markdown returns None (caller falls back)."""
     from agent.rag import docling_parser as dp

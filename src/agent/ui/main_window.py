@@ -746,6 +746,15 @@ class SyncKnowledgeWorker(QThread):
                 release_mlx_pool()
             except Exception as e:  # 防御：清理失败不该中断同步
                 logger.debug("SyncKnowledgeWorker: pre-sync mlx cleanup failed: %s", e)
+            # 解析并发配置（docling 实例池：小文件并行、大文件独占）。
+            try:
+                from ..rag.docling_parser import set_docling_concurrency
+                set_docling_concurrency(
+                    getattr(self._config, "rag_parse_parallel", 2),
+                    getattr(self._config, "rag_parse_large_mb", 8),
+                )
+            except Exception as e:
+                logger.debug("SyncKnowledgeWorker: parse concurrency inject failed: %s", e)
             self._engine = RAGEngine(
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,

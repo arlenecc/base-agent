@@ -41,9 +41,11 @@ _TABLE_MIN_COLS = 3           # 词网格至少 N 列
 # ---------------------------------------------------------------------------
 # 逐页策略的当前值（convert 期间独占）
 # ---------------------------------------------------------------------------
-# docling_parser.extract_markdown 在 _converter_lock 内串行调用 convert()，
-# 只有一次转换在跑，所以这个模块级变量是安全的。set/clear 成对出现在
-# extract_markdown 的 try/finally 里。
+# docling_parser.extract_markdown 在动态策略开启时强制**独占**实例池
+# （extract_markdown 里 exclusive = large or _ocr_scale_dynamic）——只有一次
+# 转换在跑，这个模块级变量才是安全的；并行转换会互相改写策略。动态策略
+# 默认关闭，此时不经过本变量（scale 在 converter 构建时固化）。set/clear
+# 成对出现在 extract_markdown 的 try/finally 里。
 _current_policy: Optional[Dict[int, float]] = None
 _policy_lock = threading.Lock()
 

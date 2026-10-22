@@ -36,6 +36,9 @@ _MARKER_EXTENSIONS = {".pdf", ".epub", ".mobi", ".azw3", ".azw", ".png", ".jpg",
 _converter = None
 _converter_lock = threading.Lock()
 _converter_unavailable = False
+# marker 不做 docling 那样的多实例池：surya 系模型 ~3GB/实例，两实例 ~6GB
+# 起步，16GB 机器扛不住——保持单实例独占串行（rag_parse_parallel 只对
+# docling 生效）。
 
 
 def release_converter() -> None:

@@ -85,6 +85,14 @@ class AgentConfig:
     #     作为 docling/marker 之外的第三选项与最后兜底（替换原 PyMuPDF+
     #     RapidOCR 方案，后者只能出无版面纯文本）
     # 回退链：主引擎 → 其余统一引擎 → ovis → PyMuPDF 纯文本兜底。
+    # 解析并发（docling 实例池，2026-10-22 用户定版：内存压力与 PDF 大小
+    # 相关——小文件并行、大文件独占）：
+    #   rag_parse_parallel  docling 转换器实例上限 = 小文件并行转换路数
+    #                       （每实例布局/表格模型 ~1.6GB，16GB 机器别超 2）
+    #   rag_parse_large_mb  ≥ 此大小的 PDF 独占全部实例（一次只转一个），
+    #                       防大页渲染位图（∝ scale²）叠加撑爆内存
+    rag_parse_parallel: int = 2
+    rag_parse_large_mb: int = 8
     # OvisOCR2 VLM 模型配置（ovis 引擎用）：
     #   rag_ocr_engine    实现后端：mlx-vlm（safetensors 目录）| gguf（主模型
     #                     .gguf + mmproj*.gguf，llama-cpp 多模态）| onnx
@@ -194,6 +202,7 @@ class AgentConfig:
     # 直接喂给 dataclass 会让后续算术/比较在运行时炸掉。
     _INT_FIELDS = ("max_tokens", "top_k", "max_iterations", "max_history",
                    "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
+                   "rag_parse_parallel", "rag_parse_large_mb",
                    "kernel_max_context_tokens", "kernel_raw_turns",
                    "kernel_consolidate_every", "kernel_max_tool_chars",
                    "kernel_max_digest_lines",
