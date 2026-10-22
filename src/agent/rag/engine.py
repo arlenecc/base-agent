@@ -967,8 +967,12 @@ class RAGEngine:
         # 必须在 if 之前初始化：全跳过时下面的取消分支也要读它。
         added = 0
         if files_to_process:
+            # 实际 worker 数 = min(配置并发, 文件数)——文件少时只启必要的
+            # 线程（旧实现头部照写 self._parallel_workers，1 个文件也显示
+            # 「2 个并行 Worker」，与实际启动的线程数不符）。
+            _num_workers = min(self._parallel_workers, len(files_to_process))
             _log("━━━ Step 3/6: 解析文档 + 清洗 + 切片（%d 个文件，%d 个并行 Worker） ━━━",
-                        len(files_to_process), self._parallel_workers)
+                        len(files_to_process), _num_workers)
             q: "queue.Queue[Any]" = queue.Queue(maxsize=self._parallel_workers * _QUEUE_CAPACITY_FACTOR)
 
             # 全局文件序号计数器（用于日志显示 "文件 3/10"）
