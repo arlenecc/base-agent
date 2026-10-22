@@ -899,12 +899,17 @@ class Agent:
         self._log(f"USER: {user_input}")
 
         # skill suggestion (固化) - non-blocking
-        try:
-            suggested = self.skills.record_request(user_input)
-            if suggested is not None:
-                self.callbacks.on_skill_suggested(suggested)
-        except Exception as e:  # pragma: no cover
-            self._log(f"[skills] record_request error: {e}")
+        # 寒暄 / 问询 / 查询类（简单、无需计划、非多步完成）不值得固化成技能，
+        # 跳过计数，避免反复弹出「是否保存为技能」的打扰弹窗。这类输入命中
+        # _is_simple_input（短且无多步信号，恰好对应「不涉及计划、非多步」），
+        # 真正的多步/执行类任务仍正常累积、达阈值后建议固化。
+        if not KernelLoop._is_simple_input(user_input):
+            try:
+                suggested = self.skills.record_request(user_input)
+                if suggested is not None:
+                    self.callbacks.on_skill_suggested(suggested)
+            except Exception as e:  # pragma: no cover
+                self._log(f"[skills] record_request error: {e}")
 
         # 跨会话连续性：恢复上一次 persist 的工作检查点
         restore_checkpoint(self.config, self.session)

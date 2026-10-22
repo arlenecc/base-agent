@@ -595,9 +595,14 @@ class AgentWorker(QThread):
             bridge.disconnect()
 
     def run(self) -> None:  # type: ignore[override]
-        # 在 worker 线程内预填系统提示 KV（与真实生成同线程，缓存不被线程隔离
-        # 丢弃）。worker 在模型加载完成后即启动，用户打字前本线程处于空闲，预填
-        # 完成后首句直接命中缓存、跳过数千 token 全量预填充。失败不致命。
+        # 模型加载完成后本线程即启动，先做两件「空闲期预热」，都跑在 worker 线程、
+        # 与真实生成同线程（缓存不被线程隔离丢弃），且二者串行避免并发抢同一份权重
+        # （MLX 前向非线程安全）：
+        #  (1) 用 system prompt 预填 KV（数秒）——首句直接命中缓存、跳过数千 token
+        #      全量预填充；
+        #  (2) warm_up 跑一次真实形状推理，触发 MLX 首推图编译（20-30s），首句不再
+        #      等冷启动。
+        # 两步都失败不致命；预填/编译完才进入消息循环，用户打字前本线程已空闲。
         try:
             self._callbacks.bridge.status.emit(
                 "系统提示预热中（预填上下文，请稍候）")
@@ -605,6 +610,16 @@ class AgentWorker(QThread):
             self._callbacks.bridge.status.emit("系统提示已预热，可开始对话")
         except Exception:
             self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
+        # warm_up（首次推理编译）：与预填串行、同在 worker 线程，不另起并发抢权重。
+        try:
+            self._callbacks.bridge.status.emit(
+                "主模型预热中（首次推理编译，约 20-30s，请稍候）")
+            self._agent.warm_up()
+            self._callbacks.bridge.status.emit("主模型预热完成，可开始对话")
+        except Exception as e:
+            logger.warning("主模型预热失败(忽略): %s", e)
+            self._callbacks.bridge.status.emit(
+                "预热失败，但仍可对话（首句会偏慢）")
         while True:
             text = self._queue.get()
             if text is None:
@@ -963,17 +978,15 @@ class SendEditor(QPlainTextEdit):
     send_requested = pyqtSignal()
 
     def keyPressEvent(self, e: QKeyEvent) -> None:  # type: ignore[override]
-        # 只放行**裸** Enter/Return 发送：Ctrl+Enter / Meta+Enter 也走 super()
-        #（旧实现 Ctrl+Enter 同样触发发送，且未 accept 的事件会继续向父控件
-        # 传播，可能触发对话框默认按钮等意外行为）。
+        # 裸 Enter/Return 发送；Shift/Ctrl/Meta+Enter 走 super()（换行）。
         #
-        # 另外必须放行 IME 预编辑态的 Return：中文/日文输入法组字时按回车，
-        # Qt 发来的 Return 事件 text() 为空（那是「确认候选词」而不是「发送」）。
-        # 旧实现不看 text()，会把半条消息直接发出去——中文用户每确认一个候选词
-        # 就误发一次。
+        # IME 预编辑态按回车是「确认候选词」而非「发送」：此时 Return 事件的
+        # text() 为空；普通回车的 text() 为 "\r"（非空）。用「text 非空」区分
+        # 二者——旧实现多写了 .strip("\r\n")，把普通回车的 "\r" 也剥成空，
+        # 导致普通回车永远不进入发送分支、回车发送彻底失效（只能点按钮）。
         if (e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
                 and not (e.modifiers() & ~Qt.KeyboardModifier.KeypadModifier)
-                and (e.text() or "").strip("\r\n") != ""):
+                and (e.text() or "") != ""):
             self.send_requested.emit()
             e.accept()
             return
@@ -1071,6 +1084,8 @@ class MainWindow(QMainWindow):
         self._setup_log_bridge()
         self._apply_config_to_widgets()
         self._rebuild_agent()
+        # 启动主动加载：本地模式自动加载主模型；辅助模型恒为本地、启动即加载。
+        self._auto_load_startup()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1465,25 +1480,13 @@ class MainWindow(QMainWindow):
                 logger.info("%s 权重已预加载", label)
                 # 先置绿：加载成功即标记为「已就绪」（变绿），用户可立即开始对话。
                 self.model_loaded.emit(key, True)
-                # 主模型加载完成后**后台**预热一次：用完整 system prompt + 一条
-                # 'hi' 触发一次真实形状的推理，本地模型首次 generate 的编译/图优化
-                # 就在这一步完成——用户第一条消息无需再等 20-30s 冷启动。仅在已
-                # 就绪（按钮变绿）后再跑，不阻塞按钮态；失败不致命。
+                # 主模型加载完成后**立即**启动常驻 worker：run() 内会先用 system
+                # prompt 预填 KV（数秒）、再串行跑 warm_up 编译（20-30s），都在
+                # worker 线程内完成、与真实生成同线程。用户打字前 worker 已空闲，
+                # 首句直接命中缓存。绝不在本（预加载）线程里再跑 warm_up——否则会和
+                # worker 内的预填/编译并发抢同一份权重（MLX 前向非线程安全）。
                 if key == "main" and not self._busy:
-                    agent = getattr(self, "_agent", None)
-                    if agent is not None:
-                        try:
-                            self.warmup_status.emit(
-                                "主模型预热中（首次推理编译，约 20-30s，请稍候）")
-                            agent.warm_up()
-                            self.warmup_status.emit("主模型预热完成，可开始对话")
-                        except Exception as e:
-                            logger.warning("主模型预热失败(忽略): %s", e)
-                            self.warmup_status.emit(
-                                "预热失败，但仍可对话（首句会偏慢）")
-                        # 模型已就绪：立即启动常驻 worker（空闲期预填系统提示 KV），
-                        # 让首句直接命中缓存、无需全量预填充。worker 在首句前就跑起来。
-                        self._start_worker()
+                    self._start_worker()
             except Exception as e:  # 预加载失败不影响主流程，首次用时再报错
                 logger.warning("%s 预加载失败: %s", label, e)
                 self.model_loaded.emit(key, False)
@@ -1501,13 +1504,38 @@ class MainWindow(QMainWindow):
         self._preload_threads[key] = t
         t.start()
 
+    def _auto_load_startup(self) -> None:
+        """应用启动后主动预加载模型（后台线程，不阻塞 UI）。
+
+        · 主模型：仅本地模式（``llm_provider == "local"``）下自动加载——API 模式
+          无本地权重可加载，跳过（按钮保持未加载态，由网络调用兜底）。
+        · 辅助模型：恒为本地模型（无 OpenAI 模式），无论主模型是什么模式，启动
+          即加载，用于事实抽取 / RAG 归纳等子任务，避免首次用到才冷启动。
+        """
+        if getattr(self, "_busy", False):
+            return
+        started = False
+        if getattr(self.config, "llm_provider", "local") == "local":
+            main = getattr(self, "_llm", None)
+            if main is not None and getattr(main, "_ensure_model", None) is not None:
+                self._preload_client(main, "主模型", "main")
+                started = True
+        aux = getattr(self, "_aux_llm", None)
+        if aux is not None and getattr(aux, "_ensure_model", None) is not None:
+            self._preload_client(aux, "辅助模型", "aux")
+            started = True
+        if started:
+            self.status_label.setText("正在后台加载模型…")
+
     def _on_load_main_model(self) -> None:
         if self._busy:
             QMessageBox.warning(
                 self, "正在运行", "Agent 正在运行，请先「终止对话」再加载模型。")
             return
         self.config.save(CONFIG_PATH)
-        self._rebuild_agent()
+        # 仅重载主模型：保留已加载的辅助模型（不销毁权重、不动其按钮态）。
+        # 若要同时换辅助模型路径，点「重新加载辅助模型」或「应用配置」。
+        self._rebuild_agent(rebuild_aux=False)
         self._preload_client(getattr(self, "_llm", None), "主模型", "main")
         self.status_label.setText("主模型加载中…")
 
@@ -1564,6 +1592,9 @@ class MainWindow(QMainWindow):
         self._aux_llm = aux
         if self._agent is not None:
             self._agent.aux_llm = aux
+            # 主模型复用刚加载的辅助模型当投机解码草稿（不另起权重）。
+            if self._llm is not None:
+                self._llm.set_draft_source(aux)
         self._preload_client(aux, "辅助模型", "aux")
         self.status_label.setText("辅助模型加载中…")
 
@@ -1581,6 +1612,9 @@ class MainWindow(QMainWindow):
         self._aux_llm = None
         if self._agent is not None:
             self._agent.aux_llm = None
+            # 辅助模型卸载 → 主模型关闭投机解码（退化为普通生成）。
+            if self._llm is not None:
+                self._llm.set_draft_source(None)
         self._mark_model_unloaded("aux")
         self.status_label.setText("辅助模型已卸载")
 
@@ -1943,7 +1977,7 @@ class MainWindow(QMainWindow):
             self.config.rag_ocr_model_name = ocr_name
         self.config.rag_ocr_model_path = self.ocr_path_edit.text().strip()
 
-    def _rebuild_agent(self) -> None:
+    def _rebuild_agent(self, rebuild_aux: bool = True) -> None:
         # 常驻 worker 持有旧 agent 引用：先让它退出循环，否则重建后用户再发
         # 消息会打进已 close 的旧 agent（MCP/httpx 已关）。应用配置只在空闲时
         # 可点（_set_controls_busy），所以线程此刻必然阻塞在 queue.get，
@@ -1984,11 +2018,13 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             pass
-        # 重建会换掉主/辅模型，先把两个按钮复位为「加载模型」未就绪态，
-        # 待各自后台预加载成功后再置绿（仅当按钮已创建时操作）。
+        # 重建会换掉主模型，先把主按钮复位为「加载模型」未就绪态，待后台预加载
+        # 成功后再置绿（仅当按钮已创建时操作）。仅重载主模型时（rebuild_aux=False
+        # ）保留辅助模型：aux client 与已加载权重都不动，按钮态也保持不变。
         if getattr(self, "load_main_btn", None) is not None:
             self._mark_model_unloaded("main")
-            self._mark_model_unloaded("aux")
+            if rebuild_aux:
+                self._mark_model_unloaded("aux")
         # Shut down the old agent's resources (MCP subprocesses, httpx client)
         # before replacing it — otherwise each "应用配置" click leaks a set of
         # MCP server subprocesses and an open httpx connection.
@@ -2009,8 +2045,9 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         # 辅助模型同样需要在重建前关闭，否则每次「加载/应用」都泄漏一份权重。
+        # 仅重载主模型时（rebuild_aux=False）保留 aux——不关权重、不置空引用。
         old_aux = getattr(self, "_aux_llm", None)
-        if old_aux is not None:
+        if old_aux is not None and rebuild_aux:
             try:
                 old_aux.close()
             except Exception:
@@ -2022,7 +2059,8 @@ class MainWindow(QMainWindow):
         # "Cannot send a request, as the client has been closed."。
         self._agent = None
         self._llm = None
-        self._aux_llm = None
+        if rebuild_aux:
+            self._aux_llm = None
         try:
             # 主 LLM：按 config.llm_provider 选择网络 API 或本地加载（工厂路由）。
             from ..local.factory import (
@@ -2033,13 +2071,23 @@ class MainWindow(QMainWindow):
             new_agent = Agent(llm=new_llm, config=self.config, callbacks=self._callbacks)
             new_agent.max_iterations = self.config.max_iterations
             # 辅助模型（本地）：用于事实抽取等轻量子任务。加载失败不影响主流程。
-            try:
-                new_aux = build_aux_llm_client(self.config)
-            except Exception as aux_err:
-                logger.warning("辅助模型加载失败（不影响主流程）: %s", aux_err)
-                new_aux = None
-            new_agent.aux_llm = new_aux
-            self._aux_llm = new_aux
+            if rebuild_aux:
+                try:
+                    new_aux = build_aux_llm_client(self.config)
+                except Exception as aux_err:
+                    logger.warning("辅助模型加载失败（不影响主流程）: %s", aux_err)
+                    new_aux = None
+                new_agent.aux_llm = new_aux
+                self._aux_llm = new_aux
+                # 主模型复用已加载的辅助模型当投机解码草稿（不另起权重）。
+                if new_aux is not None:
+                    new_llm.set_draft_source(new_aux)
+            else:
+                # 仅重载主模型：复用已加载的辅助模型 client（含权重）与按钮态，
+                # 不销毁、不重置；新主 client 指向同一个 aux，草稿解码继续可用。
+                new_agent.aux_llm = self._aux_llm
+                if self._aux_llm is not None:
+                    new_llm.set_draft_source(self._aux_llm)
         except Exception as e:
             self._on_error(f"无法创建 agent: {e}")
             # 保持 None：_on_send 会给出明确提示，而不是用一个坏掉的 agent。

@@ -154,6 +154,13 @@ class AgentConfig:
     # 结论，首字延迟成倍上升（主模型实测 3.49s → 0.38s 的差额就是这段），而
     # 抽取质量并没有可观测收益。主模型默认仍开着（复杂任务需要推理）。
     aux_local_llm_enable_thinking: bool = False
+    # 投机解码：主模型生成时用小草稿模型并行猜 token、一次验证多个，解码吞吐
+    # 通常 1.5-2.5x。本仓库固定复用「已加载的辅助模型」当草稿（不另起权重），
+    # 故无额外显存；辅助模型未加载时自动退化为普通自回归生成。0 = 关闭。
+    local_llm_num_draft_tokens: int = 6
+    # prefill 批大小（mlx-lm 的 prefill_step_size）：长 prompt（系统提示约 5900
+    # token）预填充的分块大小，调大加快缓存失效轮（压缩）的重填；0 = 用默认值。
+    local_llm_prefill_step_size: int = 4096
 
     embedding_provider: str = "local"
     local_embedding_model: str = ""
@@ -188,7 +195,8 @@ class AgentConfig:
                    "kernel_max_context_tokens", "kernel_raw_turns",
                    "kernel_consolidate_every", "kernel_max_tool_chars",
                    "kernel_max_digest_lines",
-                   "aux_max_tokens", "aux_top_k")
+                   "aux_max_tokens", "aux_top_k",
+                   "local_llm_num_draft_tokens", "local_llm_prefill_step_size")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
                      "aux_temperature", "aux_top_p", "aux_min_p",

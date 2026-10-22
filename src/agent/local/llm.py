@@ -412,6 +412,8 @@ class LocalLLMClient:
         repetition_penalty: float = 1.0,
         dtype: str = "float16",
         enable_thinking: bool = True,
+        num_draft_tokens: int = 0,
+        prefill_step_size: int = 0,
     ):
         self._path = path
         self._backend = (backend or "mlx").strip().lower()
@@ -425,6 +427,12 @@ class LocalLLMClient:
         # Qwen3 系模板的 enable_thinking：False 时模板注入空 think 块，模型
         # 直接作答（首字延迟大幅降低，复杂推理质量换速度）。
         self._enable_thinking = bool(enable_thinking)
+        self._num_draft_tokens = int(num_draft_tokens)
+        self._prefill_step_size = int(prefill_step_size)
+        # 投机解码草稿源：指向已加载的辅助模型 client（复用其权重，不另起草稿）。
+        # 惰性取值——真正生成时才取 draft_source._model（此时必然已加载），避免
+        # 「加载时 _model 尚为 None」的时序坑；None 表示不启用投机解码。
+        self._draft_source = None
         self._model = None
         self._tokenizer = None
         self._session = None
@@ -766,12 +774,59 @@ class LocalLLMClient:
             gen_ref.append(gen_ids)
             _t0 = time.time()
             _first_ts: List[Optional[float]] = [None]
+            # 投机解码：草稿源指向已加载的辅助模型（复用权重，不另起草稿）。惰性取
+            # aux._model（生成时必然已加载）；取不到 / 后端非 mlx / 未配置则不启用。
+            # mlx-lm 的 stream_generate 仅在 draft_model 非空时把 num_draft_tokens
+            # 透传给 speculative_generate_step，故 draft 关闭时不会误传该参数。
+            draft_model = None
+            draft_lock = None
+            ds = self._draft_source
+            if (self._backend == "mlx" and ds is not None
+                    and self._num_draft_tokens > 0):
+                dm = getattr(ds, "_model", None)
+                if dm is not None:
+                    # 投机解码要求主/草稿缓存都「可裁剪」；但 Qwen3.5 等模型的线性
+                    # 注意力层用 ArraysCache（不可裁剪），与 mlx-lm 的可裁剪要求
+                    # 互斥——mlx-lm 最新即 0.32.2 对此类模型不可用。探测缓存可裁剪
+                    # 性，不可则静默降级为普通生成（prefill_step_size 仍生效），避免
+                    # ValueError / IndexError 崩溃。
+                    from mlx_lm.models.cache import can_trim_prompt_cache
+                    if (can_trim_prompt_cache(cache)
+                            and can_trim_prompt_cache(dm.make_cache())):
+                        draft_model = dm
+                        draft_lock = getattr(ds, "_gen_lock", None)
+                    else:
+                        logger.debug(
+                            "LLM: prompt cache 不可裁剪，关闭投机解码"
+                            "（降级为普通生成）")
             try:
+                # 持有 aux 的生成锁：防止主模型把 aux 当草稿做前向时，aux 自身正在
+                # 别处生成（权重前向非线程安全）。本仓库本地模式下二者在 worker
+                # 线程内串行，这里仅为兜底。
+                if draft_lock is not None:
+                    draft_lock.acquire()
+                _sg_kwargs: Dict[str, Any] = {}
+                # prefill 批大小（mlx-lm 的 prefill_step_size）：加快长 prompt 的
+                # 预填充；0 表示用 mlx-lm 默认值（普通 2048 / 投机 512）。
+                if self._prefill_step_size and self._prefill_step_size > 0:
+                    _sg_kwargs["prefill_step_size"] = self._prefill_step_size
+                # 草稿模型需独立 KV 缓存，且与主缓存【拼接】后整体传入
+                # stream_generate（mlx 按 len(model.layers) 切片：前半主缓存、
+                # 后半草稿缓存）。草稿缓存不持久化、每轮新建——草稿模型每轮重新
+                # prefill 当前 prompt，旧 KV 无意义；结构须与主/草稿模型 make_cache
+                # 完全一致（含线性注意力层的 ArraysCache），故用 make_prompt_cache。
+                prompt_cache = cache
+                if draft_model is not None:
+                    _sg_kwargs["draft_model"] = draft_model
+                    _sg_kwargs["num_draft_tokens"] = self._num_draft_tokens
+                    from mlx_lm.models.cache import make_prompt_cache as _mpc
+                    draft_cache = _mpc(draft_model)
+                    prompt_cache = cache + draft_cache
                 for resp in stream_generate(
                     self._model, tok, prompt=suffix_ids,
                     max_tokens=self._max_tokens, sampler=sampler,
                     logits_processors=logits_processors,
-                    prompt_cache=cache,
+                    prompt_cache=prompt_cache, **_sg_kwargs,
                 ):
                     text = getattr(resp, "text", "") or ""
                     if text:
@@ -786,6 +841,8 @@ class LocalLLMClient:
                         except (ValueError, TypeError):
                             pass
             finally:
+                if draft_lock is not None:
+                    draft_lock.release()
                 _total = time.time() - _t0
                 _ttft = _first_ts[0] if _first_ts[0] is not None else _total
                 # 诊断：重算公共前缀长度 + 解码两端前几个 token，定位 reuse=0 的根因
@@ -1045,6 +1102,15 @@ class LocalLLMClient:
                 self._mlx_cache = None
                 self._cache_token_ids = []
                 self._kv_thread = None
+
+    def set_draft_source(self, client: "Optional[LocalLLMClient]") -> None:
+        """把辅助模型 client 设为投机解码的草稿源（复用其已加载权重，不另起草稿）。
+
+        仅主模型 client 调用；辅助模型 client 自身不应设。传入 None 关闭投机解码
+        （退化为普通自回归生成）。线程安全：本方法只改一个引用，真正的 draft_model
+        在 ``_stream_mlx`` 生成时惰性取值。
+        """
+        self._draft_source = client
 
     def invalidate_kv_cache(self) -> None:
         """丢弃跨轮 KV 缓存。

@@ -49,6 +49,8 @@ def build_llm_client(config) -> Any:
             top_k=getattr(config, "top_k", 20),
             repetition_penalty=getattr(config, "repetition_penalty", 1.0),
             enable_thinking=bool(getattr(config, "local_llm_enable_thinking", True)),
+            num_draft_tokens=getattr(config, "local_llm_num_draft_tokens", 0),
+            prefill_step_size=getattr(config, "local_llm_prefill_step_size", 0),
         )
     # 默认：网络 API
     from ..llm_client import LLMClient
