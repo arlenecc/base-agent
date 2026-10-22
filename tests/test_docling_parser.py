@@ -15,6 +15,27 @@ def _fresh_converter_pool():
     dp._pool.release_all()
 
 
+def test_is_docling_available_does_not_raise():
+    """回归：池化改造曾误删 _converter_unavailable 模块级定义，
+    is_docling_available() 一调用就 NameError——engine 回退链的
+    except Exception 把它静默吞掉，症状是「PDF 全部静默降级到 marker、
+    docling 毫无报错」。既有测试都 monkeypatch 掉了本函数所以没拦住。
+    这里直接调用真实函数（不 monkeypatch）。"""
+    from agent.rag import docling_parser as dp
+
+    result = dp.is_docling_available()
+    assert isinstance(result, bool)
+
+
+def test_converter_unavailable_flag_defined():
+    """_converter_unavailable 必须存在于模块级（reset 路径也要能读写）。"""
+    from agent.rag import docling_parser as dp
+
+    assert dp._converter_unavailable in (True, False)
+    dp.reset_unavailable()
+    assert dp._converter_unavailable is False
+
+
 def test_extract_markdown_returns_none_when_docling_missing(monkeypatch):
     """Without docling, extract_markdown returns None (caller falls back)."""
     from agent.rag import docling_parser as dp

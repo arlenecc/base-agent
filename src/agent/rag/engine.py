@@ -465,8 +465,13 @@ def _extract_with_docling(filepath: str) -> tuple:
             markdown = extract_markdown(filepath)
             if markdown is not None:
                 return markdown, True
-        except Exception:
-            pass
+        except Exception as e:
+            # 不再静默吞掉：2026-10-22 docling 的 NameError（池化改造误删
+            # 模块级 _converter_unavailable）就是被这里吞掉的，症状是「PDF
+            # 全部静默降级 marker、docling 毫无报错」，极难定位。debug 级
+            # 记录引擎名 + 异常，日志窗口开 debug 即可见。
+            logger.debug("RAG: 解析引擎 %s 失败（走下一棒）: %s: %s",
+                         engine, type(e).__name__, e)
     return extract_text(filepath), False
 
 

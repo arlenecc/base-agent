@@ -116,6 +116,11 @@ _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"
 # - 排队的大文件优先：有大文件等待时小文件不再新增并行（防饿死）。
 _max_parallel = 2
 _large_file_bytes = 20 * 1024 * 1024
+# 「docling 不可用」永久禁用标志（ImportError 时置位，reset_unavailable 复位）。
+# 池化改造时曾误删此模块级定义 → is_docling_available()/ _get_converter() 一
+# 调用就 NameError，且被 engine 回退链的 except Exception 静默吞掉，表现为
+# 所有 PDF 静默降级到 marker（2026-10-22 实测修复）。
+_converter_unavailable = False
 
 
 def set_docling_concurrency(max_parallel: int, large_file_mb: float) -> None:
