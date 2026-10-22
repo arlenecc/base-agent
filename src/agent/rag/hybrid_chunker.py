@@ -13,8 +13,8 @@ Combines the strengths of two approaches:
 
 Chunk sizing (all measured in tokens via the shared heuristic):
   * min 100 tokens — undersized sections are merged with their neighbours.
-  * max 800 tokens — over-long sections are split (semantically).
-  * overlap 10% (80 tokens) — consecutive chunks borrow the tail sentence(s)
+  * max 1000 tokens — over-long sections are split (semantically).
+  * overlap 5% (50 tokens) — consecutive chunks borrow the tail sentence(s)
     of the previous chunk to preserve cross-boundary context.
 
 The pipeline is:
@@ -41,18 +41,18 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+\S", re.MULTILINE)
 
 def hybrid_chunk_text(
     text: str,
-    chunk_size: int = 800,
-    chunk_overlap: int = 80,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 50,
     min_chunk_size: int = 100,
-    overlap_percent: float = 0.10,
+    overlap_percent: float = 0.05,
     embedding_function=None,
 ) -> List[str]:
     """Split text using structure + semantic hybrid chunking.
 
     Args:
         text: The (Markdown) text to split.
-        chunk_size: Maximum chunk size in tokens (800).
-        chunk_overlap: Overlap in tokens (default 10% of chunk_size = 80).
+        chunk_size: Maximum chunk size in tokens (1000).
+        chunk_overlap: Overlap in tokens (default 5% of chunk_size = 50).
         min_chunk_size: Minimum chunk size in tokens (100).
         overlap_percent: Overlap as a fraction of chunk_size.
         embedding_function: Optional ``embed_documents(list[str]) -> list``

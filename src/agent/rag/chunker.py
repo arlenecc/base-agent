@@ -42,8 +42,8 @@ def _token_count(text: str) -> int:
 
 def chunk_text(
     text: str,
-    chunk_size: int = 800,
-    chunk_overlap: int = 80,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 50,
     separators: List[str] | None = None,
 ) -> List[str]:
     """Split text into overlapping chunks using token-based sizing.
@@ -68,10 +68,10 @@ def chunk_text(
 
 def chunk_documents(
     documents: List[Dict[str, Any]],
-    chunk_size: int = 800,
-    chunk_overlap: int = 80,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 50,
     min_chunk_size: int = 100,
-    overlap_percent: float = 0.10,
+    overlap_percent: float = 0.05,
     embedding_function=None,
 ) -> List[Dict[str, Any]]:
     """Chunk multiple documents with metadata.
@@ -83,13 +83,13 @@ def chunk_documents(
 
     Args:
         documents: List of dicts with 'source' (filepath) and 'text' keys.
-        chunk_size: Target maximum chunk size in **tokens** (800).
-        chunk_overlap: Overlap between chunks in **tokens** (default 10% of
-            ``chunk_size`` = 80).
+        chunk_size: Target maximum chunk size in **tokens** (1000).
+        chunk_overlap: Overlap between chunks in **tokens** (default 5% of
+            ``chunk_size`` = 50).
         min_chunk_size: Target minimum chunk size in **tokens** (100) — used by
             the semantic path to merge undersized chunks.
         overlap_percent: Fraction of ``chunk_size`` used as overlap between
-            consecutive chunks (0.10 => 80 tokens), preserving continuity —
+            consecutive chunks (0.05 => 50 tokens), preserving continuity —
             used by the semantic path.
 
     Returns:

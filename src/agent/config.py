@@ -54,8 +54,8 @@ class AgentConfig:
     kernel_max_digest_lines: int = 40
 
     # RAG settings
-    rag_chunk_size: int = 500       # tokens per chunk
-    rag_chunk_overlap: int = 50     # 10% of chunk_size
+    rag_chunk_size: int = 1000      # tokens per chunk
+    rag_chunk_overlap: int = 50     # 5% of chunk_size
     rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
     # 重排序模型：**INT8 量化版**（~570MB）。fp32 全量是 2.27GB，4 倍体积
     # 4 倍内存，而 cross-encoder 只输出排序分数，INT8 的排序质量损失可忽略

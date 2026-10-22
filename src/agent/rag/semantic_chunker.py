@@ -50,24 +50,24 @@ def _is_chonkie_available() -> bool:
 
 def semantic_chunk_text(
     text: str,
-    chunk_size: int = 800,
-    chunk_overlap: int = 80,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 50,
     min_chunk_size: int = 100,
-    overlap_percent: float = 0.10,
+    overlap_percent: float = 0.05,
     embedding_function=None,
 ) -> Optional[List[str]]:
     """Split ``text`` into semantic chunks using chonkie's SemanticChunker.
 
     Args:
         text: The text to split.
-        chunk_size: Target maximum chunk size in **tokens** (800).
+        chunk_size: Target maximum chunk size in **tokens** (1000).
         chunk_overlap: Overlap between consecutive chunks in **tokens**.
-            Defaults to 10% of ``chunk_size`` (80).  When ``overlap_percent``
+            Defaults to 5% of ``chunk_size`` (50).  When ``overlap_percent``
             is set, ``int(chunk_size * overlap_percent)`` overrides this.
         min_chunk_size: Target minimum chunk size in **tokens** (100). Chunks
             smaller than this are greedily merged into their neighbours.
-        overlap_percent: Fraction of ``chunk_size`` used as overlap (0.10 =>
-            80 tokens), preserving continuity across chunk boundaries.  Takes
+        overlap_percent: Fraction of ``chunk_size`` used as overlap (0.05 =>
+            50 tokens), preserving continuity across chunk boundaries.  Takes
             precedence over ``chunk_overlap``.
         embedding_function: A callable ``embed_documents(list[str]) ->
             list[list[float]]``. When omitted, the shared nomic-embed-text
