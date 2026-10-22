@@ -2279,6 +2279,18 @@ class MainWindow(QMainWindow):
         # 导致的并发崩溃。RAG 日志在同步期间完全由 _log_buffer + QTimer 处理。
         if hasattr(self, '_log_handler') and self._log_handler is not None:
             self._log_handler._sync_active = True
+        # 同步开始前临时卸载「同步前已加载」的本地主/辅模型，释放显存给 RAG 入库
+        # （解析/清洗/切片/向量化是大内存操作，且只用到 embedding/reranker，不依赖
+        # 对话 LLM）。记住卸载状态，待同步结束后原样重载（含主模型预热）。
+        # API 模式主模型无本地权重，不处理。
+        _local_mode = getattr(self.config, "llm_provider", "local") == "local"
+        self._sync_unloaded_main = bool(_local_mode and getattr(self, "_llm", None) is not None)
+        self._sync_unloaded_aux = bool(getattr(self, "_aux_llm", None) is not None)
+        if self._sync_unloaded_main:
+            self._on_unload_main_model()
+        if self._sync_unloaded_aux:
+            self._on_unload_aux_model()
+        self._append_log("[rag] 已临时卸载对话模型以释放资源，同步结束后将自动重载")
         self._sync_worker = SyncKnowledgeWorker(
             ws, kb,
             embedding_model=self.config.rag_embedding_model,
@@ -2407,6 +2419,26 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("知识库同步完成（状态已自动恢复）")
             except Exception:
                 pass
+        # 同步结束后，把「同步前已加载」的本地主/辅模型原样重载（释放的显存回收），
+        # 主模型重载后会自动预热（预填系统提示 KV + warm_up 编译）。仅当该模型仍
+        # 处于未加载态时才重载——若用户在同步期间手动重载过，则不重复操作。
+        _reload_main = getattr(self, "_sync_unloaded_main", False) and getattr(self, "_llm", None) is None
+        _reload_aux = getattr(self, "_sync_unloaded_aux", False) and getattr(self, "_aux_llm", None) is None
+        if _reload_aux or _reload_main:
+            self.status_label.setText("同步完成，正在重新加载对话模型…")
+            self._append_log("[rag] 同步结束，开始重新加载对话模型（含主模型预热）")
+        if _reload_aux:
+            try:
+                self._on_load_aux_model()
+            except Exception as _e:
+                logger.warning("同步后重载辅助模型失败: %s", _e)
+        if _reload_main:
+            try:
+                self._on_load_main_model()
+            except Exception as _e:
+                logger.warning("同步后重载主模型失败: %s", _e)
+        self._sync_unloaded_main = False
+        self._sync_unloaded_aux = False
         # 清理 worker 引用，防止后续误判
         if self._sync_worker is not None:
             self._sync_worker = None
