@@ -635,11 +635,12 @@ class RAGEngine:
                     promoted.append(_fp)      # 迭代后删（避免边遍历边删）
         for _fp in promoted:
             manifest.pop(_fp, None)
-        # 2) 按 content_hash 分组清理
+        # 2) 按 content_hash 分组清理。**包含已标记条目**——它可能还带着
+        # 旧向量（force 模式下字典序在前的副本被重解析、另一个被标记时，
+        # 或历史 manifest 里两个副本都入过库），不能只按「无标记」分组，
+        # 否则这批旧向量永远清理不掉、检索继续双倍召回。
         groups: Dict[str, List[str]] = {}
         for fp, entry in manifest.items():
-            if entry.get("duplicate_of"):
-                continue
             ch = entry.get("content_hash")
             if ch:
                 groups.setdefault(ch, []).append(fp)
@@ -648,23 +649,30 @@ class RAGEngine:
         for _ch, paths in groups.items():
             if len(paths) < 2:
                 continue
-            paths.sort()                      # 确定性：字典序最小者为 owner
-            owner = paths[0]
-            for dup_path in paths[1:]:
+            # owner：优先无 duplicate_of 标记的，其次字典序最小（确定性）。
+            unmarked = [p for p in paths if not manifest[p].get("duplicate_of")]
+            owner = sorted(unmarked)[0] if unmarked else sorted(paths)[0]
+            for dup_path in paths:
+                if dup_path == owner:
+                    continue
                 entry = manifest[dup_path]
-                if entry.get("duplicate_of") == owner:
+                if (entry.get("duplicate_of") == owner
+                        and not entry.get("chunk_count")):
                     continue                  # 上轮已清理（幂等）
-                if store is None:
-                    store = self._get_store()
-                try:
-                    store.delete_by_source(dup_path)
-                    # documents 表同样清（三种 id 兼容，见 _cleanup_deleted_files）
-                    store.delete_document(
-                        os.path.relpath(dup_path, self._knowledge_base))
-                    store.delete_document(os.path.basename(dup_path))
-                except Exception as e:
-                    logger.warning("RAG: 清理副本向量失败 %s: %s", dup_path, e)
+                if entry.get("chunk_count"):
+                    # 有旧向量才动 store（从未入库的副本无向量可删）
+                    if store is None:
+                        store = self._get_store()
+                    try:
+                        store.delete_by_source(dup_path)
+                        # documents 表同样清（三种 id 兼容，见 _cleanup_deleted_files）
+                        store.delete_document(
+                            os.path.relpath(dup_path, self._knowledge_base))
+                        store.delete_document(os.path.basename(dup_path))
+                    except Exception as e:
+                        logger.warning("RAG: 清理副本向量失败 %s: %s", dup_path, e)
                 entry["duplicate_of"] = owner
+                entry["chunk_count"] = 0       # 向量已删，计数归零（幂等依据）
                 removed += 1
         if promoted or removed:
             logger.info(
@@ -821,10 +829,19 @@ class RAGEngine:
         skipped_detail: List[str] = []
         new_detail: List[str] = []
         dup_detail: List[str] = []
-        # 内容去重（B 方案，2026-10-22 用户定版）：采样指纹 → 首个副本路径。
-        # 同一本书放在不同子目录/改名，只解析入库第一个，其余记 duplicate_of
+        # 内容去重（B 方案，2026-10-22 用户定版）：采样指纹 → owner 路径。
+        # 同一本书放在不同子目录/改名，只解析入库 owner，其余记 duplicate_of
         # 跳过——省一遍解析+切片+嵌入，也避免同段内容在检索里双倍召回。
         seen_fp: Dict[str, str] = {}
+        # 预播种：**已入库**文件的指纹先进 seen 表。新副本（新建文件夹拷贝
+        # 进来的）遇到它们时把 owner 让给「已在库」的文件——复用现成向量，
+        # 而不是按路径排序把新副本当成 owner 白解析一遍（2026-10-22 用户
+        # 实测：拷贝进新文件夹的文件仍被重新解析，根因即遍历顺序不确定）。
+        # 只播种磁盘上仍存在的条目——已删除文件的指纹不能让新副本让位。
+        for _p, _e in manifest.items():
+            _h = _e.get("source_hash")
+            if _h and os.path.exists(_p):
+                seen_fp.setdefault(_h, _p)
         for filepath in all_files:
             sig = _file_signature(filepath)
             if sig is None:
@@ -892,8 +909,11 @@ class RAGEngine:
                         **sig,
                         "source_hash": fp,
                         "duplicate_of": owner,
-                        "content_hash": None,
-                        "chunk_count": 0,
+                        # 带上旧条目的 content_hash/chunk_count：这个副本
+                        # 此前若真入过库（force 场景），收尾清理要靠它们
+                        # 认出「还有旧向量要删」；从没入库过的副本两项为空。
+                        "content_hash": (prev or {}).get("content_hash"),
+                        "chunk_count": (prev or {}).get("chunk_count", 0),
                     }
                     with stats_lock:
                         stats["files_duplicated"] += 1

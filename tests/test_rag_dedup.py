@@ -129,6 +129,22 @@ def test_dedup_noop_for_unique_content(tmp_path):
     assert eng._dedup_manifest_by_content(m) == 0
 
 
+def test_dedup_cleans_marked_entry_with_leftover_vectors(tmp_path):
+    """已标记副本但还带着旧向量（force 场景/历史双份入库）→ 也要清。"""
+    eng = _make_engine(tmp_path)
+    fake = _FakeStore()
+    eng._get_store = lambda: fake
+    kb = str(tmp_path / "kb")
+    a, b = os.path.join(kb, "a.pdf"), os.path.join(kb, "b.pdf")
+    m = {a: _entry(chunk_count=3),
+         b: _entry(chunk_count=3, duplicate_of=a)}
+    assert eng._dedup_manifest_by_content(m) == 1
+    assert fake.deleted_sources == [b]
+    assert m[b]["chunk_count"] == 0
+    fake.deleted_sources.clear()
+    assert eng._dedup_manifest_by_content(m) == 0     # 幂等
+
+
 # ---------------------------------------------------------------------------
 # 集成测试：完整 ingest（FakeEmbeddingFunction）
 # ---------------------------------------------------------------------------
@@ -178,6 +194,60 @@ def test_duplicate_promoted_after_owner_deleted(dedup_env):
     results = eng.search("副本转正")
     assert results
     assert {r["source"] for r in results} == {str(b)}
+
+
+def test_copy_into_new_folder_not_reparsed(dedup_env):
+    """用户实测场景（2026-10-22）：已入库的文件，新建文件夹拷贝一份进去，
+    再次同步时**不重新解析**——新副本把 owner 让给「已在库」的文件。
+
+    根因：seen_fp 原先边遍历边播种，拷贝路径排序在原文件之前时会抢先成为
+    owner 被解析。现在已入库指纹预播种，新副本必让位。
+    """
+    eng, kb, ws = dedup_env
+    content = "# 已在库的书\n\n" + "拷贝到新文件夹后不应再次解析入库。" * 50
+    a = kb / "book.md"
+    a.write_text(content, encoding="utf-8")
+    eng.ingest()                              # 首次入库
+    store = eng._get_store()
+    before = store._ensure_table().count_rows()
+    # 新建文件夹，拷贝一份进去（新路径、新 mtime）
+    newdir = kb / "a-copy"
+    newdir.mkdir()
+    b = newdir / "book.md"
+    b.write_text(content, encoding="utf-8")
+    stats = eng.ingest()
+    # 新副本被记成重复，零解析零入库
+    assert stats["files_duplicated"] == 1
+    assert stats["files_extracted"] == 0
+    assert store._ensure_table().count_rows() == before
+    manifest = _load_manifest(eng._rag_dir)
+    assert manifest[str(b)]["duplicate_of"] == str(a)
+    assert "duplicate_of" not in manifest[str(a)]
+    # 检索仍只召回原路径一个来源
+    results = eng.search("再次解析")
+    assert {r["source"] for r in results} == {str(a)}
+
+
+def test_copy_into_new_folder_not_reparsed_even_with_force(dedup_env):
+    """force（强制全量）下同样不重复解析副本：owner 让给已在库文件，
+    只重解析 owner 本身。"""
+    eng, kb, ws = dedup_env
+    content = "# 强制全量\n\n" + "force 模式下副本也不应被单独解析。" * 50
+    a = kb / "book.md"
+    a.write_text(content, encoding="utf-8")
+    eng.ingest()
+    newdir = kb / "a-copy2"
+    newdir.mkdir()
+    b = newdir / "book.md"
+    b.write_text(content, encoding="utf-8")
+    stats = eng.ingest(force=True)
+    assert stats["files_duplicated"] == 1     # 副本被去重
+    assert stats["files_extracted"] == 1      # 只有 owner 被重解析
+    manifest = _load_manifest(eng._rag_dir)
+    assert manifest[str(b)]["duplicate_of"] == str(a)
+    # 无双份向量：owner 的旧向量被替换，副本从未入库
+    results = eng.search("单独解析")
+    assert {r["source"] for r in results} == {str(a)}
 
 
 def test_legacy_duplicate_vectors_cleaned_by_content_hash(dedup_env):
