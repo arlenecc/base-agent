@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
-from .cleaner import clean_text, normalize_markdown
+from .cleaner import clean_text, clean_docling_markdown, normalize_markdown
 from .chunker import chunk_documents
 from .document_outline import build_digest
 from .vector_store import DEFAULT_RERANK_MODEL, VectorStore
@@ -982,10 +982,12 @@ class RAGEngine:
                                     cache_is_fresh = False
                             if not cache_is_fresh:
                                 if is_markdown:
-                                    # docling 已输出规范 Markdown，无需再清洗/转换，
-                                    # 直接作为最终文本（省去 clean_text 的 HTML 剥离，
-                                    # 避免误删 Markdown 标题/表格语法）。
-                                    cleaned = text
+                                    # docling/统一引擎已输出规范 Markdown，不做
+                                    # clean_text 的 HTML 标签剥离（会误删 Markdown
+                                    # 标题/表格语法），但注释类占位噪声必须洗掉——
+                                    # docling 给每张图片输出 `<!-- image -->`，
+                                    # 不洗会原样进切片、污染检索命中。
+                                    cleaned = clean_docling_markdown(text)
                                     _log("    ├─ docling Markdown 就绪: %s (%d 字符)", fname, len(cleaned))
                                 else:
                                     # ---- 2. 清洗文本 ----

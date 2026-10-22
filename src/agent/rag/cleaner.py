@@ -185,6 +185,25 @@ def clean_text(text: str) -> str:
     return text
 
 
+def clean_docling_markdown(text: str) -> str:
+    """统一引擎（docling/marker/ovis）Markdown 的**轻清洗**。
+
+    这些解析器直接输出规范 Markdown，不能走 clean_text——它的 HTML 标签
+    剥离会误伤 Markdown 标题/表格语法。这里只除占位噪声：
+    - HTML 注释：docling 给每张图片输出 ``<!-- image -->`` 占位、
+      导出元信息注释等（这是此前切片里混进 `<!-- image -->` 的根因——
+      docling 路径有意跳过 clean_text，注释从没被洗过）；
+    - DOCTYPE / 处理指令残留（``<!…>``、``<?…>``）。
+    最后折叠 3+ 连续空行。Markdown 结构（标题/表格/代码栅栏）原样保留。
+    """
+    if not text:
+        return ""
+    text = re.sub(r'<!--[\s\S]*?-->', ' ', text)
+    text = re.sub(r'<[!?][^>]*>', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def normalize_markdown(text: str) -> str:
     """Convert cleaned text to clean markdown format.
 
