@@ -222,36 +222,126 @@ class _TableToMarkdown(HTMLParser):
             self._cell.append(data)
 
 
+_TABLE_TAG_RE = re.compile(r'<(/?)table\b[^>]*>', re.IGNORECASE)
+# 管道表无法表达的结构：合并单元格、表格标题/列组
+_SPAN_ATTR_RE = re.compile(
+    r'<t[dh]\b[^>]*?(?:col|row)span\s*=\s*["\']?(\d+)', re.IGNORECASE)
+_TABLE_META_RE = re.compile(r'<(caption|colgroup)\b', re.IGNORECASE)
+
+
+def _find_table_blocks(text: str) -> List[tuple]:
+    """产出 (start, end) 平衡的 <table>…</table> 块（支持嵌套）。
+
+    不能用 ``<table.*?</table>`` 懒匹配——嵌套表会截到内层闭合符，
+    外层块被腰斩。
+    """
+    blocks: List[tuple] = []
+    depth = 0
+    start = None
+    for m in _TABLE_TAG_RE.finditer(text):
+        if m.group(1):                      # </table>
+            depth -= 1
+            if depth == 0 and start is not None:
+                blocks.append((start, m.end()))
+                start = None
+        else:                               # <table …>
+            if depth == 0:
+                start = m.start()
+            depth += 1
+    return blocks
+
+
+def _is_complex_table(block: str) -> bool:
+    """管道表无法表达 → True：嵌套表、caption/colgroup、colspan/rowspan>1。
+
+    这类结构摊平成规则网格会丢合并单元格语义（2026-10-22 用户定版：
+    复杂表保留 HTML 块）。
+    """
+    if block.lower().count("<table") > 1:   # 嵌套表
+        return True
+    if _TABLE_META_RE.search(block):
+        return True
+    try:
+        return any(int(v) > 1 for v in _SPAN_ATTR_RE.findall(block))
+    except ValueError:
+        return True                         # 属性值畸形 → 按复杂表保守处理
+
+
+def _convert_table(block: str) -> str:
+    """单个（简单）<table> 块 → Markdown 管道表；解析失败返回原块。"""
+    p = _TableToMarkdown()
+    try:
+        p.feed(block)
+    except Exception:
+        return block
+    rows = [r for r in p.rows if any(c.strip() for c in r)]
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    out = ["| " + " | ".join(rows[0]) + " |",
+           "| " + " | ".join(["---"] * width) + " |"]
+    for r in rows[1:]:
+        out.append("| " + " | ".join(r) + " |")
+    return "\n".join(out)
+
+
+_TBL_PH = chr(0) + "TBL"                    # 复杂表占位前缀（NUL 不出现在正文）
+
+
+def stash_complex_tables(text: str) -> tuple:
+    """简单 <table> 转管道表；复杂表占位保护。
+
+    返回 ``(text, stash)``：复杂块被替换为 ``\\x00TBL<i>\\x00`` 占位，
+    调用方在剥标签等破坏性替换全部完成后用 :func:`restore_table_stash`
+    原样还原。复杂表保留 HTML 块（Markdown 管道表无法表达合并单元格等
+    结构，摊平即丢语义）。
+    """
+    stash: List[str] = []
+    if "<table" not in text.lower():
+        return text, stash
+    for start, end in reversed(_find_table_blocks(text)):
+        block = text[start:end]
+        converted = "" if _is_complex_table(block) else _convert_table(block)
+        if converted.strip() and "|" in converted:
+            text = text[:start] + "\n\n" + converted + "\n\n" + text[end:]
+        else:
+            # 复杂表 / 解析失败 / 无内容：原块占位保留
+            stash.append(block)
+            text = (text[:start] + _TBL_PH + str(len(stash) - 1) + chr(0)
+                    + text[end:])
+    return text, stash
+
+
+def restore_table_stash(text: str, stash: List[str]) -> str:
+    """把 stash_complex_tables 的占位还原为原始 <table> 块。"""
+    for i, block in enumerate(stash):
+        text = text.replace(_TBL_PH + str(i) + chr(0), block)
+    return text
+
+
 def html_tables_to_markdown(text: str) -> str:
     """把文本里的 <table> 块转成 Markdown 管道表格，其余文本原样保留。
 
     docling/marker 的复杂表格、ovis 的 4-bit 模型输出都会给 HTML 表格。
-    直接当标签剥掉会让单元格文本粘连成一行（结构信息全丢）——转成管道
-    表既保结构又对 embedding 友好。
+    直接当标签剥掉会让单元格文本粘连成一行（结构信息全丢）——简单表转
+    管道表既保结构又对 embedding 友好；**复杂表（嵌套/caption/colgroup/
+    colspan/rowspan>1）原样保留**，管道表表达不了的语义不强行摊平。
+    需要在剥标签的场景使用时改用 :func:`stash_complex_tables` +
+    :func:`restore_table_stash`（占位保护），否则保留的 HTML 块会被
+    后续剥标签规则销毁。
     """
     if "<table" not in text.lower():
         return text
-
-    def _convert(m: "re.Match") -> str:
-        block = m.group(0)
-        p = _TableToMarkdown()
-        try:
-            p.feed(block)
-        except Exception:
-            return block
-        rows = [r for r in p.rows if any(c.strip() for c in r)]
-        if not rows:
-            return ""
-        width = max(len(r) for r in rows)
-        rows = [r + [""] * (width - len(r)) for r in rows]
-        out = ["| " + " | ".join(rows[0]) + " |",
-               "| " + " | ".join(["---"] * width) + " |"]
-        for r in rows[1:]:
-            out.append("| " + " | ".join(r) + " |")
-        return "\n".join(out)
-
-    return re.sub(r"<table.*?</table>", _convert, text,
-                  flags=re.IGNORECASE | re.DOTALL)
+    out: List[str] = []
+    pos = 0
+    for start, end in _find_table_blocks(text):
+        out.append(text[pos:start])
+        block = text[start:end]
+        out.append(block if _is_complex_table(block) else _convert_table(block))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +358,6 @@ _INLINE_CODE_RE = re.compile(r'(`{1,3})[^`\n]+?\1')
 _DROP_BLOCK_RE = re.compile(
     r'<(script|style|svg)\b[^>]*>[\s\S]*?</\1\s*>', re.IGNORECASE)
 _COMMENT_RE = re.compile(r'<!--[\s\S]*?-->')
-_TABLE_BLOCK_RE = re.compile(r'<table[\s\S]*?</table>', re.IGNORECASE)
 _BR_RE = re.compile(r'<br\s*/?>', re.IGNORECASE)
 _TAG_RE = re.compile(r'</?[a-zA-Z][^>]*>')          # 属性可跨行
 # 块级标签剥除后换行（HTML 渲染语义：div/p/li/h1-6 等本身隐含断行）；
@@ -286,8 +375,8 @@ def _clean_md_segment(seg: str) -> str:
     seg = _DROP_BLOCK_RE.sub(' ', seg)
     seg = _COMMENT_RE.sub(' ', seg)
     seg = _DECL_RE.sub(' ', seg)
-    seg = _TABLE_BLOCK_RE.sub(
-        lambda m: '\n\n' + html_tables_to_markdown(m.group(0)) + '\n\n', seg)
+    # 简单表转管道表；复杂表占位保护（剥标签后再还原原块）
+    seg, tbl_stash = stash_complex_tables(seg)
     seg = _BR_RE.sub('\n', seg)
     # 行内代码 stash → 剥标签 → 实体还原 → 还原行内代码
     stash: List[str] = []
@@ -304,6 +393,7 @@ def _clean_md_segment(seg: str) -> str:
     seg = seg.replace('\xa0', ' ')
     for i, code in enumerate(stash):
         seg = seg.replace(chr(0) + str(i) + chr(0), code)
+    seg = restore_table_stash(seg, tbl_stash)
     return seg
 
 
@@ -318,7 +408,9 @@ def clean_docling_markdown(text: str) -> str:
       （此前切片混进 `<!-- image -->` 的根因——docling 路径有意跳过
       clean_text，注释从没被洗过）；
     - `<script>/<style>/<svg>` 整块丢弃；
-    - HTML 表格 → Markdown 管道表（docling/marker 复杂表、ovis 输出）；
+    - HTML 表格：简单表 → Markdown 管道表；复杂表（嵌套/caption/colgroup/
+      colspan/rowspan>1）**保留 HTML 块**——管道表表达不了的合并单元格
+      语义不强行摊平（2026-10-22 用户定版）；
     - `<br>`/块级标签 → 换行，行内残标剥除、留内容；
     - DOCTYPE / 处理指令；`&amp;` 等实体还原为真实字符；
     - 折叠 3+ 连续空行。

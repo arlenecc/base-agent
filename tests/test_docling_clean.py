@@ -143,3 +143,74 @@ def test_tilde_fence_protected():
     out = clean_docling_markdown(md)
     assert "<!-- 保真 -->" in out
     assert "<!-- image -->" not in out
+
+
+# ---------------------------------------------------------------------------
+# 复杂表保留（管道表无法表达的结构不强摊平，2026-10-22 用户定版）
+# ---------------------------------------------------------------------------
+
+def test_complex_table_colspan_kept_as_html():
+    md = "前文。\n<table><tr><td colspan=\"2\">合并</td></tr>" \
+         "<tr><td>A</td><td>B</td></tr></table>\n后文。"
+    out = clean_docling_markdown(md)
+    assert "<table>" in out and 'colspan="2"' in out and "合并" in out
+    assert "| A | B |" not in out          # 整块保留，不摊平
+    assert "前文。" in out and "后文。" in out
+
+
+def test_complex_table_rowspan_kept_as_html():
+    md = "<table><tr><td rowspan=\"2\">合并</td><td>A</td></tr>" \
+         "<tr><td>B</td></tr></table>"
+    out = clean_docling_markdown(md)
+    assert "<table>" in out and 'rowspan="2"' in out
+
+
+def test_complex_table_caption_kept_as_html():
+    md = "<table><caption>表标题</caption><tr><td>A</td></tr></table>"
+    out = clean_docling_markdown(md)
+    assert "<table>" in out and "<caption>表标题</caption>" in out
+
+
+def test_nested_table_outer_block_kept():
+    md = ("<table><tr><td>外\n"
+          "<table><tr><td>内</td></tr></table>\n</td></tr></table>")
+    out = clean_docling_markdown(md)
+    # 平衡扫描：外层块完整保留（含内层表），不会被懒匹配腰斩
+    assert out.count("<table>") == 2
+    assert "内" in out
+
+
+def test_simple_table_still_converted():
+    md = "<table><tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td>" \
+         "</tr></table>"
+    out = clean_docling_markdown(md)
+    assert "<table" not in out
+    assert "| A | B |" in out and "| 1 | 2 |" in out
+
+
+def test_html_tables_to_markdown_keeps_complex():
+    from agent.rag.cleaner import html_tables_to_markdown
+    block = '<table><tr><td colspan="3">合并</td></tr></table>'
+    assert html_tables_to_markdown(block) == block
+    # 嵌套：外层块完整（懒匹配会腰斩，这里验证平衡扫描）
+    nested = "<table><tr><td>x<table><tr><td>y</td></tr></table></td></tr></table>"
+    assert html_tables_to_markdown(nested) == nested
+
+
+def test_table_survives_inside_html_kept_block():
+    # 保留的复杂表块内的标签不再被行内/块级剥标签规则二次销毁
+    md = ("<table><thead><tr><th>列</th></tr></thead><tbody>"
+          "<tr><td colspan=\"2\">值</td></tr></tbody></table>")
+    out = clean_docling_markdown(md)
+    assert "<thead>" in out and "<tbody>" in out and "<th>列</th>" in out
+
+
+def test_ebook_path_table_handling():
+    from agent.rag.ebook_parser import clean_ebook_markdown
+    simple = "前言\n<table><tr><td>A</td><td>B</td></tr></table>\n正文"
+    out = clean_ebook_markdown(simple)
+    assert "<table" not in out and "A" in out and "B" in out
+    complex_md = ('前言\n<table><tr><td colspan="2">合并</td></tr></table>\n正文')
+    out = clean_ebook_markdown(complex_md)
+    # 复杂表原样保留（不被剥标签销毁）
+    assert "<table>" in out and 'colspan="2"' in out and "合并" in out
