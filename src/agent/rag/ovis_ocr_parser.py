@@ -17,9 +17,15 @@
 
 模型配置：``rag_ocr_engine``（mlx-vlm / onnx / gguf）+
 ``rag_ocr_model_name`` / ``rag_ocr_model_path``，经
-:func:`set_ovis_model_config` 注入。默认自动加载 models/ 下
-``OvisOCR2-0.8B-MLX-4bit``。onnx/gguf 后端预留了配置位，当前仅实现
-MLX（mlx_vlm）。
+:func:`set_ovis_model_config` 注入。三个后端与模型目录判据：
+- mlx-vlm：目录含 model.safetensors(.index.json)（默认
+  models/OvisOCR2-0.8B-MLX-4bit），走 mlx_vlm.load / generate。
+- gguf：目录含 主模型.gguf + mmproj*.gguf（视觉塔投影），走
+  llama-cpp-python 的 MTMDChatHandler 多模态 chat（旧版回退
+  Llava15ChatHandler）。
+- onnx：目录含 genai_config.json（onnxruntime-genai Model Builder 导出的
+  多模态模型），走 og.Model / Processor / Generator；未安装
+  onnxruntime-genai 时给出安装提示并返回 None（回退链继续）。
 """
 from __future__ import annotations
 
@@ -53,16 +59,29 @@ _OVIS_PROMPT = (
     "<|vision_start|><|image_pad|><|vision_end|>\n"
     "Transcribe this document to markdown."
 )
+# gguf（llama-cpp chat handler 自行插入图像占位）与 onnx（ORT-GenAI Processor
+# 需要模型导出时约定的图像模板，Ovis 系沿用 Qwen 视觉 token）的提示词。
+_GGUF_OCR_PROMPT = "Transcribe this document to markdown."
+_OG_OCR_PROMPT = _OVIS_PROMPT
 
 _OVIS_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 
 
 def set_ovis_model_config(engine: str, name: str, path: str) -> None:
-    """注入 OCR 模型配置（UI 保存设置时调用）。"""
+    """注入 OCR 模型配置（UI 保存设置时调用）。
+
+    配置（后端/模型名/路径）变化时释放已加载的模型单例——否则切后端后
+    仍沿用旧引擎的权重，新配置要重启才生效。
+    """
     global _engine, _model_name, _model_path
-    _engine = (engine or "mlx-vlm").strip() or "mlx-vlm"
-    _model_name = (name or "OvisOCR2-0.8B-MLX-4bit").strip() or _model_name
-    _model_path = (path or "").strip()
+    new_engine = (engine or "mlx-vlm").strip() or "mlx-vlm"
+    new_name = (name or "OvisOCR2-0.8B-MLX-4bit").strip() or _model_name
+    new_path = (path or "").strip()
+    changed = (new_engine != _engine or new_name != _model_name
+               or new_path != _model_path)
+    _engine, _model_name, _model_path = new_engine, new_name, new_path
+    if changed:
+        release_model()
 
 
 def _candidate_model_dirs() -> List[Path]:
@@ -77,8 +96,32 @@ def _candidate_model_dirs() -> List[Path]:
     return dirs
 
 
-def resolve_model_dir() -> Optional[Path]:
-    """找到可用的模型目录（含 model.safetensors）。"""
+def _gguf_files(d: Path):
+    """目录里的 (主模型 gguf, mmproj 视觉塔 gguf)；无则对应位为 None。"""
+    main = proj = None
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return None, None
+    for n in names:
+        low = n.lower()
+        if not low.endswith(".gguf"):
+            continue
+        if low.startswith("mmproj"):
+            proj = proj or os.path.join(d, n)
+        else:
+            main = main or os.path.join(d, n)
+    return main, proj
+
+
+def resolve_model_dir(engine: Optional[str] = None) -> Optional[Path]:
+    """按后端判据找到可用的模型目录（engine 缺省用当前配置）。
+
+    - mlx-vlm：含 model.safetensors(.index.json)
+    - gguf：含主模型 *.gguf（mmproj 在加载期校验，缺了给明确错误）
+    - onnx：含 genai_config.json（ORT-GenAI 导出标志）
+    """
+    engine = (engine or _engine or "mlx-vlm").strip().lower()
     seen = set()
     for d in _candidate_model_dirs():
         key = str(d)
@@ -86,78 +129,156 @@ def resolve_model_dir() -> Optional[Path]:
             continue
         seen.add(key)
         try:
-            if (d / "model.safetensors").is_file() or (
-                d / "model.safetensors.index.json"
-            ).is_file():
-                return d
+            if engine == "gguf":
+                main, _proj = _gguf_files(d)
+                if main:
+                    return d
+            elif engine == "onnx":
+                if (d / "genai_config.json").is_file():
+                    return d
+            else:
+                if (d / "model.safetensors").is_file() or (
+                    d / "model.safetensors.index.json"
+                ).is_file():
+                    return d
         except OSError:
             continue
     return None
 
 
 def is_ovis_available() -> bool:
-    """ovis 引擎可用性：mlx_vlm 已装 + 模型目录存在。
+    """ovis 引擎可用性：当前后端的依赖已装 + 模型目录存在。
 
-    探测只用 find_spec——真实 import mlx_vlm 会连带加载 mlx/torch 全家桶。
+    探测只用 find_spec——真实 import mlx_vlm / llama_cpp / onnxruntime_genai
+    会连带加载重型依赖。
     """
-    if _engine != "mlx-vlm":
-        # onnx/gguf 后端尚未实现：不可用（回退链继续往下走）
+    import importlib.util
+    engine = (_engine or "mlx-vlm").strip().lower()
+    need = {"mlx-vlm": "mlx_vlm", "gguf": "llama_cpp",
+            "onnx": "onnxruntime_genai"}.get(engine)
+    if need is None:
         return False
     try:
-        import importlib.util
-        if importlib.util.find_spec("mlx_vlm") is None:
+        if importlib.util.find_spec(need) is None:
             return False
     except Exception:
         return False
-    return resolve_model_dir() is not None
+    return resolve_model_dir(engine) is not None
 
 
 # ---------------------------------------------------------------------------
 # 模型单例
 # ---------------------------------------------------------------------------
 _model = None
-_processor = None
+_processor = None             # mlx: processor；onnx: (og.Processor, og.Tokenizer)；gguf: None
+_loaded_engine: Optional[str] = None
 _model_lock = threading.Lock()
 _model_load_error: Optional[str] = None
 
 
+def _load_mlx_model(model_dir: Path):
+    from mlx_vlm import load
+
+    return load(str(model_dir))
+
+
+def _load_gguf_model(model_dir: Path):
+    """GGUF 多模态：主模型 gguf + MTMDChatHandler(mmproj)。
+
+    llama-cpp-python ≥0.3.30 用 MTMDChatHandler（通用 mtmd 接口）；更旧版本
+    回退 Llava15ChatHandler（同一构造签名）。两者都不在 → 无 chat_handler
+    直接构造 Llama，生成期会因不识别图像内容而报错（记入 _model_load_error）。
+    """
+    from llama_cpp import Llama
+
+    main, proj = _gguf_files(model_dir)
+    if main is None:
+        raise FileNotFoundError(f"目录中没有 .gguf 主模型: {model_dir}")
+    if proj is None:
+        raise FileNotFoundError(
+            "目录中没有 mmproj*.gguf——GGUF 多模态必须带视觉塔投影文件"
+            f"（llama.cpp 导出时的 mmproj-*of-*.gguf）: {model_dir}")
+    kwargs: dict = dict(model_path=main, n_ctx=4096, n_gpu_layers=-1,
+                        verbose=False)
+    handler = None
+    try:
+        from llama_cpp.llama_chat_format import MTMDChatHandler
+        handler = MTMDChatHandler(clip_model_path=proj, verbose=False)
+    except Exception:
+        try:
+            from llama_cpp.llama_chat_format import Llava15ChatHandler
+            handler = Llava15ChatHandler(clip_model_path=proj, verbose=False)
+        except Exception as e:
+            logger.warning("GGUF 多模态 chat handler 构造失败: %s", e)
+    if handler is not None:
+        kwargs["chat_handler"] = handler
+    return Llama(**kwargs)
+
+
+def _load_onnx_model(model_dir: Path):
+    """ORT-GenAI 多模态模型（Model Builder 导出，目录含 genai_config.json）。"""
+    try:
+        import onnxruntime_genai as og
+    except Exception as e:
+        raise RuntimeError(
+            "ONNX OCR 后端不可用：未安装 onnxruntime-genai。\n"
+            "安装：pip install onnxruntime-genai\n"
+            f"原始错误: {type(e).__name__}: {e}"
+        ) from e
+    model = og.Model(str(model_dir))
+    processor = og.Processor(str(model_dir))
+    tokenizer = og.Tokenizer(str(model_dir))
+    return model, processor, tokenizer
+
+
 def _get_model():
-    """加载（并缓存）OvisOCR2 模型。线程安全；失败返回 None。"""
-    global _model, _processor, _model_load_error
-    if _model is not None:
+    """按当前后端加载（并缓存）OCR 模型。线程安全；失败返回 None。"""
+    global _model, _processor, _model_load_error, _loaded_engine
+    engine = (_engine or "mlx-vlm").strip().lower()
+    if _model is not None and _loaded_engine == engine:
         return _model, _processor
-    if _model_load_error is not None:
+    if _model_load_error is not None and _loaded_engine == engine:
         return None
     with _model_lock:
-        if _model is not None:
+        if _model is not None and _loaded_engine == engine:
             return _model, _processor
-        model_dir = resolve_model_dir()
+        model_dir = resolve_model_dir(engine)
         if model_dir is None:
-            _model_load_error = "模型目录不存在"
+            _model_load_error = (
+                f"模型目录不存在或不含 {engine} 后端所需的权重文件")
+            _loaded_engine = engine
             return None
         try:
-            from mlx_vlm import load
+            import time
 
-            t0 = __import__("time").monotonic()
-            model, processor = load(str(model_dir))
-            _model, _processor = model, processor
+            t0 = time.monotonic()
+            if engine == "gguf":
+                model, processor = _load_gguf_model(model_dir), None
+            elif engine == "onnx":
+                m, p, t = _load_onnx_model(model_dir)
+                model, processor = m, (p, t)
+            else:
+                model, processor = _load_mlx_model(model_dir)
+            _model, _processor, _loaded_engine = model, processor, engine
             logger.info(
-                "OvisOCR2 模型加载完成: %s (%.1fs)", model_dir.name,
-                __import__("time").monotonic() - t0,
+                "OvisOCR2 模型加载完成[%s]: %s (%.1fs)", engine,
+                model_dir.name, time.monotonic() - t0,
             )
             return _model, _processor
         except Exception as e:
             _model_load_error = str(e)
-            logger.warning("OvisOCR2 模型加载失败: %s", e)
+            _loaded_engine = engine
+            logger.warning("OvisOCR2 模型加载失败[%s]: %s", engine, e)
             return None
 
 
 def release_model() -> None:
-    """释放模型引用（同步结束后调用，让 MLX 归还显存）。"""
-    global _model, _processor, _model_load_error
+    """释放模型引用（同步结束后/配置切换时调用，归还显存）。"""
+    global _model, _processor, _model_load_error, _loaded_engine
     with _model_lock:
         _model = None
         _processor = None
+        _loaded_engine = None
         _model_load_error = None  # 允许下次重新尝试加载
     try:
         import gc
@@ -297,12 +418,80 @@ def fitz_pixmap_rgb(pix):
 # VLM 推理
 # ---------------------------------------------------------------------------
 
+def _gguf_ocr(model, image_path: str) -> str:
+    """GGUF 多模态推理：chat handler 负责视觉塔，本地路径/数据 URI 均可。"""
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": _GGUF_OCR_PROMPT},
+            {"type": "image_url", "image_url": {"url": image_path}},
+        ],
+    }]
+    resp = model.create_chat_completion(
+        messages=messages, max_tokens=1024, temperature=0.2, stream=False)
+    return (resp["choices"][0]["message"].get("content") or "")
+
+
+def _onnx_ocr(model, processor_bundle, image_path: str) -> str:
+    """ONNX 多模态推理（onnxruntime-genai）。
+
+    ORT-GenAI 的 Python API 在版本间有改动（GeneratorParams 构造 /
+    token 获取），这里用 0.5-0.6 的主流形态 + getattr 防御；不兼容时
+    抛异常 → _vlm_ocr 记日志返回 None → 回退链继续。
+    """
+    og_proc, og_tok = processor_bundle
+    try:
+        import onnxruntime_genai as og
+    except Exception as e:
+        raise RuntimeError(
+            "ONNX OCR 后端不可用：未安装 onnxruntime-genai。\n"
+            "安装：pip install onnxruntime-genai\n"
+            f"原始错误: {type(e).__name__}: {e}"
+        ) from e
+    images = None
+    try:
+        images = og.Images.open(image_path)
+    except Exception as e:
+        logger.debug("og.Images 打开失败（退纯文本输入）: %s", e)
+    try:
+        inputs = og_proc(_OG_OCR_PROMPT, images=images)
+    except TypeError:
+        inputs = og_proc(_OG_OCR_PROMPT)
+    params = og.GeneratorParams(model)
+    params.set_inputs(inputs)
+    try:
+        params.set_search_options(max_length=1024)
+    except Exception:
+        pass
+    generator = _og.Generator(model, params)
+    stream = og_tok.create_stream()
+    chunks: List[str] = []
+    while not generator.is_done():
+        generator.compute_logits()
+        generator.generate_next_token()
+        try:
+            ids = generator.get_next_tokens()
+        except Exception:
+            break
+        if isinstance(ids, int):
+            ids = [ids]
+        for i in ids:
+            chunks.append(stream.decode(int(i)))
+    return "".join(chunks)
+
+
 def _vlm_ocr(image_path: str) -> Optional[str]:
+    """按当前后端推理：单张（已归一化的）图片 → Markdown 文本。"""
     got = _get_model()
     if got is None:
         return None
     model, processor = got
+    engine = (_engine or "mlx-vlm").strip().lower()
     try:
+        if engine == "gguf":
+            return _clean_vlm_output(_gguf_ocr(model, image_path))
+        if engine == "onnx":
+            return _clean_vlm_output(_onnx_ocr(model, processor, image_path))
         from mlx_vlm import generate
 
         result = generate(
@@ -311,10 +500,8 @@ def _vlm_ocr(image_path: str) -> Optional[str]:
         )
         return _clean_vlm_output(getattr(result, "text", "") or "")
     except Exception as e:
-        logger.debug("OvisOCR2 推理失败: %s", e)
+        logger.debug("OvisOCR2 推理失败[%s]: %s", engine, e)
         return None
-
-
 def _vlm_ocr_pil(pil_image, out_dir: str = "") -> Optional[str]:
     path = _save_normalized(pil_image, out_dir)
     if path is None:

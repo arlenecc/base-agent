@@ -63,9 +63,15 @@ class LocalVLMClient:
 
     def _load_gguf(self) -> None:
         gguf = self._path
+        mmproj = None
         if os.path.isdir(gguf):
             for f in sorted(os.listdir(gguf)):
-                if f.endswith(".gguf"):
+                low = f.lower()
+                if not low.endswith(".gguf"):
+                    continue
+                if low.startswith("mmproj"):
+                    mmproj = mmproj or os.path.join(gguf, f)
+                else:
                     gguf = os.path.join(gguf, f)
                     break
         try:
@@ -75,8 +81,27 @@ class LocalVLMClient:
                 "GGUF VLM 后端不可用：未安装 llama-cpp-python。\n"
                 f"原始错误: {type(e).__name__}: {e}"
             ) from e
-        self._model = Llama(model_path=gguf, n_ctx=4096, n_gpu_layers=-1,
-                            verbose=False, multimodal=True)
+        # llama-cpp-python 没有 multimodal 构造参数（传入会 TypeError）——
+        # 多模态必须挂 chat handler：≥0.3.30 用 MTMDChatHandler(mmproj)，
+        # 更旧版本回退 Llava15ChatHandler（同一构造签名）。mmproj 缺失时
+        # 退纯文本 Llama（调用方传图会在生成期报错，错误信息可定位）。
+        kwargs: Dict[str, Any] = dict(model_path=gguf, n_ctx=4096,
+                                      n_gpu_layers=-1, verbose=False)
+        if mmproj:
+            handler = None
+            try:
+                from llama_cpp.llama_chat_format import MTMDChatHandler
+                handler = MTMDChatHandler(clip_model_path=mmproj, verbose=False)
+            except Exception:
+                try:
+                    from llama_cpp.llama_chat_format import Llava15ChatHandler
+                    handler = Llava15ChatHandler(clip_model_path=mmproj,
+                                                 verbose=False)
+                except Exception as e:
+                    logger.warning("GGUF VLM chat handler 构造失败: %s", e)
+            if handler is not None:
+                kwargs["chat_handler"] = handler
+        self._model = Llama(**kwargs)
 
     # ------------------------------------------------------------------
     def chat(self, prompt: str, images: Optional[List[str]] = None) -> str:
@@ -101,11 +126,10 @@ class LocalVLMClient:
 
     def _chat_gguf(self, prompt: str, images: List[str]) -> str:
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        # chat handler（MTMD/Llava）只识别 image_url 形态；url 可为
+        # data-uri 或本地路径（load_image 两者都支持）。
         for img in images:
-            if img.startswith("data:"):
-                content.append({"type": "image_url", "image_url": {"url": img}})
-            else:
-                content.append({"type": "image", "image_path": img})
+            content.append({"type": "image_url", "image_url": {"url": img}})
         messages = [{"role": "user", "content": content}]
         resp = self._model.create_chat_completion(
             messages=messages, temperature=self._temperature,

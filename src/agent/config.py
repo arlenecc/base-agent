@@ -86,7 +86,9 @@ class AgentConfig:
     #     RapidOCR 方案，后者只能出无版面纯文本）
     # 回退链：主引擎 → 其余统一引擎 → ovis → PyMuPDF 纯文本兜底。
     # OvisOCR2 VLM 模型配置（ovis 引擎用）：
-    #   rag_ocr_engine    实现后端：mlx-vlm（已实现）| onnx | gguf（后两者预留）
+    #   rag_ocr_engine    实现后端：mlx-vlm（safetensors 目录）| gguf（主模型
+    #                     .gguf + mmproj*.gguf，llama-cpp 多模态）| onnx
+    #                     （genai_config.json 目录，onnxruntime-genai 推理）
     #   rag_ocr_model_name 模型目录名（默认 OvisOCR2-0.8B-MLX-4bit）
     #   rag_ocr_model_path 显式本地路径（优先于 models/<name>，留空自动）
     rag_ocr_engine: str = "mlx-vlm"

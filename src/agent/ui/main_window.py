@@ -1344,8 +1344,11 @@ class MainWindow(QMainWindow):
         r.addWidget(self.ocr_model_name_edit, 2)
         r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit))
         self.ocr_impl_combo.setToolTip(
-            "OvisOCR2 VLM 后端：mlx-vlm（Apple Silicon 已实现）；"
-            "onnx / gguf 为预留配置位，暂未实现"
+            "OvisOCR2 VLM 后端：\n"
+            "· mlx-vlm：目录含 model.safetensors（Apple Silicon 推荐）\n"
+            "· gguf：目录含 主模型.gguf + mmproj*.gguf（llama-cpp 多模态）\n"
+            "· onnx：目录含 genai_config.json（onnxruntime-genai 导出，"
+            "需 pip install onnxruntime-genai）"
         )
         self.ocr_model_name_edit.setToolTip(
             "默认 OvisOCR2-0.8B-MLX-4bit，自动从 models/ 目录加载"
