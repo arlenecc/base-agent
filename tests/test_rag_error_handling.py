@@ -456,6 +456,66 @@ def test_cancel_during_sync_does_not_crash(error_dataset, tmp_path):
         engine.close()
 
 
+def test_cancel_mid_sync_completed_files_not_redone(tmp_path):
+    """取消同步：已完整入库的文件记入 manifest，下次同步跳过不再重做。
+
+    2026-10-23 用户确认点。语义（engine.ingest 取消分支）：
+      * 只有「全部切片已写入向量库」的文件（committed_manifest）才记入
+        manifest——正在处理/只写入一半的文件不记录；
+      * 下次同步：已记录文件走增量跳过，未记录文件重新处理（add_streaming
+        按 source 删旧写新，幂等、无重复）；
+      * 最终全库内容完整（30 个来源齐全）且 id 唯一。
+    """
+    from agent.rag.engine import RAGEngine, _load_manifest
+
+    kb = tmp_path / "kb"
+    kb.mkdir()
+    # 每个文件 ~17.5k 字符 → chunk_size 500/overlap 50 下约 39 个切片：
+    # 写入批大小 200 → 首批恰好装下 ~5 个文件，第 8 个文件的进度回调必然
+    # 落在首批已写入之后的第二批拉取期间（首批 pull 中的取消会整批丢弃，
+    # committed=0，测不到续传）。
+    n_files = 12
+    for i in range(n_files):
+        body = " ".join(
+            f"文件{i}第{s}段：" + "这是用于分块与续传测试的正文内容。" * 20
+            for s in range(50)
+        )
+        (kb / f"book_{i:02d}.txt").write_text(body)
+
+    engine = RAGEngine(
+        workspace=str(tmp_path),
+        knowledge_base=str(kb),
+        embedding_function=FakeEmbeddingFunction(),
+    )
+    try:
+        # 第 8 个文件进度回调时取消：首批（~5 个文件）已完整写入并 committed，
+        # 第 6-8 个文件的切片被拉取但未写入（整批丢弃）→ 不 committed。
+        def cancel_late(done, total, current):
+            if done >= 8:
+                engine.cancel()
+
+        stats1 = engine.ingest(force=False, progress_callback=cancel_late)
+        assert stats1.get("cancelled") is True
+
+        manifest = _load_manifest(engine.rag_dir)
+        committed = {fp for fp, e in manifest.items() if e.get("chunk_count")}
+        assert 0 < len(committed) < n_files          # 有续传进度可复用
+
+        # 第二次同步：已入库文件跳过，其余重新处理
+        stats2 = engine.ingest(force=False)
+        assert not stats2.get("cancelled")
+        assert stats2["files_skipped"] == len(committed)
+        assert stats2["files_extracted"] == n_files - len(committed)
+
+        # 最终内容完整：全部来源在库；id 唯一（半截文件被整体替换，无重复）
+        tbl = engine._get_store()._table
+        df = tbl.to_arrow().to_pandas()
+        assert df["id"].is_unique
+        assert df["source"].nunique() == n_files
+    finally:
+        engine.close()
+
+
 def test_cleanup_after_sync(error_dataset, tmp_path):
     """同步后 close() 应释放资源，不影响后续操作。"""
     from agent.rag.engine import RAGEngine
