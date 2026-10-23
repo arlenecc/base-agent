@@ -365,3 +365,103 @@ def test_factory_llm_local_streams():
     assert any(e.type == "content" and e.content for e in events)
     assert any(e.type == "done" for e in events)
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# 跨轮 KV / 前缀复用开关（2026-10-24：GGUF 对齐 MLX）
+# ---------------------------------------------------------------------------
+
+def test_kv_reuse_default_on_and_config_field():
+    """开关默认开，且 config 暴露该字段。"""
+    from agent.config import AgentConfig
+    from agent.local.llm import LocalLLMClient
+    assert AgentConfig().local_llm_kv_reuse is True
+    assert LocalLLMClient("/tmp/x", backend="gguf")._kv_reuse is True
+
+
+def test_gguf_kv_reuse_disabled_uses_legacy_path(monkeypatch):
+    """开关关闭 → GGUF 主对话也走旧路径（每轮整轮生成，不复用前缀）。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="gguf", kv_reuse=False)
+    c._loaded = True      # 跳过真实权重加载
+    calls = {"legacy": 0}
+
+    def fake_legacy(self, messages, tools, temperature):
+        calls["legacy"] += 1
+        return iter([])
+
+    def boom_reuse(self, messages, tools, temperature):
+        raise AssertionError("开关关闭时不该走复用路径")
+
+    monkeypatch.setattr(LocalLLMClient, "_stream_gguf_legacy", fake_legacy)
+    monkeypatch.setattr(LocalLLMClient, "_stream_gguf_reuse", boom_reuse)
+    list(c.chat_stream([{"role": "user", "content": "hi"}], temperature=0.7))
+    assert calls["legacy"] == 1
+
+
+def test_gguf_kv_reuse_enabled_tries_reuse_then_falls_back(monkeypatch):
+    """开关打开时先试复用；复用路径抛错则清状态后退回旧路径（不降级功能）。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="gguf", kv_reuse=True)
+    c._loaded = True
+    reset_calls = {"n": 0}
+
+    class FakeLlama:
+        def reset(self):
+            reset_calls["n"] += 1
+    c._model = FakeLlama()
+    c._gguf_fmt = object()     # 有 formatter 才会进入复用分支
+    c._gguf_ids = [1, 2, 3]
+    calls = {"legacy": 0}
+
+    def boom_reuse(self, messages, tools, temperature):
+        raise RuntimeError("boom")
+
+    def fake_legacy(self, messages, tools, temperature):
+        calls["legacy"] += 1
+        return iter([])
+
+    monkeypatch.setattr(LocalLLMClient, "_stream_gguf_reuse", boom_reuse)
+    monkeypatch.setattr(LocalLLMClient, "_stream_gguf_legacy", fake_legacy)
+    list(c.chat_stream([{"role": "user", "content": "hi"}], temperature=0.7))
+    assert calls["legacy"] == 1
+    assert reset_calls["n"] >= 1      # 退回前 reset
+    assert c._gguf_ids == []          # 状态清空
+
+
+def test_gguf_invalidate_kv_cache_resets_context():
+    """GGUF 的 KV 在 C++ context 里，失效必须显式 reset + 清空已 eval 序列。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="gguf")
+    calls = {"reset": 0}
+
+    class FakeLlama:
+        def reset(self):
+            calls["reset"] += 1
+    c._model = FakeLlama()
+    c._gguf_ids = [1, 2, 3]
+    c.invalidate_kv_cache()
+    assert calls["reset"] == 1
+    assert c._gguf_ids == []
+
+
+def test_gguf_render_none_without_formatter():
+    """formatter 不可用时渲染返回 (None, None) → 调用方退回旧路径。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="gguf")
+    c._gguf_fmt = None
+    c._gguf_fmt_sys = None
+    assert c._gguf_render([{"role": "user", "content": "hi"}]) == (None, None)
+
+
+def test_factory_passes_kv_reuse_and_aux_disabled():
+    """主模型按 config 传开关；辅助模型恒为 False（prompt 每轮都变）。"""
+    from agent.config import AgentConfig
+    from agent.local.factory import build_llm_client, build_aux_llm_client
+    cfg = AgentConfig()
+    cfg.llm_provider = "local"
+    cfg.local_llm_kv_reuse = False
+    main = build_llm_client(cfg)
+    assert main._kv_reuse is False
+    aux = build_aux_llm_client(cfg)
+    assert aux._kv_reuse is False

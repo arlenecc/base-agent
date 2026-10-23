@@ -1259,7 +1259,7 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda: self._pick_model_path(edit, combo))
             return b
 
-        def _params_widget(mt, temp, tp, mp, tk, rp, thinking, to):
+        def _params_widget(mt, temp, tp, mp, tk, rp, thinking, to, extra=None):
             w = QWidget()
             row = QHBoxLayout(w)
             row.setContentsMargins(0, 0, 0, 0)
@@ -1272,6 +1272,8 @@ class MainWindow(QMainWindow):
             row.addWidget(QLabel("repeat-penalty")); row.addWidget(rp)
             row.addWidget(thinking)
             row.addWidget(QLabel("超时(秒)"));  row.addWidget(to)
+            if extra is not None:
+                row.addWidget(extra)
             return w
 
         # ==================================================================
@@ -1327,11 +1329,18 @@ class MainWindow(QMainWindow):
         self.thinking_check.setToolTip(
             "启用 Qwen3 系思考模式（enable_thinking）。关闭后模型跳过思考直接作答，"
             "首字延迟显著降低，但复杂任务的推理质量可能下降。")
+        self.kv_reuse_check = QCheckBox("跨轮复用")
+        self.kv_reuse_check.setToolTip(
+            "跨轮 KV / 前缀复用：系统提示与历史不变的部分直接复用上一轮算好的 KV，"
+            "多轮对话首字延迟显著下降（MLX 与 GGUF 后端都生效）。\n"
+            "关闭后每轮整体重建（全量预填充，最慢但最保守）——用于排查前缀错位导致"
+            "的罕见乱码，或在上下文/显存极紧张时以时间换空间。")
         self.main_params_w = QWidget()
         r = QHBoxLayout(self.main_params_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(6)
         r.addWidget(_params_widget(self.max_tokens_edit, self.temp_edit, self.top_p_edit,
                                    self.min_p_edit, self.top_k_edit, self.repeat_penalty_edit,
-                                   self.thinking_check, self.timeout_edit))
+                                   self.thinking_check, self.timeout_edit,
+                                   self.kv_reuse_check))
         r.addStretch(1)
         self.load_main_btn = QPushButton("加载模型")
         self.load_main_btn.setStyleSheet("font-weight:600;")
@@ -1924,6 +1933,7 @@ class MainWindow(QMainWindow):
         self.repeat_penalty_edit.setText(str(self.config.repetition_penalty))
         self.timeout_edit.setText(str(self.config.request_timeout))
         self.thinking_check.setChecked(bool(getattr(self.config, "local_llm_enable_thinking", True)))
+        self.kv_reuse_check.setChecked(bool(getattr(self.config, "local_llm_kv_reuse", True)))
         self.workspace_edit.setText(self.config.workspace)
         self.knowledge_base_edit.setText(self.config.knowledge_base)
         # 主模型模式（本地 / OpenAI 兼容接口）+ 本地类型与路径
@@ -2010,6 +2020,7 @@ class MainWindow(QMainWindow):
         _num(self.repeat_penalty_edit, "repetition_penalty", 1.0, float, "重复惩罚")
         _num(self.timeout_edit, "request_timeout", 120, float, "超时")
         self.config.local_llm_enable_thinking = self.thinking_check.isChecked()
+        self.config.local_llm_kv_reuse = self.kv_reuse_check.isChecked()
         # 辅助模型参数（本地专用）
         _num(self.aux_temp_edit, "aux_temperature", 0.7, float, "辅助温度")
         _num(self.aux_max_tokens_edit, "aux_max_tokens", 32768, int, "辅助最大Token")

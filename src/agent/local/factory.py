@@ -51,6 +51,7 @@ def build_llm_client(config) -> Any:
             enable_thinking=bool(getattr(config, "local_llm_enable_thinking", True)),
             num_draft_tokens=getattr(config, "local_llm_num_draft_tokens", 0),
             prefill_step_size=getattr(config, "local_llm_prefill_step_size", 0),
+            kv_reuse=bool(getattr(config, "local_llm_kv_reuse", True)),
         )
     # 默认：网络 API
     from ..llm_client import LLMClient
@@ -88,6 +89,8 @@ def build_aux_llm_client(config) -> Any:
         repetition_penalty=getattr(config, "aux_repetition_penalty", 1.0),
         # 兜底值必须与 AgentConfig 的字段默认值一致（辅助模型默认关闭思考）。
         enable_thinking=bool(getattr(config, "aux_local_llm_enable_thinking", False)),
+        # 辅助调用 prompt 每轮都变，不做跨轮复用（与 MLX 的 aux 一次性缓存同款）。
+        kv_reuse=False,
     )
 
 

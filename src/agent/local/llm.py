@@ -414,7 +414,12 @@ class LocalLLMClient:
         enable_thinking: bool = True,
         num_draft_tokens: int = 0,
         prefill_step_size: int = 0,
+        kv_reuse: bool = True,
     ):
+        # 跨轮 KV / 前缀复用开关（MLX 与 GGUF 都遵守，默认开）。
+        # 关闭后每轮整体重建（全量预填充）——用于排查前缀错位导致的乱码，
+        # 或在显存/上下文特别紧张时以时间换空间。
+        self._kv_reuse = bool(kv_reuse)
         self._path = path
         self._backend = (backend or "mlx").strip().lower()
         self._max_tokens = int(max_tokens)
@@ -445,6 +450,14 @@ class LocalLLMClient:
         # 每轮只预填充本轮新增 token（对齐 Ollama 的 prompt cache 行为）。
         self._mlx_cache = None
         self._cache_token_ids: List[int] = []
+        # GGUF（llama.cpp）的跨轮前缀状态：当前已 eval 进上下文的 token 序列。
+        # llama.cpp 的 KV 缓存在 C++ context 里（不是线程局部），但**不能裁剪**
+        # ——本 build 的 kv_cache_seq_rm 不支持（llama-cpp-python 会打印
+        # "partial kv removal not supported" 并退回全量重算）。因此这里只能做
+        # 「严格扩展则复用、分叉/回退则 reset 全量」的 append-only 复用。
+        self._gguf_ids: List[int] = []
+        # 与 llama.cpp 内部同款构造的 chat formatter（取 prompt 原文用）。
+        self._gguf_fmt = None
         # 创建该缓存的线程 ID。MLX 的 GPU stream 是**线程局部**的：cache 里的
         # 数组绑定创建线程的 stream，换线程复用会直接
         # RuntimeError: There is no Stream(gpu, N) in current thread。
@@ -538,6 +551,110 @@ class LocalLLMClient:
         # GGUF 的对话模板由 llama.cpp 内建处理（create_chat_completion），
         # 不需要 HF tokenizer；预填/校验等路径对非 mlx 后端均提前返回。
         self._tokenizer = None
+        self._gguf_ids = []
+        # add_generation_prompt 是**构造期**参数（Jinja2ChatFormatter 会在
+        # render 时自带它，调用时再传会 TypeError），因此构造两个：
+        # _gguf_fmt 用于生成（带 assistant 起始标记），_gguf_fmt_sys 用于
+        # 预填系统提示（不带 → 真实首句 prompt 才是它的严格扩展）。
+        self._gguf_fmt = self._build_gguf_chat_formatter(add_generation_prompt=True)
+        self._gguf_fmt_sys = self._build_gguf_chat_formatter(add_generation_prompt=False)
+
+    # ------------------------------------------------------------------
+    # GGUF：与 llama.cpp 同款的 chat formatter（取 prompt 原文以支持前缀复用）
+    # ------------------------------------------------------------------
+
+    def _build_gguf_chat_formatter(self, add_generation_prompt: bool = True):
+        """构造与 llama-cpp-python 内部**同款**的 chat formatter。
+
+        照抄 llama.py 里 ``_chat_handlers`` 的构造参数（template / eos / bos /
+        stop_token_ids 均取自 GGUF metadata），这样我们自己渲染出的 prompt 与
+        ``create_chat_completion`` 走的是同一份 Jinja 模板、同一套特殊 token，
+        前缀复用时逐 token 对得上；行为（含工具调用块）也与旧路径一致。
+
+        构造失败返回 None → 调用方退回 ``create_chat_completion`` 旧路径
+        （无前缀复用，功能不受影响）。
+        """
+        if self._backend != "gguf" or self._model is None:
+            return None
+        try:
+            from llama_cpp.llama_chat_format import Jinja2ChatFormatter
+            meta = getattr(self._model, "metadata", {}) or {}
+            tmpl = meta.get("tokenizer.chat_template")
+            if not tmpl:
+                return None
+            eos = meta.get("tokenizer.ggml.eos_token") or "</s>"
+            bos = meta.get("tokenizer.ggml.bos_token") or "<s>"
+            try:
+                eos_id = self._model.token_eos()
+            except Exception:
+                eos_id = None
+            return Jinja2ChatFormatter(
+                template=tmpl,
+                eos_token=eos,
+                bos_token=bos,
+                stop_token_ids=[eos_id] if eos_id is not None else None,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except Exception as e:
+            logger.debug("GGUF chat formatter 不可用（降级为无前缀复用）: %s", e)
+            return None
+
+    def _preload_gguf_system(self, system_prompt: str, tools=None) -> None:
+        """GGUF：把系统提示 token eval 进上下文（首句只需 eval 用户段）。
+
+        渲染**不带** generation prompt 的系统段——真实首句 prompt = 该序列 +
+        用户段 + assistant 起始标记，是严格扩展；若带上 generation prompt，
+        真实 prompt 会在 <think> 处分叉（无法裁剪）→ 复用失效。
+        """
+        if not self._kv_reuse:
+            return
+        with self._gen_lock:
+            self._ensure_model()
+            if self._model is None or self._gguf_fmt is None:
+                return
+            if self._gguf_ids:
+                return      # 已预填/已在用 → 不重复 eval
+            try:
+                _prompt, ids = self._gguf_render(
+                    [{"role": "system", "content": system_prompt}], tools,
+                    add_generation_prompt=False)
+                if not ids:
+                    return
+                self._model.eval(ids)
+                self._gguf_ids = list(ids)
+                logger.info("LLM: GGUF 系统提示已预填（%d token）", len(ids))
+            except Exception as e:
+                logger.warning("GGUF 系统提示预填失败(忽略): %s", e)
+                self._gguf_ids = []
+
+    def _gguf_render(self, messages, tools=None, add_generation_prompt: bool = True):
+        """渲染 GGUF chat prompt → ``(prompt_text, token_ids)``；不可用返回 (None, None)。
+
+        tokenize 参数与 llama-cpp-python ``_create_completion`` 完全一致
+        （``add_bos=False, special=True``），否则复用时前缀对不上。
+        """
+        fmt = (self._gguf_fmt if add_generation_prompt else self._gguf_fmt_sys)
+        if fmt is None or self._model is None:
+            return None, None
+        try:
+            # 注意：add_generation_prompt 已在构造期决定，这里不能再传
+            # （否则 jinja2 render 报 duplicate keyword）。
+            resp = fmt(messages=messages, tools=tools or None)
+            # ChatFormatterResponse 是 TypedDict（dict），不同版本也可能是
+            # dataclass —— 两种都取一遍。
+            prompt = None
+            if isinstance(resp, dict):
+                prompt = resp.get("prompt")
+            else:
+                prompt = getattr(resp, "prompt", None)
+            if not isinstance(prompt, str) or not prompt:
+                return None, None
+            ids = list(self._model.tokenize(prompt.encode("utf-8"),
+                                            add_bos=False, special=True))
+            return prompt, ids
+        except Exception as e:
+            logger.debug("GGUF prompt 渲染失败（降级为无前缀复用）: %s", e)
+            return None, None
 
     def _load_onnx(self) -> None:
         onnx_path = self._path
@@ -576,9 +693,11 @@ class LocalLLMClient:
         kv_group: str = "main",
     ) -> Iterator[StreamEvent]:
         self._ensure_model()
-        # 双视图历史的第二视图只有 MLX 后端读得懂；gguf/onnx 后端会把
-        # messages 原样交给底层引擎，多一个键有风险 → 先剥掉。
-        if self._backend != "mlx":
+        # 双视图历史的第二视图只有本地复用型后端读得懂（MLX 的 KV 前缀、
+        # GGUF 的 append-only 上下文都要它把 assistant 消息还原成生成时的
+        # 逐 token 序列）；onnx 后端会把 messages 原样交给底层引擎，多一个
+        # 键有风险 → 先剥掉。
+        if self._backend not in ("mlx", "gguf"):
             messages = [
                 {k: v for k, v in m.items() if k != "raw_content"}
                 if isinstance(m, dict) else m
@@ -717,6 +836,10 @@ class LocalLLMClient:
         # _kv_thread / _cache_token_ids，导致下一轮主对话被判「跨线程 / 前缀不符」
         # 而整体重建，退回每句全量预填充（约 20s）。
         persist = (kv_group == "main")
+        # 跨轮复用开关：关闭后每轮整体重建（全量预填充）——与 GGUF 行为对齐，
+        # 用于排查前缀错位乱码或换取更低显存占用。
+        if not self._kv_reuse:
+            persist = False
         cache = self._mlx_cache if persist else None
         cached_ids = self._cache_token_ids if persist else []
         reuse = 0
@@ -951,6 +1074,176 @@ class LocalLLMClient:
 
     # ---- GGUF ----
     def _stream_gguf(self, messages, tools, temperature, kv_group: str = "main"):
+        """GGUF 生成入口：优先走「前缀复用」路径，否则退回旧路径。
+
+        复用只用于主对话（``kv_group == "main"``）且开关打开时。辅助调用
+        （知识图谱抽取 / RAG 精简 / 技能检索）的 prompt 每轮都变，与 MLX 的
+        aux 一次性缓存同款处理：整体 reset 后生成，不参与跨轮复用。
+        """
+        persist = (kv_group == "main")
+        if self._kv_reuse and persist and self._gguf_fmt is not None:
+            try:
+                yield from self._stream_gguf_reuse(
+                    messages, tools, temperature)
+                return
+            except Exception as e:
+                # 复用路径失败不致命：清干净状态后退回旧路径（功能不降级）。
+                logger.warning("GGUF 前缀复用失败，退回整轮生成: %s", e)
+                try:
+                    self._model.reset()
+                except Exception:
+                    pass
+                self._gguf_ids = []
+        yield from self._stream_gguf_legacy(messages, tools, temperature)
+
+    def _stream_gguf_reuse(self, messages, tools, temperature):
+        """GGUF 跨轮前缀复用：只把**新增**的 token eval 进 llama.cpp 上下文。
+
+        为什么必须自己管（而不是靠 llama-cpp-python 内置的 prefix-match）：
+        本 build 的 ``kv_cache_seq_rm`` 不支持（generate() 会打印
+        "prefix-match found but partial kv removal not supported"，随即
+        reset 全量重算），实测复用完全不生效、每轮都付全量预填充（~2.3s /
+        1500 token）。这里改成 append-only：上下文永不 reset，只要新 prompt
+        是已 eval 序列的**严格扩展**就只 eval 增量；分叉/回退/超长则 reset
+        后全量（无法裁剪，与 MLX 的 ArraysCache 退化路径同款）。
+        """
+        # 双视图历史：把 assistant 消息还原成生成时的逐 token 序列（与 MLX 同款），
+        # 否则下轮 prompt 在 assistant 处就分叉、复用直接失效。
+        messages = _rebuild_raw_messages(messages)
+        prompt, ids = self._gguf_render(messages, tools,
+                                        add_generation_prompt=True)
+        if not ids:
+            raise RuntimeError("GGUF prompt 为空（渲染失败）")
+
+        cached = self._gguf_ids
+        common = 0
+        if cached:
+            lim = min(len(cached), len(ids))
+            while common < lim and cached[common] == ids[common]:
+                common += 1
+        if cached and common == len(cached) and common < len(ids):
+            suffix = ids[common:]      # 严格扩展 → 只 eval 增量
+            reuse_n = common
+        else:
+            suffix = ids               # 首轮 / 分叉 / 回退 → 全量
+            reuse_n = 0
+            self._model.reset()
+        logger.info(
+            "GGUF KV: cached=%d prompt=%d reuse=%d eval=%d",
+            len(cached), len(ids), reuse_n, len(suffix))
+
+        # 上下文容量保护：prompt + 生成上限超出 n_ctx 时必须全量重来（reset
+        # 后从 0 开始），否则 llama.cpp 会在 eval 时截断/报错。
+        try:
+            n_ctx = int(self._model.n_ctx())
+        except Exception:
+            n_ctx = 0
+        if n_ctx and len(ids) + 64 > n_ctx:
+            logger.warning("GGUF: prompt(%d) 接近 n_ctx(%d)，整体重建",
+                           len(ids), n_ctx)
+            self._model.reset()
+            suffix = ids
+            reuse_n = 0
+
+        self._model.eval(suffix)
+        self._gguf_ids = list(ids)
+
+        start_in_think = bool(prompt and prompt.rstrip().endswith(_THINK_OPEN))
+        stop_ids = self._gguf_stop_ids()
+        gen_ids: List[int] = []
+
+        def _produce():
+            t0 = time.time()
+            first_ts: List[Optional[float]] = [None]
+            for _ in range(max(1, int(self._max_tokens))):
+                tok_id = self._model.sample(
+                    top_k=self._top_k, top_p=self._top_p,
+                    min_p=self._min_p, temp=temperature,
+                    repeat_penalty=self._repetition_penalty or 1.0,
+                )
+                if tok_id in stop_ids or self._gguf_is_eog(tok_id):
+                    break
+                # 上下文容量：prompt + 已生成 token 逼近 n_ctx 时停手
+                # （llama.cpp 溢出会报错或静默截断）。
+                if n_ctx and len(ids) + len(gen_ids) >= n_ctx - 8:
+                    logger.warning("GGUF: 上下文将满（%d/%d），停止生成",
+                                   len(ids) + len(gen_ids), n_ctx)
+                    break
+                gen_ids.append(tok_id)
+                if first_ts[0] is None:
+                    first_ts[0] = time.time() - t0
+                # 增量解码：带上少量前文，避免多字节字符在 token 边界被拆坏
+                # （llama-cpp-python 自己的流式也是带 prev_tokens 解码的）。
+                prev = ids[-8:] + gen_ids[:-1]
+                try:
+                    piece = self._model.detokenize([tok_id], prev_tokens=prev)
+                except TypeError:  # 旧版 detokenize 无 prev_tokens 参数
+                    piece = self._model.detokenize([tok_id])
+                # detokenize 返回 bytes（llama.cpp 原始接口）
+                if isinstance(piece, (bytes, bytearray)):
+                    piece = bytes(piece).decode("utf-8", errors="ignore")
+                if piece:
+                    yield piece
+                self._model.eval([tok_id])
+            # 生成结束：上下文 = prompt + 已生成 token（供下轮复用）
+            self._gguf_ids = list(ids) + gen_ids
+
+        # 模板在 assistant 起始标记后预置的片段（<think>\n\n</think>\n\n 等）。
+        # raw_content 必须带上它：下轮渲染中间轮 assistant 消息时模板才会生成
+        # 与「生成时」逐 token 一致的序列，跨轮前缀才对得上（实测不带时只能
+        # 对齐 1512/1576，带上后 1576/1576 全对齐）。与 MLX 的 _raw_getter
+        # 同款处理。
+        gen_prefix = _assistant_prompt_prefix(prompt) if prompt else ""
+
+        def _raw_getter() -> str:
+            if not gen_ids:
+                return ""
+            try:
+                raw = self._model.detokenize(gen_ids)
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = bytes(raw).decode("utf-8", errors="ignore")
+                return (gen_prefix + raw) if raw else ""
+            except Exception:
+                return ""
+
+        for ev in self._stream_with_producer(
+                _produce(), start_in_think=start_in_think,
+                raw_getter=_raw_getter):
+            if ev.type == "done":
+                ev.usage = {
+                    "prompt_tokens": len(ids),
+                    "completion_tokens": len(gen_ids),
+                    "total_tokens": len(ids) + len(gen_ids),
+                }
+            yield ev
+
+    def _gguf_stop_ids(self) -> set:
+        """GGUF 生成终止 token 集合（EOS；模板的 EOG 在采样循环里按 vocab 判定）。"""
+        ids: set = set()
+        fn = getattr(self._model, "token_eos", None)
+        if callable(fn):
+            try:
+                ids.add(int(fn()))
+            except Exception:
+                pass
+        return ids
+
+    def _gguf_is_eog(self, tok_id: int) -> bool:
+        """llama.cpp 的「生成结束」判定（含 <|im_end|> / <|endoftext|> 等）。"""
+        try:
+            import llama_cpp
+            vocab = getattr(self._model, "vocab", None)
+            if vocab is None or not hasattr(llama_cpp, "llama_vocab_is_eog"):
+                return False
+            return bool(llama_cpp.llama_vocab_is_eog(vocab, tok_id))
+        except Exception:
+            return False
+
+    def _stream_gguf_legacy(self, messages, tools, temperature):
+        """旧路径：整轮走 ``create_chat_completion``（无跨轮复用）。"""
+        # 旧路径每轮 reset（create_chat_completion → generate(reset=True)），
+        # 预填/复用状态不再有效 → 清空，避免下轮拿过期序列做前缀判断。
+        self._gguf_ids = []
         create = getattr(self._model, "create_chat_completion", None)
         if create is None:
             raise RuntimeError("llama-cpp-python 版本过旧，缺少 create_chat_completion")
@@ -1121,10 +1414,16 @@ class LocalLLMClient:
         缓存创建线程与首句生成线程一致，首句才不会因「跨线程」被判丢弃、退回
         全量预填充。只做前向、不解码，因此缓存精确等于系统提示 token 序列；
         首句 prompt = 系统提示 + 用户消息 时 form ① 命中（need=0，无需裁剪）。
-        仅 MLX 后端有效；失败不致命（退化成首句全量预填充）。
+        GGUF 同款：把系统提示 token eval 进 llama.cpp 上下文（首句 prompt 是
+        它的严格扩展 → 只 eval 用户那一段）。失败不致命（退化成首句全量预填充）。
         """
+        if self._backend == "gguf":
+            self._preload_gguf_system(system_prompt, tools)
+            return
         if self._backend != "mlx":
             return
+        if not self._kv_reuse:
+            return        # 开关关闭 → 不做预填（每轮全量）
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
         with self._gen_lock:
@@ -1196,6 +1495,14 @@ class LocalLLMClient:
         self._mlx_cache = None
         self._cache_token_ids = []
         self._kv_thread = None
+        # GGUF：上下文里已 eval 的 token 序列失效（llama.cpp 的 KV 在 C++
+        # context 里，必须显式 reset，否则下轮会拿旧上下文续算）。
+        if self._backend == "gguf" and self._model is not None:
+            try:
+                self._model.reset()
+            except Exception:
+                pass
+        self._gguf_ids = []
         # ONNX 的 past_key_values 同样必须失效（会话重置/取消后不能拿旧 KV 续算）
         self._past = {}
         # ONNX 侧记录「past 对应的 prompt」，一并失效（见 _stream_onnx）

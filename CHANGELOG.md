@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-10-24 · GGUF 后端支持跨轮 KV / 前缀复用（对齐 MLX）+ 复用开关
+
+> 用户需求：在 GGUF 后端增加跨轮 KV/前缀复用开关，对齐 MLX 行为，用 KV cache 缓解系统提示不变部分，加快响应。
+
+### 背景（实测）
+llama-cpp-python 0.3.36 的 `generate()` 虽有 prefix-match 逻辑，但本 build 的 **`kv_cache_seq_rm` 不支持**（日志：`prefix-match found but partial kv removal not supported`），随即 reset 全量重算——GGUF 此前**每轮都付全量预填充**（1500 token ≈ 2.3s）。
+
+### 实现
+- **append-only 复用**：自己渲染 prompt（复用 llama.cpp 内部同款 `Jinja2ChatFormatter`，template/eos/bos 取自 GGUF metadata）→ 自己 `eval()`。新 prompt 是已 eval 序列的**严格扩展**时只 eval 增量；分叉/回退/超 `n_ctx` 才 reset 全量（无法裁剪，与 MLX 的 ArraysCache 退化路径同款）。
+- **`preload_system_kv` 扩展到 GGUF**：启动空闲期把系统提示 token eval 进上下文（渲染**不带** generation prompt，保证真实首句 prompt 是它的严格扩展）。
+- **`raw_content` 对齐 MLX**：必须是 `gen_prefix + 原始生成文本`（实测不带 gen_prefix 只能对齐 1512/1576，带上后 1576/1576 全对齐），否则下轮在 assistant 边界分叉、复用失效。
+- **开关 `local_llm_kv_reuse`（默认开）**：MLX 与 GGUF 都遵守；关闭后每轮整体重建（最保守，用于排查前缀错位乱码）。辅助模型恒为 False（prompt 每轮都变）。配置窗口新增「跨轮复用」勾选框。
+- 健壮性：生成期逼近 `n_ctx` 自动停手；复用路径异常→reset+清状态后退回旧路径（功能不降级）；`invalidate_kv_cache` 对 GGUF 显式 `reset()`。
+
+### 实测效果（Qwen3.5-2B-Agent-Q4_K_M）
+| 场景 | 旧 | 新 |
+|---|---|---|
+| 首轮（已预填系统提示） | 2.28s | **0.85s** |
+| 第 2/3 轮续接 | 2.3~2.4s | **0.27~0.34s**（只 eval 16~17 token） |
+| 开关关闭 / 缓存失效 | 2.3s | 2.1~2.4s（全量，符合预期） |
+
+### 测试
+- `test_local_models.py` 新增 5 用例：默认开 + config 字段 / GGUF 关闭开关走 legacy / 开启时复用失败自动回落（reset+清状态）/ `invalidate_kv_cache` 显式 reset / formatter 缺失时渲染返回 None / factory 传参（aux 恒 False）。
+
+---
+
 ## 2026-10-23 · 修复：模型路径选择只能选目录（GGUF/ONNX 选不到权重文件）+ 新填配置不落盘
 
 > 用户反馈：设置界面只能选目录，选不到 .gguf 文件；手工输入文件路径后加载不了。
