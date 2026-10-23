@@ -489,12 +489,24 @@ class LocalLLMClient:
         self._model, self._tokenizer = load(self._path, trust_remote_code=True)
 
     def _load_gguf(self) -> None:
-        gguf = self._path
-        if os.path.isdir(gguf):
+        raw = (self._path or "").strip()
+        gguf = os.path.expanduser(raw)
+        is_dir = bool(gguf) and os.path.isdir(gguf)
+        if is_dir:
             for f in sorted(os.listdir(gguf)):
                 if f.endswith(".gguf"):
                     gguf = os.path.join(gguf, f)
                     break
+        # 路径校验：旧实现把「不存在的路径 / 目录里没有 .gguf / 填了 MLX 目录」
+        # 直接喂给 llama.cpp，只报一句 Failed to load model from file: xxx——
+        # 用户完全看不出是路径问题（MLX/ONNX 路径都有明确报错，GGUF 却没有）。
+        # 顺带支持 ~ 路径（配置里填 ~/Downloads/x.gguf 是最自然的写法）。
+        if not gguf or not os.path.isfile(gguf):
+            hint = "（该目录下没有 .gguf 文件）" if is_dir else ""
+            raise FileNotFoundError(
+                f"未找到 GGUF 权重: {raw or '(空路径)'}{hint}。"
+                "请把「本地路径」指向 .gguf 文件本身或其所在目录。"
+            )
         try:
             from llama_cpp import Llama
         except Exception as e:
@@ -507,9 +519,25 @@ class LocalLLMClient:
         # 报错，max_tokens 形同虚设且静默发生。预留 1k 给 prompt 余量，
         # 下限 8192（短 max_tokens 时也有基本的多轮空间）。
         n_ctx = max(8192, min(self._max_tokens + 1024, 131072))
-        self._model = Llama(
-            model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False
-        )
+        try:
+            self._model = Llama(
+                model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False
+            )
+        except Exception as e:
+            # llama.cpp 的原始报错只有 "Failed to load model from file"，
+            # 把常见原因写进信息里：文件损坏 / 非 GGUF / 量化类型不被当前
+            # llama-cpp-python 构建支持（PTQ/IQ 等特殊量化需定制构建）/
+            # n_gpu_layers=-1 显存不足。
+            raise RuntimeError(
+                f"GGUF 模型加载失败: {os.path.basename(gguf)}"
+                f"（{type(e).__name__}: {e}）。常见原因：文件损坏或不是 GGUF 格式、"
+                "量化类型不被当前 llama-cpp-python 构建支持（PTQ/IQ 等特殊量化需"
+                "对应定制构建）、或显存不足（n_gpu_layers=-1 全量 offload，可换更"
+                "小量化或减小 max_tokens）。"
+            ) from e
+        # GGUF 的对话模板由 llama.cpp 内建处理（create_chat_completion），
+        # 不需要 HF tokenizer；预填/校验等路径对非 mlx 后端均提前返回。
+        self._tokenizer = None
 
     def _load_onnx(self) -> None:
         onnx_path = self._path

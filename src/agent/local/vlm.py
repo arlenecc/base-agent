@@ -62,9 +62,10 @@ class LocalVLMClient:
         self._model, self._processor = load(self._path, trust_remote_code=True)
 
     def _load_gguf(self) -> None:
-        gguf = self._path
+        gguf = os.path.expanduser((self._path or "").strip())
+        is_dir = bool(gguf) and os.path.isdir(gguf)
         mmproj = None
-        if os.path.isdir(gguf):
+        if is_dir:
             for f in sorted(os.listdir(gguf)):
                 low = f.lower()
                 if not low.endswith(".gguf"):
@@ -74,6 +75,14 @@ class LocalVLMClient:
                 else:
                     gguf = os.path.join(gguf, f)
                     break
+        # 路径校验（与 llm._load_gguf 同款）：无效路径直接喂 llama.cpp 只会
+        # 得到一句 "Failed to load model from file"，看不出是路径问题。
+        if not gguf or not os.path.isfile(gguf):
+            hint = "（该目录下没有 .gguf 文件）" if is_dir else ""
+            raise FileNotFoundError(
+                f"未找到 GGUF VLM 权重: {self._path or '(空路径)'}{hint}。"
+                "请把「本地路径」指向 .gguf 文件本身或其所在目录。"
+            )
         try:
             from llama_cpp import Llama
         except Exception as e:
@@ -101,7 +110,15 @@ class LocalVLMClient:
                     logger.warning("GGUF VLM chat handler 构造失败: %s", e)
             if handler is not None:
                 kwargs["chat_handler"] = handler
-        self._model = Llama(**kwargs)
+        try:
+            self._model = Llama(**kwargs)
+        except Exception as e:
+            raise RuntimeError(
+                f"GGUF VLM 模型加载失败: {os.path.basename(gguf)}"
+                f"（{type(e).__name__}: {e}）。常见原因：文件损坏或不是 GGUF 格式、"
+                "量化类型不被当前 llama-cpp-python 构建支持（PTQ/IQ 等特殊量化需"
+                "对应定制构建）、或显存不足（n_gpu_layers=-1 全量 offload）。"
+            ) from e
 
     # ------------------------------------------------------------------
     def chat(self, prompt: str, images: Optional[List[str]] = None) -> str:

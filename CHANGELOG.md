@@ -4,6 +4,24 @@
 
 ---
 
+## 2026-10-23 · 修复：GGUF 加载失败时错误不可读 + 不支持 `~` 路径
+
+> 用户反馈：GGUF 模型加载不了，实现可能有问题。
+
+### 排查结论（实测）
+- 标准 GGUF 加载/流式/工具调用**全部正常**：Qwen3.5-2B-Agent-Q4_K_M.gguf 5.5s 加载、`create_chat_completion` 流式与 tools 解析均 OK；IQ3_XXS 亦可加载。失败的是 `Ternary-Bonsai-2-27B-PTQ1_0.gguf`——PTQ1_0 是 llama.cpp 不支持的特殊量化（需定制构建），属模型文件问题。
+- 真正的实现缺陷：**路径无效时报错不可读**——路径不存在 / 目录里没有 `.gguf` / 把 MLX 目录当成 GGUF 路径时，旧代码把无效路径直接喂给 llama.cpp，只报一句 `Failed to load model from file: xxx`，用户完全看不出是路径问题（MLX/ONNX 路径都有明确 `FileNotFoundError`，唯独 GGUF 没有）；且**不支持 `~` 路径**（填 `~/Downloads/x.gguf` 直接失败）。
+
+### 修复
+- `llm._load_gguf` / `vlm._load_gguf` 加载前做路径校验：不存在 / 目录无 `.gguf` → 明确的 `FileNotFoundError`（含目录提示与填法指引）；支持 `~` 展开。
+- llama.cpp 构造失败时包装为带常见原因的 `RuntimeError`：文件损坏 / 非 GGUF 格式 / 量化类型不被当前构建支持（PTQ/IQ 等需定制构建）/ `n_gpu_layers=-1` 显存不足。
+- 显式置 `self._tokenizer = None`（GGUF 的对话模板由 llama.cpp 内建处理，预填/校验路径对非 mlx 后端均提前返回）。
+
+### 测试
+- `test_local_models.py` 新增 4 用例：不存在路径报 `FileNotFoundError` / 目录无 `.gguf` 报明确错误 / 目录取字典序首个 `.gguf` 且 `n_ctx=max_tokens+1024` / `~` 路径展开。
+
+---
+
 ## 2026-10-23 · manifest 逐批增量落盘（杀进程也不丢同步进度）
 
 > 用户反馈：manifest 只在收尾一次性写盘——用户不是点「停止同步」而是直接杀掉程序时，本轮已完整入库的文件下次同步仍然全部重做。

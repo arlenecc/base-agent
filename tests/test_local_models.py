@@ -5,6 +5,7 @@
 """
 import os
 import sys
+import types
 
 import numpy as np
 import pytest
@@ -278,6 +279,76 @@ def test_llm_close_no_clear_cache_for_non_mlx(monkeypatch):
     assert c._session is None
     assert c._loaded is False
     assert calls["clear_cache"] == 0
+
+
+# ---------------------------------------------------------------------------
+# GGUF 加载路径校验（2026-10-23：加载失败时给出明确错误）
+# ---------------------------------------------------------------------------
+
+def _fake_llama_cpp(monkeypatch):
+    """注入假 llama_cpp.Llama：记录构造 kwargs，不加载真实权重。"""
+    seen: dict = {}
+
+    class _Llama:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    mod = types.ModuleType("llama_cpp")
+    mod.Llama = _Llama
+    monkeypatch.setitem(sys.modules, "llama_cpp", mod)
+    return seen
+
+
+def test_gguf_missing_path_raises_clear_error():
+    """路径不存在时应报 FileNotFoundError（而不是 llama.cpp 的黑盒报错）。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/nonexistent/model.gguf", backend="gguf",
+                       max_tokens=4096)
+    try:
+        c._ensure_model()
+    except FileNotFoundError as e:
+        assert "未找到 GGUF 权重" in str(e)
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+
+def test_gguf_dir_without_gguf_raises_clear_error(tmp_path):
+    """目录里没有 .gguf 文件时应报明确错误（含目录提示）。"""
+    from agent.local.llm import LocalLLMClient
+    (tmp_path / "config.json").write_text("{}")
+    c = LocalLLMClient(str(tmp_path), backend="gguf", max_tokens=4096)
+    try:
+        c._ensure_model()
+    except FileNotFoundError as e:
+        assert "未找到 GGUF 权重" in str(e)
+        assert "目录下没有 .gguf 文件" in str(e)
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+
+def test_gguf_picks_first_gguf_in_dir(monkeypatch, tmp_path):
+    """目录含多个 .gguf 时取字典序第一个，并透传给 llama.cpp。"""
+    from agent.local.llm import LocalLLMClient
+    (tmp_path / "a.gguf").write_bytes(b"fake")
+    (tmp_path / "b.gguf").write_bytes(b"fake")
+    seen = _fake_llama_cpp(monkeypatch)
+    c = LocalLLMClient(str(tmp_path), backend="gguf", max_tokens=8192)
+    c._ensure_model()
+    assert seen["model_path"] == str(tmp_path / "a.gguf")
+    # n_ctx 由 max_tokens 推导（预留 1k prompt 余量）
+    assert seen["n_ctx"] == 8192 + 1024
+
+
+def test_gguf_expands_user_path(monkeypatch, tmp_path):
+    """配置里填 ~/xxx.gguf 应展开为用户主目录（旧实现不展开直接失败）。"""
+    from agent.local.llm import LocalLLMClient
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "model.gguf").write_bytes(b"fake")
+    seen = _fake_llama_cpp(monkeypatch)
+    c = LocalLLMClient("~/model.gguf", backend="gguf", max_tokens=8192)
+    c._ensure_model()
+    assert seen["model_path"] == str(tmp_path / "model.gguf")
+    assert c._loaded is True
 
 
 @pytest.mark.skipif(not os.path.isdir(QWEN), reason="qwen MLX 权重缺失")
