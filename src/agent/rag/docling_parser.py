@@ -230,15 +230,24 @@ class _ConverterPool:
                 return 0
             freed = len(self._free)
             self._free = []
-            self._created = 0
+            # 只减「被释放的空闲实例数」——租借中的实例仍存活（见 release_all
+            # 的注释：整池清零会把 _created 归零，导致本函数永久短路）。
+            self._created = max(0, self._created - freed)
             self._cond.notify_all()
             return freed
 
     def release_all(self) -> None:
-        """立刻丢掉全部空闲实例（engine 同步结束后的显式释放）。"""
+        """立刻丢掉全部空闲实例（engine 同步结束后的显式释放）。
+
+        **只能丢空闲实例**：租借中的实例（同步取消/异常路径常见）要保留
+        计数——否则 _created 被整池归零后，实例归还时只 append 到 _free 而
+        不再 +1，reap_if_idle 的 ``_created == 0`` 短路永久生效，
+        4.6GB 布局/表格模型直到进程退出都不释放。
+        """
         with self._cond:
+            on_loan = max(0, self._created - len(self._free))
             self._free = []
-            self._created = 0
+            self._created = on_loan
             self._cond.notify_all()
 
 

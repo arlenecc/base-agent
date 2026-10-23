@@ -98,13 +98,17 @@ def test_dedup_promotes_orphan_duplicate(tmp_path):
 
 
 def test_dedup_drops_never_ingested_orphan(tmp_path):
-    """从没入过库的副本（content_hash 为空）+ owner 没了 → 整条删除，
-    下轮同步重新完整入库（只摘标记会被当「未修改」跳过，内容永远回不来）。"""
+    """向量已被清理的副本（chunk_count=0）+ owner 没了 → 整条删除，
+    下轮同步重新完整入库（只摘标记会被当「未修改」跳过，内容永远回不来）。
+
+    判据是 chunk_count（向量是否还在）而非 content_hash：清理副本时向量被
+    删、content_hash 仍保留，只看 content_hash 会漏判这种情况。
+    """
     eng = _make_engine(tmp_path)
     eng._get_store = lambda: _FakeStore()
     kb = str(tmp_path / "kb")
     b = os.path.join(kb, "b", "book.pdf")
-    m = {b: _entry(content_hash=None, duplicate_of=os.path.join(kb, "a", "book.pdf"))}
+    m = {b: _entry(chunk_count=0, duplicate_of=os.path.join(kb, "a", "book.pdf"))}
     eng._dedup_manifest_by_content(m)
     assert b not in m
 

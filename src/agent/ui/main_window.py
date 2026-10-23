@@ -2350,6 +2350,10 @@ class MainWindow(QMainWindow):
         if self._deps_cancelled:
             self._deps_cancelled = False
             logger.info("Deps check finished but user cancelled — aborting sync")
+            # 必须复位：_sync_active 是 _set_controls_busy 的开关，漏复位会让
+            # 同步按钮从此永久脱离 busy 管理（不随 agent 忙闲翻转）。下面两个
+            # 提前 return 是同一条路径，一并处理。
+            self._sync_active = False
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
             self.stop_sync_btn.setEnabled(False)
@@ -2361,6 +2365,7 @@ class MainWindow(QMainWindow):
         if report is not None and report.has_blocking:
             # Required deps still missing after auto-install attempt
             logger.warning("Deps check: blocking dependencies missing, aborting sync")
+            self._sync_active = False
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
             self.stop_sync_btn.setEnabled(False)
@@ -2378,6 +2383,7 @@ class MainWindow(QMainWindow):
             # 绝不能照常启动 RAG 同步——那会在缺 lancedb/fastembed 的环境里
             # 跑引擎，产生难懂的二次异常并吞掉真正的失败原因。
             logger.error("Deps check failed with an exception — aborting sync")
+            self._sync_active = False
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
             self.stop_sync_btn.setEnabled(False)
@@ -2671,6 +2677,15 @@ class MainWindow(QMainWindow):
             # Agent 运行中不能发新消息（输入框可编辑但回车无效），但「终止对话」
             # 按钮此刻是启用的——卡住/跑太久时直接点它即可，不必干等。
             self.status_label.setText("正在运行中…（如需中断请点「终止对话」）")
+            return
+        if getattr(self, "_sync_active", False) or self._is_worker_running(
+                self._sync_worker):
+            # 知识同步进行中：此时主/辅模型已被卸载（self._agent 被置 None），
+            # 往下走会在**主线程**里重建 Agent（加载模型 + 拉 MCP 子进程 +
+            # 新建第二个 RAGEngine），既卡死 UI 又让 agent 侧引擎与 sync
+            # worker 并发读写同一张 LanceDB 表（"table modified during
+            # query"）。明确拒绝并说明原因。
+            self.status_label.setText("知识同步进行中，暂不可发送消息")
             return
         text = self.send_editor.toPlainText().strip()
         if not text:
@@ -3375,6 +3390,14 @@ class MainWindow(QMainWindow):
                 self._llm.close()
             except Exception as e:
                 logger.warning("UI: llm close error: %s", e)
+        # 辅助模型（投机解码用）同样要关：旧实现只关 _llm，本地辅助权重
+        # （~1.6GB）在关窗口时泄漏——进程退出前一直占着。
+        if getattr(self, "_aux_llm", None) is not None:
+            try:
+                self._aux_llm.close()
+            except Exception as e:
+                logger.warning("UI: aux llm close error: %s", e)
+            self._aux_llm = None
 
         # --- Remove the QSignalLogHandler from the root logger.
         # Without this, the handler (which holds a reference to the QPlainTextEdit

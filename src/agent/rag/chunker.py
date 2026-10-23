@@ -353,7 +353,7 @@ def _gap_between(source: Optional[str], left: str, right: str, fallback: str = "
         return fallback
     _MAX_GAP = 256
     start = 0
-    while True:
+    while start >= 0 and start < len(source):
         i = source.find(left, start)
         if i < 0:
             return fallback
@@ -363,18 +363,62 @@ def _gap_between(source: Optional[str], left: str, right: str, fallback: str = "
         if j - (i + len(left)) <= _MAX_GAP:
             return source[i + len(left):j]
         start = i + 1
+    return fallback
+
+
+class _GapLocator:
+    """``_gap_between`` 的游标版（对应 semantic_chunker._SourceLocator）。
+
+    ``_merge_overlap`` 对每个 chunk 调一次 ``_gap_between``，而后者每次都从
+    ``start=0`` 重新 ``str.find`` 全文档——对大书是 O(文档长度²/2)（几百页
+    文档上切块耗时从秒级涨到分钟级）。这里记住「上一对片段的结束位置」，
+    下一次从该位置继续找，整体退化成约 O(文档长度)。
+
+    语义与 ``_gap_between`` 保持一致：重复片段最多依次试 8 个出现位置、
+    gap 超过 256 字符即放弃。游标推进过头时（递归子片段/乱序）退回全文重找。
+    """
+
+    _MAX_GAP = 256
+    _MAX_TRIES = 8
+
+    def __init__(self, source: Optional[str]):
+        self.source = source or ""
+        self._pos = 0
+
+    def gap(self, left: str, right: str, fallback: str) -> str:
+        if not self.source or not left or not right:
+            return fallback
+        # 先从游标处找；找不到再从全文开头重试一次（游标可能被推过头）
+        for base in (self._pos, 0):
+            start = base
+            for _ in range(self._MAX_TRIES):
+                i = self.source.find(left, start)
+                if i < 0:
+                    break
+                j = self.source.find(right, i + len(left))
+                if j >= 0 and j - (i + len(left)) <= self._MAX_GAP:
+                    self._pos = j          # 游标推进到 right 的起点
+                    return self.source[i + len(left):j]
+                start = i + 1
+        return fallback
 
 
 def _merge_overlap(chunks: List[str], overlap: int, sep: str,
-                   source: Optional[str] = None) -> List[str]:
+                   source: Optional[str] = None,
+                   locator: Optional["_GapLocator"] = None) -> List[str]:
     """Add token-based overlap between consecutive chunks.
 
     Prepends the tail of the previous chunk to the current chunk so that
     retrieval has surrounding context at chunk boundaries. The separator
     is included so the result remains a substring of the original text.
+
+    ``locator``：传 ``_GapLocator`` 时用它定位真实间隔（带游标，O(N)）；
+    不传则退化为每个 chunk 全文档 find 的 O(N²) 路径。
     """
     if overlap <= 0 or len(chunks) <= 1:
         return chunks
+    if locator is None and source:
+        locator = _GapLocator(source)
 
     merged: List[str] = [chunks[0]]
     for i in range(1, len(chunks)):
@@ -409,7 +453,8 @@ def _merge_overlap(chunks: List[str], overlap: int, sep: str,
             # sep 会伪造出原文没有的字符（与 semantic_chunker 的同类 bug）。
             # 没有原文可查时退回 sep（与旧行为一致）。
             if prev_end.strip():
-                gap = _gap_between(source, prev, curr, fallback=sep)
+                gap = (locator.gap(prev, curr, sep) if locator is not None
+                       else _gap_between(source, prev, curr, fallback=sep))
                 merged.append(prev_end + gap + curr)
             else:
                 merged.append(curr)

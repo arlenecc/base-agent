@@ -237,6 +237,11 @@ class _ToolDispatcher:
                 if not agent.callbacks.confirm(confirm_msg):
                     agent._log(f"[tool] {name} DENIED by user")
                     res = ToolResult(False, error=f"User denied {name} ({confirm_msg})")
+                    # 注意：**故意不发** on_tool_start——工具从未真正启动。
+                    # tests/test_agent.py::test_code_run_aborted_when_user_declines
+                    # 明确断言 tool_starts == []（UI 侧据此区分「未执行」与
+                    # 「执行失败」）。曾尝试补发 start 使 start/end 配对，
+                    # 结果与该契约冲突，已撤回。
                     agent.callbacks.on_tool_end(name, res)
                     results[idx] = res
                     continue

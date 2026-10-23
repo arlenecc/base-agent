@@ -233,8 +233,11 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 ### 工作流程
 
 ```
-文档目录 → 统一解析 (docling → Markdown) → Hybrid 智能分片 (结构+语义, 100-800 tokens, 10% overlap)
-→ 向量化 (nomic-embed-text-v1.5 / FastEmbed ONNX) → LanceDB 存储（向量 + 完整原文 + BM25 全文索引）
+文档目录 → 增量比对（manifest：mtime+size+字节采样指纹）
+→ 统一解析 (docling → Markdown，大小分流的实例池并发) → 清洗（注释/残留标签剥离 + 密度压缩）
+→ Hybrid 智能分片 (结构+语义, 1000 tokens, 5% overlap)
+→ 内容去重 / 向量去重 → 向量化 (nomic-embed-text-v1.5 / FastEmbed ONNX)
+→ LanceDB 存储（向量 + 完整原文 + BM25 全文索引）
 检索时: 向量相似度 top_k×4 + BM25 关键词 top_k×4 → 合并去重 → FastEmbed Reranker 精排
        → 过滤相似度 < 0.7 → 返回最相关 ≤ 3 条
 ```
@@ -245,7 +248,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 
 ```
 ══════════════════════════════════════════
-▶ 知识库同步开始: 目录=/data/kb 模式=增量同步 并发数=4
+▶ 知识库同步开始: 目录=/data/kb 模式=增量同步 并发数=2
 ══════════════════════════════════════════
 ━━━ Step 1/6: 扫描知识库目录 ━━━
   扫描完成: 共发现 12 个文件 [.pdf(5), .docx(3), .md(4)]
@@ -262,7 +265,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
     ├─ 清洗完成: new_doc.docx → 11800 字符 (耗时 0.02s)
     ├─ 转换 Markdown: new_doc.docx
     ├─ Markdown 完成: new_doc.docx (11800 字符)
-    ├─ 文档切片: new_doc.docx → 24 个切片 (每片 100-800 tokens, 重叠 10%, 耗时 0.01s)
+    ├─ 文档切片: new_doc.docx → 24 个切片 (每片约 1000 tokens, 重叠 50 tokens, 耗时 0.01s)
     └─ ✅ 文件处理完成: new_doc.docx (24 切片, 总耗时 0.21s)
 ━━━ Step 4/6: 向量化 + 存入向量库 ━━━
   ├─ 向量化: 首批 24 个切片正在嵌入...
@@ -332,12 +335,23 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 - **定向检索**：`rag_search` 支持 `source` 参数（文档名关键词），限定在某本书内检索，避免混入其它文档。
 - **增量重刷**：同步时无论文件是否修改，都会扫描 Markdown 缓存，对缺记录或旧格式（含已废弃的「章节摘要」段/空目录）的文档重刷为纯目录结构。
 
-- **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + content_hash），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
-- **流式 ingest**：worker 池（默认 4 线程）按 LPT 负载均衡分片（文件大小降序 + 贪心最轻负载）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 通过全局信号量串行执行，单例引擎避免多 worker 重复加载模型，且每页从单例取用、页末释放（引擎每 50 页周期重建，冲刷原生缓存）。写入批量 200 个切片。
+- **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + **字节采样指纹** `source_hash`，小文件全量哈希 / 大文件头中尾各 64KB），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
+  - 指纹只在「本来要跳过」的路径上读盘（192KB/文件），正常路径零额外开销；它专门兜住 `cp -p` / `rsync -t` / 解压保留 mtime / 云盘回滚等「内容换了但 mtime+size 不变」的永久漏同步场景。
+- **内容去重（跨目录同一本书只入一次）**：待处理文件先算采样指纹，命中「已入库文件」或本批更早出现的副本即记 `duplicate_of` 跳过——不解析、不切片、不嵌入；同步收尾再按 `content_hash` 分组，删掉副本的向量与目录元数据行并标记 `duplicate_of`（清理去重功能上线前各自入库留下的双份向量）。owner 被删除时副本自动转正（向量还在则直接转正，已被清理则下轮重新完整入库，不会静默丢失）。
+- **向量去重（手动按钮）**：设置 → 知识同步区「向量去重」按钮，扫描向量库按**归一化文本哈希**分组，每组只保留**最早入库**的一份（入库时间 = Markdown 缓存 mtime 代理），其余按 id 分批删除，用于降低同段内容双倍召回的检索噪声。
+- **流式 ingest**：worker 池（默认 2 线程）按 LPT 负载均衡分片（文件字节降序 + 贪心最轻负载）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。写入批量 200 个切片。
+- **解析并发按文件大小分流**（内存压力与 PDF 大小相关）：docling 转换器**实例池**——`DocumentConverter` 非线程安全，不能单实例并发 `convert`，改用多实例各自转换：
+  - 小文件（< `rag_parse_large_mb`，默认 20MB）：≤ `rag_parse_parallel`（默认 2）路**真并行**；每实例布局/表格模型 ~1.6GB，16GB 机器不建议超过 2；
+  - 大文件（≥ 阈值）：**独占全部实例**，一次只转一个（大页渲染位图 ∝ scale²，两份大书并行即可撑爆内存）；
+  - 排队的大文件优先，避免被小文件饿死；实例空闲 90s 整池释放、同步结束显式释放。
+  - marker 引擎保持单实例独占串行（surya ~3GB/实例，两实例 16GB 机器扛不住）。
 - **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
 - **批量嵌入**：嵌入按批次进行（默认 200 条/批），避免大知识库一次性嵌入导致 OOM。每批次内**按文本长度降序分桶**（批内长度相近使 padding 归零——混杂批的 padding 可浪费 2-4 倍算力）再拆为 1-5 条/子批，子批大小由自适应调优器按实际吞吐在边界上收敛；子批间主动释放 GIL 让 UI 保持响应，并按激活形状预算（条数 × 批内最长序列²）钳制超长文本的子批大小、以 8GB RSS 软墙降档避让。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
-- **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、FastEmbed reranker、RapidOCR 引擎（~500MB，仅图片 PDF 入库时加载）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
+- **资源释放**：同步结束（正常/取消/异常任一路径，由 `ingest()` 的 finally 保证）都会调 `RAGEngine.release_parsers()` 释放 docling 转换器池（~4.6GB）、OCR 引擎（~500MB）、marker 与 OvisOCR2（~0.9GB）——agent 侧的 `rag_ingest` 工具不会走 `close()`，只有这条路径能兜住它。`close()` 额外释放 LanceDB 连接、FastEmbed ONNX 模型与 reranker；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 并关闭主/辅模型客户端防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
+- **同步期间释放对话模型**：点「同步知识」会先卸载主/辅本地模型（释放数 GB 显存给解析/嵌入），同步结束再原样重载并对主模型做预热（预填系统提示 KV + `warm_up` 编译）；同步期间禁止发送消息（避免在主线程重建 Agent 与 sync worker 并发读写同一张 LanceDB 表）。
+- **取消即断点续传**：中途点停止时，**已完整写入向量库**的文件记入 manifest（下次跳过，不重做解析/清洗/切片/嵌入），进行中或只入库一半的文件不记录、下次从断点重来（幂等 upsert，不留「记录完成却只入库一半」的永久缺失）。
+- **Markdown / 纯文本清洗**：统一引擎（docling/marker/OvisOCR2）与 pandoc 输出都过一遍轻清洗——剥除 `<!-- image -->` 等注释与占位块（docling 给每张图输出）、`<script>/<style>/<svg>` 整块丢弃、HTML 表格转 Markdown 管道表（**合并单元格/嵌套/caption 等管道表表达不了的结构保留 HTML 块**，不强行摊平）、残标剥除、实体还原；再做**密度压缩**（行内连续空格折叠、行尾空白剥除、纯空白行归为段间空行、连续空行收敛为一个），标题/列表/表格/引用/代码栅栏/行内代码/缩进代码块全部原样保留。
 - **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
 - **不存全文 Markdown**：documents 表只存「缩略版本 + 章节列表 + Markdown 缓存路径」，**不存全文**（全文已有 `rag/documents/*.md` 缓存，表内再存是第三份冗余，且会被缓存全量载入内存；该字段实际零消费者）。缓存按列读取并显式剔除 `markdown`，兼容旧数据。
 - **删除即清理**：源文件从知识库移除后，同步时一并清理向量、documents 元数据行与 manifest 条目。
@@ -353,7 +367,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 | Word | `.docx`, `.doc` | docling（回退 `python-docx`） |
 | Excel | `.xlsx`, `.xls` | docling（回退 `openpyxl`） |
 | PowerPoint | `.pptx`, `.ppt` | docling（回退 `python-pptx`） |
-| PDF | `.pdf` | docling（图片型/纯扫描走 rapidocr 3.x（或 1.x 回退）+ `opencv-python-headless` 预处理，Apple Silicon 上启用 CoreML EP） |
+| PDF | `.pdf` | docling（OCR 优先 Apple Vision/ocrmac（ANE，中英文 `zh-Hans`+`en-US`），不可用时回退 RapidOCR；整页位图 scale 默认 2.0，内存 ∝ scale²） |
 | EPUB | `.epub` | docling（回退 `ebooklib`） |
 | MOBI/AZW | `.mobi`, `.azw3` | calibre（可选） |
 | 纯文本 | `.txt`, `.md`, `.csv` | 无额外依赖 |
@@ -368,13 +382,14 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 ```
 Markdown 文本
   ├─ 按标题结构（#~######）+ 空行段落边界切分
-  ├─ 超长章节（>800 tokens）→ chonkie SemanticChunker 语义细分
+  ├─ 超长章节（>1000 tokens）→ chonkie SemanticChunker 语义细分
   │    （复用 nomic-embed-text 嵌入模型，按语义相似度边界切分）
   ├─ 合并过小块至 ≥100 tokens
-  └─ 相邻块 10% overlap（80 tokens，句子边界对齐，保证跨块上下文连续）
+  └─ 相邻块 5% overlap（50 tokens，句子边界对齐，保证跨块上下文连续）
 ```
 
-- **大小**：语义块最小 100 tokens、最大 800 tokens、重叠 10%
+- **大小**：语义块最小 100 tokens、最大 1000 tokens（`rag_chunk_size`）、重叠 5%（`rag_chunk_overlap` = 50）
+  - 1000/5% 是「切片够大以承载完整语义单元、重叠够小以免冗余向量」的折中；旧值 800/10% 会让重叠 token 占比偏高、向量库膨胀。
 - **嵌入模型**：`nomic-embed-text-v1.5-Q`（与向量存储共享同一份 ONNX 模型，不重复加载）
 - **三级回退**：hybrid → 语义分块（chonkie）→ 递归分块（无模型依赖），任何环境都能工作
 
@@ -396,8 +411,10 @@ Markdown 文本
 
 1. 在界面第三行「知识库」中输入文档目录路径（或点击 `…` 选择）
 2. 点击「同步知识」执行增量同步（只处理新增/修改的文件）；右键点击可强制全量重处理
-3. 右侧日志面板实时显示同步进度
-4. 同步完成后，对话中模型会自动调用 `rag_search` 检索相关知识
+3. 需要清理存量重复内容时，点击「向量去重」（扫描向量库，清理文本完全相同的重复向量，每组只留最早入库的一份）；也可直接删掉 `workspace/rag/documents/*.md` 缓存——但注意**缓存缺失不会触发重新解析**（跳过判断只看 manifest 指纹），要让新清洗规则应用到已入库文档必须选「强制全量重新处理」
+4. 右侧日志面板实时显示同步进度
+5. 同步完成后，对话中模型会自动调用 `rag_search` 检索相关知识
+6. 同步进行中禁止发送消息（此时主/辅模型已卸载，且 Agent 侧引擎与同步 worker 会并发读写同一张表）
 
 ### Token 控制
 

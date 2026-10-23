@@ -982,7 +982,21 @@ class LocalLLMClient:
         # 通用 KV-cache decoder 循环：输入 input_ids + attention_mask +
         # past_key_values，输出 logits + present_key_values。没有 ONNX LLM 模型
         # 可测，仅实现标准布局；遇到不同导出格式会给出明确报错。
-        input_ids = np.array([ids], dtype=np.int64)
+        # KV 前缀续算（与 MLX 同源）：past 只有在「新 prompt 是旧 prompt 的
+        # 延长」时可复用，且只需喂**新增的那一段**。旧实现每轮都喂整段新
+        # prompt 却带着上一轮的 past → 历史被重复计入（第二轮起生成与
+        # prompt 错位）；且 past 只增不减，会话越长 KV 张量越大（无界）。
+        ids_list = [int(x) for x in ids]
+        prev_ids = getattr(self, "_onnx_prompt_ids", None)
+        if (prev_ids and len(ids_list) > len(prev_ids)
+                and ids_list[:len(prev_ids)] == prev_ids):
+            feed_ids = ids_list[len(prev_ids):]
+        else:
+            # 序列不再对齐（换了会话/回滚/提示词改写）→ 丢弃旧 KV
+            feed_ids = ids_list
+            self._past = {}
+        self._onnx_prompt_ids = ids_list
+        input_ids = np.array([feed_ids], dtype=np.int64)
         full: List[str] = []
         generated: List[int] = []
         # 同 MLX：模板可能已把 <think> 预填进生成提示（见 _stream_mlx 注释）。
@@ -1139,6 +1153,8 @@ class LocalLLMClient:
         self._kv_thread = None
         # ONNX 的 past_key_values 同样必须失效（会话重置/取消后不能拿旧 KV 续算）
         self._past = {}
+        # ONNX 侧记录「past 对应的 prompt」，一并失效（见 _stream_onnx）
+        self._onnx_prompt_ids = None
 
     def close(self) -> None:
         # 释放大块权重：引用置空，等待 GC。会话级 ORT session 亦可析构。

@@ -620,8 +620,10 @@ class RAGEngine:
         的僵尸副本提升为正常条目，下轮同步重新入库。返回删除向量的副本数。
         """
         # 1) 僵尸副本提升：duplicate_of 指向的条目没了/没入库成功。
-        # 曾真实入库（有 content_hash，向量还在）→ 只摘标记，内容继续可检索；
-        # 从没入过库（content_hash 为空）→ 整条删除，下轮同步重新完整入库。
+        # 判据是**向量是否还在**（chunk_count），而不是有没有 content_hash：
+        # 第 2 步清理副本时会删掉向量但保留 content_hash，此时若只摘标记，
+        # 下轮会因 mtime/size/指纹未变被判「未修改」跳过 —— 向量已删且不会
+        # 重新入库，内容永久检索不到。
         promoted = []
         for _fp, entry in manifest.items():
             owner = entry.get("duplicate_of")
@@ -629,8 +631,8 @@ class RAGEngine:
                 continue
             owner_entry = manifest.get(owner)
             if owner_entry is None or not owner_entry.get("content_hash"):
-                if entry.get("content_hash"):
-                    entry.pop("duplicate_of", None)
+                if entry.get("chunk_count"):
+                    entry.pop("duplicate_of", None)   # 向量还在 → 摘标记转正
                 else:
                     promoted.append(_fp)      # 迭代后删（避免边遍历边删）
         for _fp in promoted:
@@ -671,6 +673,25 @@ class RAGEngine:
                         store.delete_document(os.path.basename(dup_path))
                     except Exception as e:
                         logger.warning("RAG: 清理副本向量失败 %s: %s", dup_path, e)
+                    # Markdown 缓存 + digest 行必须一起清：否则紧接着的 Step 7
+                    # （ensure_digests_for_cached_documents）看到「有缓存、无
+                    # 记录」会用旧缓存重新生成一条 digest → documents 表出现
+                    # 「有目录、无向量」的孤儿行，rag_outline 持续列出一个
+                    # 检索不到的文档（与 _cleanup_deleted_files 保持自洽）。
+                    md_path = self._cache_md_path(dup_path)
+                    try:
+                        store.delete_document_by_md_path(md_path)
+                    except Exception as e:
+                        logger.debug("RAG: 清理副本 digest 失败 %s: %s", dup_path, e)
+                    try:
+                        if os.path.isfile(md_path):
+                            os.remove(md_path)
+                        sidecar = _md_meta_path(md_path)
+                        if os.path.isfile(sidecar):
+                            os.remove(sidecar)
+                    except OSError as e:
+                        logger.warning("RAG: 删除副本 Markdown 缓存失败 %s: %s",
+                                       md_path, e)
                 entry["duplicate_of"] = owner
                 entry["chunk_count"] = 0       # 向量已删，计数归零（幂等依据）
                 removed += 1
@@ -694,16 +715,22 @@ class RAGEngine:
         内容一字不差才算重复（归一化空白后哈希）；不同文档的相同样板文字
         （如纯「目录」页）同样只留一份——降低检索噪声。近似重复不处理。
         """
+        # 缓存：同一 source 的数千个切片共用一个 stat（旧实现**每行一次**
+        # os.path.getmtime，全表 N 行 N 次系统调用且完全重复）。
+        _ts_cache: Dict[str, float] = {}
+
         def _order_key(rec: Dict[str, Any]) -> tuple:
             src = rec.get("source") or ""
-            ts = 0.0
-            try:
-                rel = os.path.relpath(src, self._knowledge_base)
-                md_path = os.path.join(
-                    self._markdown_dir, _safe_filename(rel) + ".md")
-                ts = os.path.getmtime(md_path)
-            except OSError:
-                ts = 0.0
+            ts = _ts_cache.get(src)
+            if ts is None:
+                try:
+                    rel = os.path.relpath(src, self._knowledge_base)
+                    md_path = os.path.join(
+                        self._markdown_dir, _safe_filename(rel) + ".md")
+                    ts = os.path.getmtime(md_path)
+                except OSError:
+                    ts = 0.0
+                _ts_cache[src] = ts
             return (ts, src, rec.get("chunk_index") or 0)
 
         store = self._get_store()
@@ -729,6 +756,13 @@ class RAGEngine:
         try:
             return self._ingest_locked(force, progress_callback, log_callback)
         finally:
+            # 无论正常结束/取消/异常/提前 return 都要释放解析单例：agent 的
+            # rag_ingest 工具路径不会调 close()（引擎长期持有），不释放会让
+            # docling 池 + OCR + ovis 常驻到会话结束（数 GB）。
+            try:
+                self.release_parsers()
+            except Exception as e:
+                logger.debug("RAG: release_parsers error: %s", e)
             self._ingest_lock.release()
 
     def _ingest_locked(
@@ -862,14 +896,21 @@ class RAGEngine:
         # 同一本书放在不同子目录/改名，只解析入库 owner，其余记 duplicate_of
         # 跳过——省一遍解析+切片+嵌入，也避免同段内容在检索里双倍召回。
         seen_fp: Dict[str, str] = {}
+        # 预扫描已算出的采样指纹，消费端直接复用（大文件每次 192KB 读盘，
+        # 同一文件算两遍纯属浪费）。
+        fp_by_path: Dict[str, str] = {}
         # 预播种：**已入库**文件的指纹先进 seen 表。新副本（新建文件夹拷贝
         # 进来的）遇到它们时把 owner 让给「已在库」的文件——复用现成向量，
         # 而不是按路径排序把新副本当成 owner 白解析一遍（2026-10-22 用户
         # 实测：拷贝进新文件夹的文件仍被重新解析，根因即遍历顺序不确定）。
-        # 只播种磁盘上仍存在的条目——已删除文件的指纹不能让新副本让位。
+        # 只播种磁盘仍存在、且**自己有向量**的条目：
+        # - 已删除文件的指纹不能让新副本让位；
+        # - 被标记为副本（duplicate_of）的条目向量已被清理，让它当 owner 会
+        #   使同内容的新文件被判成它的副本 → 永不解析、永不入库（内容丢失）。
         for _p, _e in manifest.items():
             _h = _e.get("source_hash")
-            if _h and os.path.exists(_p):
+            if (_h and not _e.get("duplicate_of")
+                    and _e.get("chunk_count") and os.path.exists(_p)):
                 seen_fp.setdefault(_h, _p)
         for filepath in all_files:
             sig = _file_signature(filepath)
@@ -890,7 +931,11 @@ class RAGEngine:
             #   指纹未变，下面就被当「未修改」跳过，内容永远回不到知识库。
             dup_owner = (prev or {}).get("duplicate_of")
             if dup_owner and not os.path.exists(dup_owner):
-                if prev.get("content_hash"):
+                # 判据必须是 **向量是否还在**（chunk_count），而不是有没有
+                # content_hash：去重清理会把副本的向量删掉但保留 content_hash，
+                # 这时只摘标记 → 下面按 mtime/size/指纹判「未修改」跳过，
+                # 而向量早已被删且没有路径会重新入库 → 内容永久检索不到。
+                if (prev or {}).get("chunk_count"):
                     prev = dict(prev)
                     prev.pop("duplicate_of", None)
                     manifest[filepath] = prev
@@ -953,6 +998,7 @@ class RAGEngine:
                 files_to_process.append(filepath)
                 if fp:
                     seen_fp.setdefault(fp, filepath)
+                    fp_by_path[filepath] = fp
                 reason = "新增" if prev is None else "已修改"
                 new_detail.append(f"  → 待处理({reason}): {os.path.basename(filepath)}")
         # 汇总输出
@@ -1390,7 +1436,11 @@ class RAGEngine:
                             continue
                         pending_manifest[filepath] = {
                             **sig_now,
-                            "source_hash": _source_fingerprint(filepath, sig_now["size"]),
+                            # 复用预扫描算好的指纹（该文件本次未被改动的
+                            # 情况下一致；算不出来才回退读盘）。
+                            "source_hash": (fp_by_path.get(filepath)
+                                            or _source_fingerprint(
+                                                filepath, sig_now["size"])),
                             "content_hash": c_hash,
                             "chunk_count": n_chunks,
                         }
@@ -1609,6 +1659,11 @@ class RAGEngine:
             return set()
         logger.info("  发现 %d 个已删除文件，清理对应向量与目录概要...", len(removed))
         store = self._get_store()
+        # 只把**真正删成功**的文件交给调用方从 manifest 移除：返回值会喂给
+        # _save_manifest(removed=…)，旧实现直接返回全部 removed —— 失败文件
+        # 的条目连同「下次同步重试」的机会一起被 pop 掉，而 _cleanup_deleted_files
+        # 只遍历 manifest 键 → 孤儿向量永久残留且仍可被检索。
+        deleted_ok: set = set()
         for source in removed:
             # 单个文件的删除失败不能中断整个清理：此时向量写入已完成、manifest
             # 尚未保存（Step 6 在其后），一次 LanceDB 异常带着未保存的 manifest
@@ -1644,6 +1699,7 @@ class RAGEngine:
                 except OSError as e:
                     logger.warning("  ⚠ 删除 Markdown 缓存失败 %s: %s", md_path, e)
                 new_manifest.pop(source, None)
+                deleted_ok.add(source)
                 with stats_lock:
                     stats["files_deleted"] += 1
                 logger.info("  🗑 已清理: %s", os.path.basename(source))
@@ -1652,7 +1708,7 @@ class RAGEngine:
                     "  ⚠ 清理已删除文件失败 %s: %s（保留 manifest 条目，下次同步重试）",
                     source, e,
                 )
-        return set(removed)
+        return deleted_ok
 
     # ------------------------------------------------------------------
     # retrieval
@@ -2003,6 +2059,17 @@ class RAGEngine:
                     except Exception as e:
                         logger.debug("RAG: VectorStore close error: %s", e)
                     self._store = None
+        self.release_parsers()
+
+    def release_parsers(self) -> None:
+        """释放同步期占用的重量级解析单例（OCR / docling / marker / ovis）。
+
+        UI 同步路径会调 ``close()``，但 **agent 的 rag_ingest 工具路径不会**
+        （引擎被 ToolRegistry 长期持有，只在 shutdown 时 close）——一次
+        rag_ingest 后 docling 池（~4.6GB）+ OCR（~0.5GB）+ ovis（~0.9GB）
+        会常驻到会话结束。所以 ingest 结束时**无条件**调用本方法（见
+        ``ingest()`` 的 finally），下次需要时惰性重建。
+        """
         # Release the global OCR singleton (~500MB) as well.  It is only needed
         # during ingestion of image-based PDFs; after a sync finishes the
         # engine can reclaim it.  Lazy re-created on the next OCR-requiring run.
@@ -2011,7 +2078,7 @@ class RAGEngine:
             release_ocr_engine()
         except Exception as e:
             logger.debug("RAG: release_ocr_engine error: %s", e)
-        # 同样释放 docling 的共享 DocumentConverter（重量级模型常驻）。
+        # 同样释放 docling 的共享转换器池（重量级模型常驻）。
         try:
             from .docling_parser import release_converter
             release_converter()
