@@ -488,14 +488,30 @@ def test_cancel_mid_sync_completed_files_not_redone(tmp_path):
         embedding_function=FakeEmbeddingFunction(),
     )
     try:
-        # 第 8 个文件进度回调时取消：首批（~5 个文件）已完整写入并 committed，
-        # 第 6-8 个文件的切片被拉取但未写入（整批丢弃）→ 不 committed。
-        def cancel_late(done, total, current):
-            if done >= 8:
-                engine.cancel()
+        # 确定性钩子：_on_batch 的进度回调带「已写入 N 切片」文案——首次出现
+        # 即首批已写完并提交。此刻同步做两件事：
+        #   1) 快照磁盘 manifest → 验证「批次提交即增量落盘」（用户直接杀
+        #      程序的场景：此时离收尾保存还很远，manifest 却已在盘上）；
+        #   2) 触发取消 → 第二批拉取的缓冲被整批丢弃（不 committed）。
+        # 注意 done 计数在 worker（生产者）侧递增，跑在消费端前面——用它
+        # 触发取消有竞态，必须用批次回调。
+        mid_manifest = [None]
+        batch_seen = [False]
 
-        stats1 = engine.ingest(force=False, progress_callback=cancel_late)
+        def cancel_on_first_batch(done, total, current):
+            if batch_seen[0] or not str(current).startswith("已写入"):
+                return
+            batch_seen[0] = True
+            from agent.rag.engine import _load_manifest as _lm
+            mid_manifest[0] = _lm(engine.rag_dir)
+            engine.cancel()
+
+        stats1 = engine.ingest(force=False, progress_callback=cancel_on_first_batch)
         assert stats1.get("cancelled") is True
+        assert batch_seen[0]  # 首批回调确实发生过
+        # 增量落盘生效：首批提交的文件在 ingest 结束前就已在磁盘 manifest 里
+        assert mid_manifest[0], "首批写完但 manifest 未增量落盘"
+        assert all(e.get("chunk_count") for e in mid_manifest[0].values())
 
         manifest = _load_manifest(engine.rag_dir)
         committed = {fp for fp, e in manifest.items() if e.get("chunk_count")}

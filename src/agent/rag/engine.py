@@ -1557,6 +1557,14 @@ class RAGEngine:
                             committed_manifest[fp] = entry
                     else:
                         break
+                # 增量落盘：每批提交后立即把新 committed 条目合并写进 manifest。
+                # 只在收尾一次性写盘的话，用户不是点「停止同步」而是直接杀掉
+                # 程序时，本轮已完整入库的文件进度全部丢失，下次同步照样重做
+                # （重嵌入比重新解析更费时）。_save_manifest 是读改写合并 +
+                # 跨进程锁：只合并本次新提交的条目，历史/并发实例条目不受影响；
+                # 写盘发生在 table.add 之后，崩活两个方向都一致（记录了就一定
+                # 已入库；没记录的下次幂等重做）。
+                _flush_committed_manifest()
                 if progress_callback is not None:
                     try:
                         progress_callback(stats["files_extracted"] + stats["files_skipped"],
@@ -1571,6 +1579,21 @@ class RAGEngine:
             # committed 记录「chunks 已实际落库的文件」——取消时二者之差就是
             # 正在处理 / 只写入一半的文件，不记入同步记录，下次同步重新处理即可。
             committed_manifest: Dict[str, Dict[str, Any]] = {}
+            # 已增量写盘的 committed 条目（_on_batch 里每批冲刷一次增量）。
+            _manifest_flushed: set = set()
+
+            def _flush_committed_manifest() -> None:
+                """把本轮新 committed 的条目增量合并写盘（已写过的跳过）。"""
+                new = {fp: e for fp, e in committed_manifest.items()
+                       if fp not in _manifest_flushed}
+                if not new:
+                    return
+                try:
+                    _save_manifest(self._rag_dir, new)
+                    _manifest_flushed.update(new)
+                except OSError as e:
+                    # 增量保存失败不致命：最坏情况是进程被杀后这批文件重做一遍。
+                    logger.warning("RAG: 增量保存 manifest 失败（不影响本次同步）: %s", e)
             try:
                 # 批量 200（旧值 20）：LanceDB 每次 add 都会产生一个新
                 # fragment，小批量在大库上留下海量碎片，检索要逐段扫描。
