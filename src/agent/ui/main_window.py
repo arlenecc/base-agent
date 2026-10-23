@@ -603,23 +603,31 @@ class AgentWorker(QThread):
         #  (2) warm_up 跑一次真实形状推理，触发 MLX 首推图编译（20-30s），首句不再
         #      等冷启动。
         # 两步都失败不致命；预填/编译完才进入消息循环，用户打字前本线程已空闲。
-        try:
+        # 但若用户手快、消息已经在队列里等着：跳过空闲期预热，先处理真实消息
+        # （首句自己会把编译/预填一并付掉——反正躲不掉；让它干等 warm_up 完成是
+        # 纯浪费，实测表现为「发了消息 18s 没动静」）。空队列时才值得预热。
+        if not self._queue.empty():
             self._callbacks.bridge.status.emit(
-                "系统提示预热中（预填上下文，请稍候）")
-            self._agent.preload_kv()
-            self._callbacks.bridge.status.emit("系统提示已预热，可开始对话")
-        except Exception:
-            self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
-        # warm_up（首次推理编译）：与预填串行、同在 worker 线程，不另起并发抢权重。
-        try:
-            self._callbacks.bridge.status.emit(
-                "主模型预热中（首次推理编译，约 20-30s，请稍候）")
-            self._agent.warm_up()
-            self._callbacks.bridge.status.emit("主模型预热完成，可开始对话")
-        except Exception as e:
-            logger.warning("主模型预热失败(忽略): %s", e)
-            self._callbacks.bridge.status.emit(
-                "预热失败，但仍可对话（首句会偏慢）")
+                "已有消息在排队，跳过空闲期预热（首句将自行完成编译）")
+            logger.info("AgentWorker: 队列已有待处理消息，跳过空闲期预热")
+        else:
+            try:
+                self._callbacks.bridge.status.emit(
+                    "系统提示预热中（预填上下文，请稍候）")
+                self._agent.preload_kv()
+                self._callbacks.bridge.status.emit("系统提示已预热，可开始对话")
+            except Exception:
+                self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
+            # warm_up（首次推理编译）：与预填串行、同在 worker 线程，不另起并发抢权重。
+            try:
+                self._callbacks.bridge.status.emit(
+                    "主模型预热中（首次推理编译，约 20-30s，请稍候）")
+                self._agent.warm_up()
+                self._callbacks.bridge.status.emit("主模型预热完成，可开始对话")
+            except Exception as e:
+                logger.warning("主模型预热失败(忽略): %s", e)
+                self._callbacks.bridge.status.emit(
+                    "预热失败，但仍可对话（首句会偏慢）")
         while True:
             text = self._queue.get()
             if text is None:

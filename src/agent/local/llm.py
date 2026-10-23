@@ -765,9 +765,17 @@ class LocalLLMClient:
             raise ValueError(
                 "渲染后的 prompt 为空（chat template 未产出任何 token）")
         suffix_ids = prompt_ids[reuse:]
-        logger.debug(
-            "MLX KV cache: cached=%d prompt=%d reuse=%d suffix=%d group=%s",
-            len(cached_ids), len(prompt_ids), reuse, len(suffix_ids), kv_group)
+        if persist:
+            # 主对话组命中/复用必须 info 级可见：用户问「预热到底生效没」时，
+            # UI 日志里这行直接给出答案（reuse≈cached 即命中；重建另有
+            # 「KV 缓存整体重建」的 info 行说明原因）。aux 组高频调用保持 debug。
+            logger.info(
+                "MLX KV cache: cached=%d prompt=%d reuse=%d suffix=%d group=%s",
+                len(cached_ids), len(prompt_ids), reuse, len(suffix_ids), kv_group)
+        else:
+            logger.debug(
+                "MLX KV cache: cached=%d prompt=%d reuse=%d suffix=%d group=%s",
+                len(cached_ids), len(prompt_ids), reuse, len(suffix_ids), kv_group)
         # 仅主对话持久化 KV 缓存；aux 调用用一次性本地缓存，不写实例状态，
         # 避免覆盖主对话缓存导致下一轮全量重 prefill。
         if persist:
@@ -1117,6 +1125,15 @@ class LocalLLMClient:
                 out = self._model(mx.expand_dims(mx.array(prompt_ids), 0), cache)
                 if isinstance(out, tuple) and len(out) >= 2:
                     cache = out[1]
+                # MLX 是惰性求值：上面的前向只构建了计算图，不 mx.eval 就一个
+                # token 都不会真正算——KV 全是懒数组，首句 stream_generate 第一次
+                # 求值时才把 1400+ token 的 prefill 整体补算（实测 preload 0.0s、
+                # 首句 TTFT 4.5s 里含全部 prefill），预热完全白做。求值 logits 会
+                # 级联算出所有层的 KV（cache 里的 k/v 都是 logits 的依赖中间量），
+                # 把这笔成本在启动空闲期一次性付清。
+                first = out[0] if isinstance(out, tuple) and len(out) > 0 else out
+                if first is not None:
+                    mx.eval(first)
                 self._mlx_cache = cache
                 self._cache_token_ids = list(prompt_ids)
                 self._kv_thread = threading.get_ident()

@@ -4,6 +4,24 @@
 
 ---
 
+## 2026-10-23 · 修复：启动预热形同虚设（首句 18s 才出字）
+
+> 用户反馈：应用启动后自动加载的主模型理应已预热，但第一句话等了 18s 才开始返回——预热根本没生效。
+
+### 根因（探针实测复现）
+- `preload_system_kv` 的前向 `self._model(input, cache)` 是 **MLX 惰性求值**：没有 `mx.eval()`，计算图根本没执行，KV 全是懒数组。实测 preload 耗时 **0.0s**（假完成），首句 `stream_generate` 第一次求值时才把 1400+ token 的 prefill 整体补算——预热完全白做，首句 TTFT 4.5s 里全是这笔迟到账。
+- 叠加因素：预热（preload + warm_up）**串行占住 worker 线程**后才进消息循环。用户手快在预热窗口内发消息，就得在队列里干等 warm_up 完成（应用内表现为 18s+）。且内核首句生成前还有技能检索等 aux LLM 调用（各自 prefill）。
+
+### 修复
+- `preload_system_kv` 在前向后 `mx.eval(logits)` 强制求值——logits 级联依赖所有层的 KV，预热成本在启动空闲期一次性付清。实测 preload 0.0s→4.2s，**首句 TTFT 4.5s→0.9s**（`reuse=1410/1426`，只喂 16 个新 token）。
+- `AgentWorker.run` 在做空闲期预热前先查队列：**已有用户消息排队就跳过预热**，直接处理真实消息（首句自己会把编译/预填付掉——反正躲不掉；让它干等 warm_up 是纯浪费）。
+- 主对话组（kv_group="main"）的 KV 命中/复用日志从 debug 升为 info：`MLX KV cache: cached=… reuse=… suffix=…`，UI 日志里直接可查预热是否生效（重建另有「KV 缓存整体重建」info 行说明原因）。
+
+### 验证
+- 探针复刻应用时序（加载→preload→warm_up→首句→第二句）：preload 0.0s→4.2s，首句 TTFT 4.5s→0.9s。同步结束后重载路径走同一 `AgentWorker.run`，一并生效。
+
+---
+
 ## 2026-10-23 · 修复：同步前卸载对话模型并未真正回收 MLX 内存
 
 > 用户反馈：点「同步知识」理论上会先卸载主/辅本地模型释放显存，但实测同步时内存不降。
