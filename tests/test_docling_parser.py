@@ -5,14 +5,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _fresh_converter_pool():
-    """实例池会跨测试缓存旧工厂（monkeypatch 的假工厂）的实例——每个测试
-    前后清空，避免上一个测试的假 converter 泄漏到下一个测试的断言里。"""
+def _fresh_converter_singleton():
+    """converter 单例会跨测试缓存（monkeypatch 的假工厂）——每个测试前后
+    释放，避免上一个测试的假 converter 泄漏到下一个测试的断言里。"""
     from agent.rag import docling_parser as dp
 
-    dp._pool.release_all()
+    dp.release_converter()
     yield
-    dp._pool.release_all()
+    dp.release_converter()
 
 
 def test_is_docling_available_does_not_raise():

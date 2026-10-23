@@ -17,39 +17,79 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# 1. docling 转换器池引用计数
+# 1. docling 单实例 + 转换串行化（2026-10-23 回退多实例池后的契约）
 # ---------------------------------------------------------------------------
 
-def test_pool_release_all_keeps_on_loan_instances_counted():
-    from agent.rag.docling_parser import _ConverterPool
+def test_docling_converts_are_serialized(tmp_path, monkeypatch):
+    """回归：`extract_markdown` 必须全程持 `_converter_lock` 串行 convert。
 
-    pool = _ConverterPool(lambda: object(), max_size=2)
-    # 借出一个实例
-    with pool.lease(exclusive=False) as conv:
-        assert conv is not None
-        assert pool._created == 1
-        # 此时整池释放（同步结束/取消路径）：只丢空闲实例，租借中的仍计数
-        pool.release_all()
-        assert pool._created == 1          # 不能归零
-        assert pool._free == []
-    # 归还后进入空闲栈，_created 仍为 1 → reaper 能看见它
-    assert pool._created == 1
-    assert len(pool._free) == 1
-
-
-def test_pool_reap_still_works_after_release_all():
-    """回归：旧实现 release_all 后 _created=0 → reap_if_idle 永久短路。"""
+    背景：DocumentConverter 非线程安全，多实例池方案（2026-10-22）把 16GB
+    机器打到 20+GB 系统崩溃，已回退为「单实例 + 全程持锁串行」。本测试锁住
+    串行契约——并发调用不得出现两个 convert 重叠。
+    """
+    import threading
     import time
 
-    from agent.rag.docling_parser import _ConverterPool
+    from agent.rag import docling_parser as dp
 
-    pool = _ConverterPool(lambda: object(), max_size=2)
-    with pool.lease(exclusive=False):
-        pool.release_all()
-    # 空闲超时后必须能释放（_last_used 回拨模拟 90s 空闲）
-    pool._last_used = time.monotonic() - 999
-    assert pool.reap_if_idle(90.0) == 1
-    assert not pool.has_instances()
+    active = 0
+    peak = 0
+    lk = threading.Lock()
+
+    class _FakeConv:
+        def convert(self, path):
+            nonlocal active, peak
+            with lk:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lk:
+                active -= 1
+            raise RuntimeError("stop-after-overlap-check")
+
+    monkeypatch.setattr(dp, "is_docling_available", lambda: True)
+    monkeypatch.setattr(dp, "_get_converter", lambda: _FakeConv())
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    errs = []
+
+    def _run():
+        try:
+            dp.extract_markdown(str(pdf))
+        except Exception as e:  # convert 抛错会被吞并返回 None
+            errs.append(e)
+
+    ts = [threading.Thread(target=_run) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=5)
+    assert peak == 1                            # 三个调用严格串行
+    assert errs == []                           # 异常被吞，回退链继续
+
+
+def test_singleton_release_clears_converter(monkeypatch):
+    """release_converter() 必须真正清掉单例引用（否则 ~4.6GB 常驻）。"""
+    from agent.rag import docling_parser as dp
+
+    monkeypatch.setattr(dp, "is_docling_available", lambda: True)
+    monkeypatch.setattr(dp, "_get_converter",
+                        lambda: "fake-converter-sentinel")
+    # 直接验证释放语义：置位后 release_converter 清空
+    dp._converter = "fake-converter-sentinel"
+    dp.release_converter()
+    assert dp._converter is None
+
+
+def test_ingest_does_not_inject_concurrency_config(rag_engine_factory, tmp_path):
+    """回归：多实例池的并发配置注入已移除（rag_parse_* 字段不存在）。"""
+    from agent.config import AgentConfig
+    cfg = AgentConfig()
+    assert not hasattr(cfg, "rag_parse_parallel")
+    assert not hasattr(cfg, "rag_parse_large_mb")
+    from agent.rag import docling_parser as dp
+    assert not hasattr(dp, "set_docling_concurrency")
+    assert not hasattr(dp, "_ConverterPool")
 
 
 # ---------------------------------------------------------------------------

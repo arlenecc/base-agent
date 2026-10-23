@@ -787,15 +787,10 @@ class SyncKnowledgeWorker(QThread):
                 release_mlx_pool()
             except Exception as e:  # 防御：清理失败不该中断同步
                 logger.debug("SyncKnowledgeWorker: pre-sync mlx cleanup failed: %s", e)
-            # 解析并发配置（docling 实例池：小文件并行、大文件独占）。
-            try:
-                from ..rag.docling_parser import set_docling_concurrency
-                set_docling_concurrency(
-                    getattr(self._config, "rag_parse_parallel", 2),
-                    getattr(self._config, "rag_parse_large_mb", 20),
-                )
-            except Exception as e:
-                logger.debug("SyncKnowledgeWorker: parse concurrency inject failed: %s", e)
+            # 解析并发说明：docling 转换器是**单实例 + 全程持锁串行**
+            # （2026-10-23 从多实例池回退——两实例常驻 ~9GB + 两路转换
+            # 工作集把 16GB 机器打到系统崩溃）。PDF 解析吞吐的瓶颈在嵌入
+            # 侧（主线程单路），多开转换实例只会堆内存不提速。
             self._engine = RAGEngine(
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,
