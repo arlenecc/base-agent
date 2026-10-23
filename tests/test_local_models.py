@@ -225,6 +225,61 @@ def test_factory_llm_local_returns_localllmclient():
     assert client._path.endswith("models/qwen3.5-4b-agentic-coder-v4-4bit-mlx")
 
 
+# ---------------------------------------------------------------------------
+# close() 必须真正回收 MLX 统一内存（#2026-10-23：同步前卸载对话模型却没降内存）
+# ---------------------------------------------------------------------------
+
+def _fake_mlx(monkeypatch):
+    """注入一个轻量 fake mlx.core，使 close() 在不装真 mlx 时也能跑通并可见调用。"""
+    calls = {"clear_cache": 0}
+
+    class _Metal:
+        @staticmethod
+        def clear_cache():
+            calls["clear_cache"] += 1
+
+    class _Core:
+        metal = _Metal
+        clear_cache = _Metal.clear_cache   # mlx.core.clear_cache 是 metal.clear_cache 的别名
+
+    monkeypatch.setitem(sys.modules, "mlx", type(sys)("mlx"))
+    monkeypatch.setitem(sys.modules, "mlx.core", _Core)
+    return calls
+
+
+def test_llm_close_reclaims_mlx_memory(monkeypatch):
+    """MLX 后端 close() 必须摘引用 + 调 mx.clear_cache，否则权重滞留 Metal 池。"""
+    from agent.local.llm import LocalLLMClient
+    calls = _fake_mlx(monkeypatch)
+    c = LocalLLMClient(
+        "/tmp/does-not-exist-mlx", backend="mlx",
+        max_tokens=256, temperature=0.7,
+    )
+    c._model = object()      # 占位权重，模拟已加载
+    c._tokenizer = object()
+    c._loaded = True
+    c.close()
+    assert c._model is None
+    assert c._tokenizer is None
+    assert c._loaded is False
+    assert calls["clear_cache"] == 1   # 关键：必须触发回收
+
+
+def test_llm_close_no_clear_cache_for_non_mlx(monkeypatch):
+    """非 MLX 后端（如 onnx）不应调 mx.clear_cache（避免误伤/无谓调用）。"""
+    from agent.local.llm import LocalLLMClient
+    calls = _fake_mlx(monkeypatch)
+    c = LocalLLMClient(
+        "/tmp/x", backend="onnx", max_tokens=256, temperature=0.7,
+    )
+    c._session = object()
+    c._loaded = True
+    c.close()
+    assert c._session is None
+    assert c._loaded is False
+    assert calls["clear_cache"] == 0
+
+
 @pytest.mark.skipif(not os.path.isdir(QWEN), reason="qwen MLX 权重缺失")
 def test_factory_llm_local_streams():
     from agent.config import AgentConfig

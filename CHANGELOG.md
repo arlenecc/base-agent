@@ -4,6 +4,21 @@
 
 ---
 
+## 2026-10-23 · 修复：同步前卸载对话模型并未真正回收 MLX 内存
+
+> 用户反馈：点「同步知识」理论上会先卸载主/辅本地模型释放显存，但实测同步时内存不降。
+
+### 根因
+- 卸载代码路径**没失效**：同步只能在 agent 空闲时启动（`_on_sync_knowledge` 在 `_busy` 时直接拒绝），且同步期间不置 `_busy`，所以 `_start_sync` 里的 `_on_unload_main_model()` / `_on_unload_aux_model()` 确实会被调用。
+- 但 `LocalLLMClient.close()`（llm.py）只把 `self._model = None`，**没有 `gc.collect()` + `mx.clear_cache()`**。MLX 有独立的 Metal 缓冲池，权重 `del` 后只是回到池里、不立刻还给系统；而 worker 线程的 `release_mlx_pool()`（gc+clear_cache）运行时那批刚摘引用的模型阵列往往还没 freed，抓不到 → 权重滞留统一内存，同步峰值照旧冲高。
+
+### 修复
+- `LocalLLMClient.close()` 对 MLX 后端在摘引用后立即 `gc.collect() + mx.clear_cache()`，使「同步前卸载模型」**同步、确定性**地回收 ~3GB 统一内存；已加载的其它 MLX 模型（嵌入/重排）仍被引用，clear_cache 只回收无引用缓冲，不会误伤。非 MLX 后端（ONNX）走原来的 `session=None` + GC，不触发 clear_cache。
+- 新增回归测试 `test_llm_close_reclaims_mlx_memory` / `test_llm_close_no_clear_cache_for_non_mlx`，锁住「MLX 后端必须调 clear_cache、非 MLX 后端不调」。
+
+---
+
+
 ## 2026-10-23 · RapidOCR 引擎池：2 实例纯 CPU 并发
 
 > 用户定版：ocrmac 识别不了的页会整页透传到 RapidOCR，透传请求占比不低，单实例串行是扫描书解析的吞吐瓶颈。启用 2 个实例、纯 CPU EP 并发。

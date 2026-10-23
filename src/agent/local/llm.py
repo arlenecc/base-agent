@@ -1161,4 +1161,20 @@ class LocalLLMClient:
         self.invalidate_kv_cache()
         self._model = None
         self._session = None
+        self._tokenizer = None
         self._loaded = False
+        # MLX 有独立的 Metal 缓冲池：权重 del 后只是回到池里、不立刻还给系统——
+        # 必须显式 gc.collect() + mx.clear_cache() 才能真正回收统一内存。
+        # 否则「同步前卸载对话模型」形同虚设：引用清空了，但 ~3GB 权重仍在物理
+        # 内存，16GB 机器上同步峰值照旧冲高。只 MLX 后端需要这一步；ONNX 后端
+        # 靠 session=None + gc 即可，clear_cache 对 ORT 无副作用也不必要。
+        # 已加载的其它 MLX 模型（嵌入/重排）仍被引用，clear_cache 只回收「已无
+        # 引用」的缓冲，不会误伤它们。
+        if self._backend == "mlx":
+            try:
+                import gc
+                import mlx.core as mx
+                gc.collect()
+                mx.clear_cache()
+            except Exception:
+                pass
