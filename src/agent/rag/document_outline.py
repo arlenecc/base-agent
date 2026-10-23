@@ -350,6 +350,110 @@ def extract_chapters_plain(text: str) -> List[Chapter]:
 
 
 # ---------------------------------------------------------------------------
+# 纯文本 → Markdown（启发式章节还原）
+# ---------------------------------------------------------------------------
+
+def has_markdown_headings(text: str) -> bool:
+    """文本是否已含 Markdown 标题行。
+
+    围栏代码块内的 ``#`` 注释会误报为 True → 转换被保守跳过（宁可不转换，
+    也不给纯文本强加错误结构），方向安全。
+    """
+    return bool(_HEADING_RE.search(text or ""))
+
+
+def _toc_block_span(lines: List[str]) -> Optional[Tuple[int, int]]:
+    """定位「目录」块的行号区间 ``[start, end)``（含标记行；无则 None）。
+
+    终止条件（除 :func:`_extract_from_toc_block` 的「变长/句末标点」外）：
+    **目录里已见过的标题在区间内再次出现** —— 目录条目会在正文重现，首次
+    重现即正文开始（否则紧邻目录的第一章标题会被目录区间吞掉、漏标）。
+    """
+    for i, ln in enumerate(lines):
+        if ln.lower() in _TOC_MARKERS:
+            break
+    else:
+        return None
+    end = i + 1
+    seen_titles: set = set()
+    while end < len(lines):
+        ln = lines[end]
+        if len(ln) > 80 or (ln and ln[-1] in "。，；！？．,;!?"):
+            break
+        if ln and _looks_like_title(ln):
+            title = _normalize_title(ln)
+            if title in seen_titles:
+                break           # 正文重现目录条目 → 目录块结束
+            seen_titles.add(title)
+        end += 1
+    return (i, end)
+
+
+def plain_text_to_markdown(text: str) -> str:
+    """把无结构纯文本转成 Markdown：按启发式还原的章节结构给标题行加 ``#``。
+
+    处理对象：txt 文件、OCR/解析回退产出的非结构化纯文本——它们没有标题
+    层级，下游（目录 digest、分块、按章检索）全部失去章节边界；且后续
+    ``clean_text`` 的硬回车合并会把「第三章 …」这类独立标题行吞进段落，
+    所以转换必须发生在合并**之前**（``#`` 行是结构行，不会被合并）。
+
+    规则：
+      * 正文强模式标题（``第X章/节``、编号 ``1.2.3``）直接标记；
+      * 全大写弱模式仍要求前后空行；
+      * 目录块只用来提供「标题 → 级别」的权威映射与跳过区：目录里的短标题
+        （自序/后记等启发式覆盖不到的）在正文原样重现时按目录级别补标；
+        目录条目本身不转标题（否则封面目录页会炸成一堆假章节）；
+      * 同名标题只标首现（后续重现多为页眉噪声）；
+      * 标记数 < 2 时视为误判，整体不改写（保持原样最安全）。
+    """
+    if not text or not text.strip():
+        return text
+    lines = [ln.strip() for ln in re.split(r"\r\n|\r|\n", text)]
+
+    toc_chapters = _extract_from_toc_block(lines)
+    toc_level = {c.title: c.level for c in toc_chapters}
+    toc_span = _toc_block_span(lines)
+
+    marked = 0
+    seen: set = set()
+    out: List[str] = []
+    for idx, ln in enumerate(lines):
+        if toc_span and toc_span[0] <= idx < toc_span[1]:
+            out.append(ln)          # 目录块原样保留，不参与标题标记
+            continue
+        level = None
+        if ln and _looks_like_title(ln):
+            title = _normalize_title(ln)
+            hit = (_cn_section_match(title) or _cn_chapter_match(title)
+                   or _numbered_match(title))
+            if hit is not None:
+                level = hit[0]
+            elif _ALLCAPS_RE.match(title):
+                # 弱模式：要求前后空行（与 _extract_from_body_headings 一致）。
+                prev_blank = idx == 0 or lines[idx - 1] == ""
+                nxt_blank = idx + 1 >= len(lines) or lines[idx + 1] == ""
+                if prev_blank and nxt_blank:
+                    level = 1
+            elif title in toc_level:
+                # 目录里列了、正文又原样出现的短标题 → 按目录级别补标。
+                level = toc_level[title]
+            if level is not None:
+                if title in seen:
+                    level = None    # 同名标题只标首现
+                else:
+                    seen.add(title)
+        if level is not None:
+            marked += 1
+            out.append(f"{'#' * min(level, 6)} {ln}")
+        else:
+            out.append(ln)
+
+    if marked < 2:
+        return text
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # Digest assembly
 # ---------------------------------------------------------------------------
 

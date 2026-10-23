@@ -7,6 +7,8 @@ from agent.rag.document_outline import (
     extract_chapters,
     extract_chapters_plain,
     find_chapters_by_title,
+    has_markdown_headings,
+    plain_text_to_markdown,
 )
 
 
@@ -241,3 +243,110 @@ def test_plain_toc_marker_not_title():
     assert "~1~ 不可置信之书" in titles
     assert "~2~ 史上最重要的问题" in titles
     assert "目 录" not in titles
+
+
+# ---------------------------------------------------------------------------
+# 纯文本 → Markdown（启发式章节还原，2026-10-23）
+# ---------------------------------------------------------------------------
+
+def test_has_markdown_headings():
+    assert has_markdown_headings("# 第一章\n\n正文。")
+    assert has_markdown_headings("## 1.1 背景\n\n正文。")
+    assert not has_markdown_headings("第一章 引言\n\n正文，没有标题行。")
+    assert not has_markdown_headings("")
+
+
+def test_plain_to_markdown_marks_chapter_headings():
+    """强模式标题（第X章/编号）按层级标记，正文内容原样保留。"""
+    text = (
+        "前言说明文字，这是一段没有标题的介绍。\n"
+        "\n"
+        "第一章 人际关系的构成\n"
+        "假若黄金周这样度过，是不是很美妙。\n"
+        "\n"
+        "1.1 研究方法\n"
+        "本章介绍研究亲密关系的方法。\n"
+        "\n"
+        "第二章 研究结论\n"
+        "结论是关系影响幸福。\n"
+    )
+    md = plain_text_to_markdown(text)
+    assert "# 第一章 人际关系的构成" in md
+    assert "## 1.1 研究方法" in md
+    assert "# 第二章 研究结论" in md
+    # 正文原样保留（只加标题标记，不删内容）
+    assert "结论是关系影响幸福。" in md
+    # 转换结果可被标准 Markdown 章节提取识别（digest 走标题路径而非启发式）
+    titles = {c.title for c in extract_chapters(md)}
+    assert "第一章 人际关系的构成" in titles
+    assert "1.1 研究方法" in titles
+
+
+def test_plain_to_markdown_toc_block_and_level_backfill():
+    """目录条目不转标题；紧邻目录的正文标题不被吞；目录短标题正文重现时补标。"""
+    text = (
+        "书名：亲密关系\n"
+        "\n"
+        "目录\n"
+        "第一章 引言\n"
+        "自序\n"
+        "第二章 方法\n"
+        "\n"
+        "第一章 引言\n"
+        "这是第一章正文，探讨人际关系。\n"
+        "\n"
+        "自序\n"
+        "写作缘起。\n"
+        "\n"
+        "第二章 方法\n"
+        "研究方法正文。\n"
+    )
+    md = plain_text_to_markdown(text)
+    lines = md.splitlines()
+    toc_idx = lines.index("目录")
+    # 目录块内不产生任何标题
+    assert not any(l.startswith("#") for l in lines[toc_idx:toc_idx + 4])
+    # 紧邻目录的正文「第一章 引言」必须被标记（不吞进目录区间）
+    assert "# 第一章 引言" in md
+    assert "# 第二章 方法" in md
+    # 目录里列了、正文原样重现的短标题「自序」按目录级别补标
+    assert "# 自序" in md
+
+
+def test_plain_to_markdown_noop_without_structure():
+    """没有可识别标题的散文原样返回（<2 个标记不强行改写）。"""
+    text = "这是普通散文。\n\n全部是正文段落，含句号。\n\n另一段内容。"
+    assert plain_text_to_markdown(text) == text
+
+
+def test_plain_to_markdown_dedups_repeated_titles():
+    """同名标题只标首现（后续重现多为页眉噪声）。"""
+    text = (
+        "第一章 引言\n"
+        "第一章正文内容。\n"
+        "\n"
+        "第二章 方法\n"
+        "第二章正文内容。\n"
+        "\n"
+        "第二章 方法\n"
+        "页眉噪声行。\n"
+    )
+    md = plain_text_to_markdown(text)
+    assert md.count("# 第二章 方法") == 1
+
+
+def test_marked_headings_survive_clean_text():
+    """转换必须发生在 clean_text 之前：# 行不被硬回车合并吞掉。"""
+    from agent.rag.cleaner import clean_text
+    text = (
+        "第一章 引言\n"
+        "引言正文第一行没有句末标点\n"
+        "第二行接在上一行之后\n"
+        "\n"
+        "第二章 方法\n"
+        "正文内容。"
+    )
+    md = plain_text_to_markdown(text)
+    cleaned = clean_text(md)
+    assert "# 第一章 引言" in cleaned
+    assert "# 第二章 方法" in cleaned

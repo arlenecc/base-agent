@@ -14,7 +14,11 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, clean_docling_markdown, normalize_markdown
 from .chunker import chunk_documents
-from .document_outline import build_digest
+from .document_outline import (
+    build_digest,
+    has_markdown_headings,
+    plain_text_to_markdown,
+)
 from .vector_store import DEFAULT_RERANK_MODEL, VectorStore
 from ..atomic_io import atomic_write_json
 
@@ -1288,6 +1292,21 @@ class RAGEngine:
                                     cleaned = clean_docling_markdown(text)
                                     _log("    ├─ docling Markdown 就绪: %s (%d 字符)", fname, len(cleaned))
                                 else:
+                                    # ---- 1.5 纯文本 → Markdown（启发式章节还原）----
+                                    # txt / 解析回退产出的非结构化纯文本没有标题结构；
+                                    # 若直接 clean_text，硬回车合并会把「第三章 …」这类
+                                    # 独立标题行吞进段落——目录 digest 与分块全部失去
+                                    # 章节边界。必须在合并**之前**用启发式把标题标成
+                                    # # 行（# 是结构行，join_hard_wrapped_lines 不合并）。
+                                    if not has_markdown_headings(text):
+                                        marked = plain_text_to_markdown(text)
+                                        if marked != text:
+                                            n_head = sum(
+                                                1 for l in marked.splitlines()
+                                                if l.startswith("#"))
+                                            _log("    ├─ 纯文本章节还原: 标记 %d 个标题 → Markdown",
+                                                 n_head)
+                                            text = marked
                                     # ---- 2. 清洗文本 ----
                                     t_clean = time.monotonic()
                                     _log("    ├─ 清洗文本: %s (原始 %d 字符)", fname, len(text))
