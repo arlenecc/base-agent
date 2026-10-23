@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -354,6 +355,32 @@ def _is_scanned_epub(book, href_map: Dict[str, str]) -> bool:
     return textless_img_docs / max(img_docs, 1) >= _SCANNED_TEXTLESS_RATIO
 
 
+# ---------------------------------------------------------------------------
+# 扫描版 EPUB 串行闸门（2026-10-23 用户定版）
+# ---------------------------------------------------------------------------
+# 扫描版 EPUB 的解析 = 逐页 OCR（一本书 10-20 分钟），是 EPUB 里唯一的重负载。
+# 需求：整体 EPUB 解析仍保持 2 路并发（一个扫描版 + 一个文字版可以同时跑），
+# 但**不能有两个扫描版同时解析**——两份 OCR 同时打共享的 OCR 引擎单例既有
+# 线程安全风险，也让内存/CPU 尖峰翻倍。
+#
+# 因此这把信号量只闸「扫描版的 OCR」段：
+# - 文字版 EPUB 完全不碰它 → 与扫描版、与彼此都真并行（2 路并发不变）；
+# - 探测（_detect_scanned_epub）放在锁外：否则一本 20 分钟的扫描版会把后面
+#   排队到来的文字版也堵死（探测只解析 ≤20 个 HTML，毫秒级）。
+_SCANNED_EPUB_GATE = threading.Semaphore(1)
+
+
+def _detect_scanned_epub(path: str, book=None) -> bool:
+    """廉价探测 EPUB 是否扫描版（**无锁**，调用方决定是否进闸门）。
+
+    book 已由调用方读出时传入，避免重复解包 zip。
+    """
+    if book is None:
+        book = _read_epub(path)
+    href_map = _manifest_href_map(path)
+    return _is_scanned_epub(book, href_map)
+
+
 def extract_scanned_epub(path: str, book=None) -> Optional[str]:
     """扫描版 EPUB → 按 spine 顺序逐页图片 → 统一归一化 → OCR。
 
@@ -366,7 +393,8 @@ def extract_scanned_epub(path: str, book=None) -> Optional[str]:
     from urllib.parse import unquote
     from bs4 import BeautifulSoup
     from .ocr_engine import decode_image, preprocess_for_ocr
-    from .parsers import _get_ocr_engine, _ocr_image_cached
+    from .parsers import (_OCR_ACQUIRE_TIMEOUT, _OCR_SEMAPHORE,
+                          _get_ocr_engine, _ocr_image_cached)
 
     href_map = _manifest_href_map(path)
     if book is None:
@@ -432,7 +460,19 @@ def extract_scanned_epub(path: str, book=None) -> Optional[str]:
                 continue
             page_no += 1
             norm = preprocess_for_ocr(arr)
-            txt = _ocr_image_cached(engine, norm, page_no, fname)
+            # 与 PDF 兜底路径共用同一把 OCR 信号量（**逐页**粒度）：保护共享的
+            # 引擎单例不被两个线程同时调用。超时（300s）跳过该页而不是永久挂起。
+            # 注意：扫描版**之间**的串行由 extract_ebook 的 _SCANNED_EPUB_GATE
+            # 负责，这里只防「扫描版 EPUB 与图片型 PDF 兜底路径」撞车。
+            if not _OCR_SEMAPHORE.acquire(timeout=_OCR_ACQUIRE_TIMEOUT):
+                logger.warning(
+                    "扫描版 EPUB '%s' 第 %d 页 OCR 信号量等待超 %ss，跳过该页",
+                    fname, page_no, _OCR_ACQUIRE_TIMEOUT)
+                continue
+            try:
+                txt = _ocr_image_cached(engine, norm, page_no, fname)
+            finally:
+                _OCR_SEMAPHORE.release()
             if txt and txt.strip():
                 parts.append(txt)
             if page_no % 25 == 0:
@@ -580,13 +620,33 @@ def extract_ebook(path: str) -> Optional[Dict[str, Any]]:
         # 扫描版 EPUB：书页几乎无文本、由整页图片构成——pandoc/ebooklib 只会
         # 产出空壳。逐页图片走统一 OCR（归一化 → ocrmac 优先 → RapidOCR 回退），
         # 整本作为一个"章节"返回，交给通用切块器二次切分。
+        # 扫描版判定：探测放在闸门**外**（毫秒级），文字版 EPUB 永不为等待中
+        # 的扫描版让路——整体 EPUB 解析仍是 2 路并发；只有「扫描版 vs 扫描版」
+        # 才串行（用户 2026-10-23 定版）。
         if ext == ".epub" or tmp_epub:
             try:
-                scanned = extract_scanned_epub(epub_path, book)
+                _is_scanned = _detect_scanned_epub(epub_path, book)
             except Exception as e:
-                logger.warning("扫描版 EPUB OCR 异常，回退常规路径: %s: %s",
-                               os.path.basename(path), e)
-                scanned = None
+                logger.debug("扫描版探测失败（按非扫描版继续）: %s: %s",
+                             os.path.basename(path), e)
+                _is_scanned = False
+            scanned = None
+            if _is_scanned:
+                _fname = os.path.basename(path)
+                # 先试无阻塞获取：只有真的排队才打日志（避免每次同步都刷屏）
+                if not _SCANNED_EPUB_GATE.acquire(blocking=False):
+                    logger.info(
+                        "扫描版 EPUB '%s' 排队中（同一时刻只解析一本扫描版，"
+                        "文字版不受影响）", _fname)
+                    _SCANNED_EPUB_GATE.acquire()
+                try:
+                    scanned = extract_scanned_epub(epub_path, book)
+                except Exception as e:
+                    logger.warning("扫描版 EPUB OCR 异常，回退常规路径: %s: %s",
+                                   _fname, e)
+                    scanned = None
+                finally:
+                    _SCANNED_EPUB_GATE.release()
             if scanned and scanned.strip():
                 return {
                     "full_markdown": scanned,
