@@ -680,3 +680,86 @@ def test_summary_stripper_rescues_unclosed_tag():
 def test_summary_stripper_char_by_char():
     assert _strip(list("<summary>abc</summary>hello")) == "hello"
     assert _strip(list("<summary>x</summary>")) == ""
+
+
+# ---------------------------------------------------------------------------
+# 模型路径选择按钮：按「模型类型」分流文件/目录（2026-10-23）
+# ---------------------------------------------------------------------------
+
+def test_pick_model_path_file_mode_for_gguf(qtbot, monkeypatch):
+    """GGUF 类型必须弹**文件**选择框——权重是单文件，旧实现只能选目录。"""
+    from agent.ui import main_window as mw
+    from PyQt6.QtWidgets import QLineEdit, QComboBox
+    seen = {}
+
+    def fake_open(parent, title, directory, filt):
+        seen["mode"] = "file"
+        seen["filter"] = filt
+        return "/x/qwen.gguf", filt
+
+    def fake_dir(parent, title, directory):
+        seen["mode"] = "dir"
+        return ""
+
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", fake_open)
+    monkeypatch.setattr(mw.QFileDialog, "getExistingDirectory", fake_dir)
+
+    edit = QLineEdit()
+    combo = QComboBox()
+    combo.addItems(["MLX-LM", "GGUF"])
+    combo.setCurrentText("GGUF")
+    # self 只被当作对话框 parent 传给（已被 mock 的）静态方法
+    mw.MainWindow._pick_model_path(object(), edit, combo)
+    assert seen["mode"] == "file"
+    assert "gguf" in seen["filter"].lower()
+    assert edit.text() == "/x/qwen.gguf"
+
+
+def test_pick_model_path_dir_mode_for_mlx(qtbot, monkeypatch):
+    """MLX 类型保持目录选择框（权重是 safetensors 目录）。"""
+    from agent.ui import main_window as mw
+    from PyQt6.QtWidgets import QLineEdit, QComboBox
+    seen = {}
+
+    def fake_open(parent, title, directory, filt):
+        seen["mode"] = "file"
+        return "", filt
+
+    def fake_dir(parent, title, directory):
+        seen["mode"] = "dir"
+        return "/models/qwen-mlx"
+
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", fake_open)
+    monkeypatch.setattr(mw.QFileDialog, "getExistingDirectory", fake_dir)
+
+    edit = QLineEdit()
+    combo = QComboBox()
+    combo.addItems(["MLX-LM", "GGUF"])
+    combo.setCurrentText("MLX-LM")
+    mw.MainWindow._pick_model_path(object(), edit, combo)
+    assert seen["mode"] == "dir"
+    assert edit.text() == "/models/qwen-mlx"
+
+
+def test_pick_model_path_onnx_file_mode(qtbot, monkeypatch):
+    """ONNX 类型同样弹文件选择框（*.onnx 过滤）。"""
+    from agent.ui import main_window as mw
+    from PyQt6.QtWidgets import QLineEdit, QComboBox
+    seen = {}
+
+    def fake_open(p, t, d, f):
+        seen["mode"] = "file"
+        seen["filt"] = f
+        return "/x/model.onnx", f
+
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", fake_open)
+    monkeypatch.setattr(mw.QFileDialog, "getExistingDirectory",
+                        lambda p, t, d: seen.update(mode="dir") or "")
+
+    edit = QLineEdit()
+    combo = QComboBox()
+    combo.addItems(["ONNX"])
+    mw.MainWindow._pick_model_path(object(), edit, combo)
+    assert seen["mode"] == "file"
+    assert "onnx" in seen["filt"].lower()
+    assert edit.text() == "/x/model.onnx"

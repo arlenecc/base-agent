@@ -4,6 +4,20 @@
 
 ---
 
+## 2026-10-23 · 修复：模型路径选择只能选目录（GGUF/ONNX 选不到权重文件）+ 新填配置不落盘
+
+> 用户反馈：设置界面只能选目录，选不到 .gguf 文件；手工输入文件路径后加载不了。
+
+### 修复
+- **选择按钮按「模型类型/实现」下拉分流**（`_pick_model_path`，替代只弹目录框的 `_pick_model_dir`）：GGUF → `*.gguf` 文件框、ONNX → `*.onnx` 文件框、MLX/fastembed → 目录框。覆盖主模型、辅助模型、OCR、Embedding、Reranker 五处（`gguf`/`onnx` 子串匹配，OCR 的 `mlx-vlm` 走目录）。GGUF 目录形式（目录内有 .gguf）仍可手工输入，加载层支持。
+- **加载/应用配置改为「先 gather 再 save」**（`_on_load_main_model` / `_on_load_aux_model` / `_on_apply_config`）：旧实现先 `config.save()` 再 rebuild（rebuild 内部才 gather 控件）——新填的路径/后端只进内存、**不写进 config.json，重启应用即丢失**，且磁盘存的是旧值、与内存不一致。
+- 配合上一条 GGUF 加载修复（`~` 展开 + 明确报错），手工输入路径现在也可用。
+
+### 测试
+- `test_ui_flow.py` 新增 3 用例：GGUF 弹文件框（过滤 `*.gguf`）/ MLX 弹目录框 / ONNX 弹文件框（过滤 `*.onnx`）。
+
+---
+
 ## 2026-10-23 · 修复：GGUF 加载失败时错误不可读 + 不支持 `~` 路径
 
 > 用户反馈：GGUF 模型加载不了，实现可能有问题。

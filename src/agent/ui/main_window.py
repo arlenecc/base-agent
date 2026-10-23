@@ -1252,11 +1252,11 @@ class MainWindow(QMainWindow):
             e.setFixedWidth(width)
             return e
 
-        def _pick_btn(edit):
+        def _pick_btn(edit, combo=None):
             b = QPushButton("选择")
             b.setFixedWidth(56)
-            b.setToolTip("选择本地模型目录")
-            b.clicked.connect(lambda: self._pick_model_dir(edit))
+            b.setToolTip("选择本地模型：GGUF/ONNX 选权重文件，MLX/fastembed 选目录")
+            b.clicked.connect(lambda: self._pick_model_path(edit, combo))
             return b
 
         def _params_widget(mt, temp, tp, mp, tk, rp, thinking, to):
@@ -1299,7 +1299,7 @@ class MainWindow(QMainWindow):
         r = QHBoxLayout(self.main_local_row1_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(8)
         r.addWidget(QLabel("模型类型")); r.addWidget(self.main_type_combo)
         r.addWidget(QLabel("本地路径")); r.addWidget(self.local_llm_model_edit, 1)
-        r.addWidget(_pick_btn(self.local_llm_model_edit))
+        r.addWidget(_pick_btn(self.local_llm_model_edit, self.main_type_combo))
         alay.addWidget(self.main_local_row1_w)
 
         # 主模型 - OpenAI 模式 row1：Base URL + API Key + 模型 + 获取模型
@@ -1348,7 +1348,7 @@ class MainWindow(QMainWindow):
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("模型类型")); r.addWidget(self.aux_type_combo)
         r.addWidget(QLabel("本地路径")); r.addWidget(self.aux_local_llm_model_edit, 1)
-        r.addWidget(_pick_btn(self.aux_local_llm_model_edit))
+        r.addWidget(_pick_btn(self.aux_local_llm_model_edit, self.aux_type_combo))
         alay.addLayout(r)
         self.aux_max_tokens_edit = _num("32768", 80)
         self.aux_temp_edit = _num("0.7")
@@ -1397,7 +1397,7 @@ class MainWindow(QMainWindow):
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("OCR模型")); r.addWidget(self.ocr_impl_combo)
         r.addWidget(self.ocr_model_name_edit, 2)
-        r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit))
+        r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
         self.ocr_impl_combo.setToolTip(
             "OvisOCR2 VLM 后端：\n"
             "· mlx-vlm：目录含 model.safetensors（Apple Silicon 推荐）\n"
@@ -1417,7 +1417,7 @@ class MainWindow(QMainWindow):
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("Embedding")); r.addWidget(self.embedding_impl_combo)
         r.addWidget(self.embedding_model_name_edit, 2)
-        r.addWidget(self.embedding_path_edit, 2); r.addWidget(_pick_btn(self.embedding_path_edit))
+        r.addWidget(self.embedding_path_edit, 2); r.addWidget(_pick_btn(self.embedding_path_edit, self.embedding_impl_combo))
         self.dedup_vectors_btn = QPushButton("向量去重")
         self.dedup_vectors_btn.setToolTip(
             "扫描向量库，清理内容完全相同的重复向量\n"
@@ -1444,7 +1444,7 @@ class MainWindow(QMainWindow):
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("Reranker")); r.addWidget(self.reranker_impl_combo)
         r.addWidget(self.reranker_model_name_edit, 2)
-        r.addWidget(self.reranker_path_edit, 2); r.addWidget(_pick_btn(self.reranker_path_edit))
+        r.addWidget(self.reranker_path_edit, 2); r.addWidget(_pick_btn(self.reranker_path_edit, self.reranker_impl_combo))
         self.stop_sync_btn = QPushButton("停止同步")
         self.stop_sync_btn.setEnabled(False)
         self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
@@ -1466,10 +1466,30 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 配置窗口：模型路径选择 / 主模型模式切换 / 主·辅助模型加载·卸载
     # ------------------------------------------------------------------
-    def _pick_model_dir(self, edit: "QLineEdit") -> None:
-        d = QFileDialog.getExistingDirectory(self, "选择本地模型目录", edit.text() or "models")
-        if d:
-            edit.setText(d)
+    def _pick_model_path(self, edit: "QLineEdit",
+                         combo: "QComboBox" = None) -> None:
+        """按「模型类型/实现」下拉选择本地模型：GGUF/ONNX 选权重文件，其余选目录。
+
+        旧实现只弹目录选择框——GGUF/ONNX 后端的权重是**单文件**，用户根本选不到
+        文件，只能手工输入路径（还踩过 ``~`` 不展开、无效路径报错不可读的坑）。
+        这里按下拉文本分流（``gguf``/``onnx`` 子串匹配，覆盖主/辅模型、OCR、
+        Embedding、Reranker 五处）；GGUF 也接受目录形式（目录内有 .gguf 时加载
+        层按字典序取第一个），需要时手工输入即可。
+        """
+        text = (combo.currentText() if combo is not None else "").strip().lower()
+        if "gguf" in text:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择 GGUF 权重文件", edit.text() or "models",
+                "GGUF 权重 (*.gguf);;所有文件 (*)")
+        elif "onnx" in text:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择 ONNX 权重文件", edit.text() or "models",
+                "ONNX 权重 (*.onnx);;所有文件 (*)")
+        else:
+            path = QFileDialog.getExistingDirectory(
+                self, "选择本地模型目录", edit.text() or "models")
+        if path:
+            edit.setText(path)
 
     def _on_main_mode_changed(self, text: str) -> None:
         """主模型在「本地模式」与「OpenAI兼容接口」间切换：显示对应行与动作按钮。"""
@@ -1597,6 +1617,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "正在运行", "Agent 正在运行，请先「终止对话」再加载模型。")
             return
+        # 先收集控件再保存：旧实现先 save 再 rebuild（rebuild 内部才 gather），
+        # 新填的路径/后端只进了内存、没写进 config.json——重启应用后丢失，
+        # 且磁盘上存的是旧值，与内存不一致。
+        self._gather_config_from_widgets()
         self.config.save(CONFIG_PATH)
         # 仅重载主模型：保留已加载的辅助模型（不销毁权重、不动其按钮态）。
         # 若要同时换辅助模型路径，点「重新加载辅助模型」或「应用配置」。
@@ -1639,8 +1663,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "正在运行", "Agent 正在运行，请先「终止对话」再加载模型。")
             return
-        self.config.save(CONFIG_PATH)
+        # 先收集控件再保存（与 _on_load_main_model 同款修正：旧实现 save 在
+        # gather 之前，新填的辅助模型路径不落盘，重启即丢）。
         self._gather_config_from_widgets()
+        self.config.save(CONFIG_PATH)
         old = getattr(self, "_aux_llm", None)
         if old is not None:
             try:
@@ -2178,6 +2204,9 @@ class MainWindow(QMainWindow):
                 "Agent 正在运行，请先点击「终止对话」停止当前任务，再应用配置。",
             )
             return
+        # 先收集控件再保存：旧实现先 save 再 rebuild（rebuild 内部才 gather），
+        # 新填的配置不写盘，重启后回旧值。
+        self._gather_config_from_widgets()
         self.config.save(CONFIG_PATH)
         self._rebuild_agent()
         self._append_log(f"[cfg] applied: {self.config.base_url} model={self.config.model}")
