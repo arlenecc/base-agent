@@ -115,6 +115,13 @@ class AgentConfig:
     # 另见 parsers._OCR_RSS_BUDGET_GB——即使本项为 True，内存护栏也会在原生
     # 缓存超预算时自动冲刷并永久降级到 CPU EP。
     rag_ocr_coreml: bool = False
+    # RapidOCR 引擎池大小（2026-10-23 用户定版：2 个实例、纯 CPU EP 并发）。
+    # 背景：ocrmac 识别不了的页会整页透传到 RapidOCR，透传请求占比不低，
+    # 单实例串行是扫描书解析的吞吐瓶颈。两个实例 ≈ 2 × 0.5GB 常驻。
+    # 固定纯 CPU EP——CoreML 单实例基线 1.7GB 且按输入形状 67MB/页爬升，
+    # 并发会翻倍；CPU EP 的 arena 增量实测为 0 且更快（见 parsers 模块头）。
+    # 设 1 退化为单实例串行（旧行为）。
+    rag_ocr_pool_size: int = 2
     # OCR 前的图像归一化与增强（尺寸归一化 + 灰度 CLAHE + 锐化）。
     # 关掉则把渲染出的原始位图直接送进引擎（旧行为）。
     rag_ocr_preprocess: bool = True

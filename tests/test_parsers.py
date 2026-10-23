@@ -1,7 +1,9 @@
-"""Tests for document parsers (OCR singleton lifecycle)."""
+"""Tests for document parsers (OCR engine pool lifecycle)."""
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import types
 
 import pytest
@@ -10,9 +12,13 @@ from agent.rag import parsers
 
 
 def _reset_ocr_state():
-    """Reset the module-level OCR singleton so tests start clean."""
-    parsers._OCR_ENGINE = None
-    parsers._OCR_RETRY_AFTER = 0.0
+    """Reset the module-level OCR engine pool so tests start clean."""
+    with parsers._OCR_ENGINE_COND:
+        parsers._OCR_ENGINE_IDLE.clear()
+        parsers._OCR_ENGINE_LIVE = 0
+        parsers._OCR_ENGINE_GEN = 0
+        parsers._OCR_RETRY_AFTER = 0.0
+        parsers._OCR_POOL_SIZE = 2
 
 
 def _fake_rapidocr_module():
@@ -65,51 +71,97 @@ def _install_fake_ocr(monkeypatch):
     return mod3
 
 
-def test_ocr_engine_is_singleton(monkeypatch):
-    """Repeated _get_ocr_engine() returns the same instance."""
+# ---------------------------------------------------------------------------
+# 引擎池（2026-10-23：2 实例纯 CPU 并发）
+# ---------------------------------------------------------------------------
+
+def test_pool_hands_out_distinct_engines(monkeypatch):
+    """池内可同时借出多个**不同**实例（并发 OCR 的前提）。"""
     _reset_ocr_state()
     mod = _install_fake_ocr(monkeypatch)
 
-    e1 = parsers._get_ocr_engine()
-    e2 = parsers._get_ocr_engine()
-    assert e1 is not None
-    assert e1 is e2
-    # Only one RapidOCR instance was constructed.
-    assert mod.RapidOCR.instances == 1
-
-
-def test_release_ocr_engine_reclaims_and_recreates(monkeypatch):
-    """release_ocr_engine() drops the singleton; next get recreates it."""
-    _reset_ocr_state()
-    mod = _install_fake_ocr(monkeypatch)
-
-    e1 = parsers._get_ocr_engine()
-    assert e1 is not None
-
-    parsers.release_ocr_engine()
-    assert parsers._OCR_ENGINE is None
-
-    e2 = parsers._get_ocr_engine()
-    assert e2 is not None
-    assert e2 is not e1
-    # A fresh instance was constructed after release.
+    e1, g1 = parsers._acquire_ocr_engine()
+    e2, g2 = parsers._acquire_ocr_engine()
+    assert e1 is not None and e2 is not None
+    assert e1 is not e2                      # 两个独立实例
     assert mod.RapidOCR.instances == 2
+    parsers._return_ocr_engine(e1, g1)
+    parsers._return_ocr_engine(e2, g2)
+
+
+def test_pool_exhaustion_times_out(monkeypatch):
+    """池被占满后借用超时返回 None（不永久挂起）。"""
+    _reset_ocr_state()
+    _install_fake_ocr(monkeypatch)
+
+    held = [parsers._acquire_ocr_engine() for _ in range(2)]
+    assert all(e is not None for e, _ in held)
+    t0 = time.monotonic()
+    engine, _gen = parsers._acquire_ocr_engine(timeout=0.2)
+    assert engine is None                    # 超时 → None
+    assert time.monotonic() - t0 < 2.0       # 确实没等更久
+    for e, g in held:
+        parsers._return_ocr_engine(e, g)
+
+
+def test_return_wakes_waiter(monkeypatch):
+    """归还要唤醒等待中的借用者（条件变量，不是轮询）。"""
+    _reset_ocr_state()
+    _install_fake_ocr(monkeypatch)
+
+    e1, g1 = parsers._acquire_ocr_engine()
+    e2, g2 = parsers._acquire_ocr_engine()      # 池占满
+    got = {}
+
+    def _borrow():
+        got["engine"], got["gen"] = parsers._acquire_ocr_engine(timeout=5)
+
+    t = threading.Thread(target=_borrow)
+    t.start()
+    time.sleep(0.1)                             # 确保已在条件变量上等待
+    parsers._return_ocr_engine(e1, g1)          # 归还 → 等待者立刻拿到
+    t.join(timeout=5)
+    assert got.get("engine") is e1              # 复用同一实例（空闲栈）
+    parsers._return_ocr_engine(got["engine"], got["gen"])
+    parsers._return_ocr_engine(e2, g2)
+
+
+def test_release_drops_idle_only_and_recreates(monkeypatch):
+    """release 只丢空闲实例；借出中的归还时按代数淘汰（不缩水池）。"""
+    _reset_ocr_state()
+    mod = _install_fake_ocr(monkeypatch)
+
+    e1, g1 = parsers._acquire_ocr_engine()
+    e2, g2 = parsers._acquire_ocr_engine()
+    assert mod.RapidOCR.instances == 2
+    parsers.release_ocr_engine()             # 两个都在借出中 → 无可释放
+    assert parsers._OCR_ENGINE_IDLE == []
+    assert parsers._OCR_ENGINE_LIVE == 2     # 计数不被整池归零
+    # 借出中的实例归还 → 旧代淘汰（不回流、计数减一）
+    parsers._return_ocr_engine(e1, g1)
+    assert parsers._OCR_ENGINE_IDLE == []
+    assert parsers._OCR_ENGINE_LIVE == 1
+    # 下一次借用新建一个（池未满）
+    e3, g3 = parsers._acquire_ocr_engine()
+    assert e3 is not None and e3 is not e1
+    assert mod.RapidOCR.instances == 3
+    parsers._return_ocr_engine(e2, g2)
+    parsers._return_ocr_engine(e3, g3)
 
 
 def test_release_ocr_engine_when_not_loaded(monkeypatch):
-    """Releasing when the engine was never loaded is a safe no-op."""
+    """Releasing when the pool was never used is a safe no-op."""
     _reset_ocr_state()
     parsers.release_ocr_engine()
-    assert parsers._OCR_ENGINE is None
+    assert parsers._OCR_ENGINE_IDLE == []
+    assert parsers._OCR_ENGINE_LIVE == 0
 
 
-def test_get_ocr_engine_returns_none_when_missing(monkeypatch):
+def test_acquire_returns_none_when_missing(monkeypatch):
     """Missing rapidocr dependency returns None (caller skips OCR)."""
     _reset_ocr_state()
-    # Simulate ImportError by removing both module entries.
     monkeypatch.delitem(sys.modules, "rapidocr", raising=False)
     monkeypatch.delitem(sys.modules, "rapidocr_onnxruntime", raising=False)
-    # Force a fresh import attempt by patching the import to raise.
     import builtins
     real_import = builtins.__import__
 
@@ -119,8 +171,55 @@ def test_get_ocr_engine_returns_none_when_missing(monkeypatch):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _fake_import)
-    assert parsers._get_ocr_engine() is None
-    assert parsers._OCR_ENGINE is None
+    engine, _gen = parsers._acquire_ocr_engine()
+    assert engine is None
+    # 失败不占池位（下次还能重试）
+    assert parsers._OCR_ENGINE_LIVE == 0
+
+
+def test_pool_builds_cpu_ep_even_when_coreml_requested(monkeypatch):
+    """引擎池固定纯 CPU EP——即使配置里请求了 CoreML（并发翻倍爬升）。"""
+    _reset_ocr_state()
+    mod3 = _fake_rapidocr3_module()
+    monkeypatch.setitem(sys.modules, "rapidocr", mod3)
+    monkeypatch.setattr(parsers, "_is_apple_silicon", lambda: True)
+    monkeypatch.setattr(parsers, "_OCR_CONFIG",
+                        types.SimpleNamespace(rag_ocr_coreml=True))
+    seen = {}
+    _orig_init = mod3.RapidOCR.__init__
+
+    def _spy_init(self, params=None, config_path=None):
+        seen["params"] = params
+        _orig_init(self, params=params, config_path=config_path)
+
+    monkeypatch.setattr(mod3.RapidOCR, "__init__", _spy_init)
+    engine, _gen = parsers._acquire_ocr_engine()
+    assert engine is not None
+    assert seen["params"] is None             # 没有注入 CoreML 开关
+    parsers._return_ocr_engine(engine, _gen)
+
+
+def test_set_ocr_pool_size_shrink_drops_idle(monkeypatch):
+    """调小池大小立刻丢弃多出来的空闲实例。"""
+    _reset_ocr_state()
+    _install_fake_ocr(monkeypatch)
+    engines = [parsers._acquire_ocr_engine() for _ in range(2)]
+    for e, g in engines:
+        parsers._return_ocr_engine(e, g)
+    assert len(parsers._OCR_ENGINE_IDLE) == 2
+    parsers.set_ocr_pool_size(1)
+    assert len(parsers._OCR_ENGINE_IDLE) == 1  # 多出的被丢弃
+    assert parsers._OCR_POOL_SIZE == 1
+    parsers.set_ocr_pool_size(2)
+
+
+def test_set_ocr_config_injects_pool_size(monkeypatch):
+    """set_ocr_config 把 rag_ocr_pool_size 注入引擎池。"""
+    _reset_ocr_state()
+    parsers.set_ocr_config(types.SimpleNamespace(
+        rag_ocr_coreml=False, rag_ocr_pool_size=3))
+    assert parsers._OCR_POOL_SIZE == 3
+    parsers.set_ocr_pool_size(2)
 
 
 def test_build_ocr_engine_prefers_rapidocr3(monkeypatch):

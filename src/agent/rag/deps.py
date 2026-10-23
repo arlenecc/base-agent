@@ -507,7 +507,7 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
         report.has_image_pdf = has_images
         # Check if OCR is installed.
         # 新版 rapidocr (3.x) 与旧版 rapidocr-onnxruntime (1.x) 任一可用即可，
-        # 引擎选择见 parsers._get_ocr_engine。
+        # 引擎选择见 parsers._build_ocr_engine（引擎池，2026-10-23）。
         report.ocr_installed = (_is_importable("rapidocr")
                                 or _is_importable("rapidocr_onnxruntime"))
         if has_images and not report.ocr_installed:

@@ -393,8 +393,8 @@ def extract_scanned_epub(path: str, book=None) -> Optional[str]:
     from urllib.parse import unquote
     from bs4 import BeautifulSoup
     from .ocr_engine import decode_image, preprocess_for_ocr
-    from .parsers import (_OCR_ACQUIRE_TIMEOUT, _OCR_SEMAPHORE,
-                          _get_ocr_engine, _ocr_image_cached)
+    from .parsers import (_acquire_ocr_engine, _ocr_image_cached,
+                          _return_ocr_engine)
 
     href_map = _manifest_href_map(path)
     if book is None:
@@ -404,9 +404,11 @@ def extract_scanned_epub(path: str, book=None) -> Optional[str]:
     logger.info("EPUB '%s' 判定为扫描版（整页图片 + 极少文本），走逐页 OCR",
                 os.path.basename(path))
 
-    # engine 可能为 None（RapidOCR 未安装）：ocrmac 可用时仍能完整识别，
+    # engine 可能为 None（rapidocr 未安装）：ocrmac 可用时仍能完整识别，
     # 只有 ocrmac 也不可用时 _ocr_image_cached 内部才会失败并逐页返回 ""。
-    engine = _get_ocr_engine()
+    # 不再整书持有单个引擎——逐页从引擎池借用/归还（池内 2 个纯 CPU 实例，
+    # 2026-10-23），扫描版 EPUB 之间已由 _SCANNED_EPUB_GATE 串行，这里与
+    # PDF 路径公平分享池内的实例。
     # 图片 item 收集：ebooklib 的 get_items_of_type(ITEM_IMAGE) 依赖 item 的
     # type 属性，部分制作工具产出的图片 item 类型不全（实测 4 张图只回收 1
     # 张）。以 media_type 为主 + type 兜底全量扫一遍并去重。
@@ -460,19 +462,19 @@ def extract_scanned_epub(path: str, book=None) -> Optional[str]:
                 continue
             page_no += 1
             norm = preprocess_for_ocr(arr)
-            # 与 PDF 兜底路径共用同一把 OCR 信号量（**逐页**粒度）：保护共享的
-            # 引擎单例不被两个线程同时调用。超时（300s）跳过该页而不是永久挂起。
-            # 注意：扫描版**之间**的串行由 extract_ebook 的 _SCANNED_EPUB_GATE
-            # 负责，这里只防「扫描版 EPUB 与图片型 PDF 兜底路径」撞车。
-            if not _OCR_SEMAPHORE.acquire(timeout=_OCR_ACQUIRE_TIMEOUT):
+            # 逐页从引擎池借用（与 PDF 兜底路径同一把池）：池空时最多等
+            # _OCR_ACQUIRE_TIMEOUT，超时跳过该页而不是永久挂起。
+            # 扫描版**之间**的串行由 extract_ebook 的 _SCANNED_EPUB_GATE 负责。
+            engine, _gen = _acquire_ocr_engine()
+            if engine is None:
                 logger.warning(
-                    "扫描版 EPUB '%s' 第 %d 页 OCR 信号量等待超 %ss，跳过该页",
-                    fname, page_no, _OCR_ACQUIRE_TIMEOUT)
+                    "扫描版 EPUB '%s' 第 %d 页借不到 OCR 引擎，跳过该页",
+                    fname, page_no)
                 continue
             try:
                 txt = _ocr_image_cached(engine, norm, page_no, fname)
             finally:
-                _OCR_SEMAPHORE.release()
+                _return_ocr_engine(engine, _gen)
             if txt and txt.strip():
                 parts.append(txt)
             if page_no % 25 == 0:

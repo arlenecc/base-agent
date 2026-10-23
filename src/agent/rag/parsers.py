@@ -19,23 +19,121 @@ from typing import Iterator, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 全局 OCR 引擎（单例）+ 并发信号量
+# 全局 OCR 引擎池 + 借用/归还
 # ---------------------------------------------------------------------------
-# RapidOCR ONNX Runtime 单实例约 500MB 内存。如果每个 worker 各加载一份，
-# 4 worker 同时遇到图片 PDF 时会占用 ~2GB 仅仅用于 OCR 模型。
-# 改为全局单例：所有 worker 共享同一个引擎实例，通过信号量串行执行
-# （RapidOCR 可能非线程安全，串行调用 engine(img) 避免竞态）。
-_OCR_SEMAPHORE = threading.Semaphore(1)
-# 等待 OCR 信号量的上限。单页 OCR 正常远小于此；只有卡死才会走到超时，
-# 此时跳过该页而不是让所有 worker 永久挂起。
+# RapidOCR 单实例常驻约 0.5GB（CPU EP：权重 ~0.3GB + ORT 会话杂项）。
+# 旧实现是「单实例 + Semaphore(1) 全程串行」——ocrmac（Apple Vision）对繁体
+# 竖排/低质量页常识别不了，_ocr_image_cached 会把整页透传到 RapidOCR，实测
+# 透传请求占比不低，串行 OCR 直接成为扫描书解析的吞吐瓶颈。
+#
+# 2026-10-23 用户定版：启用 2 个实例、**纯 CPU EP** 并发服务。
+# - 为什么纯 CPU：CoreML EP 单实例基线就 ~1.7GB 且按输入形状保留原生缓存
+#   （实测 ~67MB/页，182 页推到 5GB 峰值），两份并发会把这个问题翻倍；
+#   CPU EP 的 arena 增量实测为 0，且同一本书还更快（172.6s vs 282.0s）、
+#   输出一字不差。
+# - 2 × ~0.5GB ≈ 1GB 常驻，16GB 机器可接受。与 docling/marker 的单实例思路
+#   不冲突——那两个是「单实例就要 3-4.6GB」，OCR 是「0.5GB 但请求密集」。
+# - 引擎非线程安全：池保证任意时刻一个实例只被一个线程使用（借出/归还）。
+#
+# 池大小可经 config.rag_ocr_pool_size 注入（默认 2；设 1 即退化为串行）。
+_OCR_POOL_SIZE = 2
+_OCR_ENGINE_IDLE: List[Any] = []      # 空闲实例栈
+_OCR_ENGINE_LIVE = 0                  # 存活实例数（含借出）
+_OCR_ENGINE_LOCK = threading.Lock()   # 池状态锁（由 Cond 持有）
+_OCR_ENGINE_COND = threading.Condition(_OCR_ENGINE_LOCK)
+_OCR_ENGINE_GEN = 0                   # 代数：release 时 +1，旧代归还即淘汰
+_OCR_RETRY_AFTER = 0.0                # 加载失败负缓存截止（monotonic）
+_OCR_RETRY_TTL = 60.0                 # 加载失败后的冷却时长（秒）
+# 借用等待上限。单页 OCR 正常远小于此；只有卡死/池被长任务占满才会走到
+# 超时，此时跳过该页而不是让所有 worker 永久挂起。
 _OCR_ACQUIRE_TIMEOUT = 300.0
-_OCR_ENGINE = None  # 全局单例；None 表示尚未尝试加载
-_OCR_ENGINE_LOCK = threading.Lock()
-# 初始化失败后的冷却截止时间（monotonic）。已安装但加载失败（模型下载
-# 不了 / ONNX 会话建不起来）时，负缓存避免每个图片型 PDF 都重试一次
-# 完整加载（每次都要跑一遍可能耗时数分钟的下载尝试）。
-_OCR_RETRY_AFTER = 0.0
-_OCR_RETRY_COOLDOWN = 60.0
+
+
+def set_ocr_pool_size(size: int) -> None:
+    """注入 OCR 引擎池大小（config.rag_ocr_pool_size，默认 2）。
+
+    调小会立刻丢弃多出来的空闲实例（借出中的归还时若超出新上限同样淘汰）；
+    调大只放宽上限，实例按需惰性创建。
+    """
+    global _OCR_POOL_SIZE
+    n = max(1, int(size or 1))
+    with _OCR_ENGINE_COND:
+        _OCR_POOL_SIZE = n
+        while len(_OCR_ENGINE_IDLE) > n:
+            _OCR_ENGINE_IDLE.pop()
+        _OCR_ENGINE_COND.notify_all()
+    logger.info("RapidOCR 引擎池大小设为 %d（纯 CPU EP）", n)
+
+
+def _acquire_ocr_engine(timeout: float = _OCR_ACQUIRE_TIMEOUT):
+    """借一个引擎，返回 ``(engine, gen)``；engine 为 None 时 gen 无意义。
+
+    None 的三种情况：rapidocr 未安装（ImportError）、加载失败且处于负缓存
+    冷却期、等待超时（池被占满）。调用方必须配对调用
+    ``_return_ocr_engine(engine, gen)``（engine 非 None 时）。
+
+    池未满时新建实例——**锁外构建**（~1-2s），持锁构建会把别人的归还/借用
+    全部堵住。
+    """
+    global _OCR_ENGINE_LIVE, _OCR_RETRY_AFTER
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _OCR_ENGINE_COND:
+        if _OCR_RETRY_AFTER and time.monotonic() < _OCR_RETRY_AFTER:
+            return None, 0
+        while True:
+            if _OCR_ENGINE_IDLE:
+                return _OCR_ENGINE_IDLE.pop(), _OCR_ENGINE_GEN
+            if _OCR_ENGINE_LIVE < _OCR_POOL_SIZE:
+                _OCR_ENGINE_LIVE += 1     # 先占位，锁外构建
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, 0
+            _OCR_ENGINE_COND.wait(remaining)
+    # ---- 锁外构建 ----
+    try:
+        engine = _build_ocr_engine(use_coreml=False)
+        _warmup_ocr_engine(engine)
+        logger.info("RapidOCR 引擎已加载（池 %d/%d，纯 CPU EP）",
+                    _OCR_ENGINE_LIVE, _OCR_POOL_SIZE)
+        return engine, _OCR_ENGINE_GEN
+    except ImportError:
+        with _OCR_ENGINE_COND:
+            _OCR_ENGINE_LIVE -= 1
+            _OCR_ENGINE_COND.notify()
+        logger.warning(
+            "rapidocr is required for OCR on image-based PDFs. "
+            "pip install rapidocr-onnxruntime"
+        )
+        return None, 0
+    except Exception as e:
+        with _OCR_ENGINE_COND:
+            _OCR_ENGINE_LIVE -= 1
+            _OCR_RETRY_AFTER = time.monotonic() + _OCR_RETRY_TTL
+            _OCR_ENGINE_COND.notify()
+        logger.warning("RapidOCR 引擎加载失败（%ds 内不重试）: %s",
+                       _OCR_RETRY_TTL, e)
+        return None, 0
+
+
+def _return_ocr_engine(engine, gen: int) -> None:
+    """归还借出的引擎（None 时 no-op——未安装/加载失败的页不占池）。
+
+    ``gen`` 是借用时拿到的代数：若期间发生过 release（代数 +1），该实例属于
+    旧代，直接淘汰而不回流——这正是周期重建/内存护栏冲刷原生缓存生效的
+    机制（旧实现「全局置 None」对池化后同样必须可见）。
+    """
+    if engine is None:
+        return
+    global _OCR_ENGINE_LIVE
+    with _OCR_ENGINE_COND:
+        if gen < _OCR_ENGINE_GEN:
+            _OCR_ENGINE_LIVE = max(0, _OCR_ENGINE_LIVE - 1)
+            logger.debug("RapidOCR: 旧代引擎归还即淘汰（冲刷原生缓存）")
+        else:
+            _OCR_ENGINE_IDLE.append(engine)
+        _OCR_ENGINE_COND.notify()
+
 
 # OCR 引擎周期性重建页数。CoreML/ORT 的原生缓存按输入形状保留（实测真实
 # 扫描页 ~35MB/页，#119：400 页扫描书滞留 ~14GB，进程退出前不释放，最终
@@ -114,13 +212,16 @@ def _ocr_coreml_requested() -> bool:
 
 
 def set_ocr_config(config) -> None:
-    """让解析层感知 AgentConfig（决定是否启用 CoreML EP / 预处理）。
+    """让解析层感知 AgentConfig（CoreML EP / 预处理 / 引擎池大小）。
 
-    引擎是进程级单例且可能已被创建，所以这里只影响**后续**创建的引擎；
-    调用方若需要立刻生效，应先 :func:`release_ocr_engine`。
+    引擎可能已被创建，所以这里只影响**后续**创建的引擎与池上限；调用方若需要
+    立刻生效，应先 :func:`release_ocr_engine`。
     """
     global _OCR_CONFIG
     _OCR_CONFIG = config
+    size = getattr(config, "rag_ocr_pool_size", None)
+    if size is not None:
+        set_ocr_pool_size(size)
 
 # ---------------------------------------------------------------------------
 # Format → extension mapping
@@ -419,26 +520,16 @@ def _extract_pdf(path: Path) -> str:
             # 无超时的 acquire 在这里是个隐患：单页 OCR 卡死（ONNX 死锁 /
             # 病态大图）时，所有 ingest worker 连同它们的 daemon 线程一起永久
             # 挂起，用户侧表现为「同步进度再也不动且没有任何报错」。
-            # 加一个宽松的超时，拿不到就跳过该页并计数。
-            if not _OCR_SEMAPHORE.acquire(timeout=_OCR_ACQUIRE_TIMEOUT):
+            # 池化后（2026-10-23，2 实例纯 CPU 并发）：借的是「一个引擎实例」
+            # 而不是一把全局锁——两个 worker 可同时各借一个真并发 OCR。
+            ocr_engine, _ocr_gen = _acquire_ocr_engine()
+            if ocr_engine is None:
+                ocr_unavailable = True
                 ocr_skipped_count += 1
-                logger.warning(
-                    "RAG: OCR 信号量等待超过 %ss，跳过第 %d 页 (%s)",
-                    _OCR_ACQUIRE_TIMEOUT, page_num + 1, path.name,
-                )
                 continue
             try:
-                # 每页从进程级单例取引擎，页末即释放局部引用（#123）。
-                # 旧实现把引擎缓存在 worker 的循环级局部变量里：周期回收
-                # （release + 全局置 None）只影响触发回收的 worker，其它
-                # worker 仍抱着旧引擎继续用——最多 4 代引擎的原生缓存并存
-                # （每代 ~1-2GB），回收形同虚设，实测内存仍涨到 16GB。
-                # 每页取用后，任意时刻至多一代引擎存活，回收立即全局生效。
-                ocr_engine = _get_ocr_engine()
-                if ocr_engine is None:
-                    ocr_unavailable = True
-                    ocr_skipped_count += 1
-                    continue
+                # 每页借用、页末归还（#123）：周期回收/内存护栏会把「旧代」
+                # 实例在归还时淘汰，任意时刻至多 _OCR_POOL_SIZE 代存活。
                 if ocr_rss_base is None:
                     # 引擎已加载后再取基线：OCR 模型自身的占用不算进预算，
                     # 之后每页新增的原生缓存才算。
@@ -479,7 +570,8 @@ def _extract_pdf(path: Path) -> str:
                 ocr_text = _ocr_image_cached(ocr_engine, image_for_ocr,
                                              page_num + 1, path.name)
             finally:
-                _OCR_SEMAPHORE.release()
+                # 归还实例（旧代则淘汰——冲刷原生缓存的机制所在）
+                _return_ocr_engine(ocr_engine, _ocr_gen)
 
             if ocr_text:
                 parts.append(ocr_text)
@@ -586,60 +678,16 @@ def _extract_pdf(path: Path) -> str:
     return "\n\n".join(parts)
 
 
-def _get_ocr_engine():
-    """Lazy-load RapidOCR engine as a global singleton.
+def _build_ocr_engine(use_coreml: Optional[bool] = None):
+    """按可用性构造 RapidOCR 引擎：3.x 优先，1.x 回退。
 
-    Returns None if not installed. All workers share the same engine instance
-    (~500MB) — without this, 4 workers loading 4 instances would OOM. The
-    _OCR_SEMAPHORE serializes actual OCR calls so the shared engine is only
-    invoked by one thread at a time.
-
-    引擎选择：优先 rapidocr 3.x（支持 CoreML EP、模型目录与 docling 共享、
-    懒加载省内存），未安装再回退旧版 rapidocr-onnxruntime 1.x（经
-    :mod:`agent.rag.ocr_engine` 注入 CoreML EP）。Apple Silicon（M 系列）上
-    3.x 启用 onnxruntime 的 CoreML EP（ANE+GPU 推理）；CoreML 初始化失败
-    自动回退 CPU EP。两种版本都会预热一次（空图）——模型本来马上就会被用到，
-    预热同时消除首页 OCR 的加载延迟并探测实际生效的 EP。
+    ``use_coreml=None`` 时跟随配置（``rag_ocr_coreml``）与内存护栏
+    （``_OCR_FORCE_CPU``）；**引擎池固定传 False**（纯 CPU EP）——并发实例下
+    CoreML 的按形状原生缓存会翻倍爬升，见模块头注释。
     """
-    global _OCR_ENGINE, _OCR_RETRY_AFTER
-    if _OCR_ENGINE is not None:
-        return _OCR_ENGINE
-    with _OCR_ENGINE_LOCK:
-        if _OCR_ENGINE is not None:
-            return _OCR_ENGINE
-        # 冷却期内不重试：持续失败的加载（模型下载不了）不该每个文件
-        # 都重新触发一遍。到期后放行一次，网络恢复后能自愈。
-        if time.monotonic() < _OCR_RETRY_AFTER:
-            return None
-        try:
-            _OCR_ENGINE = _build_ocr_engine()
-            _warmup_ocr_engine(_OCR_ENGINE)
-            logger.info("RapidOCR engine loaded (global singleton)")
-            return _OCR_ENGINE
-        except ImportError:
-            logger.warning(
-                "rapidocr is required for OCR on image-based PDFs. "
-                "pip install rapidocr"
-            )
-            return None
-        except Exception as e:
-            logger.warning("Failed to init RapidOCR: %s", e)
-            _OCR_RETRY_AFTER = time.monotonic() + _OCR_RETRY_COOLDOWN
-            return None
-
-
-def _build_ocr_engine():
-    """按可用性构造 RapidOCR 引擎：3.x 优先，1.x 回退（均带 CoreML 加速）。
-
-    ``_OCR_FORCE_CPU`` 置位后（内存护栏判定 CoreML 缓存不可控）一律走 CPU EP，
-    无论配置里 ``rag_ocr_coreml`` 是什么——配置是「请求」，护栏是「否决」。
-    """
-    # getattr 的兜底必须与 AgentConfig.rag_ocr_coreml 的默认值（False）一致：
-    # _OCR_CONFIG 未注入时（如直接调用 _extract_with_docling 的脚本路径）
-    # 兜底 True 会把 CoreML 意外打开——实测 CoreML EP 比 CPU 慢约 2 倍
-    # （3 页 4.95s vs 2.43s），见 AgentConfig.rag_ocr_coreml 注释。
-    use_coreml = (bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", False))
-                  and not _OCR_FORCE_CPU)
+    if use_coreml is None:
+        use_coreml = (bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", False))
+                      and not _OCR_FORCE_CPU)
     params = None
     try:
         from rapidocr import RapidOCR  # 3.x
@@ -694,24 +742,25 @@ def _warmup_ocr_engine(engine) -> None:
 
 
 def release_ocr_engine() -> None:
-    """Release the global OCR singleton to reclaim its ~500MB memory.
+    """丢弃全部**空闲**实例，回收其 ~0.5GB/个 的原生堆。
 
-    The RapidOCR engine holds an ONNX Runtime inference session (~500MB of
-    native heap) that Python GC cannot reclaim promptly.  GUI apps that OCR
-    image-based PDFs would otherwise hold this memory until process exit.
-    Call this from RAGEngine.close() after a sync finishes; the engine is
-    lazily re-created on the next OCR-requiring ingestion.
+    借出中的实例不强行回收：它们归还时按「代数」机制自然淘汰（见
+    ``_return_ocr_engine``）——与 docling 池同款教训：把存活计数整池归零，
+    会让借出实例归还后计数不再恢复，池大小永久缩水。
+
+    同时清掉负缓存冷却：显式释放意味着调用方要求「可重新加载」，残留冷却会
+    让下一次 ingest 在冷却期内直接跳过 OCR。
     """
-    global _OCR_ENGINE, _OCR_RETRY_AFTER
-    with _OCR_ENGINE_LOCK:
-        if _OCR_ENGINE is not None:
-            # RapidOCR wraps an onnxruntime InferenceSession.  Drop the
-            # reference so the session's C++ heap is freed on GC.
-            _OCR_ENGINE = None
-            # 同时清掉负缓存冷却：显式释放意味着调用方要求「可重新加载」，
-            # 残留冷却会让下一次 ingest 在冷却期内直接跳过 OCR。
-            _OCR_RETRY_AFTER = 0.0
-            logger.info("RapidOCR engine released (memory reclaimed)")
+    global _OCR_ENGINE_LIVE, _OCR_ENGINE_GEN, _OCR_RETRY_AFTER
+    with _OCR_ENGINE_COND:
+        dropped = len(_OCR_ENGINE_IDLE)
+        _OCR_ENGINE_IDLE.clear()
+        _OCR_ENGINE_LIVE = max(0, _OCR_ENGINE_LIVE - dropped)
+        _OCR_ENGINE_GEN += 1          # 借出中的实例归还时即被淘汰
+        _OCR_RETRY_AFTER = 0.0
+        _OCR_ENGINE_COND.notify_all()
+    if dropped:
+        logger.info("RapidOCR: 释放 %d 个空闲引擎实例（各 ~0.5GB）", dropped)
 
 
 # ocrmac 输出低于该字符数视为「疑似识别困难」——繁体竖排、艺术字体等
