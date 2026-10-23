@@ -465,3 +465,150 @@ def test_factory_passes_kv_reuse_and_aux_disabled():
     assert main._kv_reuse is False
     aux = build_aux_llm_client(cfg)
     assert aux._kv_reuse is False
+
+
+# ---------------------------------------------------------------------------
+# ONNX 后端（2026-10-24 核查：LLM 路径 + tokenizer 兼容）
+# ---------------------------------------------------------------------------
+
+def test_hf_tokenizer_prefers_the_usable_object():
+    """按「能力」取值：transformers tokenizer 本身可用就不取内层 Rust 对象。
+
+    旧实现照搬 MLX 的 ``getattr(tok, "tokenizer", tok)``：ONNX 路径会拿到
+    Rust tokenizers.Tokenizer（不可调用、无 apply_chat_template）→ 实测
+    reranker TypeError、LLM AttributeError。
+    """
+    from agent.local.tokenizer_compat import hf_tokenizer as _hf_tok
+
+    class Inner:                      # 模拟 Rust Tokenizer：不可调用
+        def decode(self, x): return ""
+        def apply_chat_template(self, *a, **k): return ""
+
+    class Fast:                       # 模拟 transformers fast tokenizer
+        def __init__(self): self.tokenizer = Inner()
+        def __call__(self, text, **k): return {"input_ids": [[1]]}
+        def decode(self, x): return "ok"
+        def apply_chat_template(self, *a, **k): return "p"
+
+    class Wrapper:                    # 模拟 mlx_lm TokenizerWrapper
+        def __init__(self): self.tokenizer = Fast()
+
+    fast = Fast()
+    assert _hf_tok(fast) is fast          # 本身可用 → 用它（不是内层 Rust 对象）
+    w = Wrapper()
+    assert _hf_tok(w) is w.tokenizer      # wrapper 不可用 → 取内层可用对象
+    assert _hf_tok(None) is None
+
+
+def test_sample_clamps_top_k_to_vocab_size():
+    """top_k 超过词表大小时不能 IndexError（小模型/裁剪 logits 会命中）。"""
+    import numpy as np
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="onnx", top_k=20, temperature=0.0)
+    small = np.zeros(8, dtype=np.float32)
+    small[3] = 1.0
+    # 温度 0 → argmax；top_k=20 > 词表 8，旧实现 IndexError
+    assert c._sample(small) == 3
+
+
+def _build_fake_onnx_decoder(path):
+    """构造一个「decoder + past」形状的最小 ONNX 图（真实 ORT 可加载）。"""
+    import onnx
+    from onnx import helper, TensorProto
+    V = 64
+    inp = [
+        helper.make_tensor_value_info("input_ids", TensorProto.INT64, ["B", "S"]),
+        helper.make_tensor_value_info("attention_mask", TensorProto.INT64, ["B", "T"]),
+        helper.make_tensor_value_info("past_key_values.0.key",
+                                      TensorProto.FLOAT, ["B", "H", "P", "D"]),
+        helper.make_tensor_value_info("past_key_values.0.value",
+                                      TensorProto.FLOAT, ["B", "H", "P", "D"]),
+    ]
+    out = [
+        helper.make_tensor_value_info("logits", TensorProto.FLOAT, ["B", "S", "V"]),
+        helper.make_tensor_value_info("present.0.key", TensorProto.FLOAT, ["B", "H", "T2", "D"]),
+        helper.make_tensor_value_info("present.0.value", TensorProto.FLOAT, ["B", "H", "T2", "D"]),
+    ]
+    const = helper.make_tensor("c", TensorProto.FLOAT, [1, 1, V],
+                               [0.0] * (V - 1) + [1.0])
+    nodes = [
+        helper.make_node("Identity", ["past_key_values.0.key"], ["present.0.key"]),
+        helper.make_node("Identity", ["past_key_values.0.value"], ["present.0.value"]),
+        helper.make_node("Constant", [], ["logits"], value=const),
+    ]
+    m = helper.make_model(helper.make_graph(nodes, "fake_decoder", inp, out),
+                          opset_imports=[helper.make_opsetid("", 13)])
+    m.ir_version = 8
+    onnx.save(m, path)
+
+
+def test_stream_onnx_runs_with_real_ort_session(tmp_path, monkeypatch):
+    """ONNX LLM 端到端：真实 ORT 会话 + 真实 HF tokenizer。
+
+    覆盖 2026-10-24 修掉的几个必崩点：
+      * 必需输入 past_key_values.* 在首轮必须喂「空 past」；
+      * attention_mask 必须按会话声明喂（覆盖 past+new 全长）；
+      * logits / past 不能用 ``or`` 取（数组求真值会抛 ambiguous）；
+      * _onnx_prompt_ids 必须含**已生成** token，否则下轮历史被重复计入。
+    """
+    import shutil
+    onnx_file = tmp_path / "model.onnx"
+    _build_fake_onnx_decoder(str(onnx_file))
+    # 借用本地 MLX 模型的 tokenizer（带 chat template），避免联网
+    src = os.path.join(MODELS, "qwen3.5-4b-agentic-coder-v4-4bit-mlx")
+    if os.path.isdir(src):
+        for f in os.listdir(src):
+            # chat template 可能在 chat_template.jinja 里（名字不含 token）
+            if f.endswith((".json", ".txt", ".jinja")) and not f.endswith(".safetensors"):
+                shutil.copy(os.path.join(src, f), tmp_path)
+
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient(str(tmp_path), backend="onnx", max_tokens=5, top_k=20)
+    c._ensure_model()
+    names = [i.name for i in c._session.get_inputs()]
+    assert "attention_mask" in names
+    assert any(n.startswith("past_key_values") for n in names)
+
+    msgs = [{"role": "system", "content": "你是助手"}, {"role": "user", "content": "你好"}]
+    raw = ""
+    for ev in c.chat_stream(msgs, tools=None, temperature=0.0):
+        if ev.type == "done":
+            raw = ev.raw_content or ""
+    # prompt(≈18) + 生成(5) —— 只记 prompt 段会让下轮 KV 错位
+    assert len(c._onnx_prompt_ids) > 5
+    assert getattr(c, "_onnx_kv_len", 0) > 0
+    assert isinstance(raw, str)
+
+    # 第二轮用 raw_content 续接：past 应被复用（不重建）
+    before = dict(c._past)
+    msgs2 = msgs + [{"role": "assistant", "content": "好的", "raw_content": raw},
+                    {"role": "user", "content": "继续"}]
+    for _ in c.chat_stream(msgs2, tools=None, temperature=0.0):
+        pass
+    assert len(c._past) == len(before)      # past 条目数不变（复用而非重建）
+
+    c.invalidate_kv_cache()
+    assert c._past == {} and c._onnx_prompt_ids is None and c._onnx_kv_len == 0
+
+
+def test_onnx_reranker_real_weights_load_and_score():
+    """真实 ONNX 权重（bge-reranker-base-ONNX）能加载并给出合理排序。
+
+    这条是 ONNX 支持里唯一有本地权重的路径；LLM 的 ONNX 路径由上面的
+    构造型 ORT 会话测试覆盖。
+    """
+    p = os.path.join(MODELS, "bge-reranker-base-ONNX")
+    if not os.path.isdir(p):
+        pytest.skip("bge-reranker-base-ONNX 权重未就位")
+    from agent.local.reranker import LocalReranker
+    rk = LocalReranker(p, backend="onnx")
+    try:
+        scores = rk.rerank(
+            "如何做番茄炒蛋",
+            ["番茄炒蛋需要鸡蛋和番茄", "量子计算原理介绍", "番茄炒蛋的详细步骤"],
+        )
+        assert len(scores) == 3
+        # 相关项应高于无关项
+        assert scores[0] > scores[1] and scores[2] > scores[1]
+    finally:
+        rk.close()

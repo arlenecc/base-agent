@@ -676,8 +676,12 @@ class LocalLLMClient:
         self._session = ort.InferenceSession(
             onnx_path, sess_options=so, providers=["CPUExecutionProvider"]
         )
+        # trust_remote_code=True：带自定义 tokenizer 代码的模型目录（如 jina 系）
+        # 否则会弹交互式确认——GUI 里没有 stdin，input() 直接 EOFError/卡死。
+        # 与 MLX 路径（load(..., trust_remote_code=True)）保持一致的取舍。
         self._tokenizer = AutoTokenizer.from_pretrained(
-            self._path if os.path.isdir(self._path) else os.path.dirname(self._path)
+            self._path if os.path.isdir(self._path) else os.path.dirname(self._path),
+            trust_remote_code=True,
         )
 
     # ------------------------------------------------------------------
@@ -694,10 +698,10 @@ class LocalLLMClient:
     ) -> Iterator[StreamEvent]:
         self._ensure_model()
         # 双视图历史的第二视图只有本地复用型后端读得懂（MLX 的 KV 前缀、
-        # GGUF 的 append-only 上下文都要它把 assistant 消息还原成生成时的
-        # 逐 token 序列）；onnx 后端会把 messages 原样交给底层引擎，多一个
-        # 键有风险 → 先剥掉。
-        if self._backend not in ("mlx", "gguf"):
+        # GGUF 的 append-only 上下文、ONNX 的 past 续算都要它把 assistant
+        # 消息还原成生成时的逐 token 序列）。三个本地后端都会先
+        # _rebuild_raw_messages 再渲染，因此这里保留该键。
+        if self._backend not in ("mlx", "gguf", "onnx"):
             messages = [
                 {k: v for k, v in m.items() if k != "raw_content"}
                 if isinstance(m, dict) else m
@@ -1228,6 +1232,32 @@ class LocalLLMClient:
                 pass
         return ids
 
+    def _onnx_zero_past(self, name: str):
+        """按声明的输入形状构造「空 past」张量（past 序列长度维 = 0）。
+
+        标准 optimum 导出布局 ``[batch, n_heads, past_len, head_dim]`` → 序列
+        维在 axis=2；其余符号维按 1 处理（batch/heads 维度取 1 不影响正确性，
+        ORT 会按广播/实际 past 长度校验）。
+        """
+        import numpy as np
+        for inp in self._session.get_inputs():
+            if inp.name != name:
+                continue
+            dims = []
+            for i, d in enumerate(inp.shape or []):
+                if isinstance(d, str):
+                    dims.append(0 if i == 2 else 1)
+                else:
+                    try:
+                        dims.append(int(d))
+                    except Exception:
+                        dims.append(1)
+            try:
+                return np.zeros(dims, dtype=np.float32)
+            except Exception:
+                return np.zeros((1, 1, 0, 1), dtype=np.float32)
+        return np.zeros((1, 1, 0, 1), dtype=np.float32)
+
     def _gguf_is_eog(self, tok_id: int) -> bool:
         """llama.cpp 的「生成结束」判定（含 <|im_end|> / <|endoftext|> 等）。"""
         try:
@@ -1302,8 +1332,15 @@ class LocalLLMClient:
     # ---- ONNX ----
     def _stream_onnx(self, messages, tools, temperature, kv_group: str = "main"):
         import numpy as np
+        # ONNX 走 transformers 的 AutoTokenizer 本身；旧实现照搬 MLX 的
+        # ``getattr(tok, "tokenizer", tok)`` 会拿到不可调用的 Rust Tokenizer
+        # （连 apply_chat_template 都没有）——按能力取值。
+        from .tokenizer_compat import hf_tokenizer as _hf_tok
+        # 双视图历史：与 MLX/GGUF 同款，把 assistant 消息还原成生成时的逐 token
+        # 序列，跨轮 KV（past）续算的前缀才对得上。
+        messages = _rebuild_raw_messages(messages)
         tok = self._tokenizer
-        hf = getattr(tok, "tokenizer", tok)
+        hf = _hf_tok(tok)
         prompt = hf.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
@@ -1341,17 +1378,53 @@ class LocalLLMClient:
         _eos = hf.eos_token_id
         _eos_ids = (set(_eos) if isinstance(_eos, (list, tuple))
                     else ({_eos} if _eos is not None else set()))
+        # 已写入 past 的 token 数（用于拼 attention_mask/position_ids 的全长）。
+        # 只喂增量时，标准导出要求 attention_mask 覆盖 past+new 全长，否则
+        # 注意力会被算在错位的位置上。
+        reused = feed_ids is not ids_list
+        kv_len = getattr(self, "_onnx_kv_len", 0) if reused else 0
+        # past 状态不完整（复用被判定成立却缺部分 past 张量）→ 整体重建，
+        # 宁可慢也不要拿错位的 KV 续算。
+        if kv_inputs and kv_len > 0 and any(n not in self._past for n in kv_inputs):
+            logger.warning("ONNX: past 状态不完整，丢弃重建")
+            self._past = {}
+            kv_len = 0
+            feed_ids = ids_list
+            input_ids = np.array([feed_ids], dtype=np.int64)
         for _ in range(self._max_tokens):
             feeds = {"input_ids": input_ids}
-            # 探测 past 输入名（不同导出差异大，尽力而为）
+            # 按需补 attention_mask / position_ids：导出格式差异大，只喂会话
+            # 真正声明的输入（旧实现只喂 input_ids+past，带 attention_mask 的
+            # 导出会直接 Missing Input 报错）。
+            for inp in self._session.get_inputs():
+                n = inp.name
+                if n in feeds:
+                    continue
+                if n == "attention_mask":
+                    feeds[n] = np.ones((1, kv_len + int(input_ids.shape[1])),
+                                       dtype=np.int64)
+                elif n == "position_ids":
+                    feeds[n] = np.arange(
+                        kv_len, kv_len + int(input_ids.shape[1]),
+                        dtype=np.int64)[None, :]
+            # past 输入：很多导出把它们列为**必需**输入，首轮没有历史时必须喂
+            # 「空 past」（序列长度 0），否则 ORT 直接 Missing Input 报错。
             if kv_inputs:
-                feeds.update({n: self._past[n] for n in kv_inputs if n in self._past})
+                for n in kv_inputs:
+                    # 同 logits：数组不能参与 ``or``（空数组/多元素数组都会抛
+                    # "truth value ... is ambiguous"），必须用 is None 判断。
+                    pv = self._past.get(n)
+                    feeds[n] = pv if pv is not None else self._onnx_zero_past(n)
             # 输出必须按 **name** 建键：旧实现 dict(zip(get_outputs(), run()))
             # 的 key 是 NodeArg 对象，outs.get("logits") 恒落空、退化成取第一个
             # 输出——若导出把 present.* 排在 logits 前，采样直接拿到 KV 张量。
             outs = {o.name: v for o, v in
                     zip(self._session.get_outputs(), self._session.run(None, feeds))}
-            logits = outs.get("logits") or next(iter(outs.values()))
+            # 注意：不能用 ``outs.get("logits") or next(...)``——对 numpy 数组
+            # 求真假会抛 "truth value of an array ... is ambiguous"。
+            logits = outs.get("logits")
+            if logits is None:
+                logits = next(iter(outs.values()))
             next_id = self._sample(np.asarray(logits)[0, -1])
             if next_id in _eos_ids:
                 break
@@ -1362,17 +1435,31 @@ class LocalLLMClient:
                 if seg:
                     yield StreamEvent(kind, content=seg)
             generated.append(next_id)
+            kv_len += int(input_ids.shape[1])
             input_ids = np.array([[next_id]], dtype=np.int64)
             # present → 下一轮 past
             for o in self._session.get_outputs():
                 if o.name.startswith("present"):
                     self._past[o.name.replace("present", "past_key_values", 1)] = outs[o.name]
+        # 已写入 past 的长度 = 本轮 prompt 段 + 生成段（供下轮拼 mask/position）
+        self._onnx_kv_len = kv_len
         for kind, seg in splitter.flush():
             if seg:
                 yield StreamEvent(kind, content=seg)
+        # 关键：past 里含**本轮生成**的 token，下轮 prompt 必须建立在
+        # 「prompt + 已生成」之上才对得上前缀。旧实现只记 prompt 段，第二轮
+        # 起会把 assistant 那段重复喂一遍（与注释里说要修掉的错误同款）。
+        self._onnx_prompt_ids = ids_list + generated
         # 本地后端补 usage（见 _stream_mlx 同款注释）
         n_prompt = int(len(ids))
+        # raw_content：与 MLX 同款，供下轮重建「生成时」的逐 token 序列
+        # （含 think 标签与工具调用 XML）。
+        try:
+            raw = hf.decode(generated) if generated else ""
+        except Exception:
+            raw = ""
         yield StreamEvent("done", tool_calls=parse_tool_calls("".join(full)),
+                          raw_content=raw,
                           usage={"prompt_tokens": n_prompt,
                                  "completion_tokens": len(generated),
                                  "total_tokens": n_prompt + len(generated)})
@@ -1384,9 +1471,12 @@ class LocalLLMClient:
             return int(np.argmax(logits_np))
         # 温度缩放 + top_k + top_p（numpy 自实现）
         logits = logits_np.astype(np.float64) / max(t, 1e-6)
-        if self._top_k > 0:
-            kth = np.sort(logits)[-self._top_k]
-            logits[logits < kth] = -np.inf
+        # top_k 必须按实际词表裁剪：小词表/裁剪过的 logits 上
+        # ``[-self._top_k]`` 会 IndexError（小模型与部分导出会命中）。
+        k = min(int(self._top_k), int(logits.shape[-1])) if self._top_k > 0 else 0
+        if k > 0:
+            kth = np.sort(logits)[-k]
+            logits = np.where(logits >= kth, logits, -np.inf)
         logits -= logits.max()
         exp = np.exp(logits)
         probs = exp / exp.sum()
@@ -1507,6 +1597,7 @@ class LocalLLMClient:
         self._past = {}
         # ONNX 侧记录「past 对应的 prompt」，一并失效（见 _stream_onnx）
         self._onnx_prompt_ids = None
+        self._onnx_kv_len = 0
 
     def close(self) -> None:
         # 释放大块权重：引用置空，等待 GC。会话级 ORT session 亦可析构。

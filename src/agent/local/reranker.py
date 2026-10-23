@@ -114,7 +114,10 @@ class LocalReranker:
             onnx_path, sess_options=so, providers=["CPUExecutionProvider"]
         )
         tok_dir = self._path if os.path.isdir(self._path) else os.path.dirname(self._path)
-        self._tokenizer = AutoTokenizer.from_pretrained(tok_dir)
+        # trust_remote_code=True：jina 等带自定义 tokenizer 代码的目录否则会弹
+        # 交互式确认（GUI 无 stdin → EOFError/卡死）。与 MLX 路径同款取舍。
+        self._tokenizer = AutoTokenizer.from_pretrained(tok_dir,
+                                                        trust_remote_code=True)
         logger.info("local-reranker[onnx]: %s", os.path.basename(onnx_path))
 
     def _load_gguf(self) -> None:
@@ -184,8 +187,11 @@ class LocalReranker:
     # ---- ONNX ----
     def _score_onnx(self, query: str, documents: List[str]) -> List[float]:
         import numpy as np
-        hf = getattr(self._tokenizer, "_tokenizer",
-                     getattr(self._tokenizer, "tokenizer", self._tokenizer))
+        # ONNX 后端的 tokenizer 是 transformers 的 AutoTokenizer（本身即可用）；
+        # 旧实现照搬 MLX 的 ``getattr(tok, "tokenizer", tok)`` 会取到底层 Rust
+        # tokenizers.Tokenizer → 不可调用，实测 TypeError。按能力取值。
+        from .tokenizer_compat import hf_tokenizer as _hf_tok
+        hf = _hf_tok(self._tokenizer)
         scores: List[float] = []
         for i in range(0, len(documents), self._batch_size):
             batch = documents[i:i + self._batch_size]

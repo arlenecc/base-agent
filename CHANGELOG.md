@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-10-24 · 修复：ONNX 后端多处必崩缺陷（LLM 路径从未可用过）
+
+> 用户要求：核查 ONNX 支持后端的实现，确认 ONNX 模型能正常加载使用。
+
+### 实测结论
+ONNX **LLM** 路径此前**从未可用过**（本地也没有 ONNX LLM 权重，只能靠构造型 ORT 会话 + 真实 HF tokenizer 端到端验证）。逐一修掉 5 个必崩点：
+
+1. **tokenizer 取值错误**（连带 ONNX reranker 实测直接崩）：`hf = getattr(tok, "tokenizer", tok)` 是 MLX 的写法，在 ONNX（transformers AutoTokenizer）上取到的是底层 Rust `tokenizers.Tokenizer`——**不可调用、也没有 `apply_chat_template`**，表现为 `TypeError: 'tokenizers.Tokenizer' object is not callable`（reranker 实测）。新增 `local/tokenizer_compat.hf_tokenizer()`：**按能力取值**（可调用 + decode + apply_chat_template），MLX wrapper 与 ONNX tokenizer 都正确。
+2. **缺 `attention_mask` / `position_ids`**：旧实现只喂 `input_ids` + past，带这些输入的导出直接 `Missing Input`。改为按会话声明喂，且 `attention_mask` 覆盖 **past+new 全长**（只喂增量时按增量长度拼会算在错位位置）。
+3. **首轮缺空 past**：很多导出把 `past_key_values.*` 列为**必需**输入，没有历史时不喂 → `Required inputs missing`。新增 `_onnx_zero_past()`（按声明形状、序列维=0）。
+4. **对 numpy 数组用 `or` 取回退值**：`outs.get("logits") or next(...)` 在数组/空数组上抛 `truth value ... is ambiguous`（两处）。改为显式 `is None` 判断。
+5. **`_sample` 的 top_k 越界**：`np.sort(logits)[-top_k]` 在词表 < top_k（小模型/裁剪 logits）时 IndexError。改为按实际词表裁剪。
+
+### 顺带修的 KV 续算错位
+`_onnx_prompt_ids` 只记 prompt 段、**不含已生成 token** → 第二轮起把 assistant 那段重复喂一遍（正是该文件注释说要修掉的历史重复计入问题）。改为 `prompt + generated`，并让 ONNX 也输出 `raw_content`、参与双视图历史重建，跨轮 past 复用才真正触发（此前 raw_content 被剥 → 永不复用）。
+
+### 其它
+- 自定义 tokenizer 代码的模型目录（如 jina ONNX）会弹 **trust_remote_code 交互式确认**，GUI 无 stdin → EOFError/卡死。ONNX 的 tokenizer 加载统一 `trust_remote_code=True`（与 MLX 路径同款取舍）。
+- 实测：`bge-reranker-base-ONNX`、`jina-reranker-v2-base-multilingual-onnx` 均可正常加载打分（相关文档高分、无关文档低分）；MLX reranker 未受影响。
+
+### 测试
+- `test_local_models.py` 新增 5 用例：`hf_tokenizer` 按能力取值（fast/wrapper/None）/ top_k 越界不崩 / **真实 ORT 会话端到端跑 `_stream_onnx`**（喂空 past、attention_mask 全长、`_onnx_prompt_ids` 含生成、第二轮复用 past、失效清空）/ 真实 ONNX reranker 权重加载打分。58 个全过。
+
+---
+
 ## 2026-10-24 · GGUF 后端支持跨轮 KV / 前缀复用（对齐 MLX）+ 复用开关
 
 > 用户需求：在 GGUF 后端增加跨轮 KV/前缀复用开关，对齐 MLX 行为，用 KV cache 缓解系统提示不变部分，加快响应。
