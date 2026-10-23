@@ -1849,7 +1849,11 @@ class RAGEngine:
         """
         results = self.search(query, top_k, source=source)
         if not results:
-            return "（知识库中未找到相关内容）"
+            return (
+                "（知识库中未找到与该查询相关的内容。"
+                "若是想了解知识库整体有哪些资料，请改用 rag_outline（不带参数）"
+                "列出全部文档；若是检索词太偏，可换用资料中可能出现的措辞重试。）"
+            )
 
         lines = [f"从知识库检索到 {len(results)} 条相关内容（已重排序）：\n"]
         total = 0

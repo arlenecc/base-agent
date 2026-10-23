@@ -1405,18 +1405,27 @@ def test_tools_schemas_are_cached(config, recording_callbacks):
 def test_system_prompt_splits_greeting_from_simple_qa():
     """简单问答不该被「禁止调用任何工具」一刀切。
 
-    2026-10-23 用户反馈：问「知识库整体资料分布」被判成简单问答，模型按
-    旧规则一句话打发、禁掉全部工具——知识库状态根本查不了。规则拆成两条：
-    纯寒暄才禁工具；简单问答/一步任务照常调工具（只是不必建计划/固化技能）。
+    2026-10-23 用户反馈（第一次）：问「知识库整体资料分布」被判成简单问答，
+    模型按旧规则一句话打发、禁掉全部工具——知识库状态根本查不了。规则拆成
+    两条：纯寒暄才禁工具；简单问答/一步任务照常调工具（只是不必建计划/固化
+    技能）。
+    2026-10-23 用户反馈（第二次）：拆分后矫枉过正——「你能做什么」也去查知识
+    库，且「知识库里有什么」把问句原样塞给 rag_search 捞回噪声。规则再拆：
+    自我认知类直接答不查库；查库指引明确「列文档 → rag_outline 不带参数，
+    检索词 ≠ 用户问句原文」。
     """
     from agent.agent import SYSTEM_PROMPT
 
     # 纯寒暄规则仍在，且只针对寒暄
     assert "纯寒暄" in SYSTEM_PROMPT
     assert "不调用工具、不建计划、不写记忆" in SYSTEM_PROMPT
-    # 简单问答规则：允许调工具
-    assert "简单问答" in SYSTEM_PROMPT
+    # 自我认知类：直接回答，不查库（第二次反馈的修复）
+    assert "自我认知" in SYSTEM_PROMPT
+    assert "不查知识库、不查记忆" in SYSTEM_PROMPT
+    # 依赖用户资料的问题：允许调工具，且给出正确姿势
     assert "该调的工具照调" in SYSTEM_PROMPT
+    assert "不带参数" in SYSTEM_PROMPT          # 列文档 → rag_outline 无参
+    assert "原样当检索词" in SYSTEM_PROMPT       # 问句 ≠ 检索词
     # 旧的一刀切文案必须已移除（曾把简单问答和寒暄混为一谈）
     assert "禁止调用任何工具，禁止建计划，禁止写记忆" not in SYSTEM_PROMPT
     # 知识库查询指引在位（分布 → rag_outline）

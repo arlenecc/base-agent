@@ -32,13 +32,21 @@ class RagSearchTool(Tool):
     """Search the local knowledge base for relevant information."""
 
     name = "rag_search"
-    description = "搜索本地知识库。查询文档内容、参考资料时使用；可用 source 限定在某本书/文档内检索。"
+    description = (
+        "在本地知识库中检索**资料内容**。仅当问题依赖用户的资料时使用"
+        "（如查某主题的原文、某本书的细节）；「知识库里有什么/你能做什么」"
+        "这类问题不适用——前者用 rag_outline（不带参数）列文档，后者直接回答。"
+    )
     parameters = {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "检索关键词/短语。用用户原始语言，提取问题核心概念，勿翻译或音译。",
+                "description": (
+                    "检索词：提取资料内容相关的概念/关键词短语，用用户原始语言，"
+                    "勿翻译或音译。不要传用户的问句原文（如「知识库里有什么」），"
+                    "那检索不到任何东西。"
+                ),
             },
             "top_k": {
                 "type": "integer",
@@ -118,8 +126,9 @@ class RagOutlineTool(Tool):
 
     name = "rag_outline"
     description = (
-        "获取某文档/书籍的目录结构（章节标题）。用户提到具体书名时先调用，"
-        "了解全文结构后再用 rag_search 检索章节细节。不带 book_name 时列出所有文档。"
+        "知识库文档总览。用户问「知识库里有什么/有哪些资料/文档」时，"
+        "**不带 book_name** 调用即可列出全部文档；用户提到具体书名时带上书名"
+        "调用，先掌握该文档的目录结构，再用 rag_search 检索章节细节。"
     )
     parameters = {
         "type": "object",
