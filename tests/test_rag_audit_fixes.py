@@ -228,8 +228,94 @@ def test_gap_locator_advances_cursor():
     assert loc.gap("BBB", "CCC", "|") == "\n\n"
 
 
-def test_gap_locator_falls_back_when_not_found():
-    from agent.rag.chunker import _GapLocator
+# ---------------------------------------------------------------------------
+# 6. 回退链熔断 + 释放（2026-10-23：防主引擎系统性失败时逐棒加载全驻留）
+# ---------------------------------------------------------------------------
 
-    loc = _GapLocator("只有一段")
-    assert loc.gap("没有的", "也没有", "|") == "|"
+def _patch_engines(monkeypatch, behaviors, released):
+    """按引擎名注入行为（函数或异常），并记录释放调用。"""
+    from agent.rag import docling_parser, engine as eng_mod
+    from agent.rag import marker_parser, ovis_ocr_parser
+
+    # 纯文本兜底也桩掉：测试文件是假 PDF，PyMuPDF 打开会抛无关异常
+    monkeypatch.setattr(eng_mod, "extract_text", lambda p: "plain-text")
+
+    def _mk(name, fn):
+        def _call(path):
+            if isinstance(fn, Exception):
+                raise fn
+            return fn(path)
+        return _call
+
+    monkeypatch.setattr(docling_parser, "extract_markdown",
+                        _mk("docling", behaviors.get("docling", lambda p: None)))
+    monkeypatch.setattr(marker_parser, "extract_markdown",
+                        _mk("marker", behaviors.get("marker", lambda p: None)))
+    monkeypatch.setattr(ovis_ocr_parser, "extract_markdown",
+                        _mk("ovis", behaviors.get("ovis", lambda p: None)))
+    for mod, fname in ((docling_parser, "release_converter"),
+                       (marker_parser, "release_converter"),
+                       (ovis_ocr_parser, "release_model")):
+        def _rel(_fname=fname):
+            released.append(_fname)
+        monkeypatch.setattr(mod, fname, _rel)
+
+
+def test_engine_breaker_trips_after_limit_and_releases(tmp_path, monkeypatch):
+    from agent.rag import engine as eng_mod
+
+    released = []
+    _patch_engines(monkeypatch,
+                   {"docling": RuntimeError("boom")}, released)
+    eng_mod.reset_engine_fail_streak()
+    f = tmp_path / "x.pdf"
+    f.write_bytes(b"%PDF-1.4")
+    # 前 3 次：docling 每次抛 → 依次尝试 marker/ovis（都返回 None）→ 纯文本
+    for _ in range(3):
+        md, is_md = eng_mod._extract_with_docling(str(f))
+        assert is_md is False
+    # 第 3 次失败后 docling 熔断并释放
+    assert released == ["release_converter"]
+    # 第 4 次：docling 被跳过（不再尝试），直接 marker→ovis→纯文本
+    released.clear()
+    md, is_md = eng_mod._extract_with_docling(str(f))
+    assert is_md is False
+    assert eng_mod._engine_fail_streak["docling"] >= 3
+
+
+def test_engine_none_return_does_not_trip_breaker(tmp_path, monkeypatch):
+    """返回 None（格式不适用）不得熔断——否则 txt 语料会把能解析 PDF 的
+    引擎也熔掉，后续 PDF 被悄悄降级成纯文本。"""
+    from agent.rag import engine as eng_mod
+
+    released = []
+    _patch_engines(monkeypatch, {}, released)   # 三个引擎全部返回 None
+    eng_mod.reset_engine_fail_streak()
+    f = tmp_path / "a.txt"
+    f.write_text("纯文本内容", encoding="utf-8")
+    for _ in range(10):
+        md, is_md = eng_mod._extract_with_docling(str(f))
+        assert is_md is False
+    assert released == []                        # 从未熔断/释放
+    assert not any(v >= 3 for v in eng_mod._engine_fail_streak.values())
+
+
+def test_engine_success_resets_streak(monkeypatch):
+    from agent.rag import engine as eng_mod
+
+    _patch_engines(monkeypatch, {}, [])
+    eng_mod.reset_engine_fail_streak()
+    eng_mod._engine_fail_streak["docling"] = 2     # 模拟已失败 2 次
+    monkeypatch.setattr("agent.rag.docling_parser.extract_markdown",
+                        lambda p: "# ok")
+    md, is_md = eng_mod._extract_with_docling("/kb/z.pdf")
+    assert is_md is True and md == "# ok"
+    assert eng_mod._engine_fail_streak["docling"] == 0   # 成功即复位
+
+
+def test_reset_engine_fail_streak_clears():
+    from agent.rag import engine as eng_mod
+
+    eng_mod._engine_fail_streak = {"docling": 9}
+    eng_mod.reset_engine_fail_streak()
+    assert eng_mod._engine_fail_streak == {}

@@ -419,6 +419,47 @@ def set_ovis_model_config(engine: str, name: str, path: str) -> None:
         pass
 
 
+# 回退链引擎的连续失败熔断（2026-10-23）：主引擎**系统性**失败（docling 版本
+# 不兼容、权重损坏等）时，回退链会把下一棒引擎逐个拉起来试——marker ~3GB /
+# ovis ~0.9GB 的权重常驻到同步结束，与 docling 的 4.6GB 叠加；且每次失败要
+# 实跑数分钟。同一引擎连续失败 _ENGINE_FAIL_LIMIT 次即本轮同步内停用，并
+# **显式释放其已加载的单例**（峰值从「全部叠加」降为「一次一个」）。
+# 只对**异常**计数：返回 None 多为「格式不适用」（如 txt 对 docling），熔断
+# 它会把本该由它解析的 PDF 悄悄降级到纯文本。
+_ENGINE_FAIL_LIMIT = 3
+_engine_fail_streak: Dict[str, int] = {}
+_engine_fail_lock = threading.Lock()
+
+
+def reset_engine_fail_streak() -> None:
+    """复位回退链熔断计数（每轮 ingest 开始时调用）。"""
+    global _engine_fail_streak
+    with _engine_fail_lock:
+        _engine_fail_streak = {}
+
+
+def _note_engine_failure(engine: str) -> bool:
+    """记录一次引擎失败；返回 True 表示该引擎已触发熔断。"""
+    with _engine_fail_lock:
+        n = _engine_fail_streak.get(engine, 0) + 1
+        _engine_fail_streak[engine] = n
+    return n >= _ENGINE_FAIL_LIMIT
+
+
+def _release_engine_singleton(engine: str) -> None:
+    """释放指定引擎的进程级单例（熔断时调用，回收其权重内存）。"""
+    try:
+        if engine == "marker":
+            from .marker_parser import release_converter as _release
+        elif engine == "ovis":
+            from .ovis_ocr_parser import release_model as _release
+        else:
+            from .docling_parser import release_converter as _release
+        _release()
+    except Exception as e:
+        logger.debug("RAG: release engine %s failed: %s", engine, e)
+
+
 def _extract_with_docling(filepath: str) -> tuple:
     """Extract text, preferring the configured unified parser (Markdown output).
 
@@ -455,6 +496,10 @@ def _extract_with_docling(filepath: str) -> tuple:
         if e and e not in order:
             order.append(e)
     for engine in order:
+        if _engine_fail_streak.get(engine, 0) >= _ENGINE_FAIL_LIMIT:
+            logger.debug("RAG: 引擎 %s 已熔断（连续失败 %d 次），本轮同步跳过",
+                         engine, _ENGINE_FAIL_LIMIT)
+            continue
         try:
             if engine == "marker":
                 from .marker_parser import extract_markdown
@@ -464,14 +509,23 @@ def _extract_with_docling(filepath: str) -> tuple:
                 from .docling_parser import extract_markdown
             markdown = extract_markdown(filepath)
             if markdown is not None:
+                with _engine_fail_lock:
+                    _engine_fail_streak[engine] = 0
                 return markdown, True
         except Exception as e:
             # 不再静默吞掉：2026-10-22 docling 的 NameError（池化改造误删
             # 模块级 _converter_unavailable）就是被这里吞掉的，症状是「PDF
             # 全部静默降级 marker、docling 毫无报错」，极难定位。debug 级
-            # 记录引擎名 + 异常，日志窗口开 debug 即可见。
+            # 记录引擎名 + 异常类型 + 信息，日志窗口开 debug 即可见。
             logger.debug("RAG: 解析引擎 %s 失败（走下一棒）: %s: %s",
                          engine, type(e).__name__, e)
+            if _note_engine_failure(engine):
+                logger.warning(
+                    "RAG: 解析引擎 %s 连续失败 %d 次，本轮同步内停用并释放其"
+                    "模型（后续文件走下一棒；若这是误判请检查该引擎依赖）",
+                    engine, _ENGINE_FAIL_LIMIT,
+                )
+                _release_engine_singleton(engine)
     return extract_text(filepath), False
 
 
@@ -816,6 +870,15 @@ class RAGEngine:
         if not self._knowledge_base or not os.path.isdir(self._knowledge_base):
             logger.warning("RAG ingest: knowledge base dir not found: %s", self._knowledge_base)
             return {"error": f"Knowledge base directory not found: {self._knowledge_base}"}
+
+        # 内存护栏前置到引擎层（覆盖**所有**调用方）：UI 同步路径在 worker 里
+        # 调过，但 agent 的 rag_ingest 工具路径不会——那时主/辅 LLM（~4GB）+
+        # KV 缓存常驻，MLX 缓存默认上限是统一内存的 ~75%（16GB 机器 ~12GB），
+        # 再叠加 docling 4.6GB 直接爆。只设上限**不清缓存**：清缓存会把 agent
+        # 预热好的系统提示 KV 一并 evict（UI 路径已卸载模型，清而无害）。
+        configure_mlx_memory_limits()
+        # 回退链熔断计数随每轮同步复位（见 _extract_with_docling）。
+        reset_engine_fail_streak()
 
         t_start = time.monotonic()
         os.makedirs(self._rag_dir, exist_ok=True)
