@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-10-24 · 修复：技能检索链路上的三处断层（量化权重 / 模型路径 / 技能放错工作区）
+
+> 用户要求：检查技能检索是否真的能按意图检索到需要的 skill 并读取应用。
+
+### 排查结论（端到端逐通道隔离）
+意图检索**此前完全失效**，三层原因叠加：
+
+1. **嵌入权重是 MLX 量化格式，加载器不识别**：用户今天把 nomic embedding 转成 8-bit/group64 量化版（`.weight` 打包 + `.scales`/`.biases`），`mlx_nomic.load_nomic_bert` 直接 `astype(float32)`——打包整数被当浮点、列数停在打包宽度 192（而非 768）→ 前向在第一层 LayerNorm 就崩（`weight must have the same size as the last dimension of x but has 768 elements`）→ 嵌入不可用 → **向量通道全灭**，技能表因探测失败也建不起来，BM25 随之无表可查。
+2. **裸模型名解析不到 `~/models`**：权重已从 `<project>/models/`（该目录已不存在）搬到 `~/models/`，`resolve_model_path` 只搜项目内 → 嵌入/重排模型「目录不存在」。
+3. **技能建错了工作区**：`fetch-ate-job-board` 写在了 `base-agent-workspace/skills`，而当前配置的 workspace 是 `app-space`（检索器扫 `<workspace>/skills`）→ 扫不到。另发现重排器配置值拼写错误（`-mx-fp8` vs 实际 `-mxfp8`）。
+
+### 修复
+- `mlx_nomic._dequantize_quantized()`：自动识别量化三件套并按「形状 + config 候选维度」反推 `group_size`/`bits` 调 `mx.dequantize` 还原稠密权重（不写死 8/64，2/3/4/6/8-bit 与常见 group 都覆盖）；无三件套的稠密模型原样返回。实测反量化后 768 维、L2 归一化正确、同句余弦 0.84。
+- `registry.resolve_model_path` 新增 **`~/models/<name>` 兜底**（搜索顺序：绝对/相对 → `<root>/models` → `<root>` → `~/models`）。
+- 技能复制到当前工作区 `/Volumes/ebook/app-space/skills/`；配置里的重排器路径改为正确的绝对路径。
+- 本机 `config.json` 同步修正（重排器两个键）。
+
+### 验证（端到端）
+`skill_semantic_search("…获取今天所有的招聘信息，并整理成列表")` → **`fetch-ate-job-board` 排名第一**（向量 0.808 + BM25 9.80）→ `skill_load` 读到完整 1935 字技能内容。嵌入/重排器真实权重加载与推理均恢复正常。
+
+### 测试
+新增 3 用例：量化权重自动推断反量化（合成张量，含近似误差与附属键清理）/ 稠密权重原样返回 / `~/models` 兜底解析。
+
+---
+
 ## 2026-10-24 · 修复：rollback 把原始任务从上下文里抹掉（模型自问「你没有给出具体任务」的真凶）
 
 > 用户反馈（第四次）：消息里 URL 和任务都写得很清楚，模型却反复说「用户没有给出具体任务内容」，甚至幻觉出用户说过「直接开始」。

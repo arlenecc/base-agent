@@ -283,6 +283,74 @@ class NomicBertModel:
         return h
 
 
+def _dequantize_quantized(weights: Dict[str, Any], config: Any) -> Dict[str, Any]:
+    """把 MLX 量化格式的权重三件套（``.weight`` 打包 + ``.scales`` + ``.biases``）
+    反量化成稠密数组。
+
+    ``mx.quantize()`` 存盘时 weight 是**打包整数**（uint32，列数 = 原列数 ×
+    bits / 32），另存 scales/biases 两个 (out, in/group_size) 张量。旧实现直接
+    ``astype(float32)``：打包整数被当成浮点、列数停在打包宽度（192 而非 768）
+    → 前向在第一层 LayerNorm 就崩（「weight must have the same size as the last
+    dimension of x but has 768 elements」）。
+
+    group_size / bits 由**形状 + config 候选维度**反推，不依赖转换时的命令行：
+    ``in_dim = 打包列数 × 打包位宽 / bits``、``group_size = in_dim / scales 列数``，
+    候选 in_dim 取 config 的 hidden / intermediate / vocab。无法识别的张量原样
+    保留（稠密模型不受影响）。
+    """
+    mx, _ = _require_mlx()
+    packed_bits = {mx.uint32: 32, mx.uint16: 16, mx.uint8: 8}
+    cands: List[int] = []
+    for v in (getattr(config, "hidden_size", 0),
+              getattr(config, "intermediate_size", 0),
+              getattr(config, "vocab_size", 0)):
+        if v and v not in cands:
+            cands.append(v)
+
+    bases = sorted({
+        k[:-len(".weight")] for k in weights
+        if k.endswith(".weight")
+        and (k[:-len(".weight")] + ".scales") in weights
+        and (k[:-len(".weight")] + ".biases") in weights
+    })
+    if not bases:
+        return weights
+
+    out = dict(weights)
+    n_deq = 0
+    for base in bases:
+        w = weights[base + ".weight"]
+        s = weights[base + ".scales"]
+        b = weights[base + ".biases"]
+        bits_total = packed_bits.get(w.dtype)
+        if (bits_total is None or len(w.shape) != 2 or len(s.shape) != 2
+                or s.shape[1] <= 0 or w.shape[0] != s.shape[0]):
+            continue
+        for in_dim in cands:
+            if in_dim % s.shape[1]:
+                continue
+            gs = in_dim // s.shape[1]
+            if (w.shape[1] * bits_total) % in_dim:
+                continue
+            bits = (w.shape[1] * bits_total) // in_dim
+            if bits not in (2, 3, 4, 6, 8):
+                continue
+            try:
+                deq = mx.dequantize(w, s, b, group_size=gs, bits=bits)
+            except Exception:
+                continue
+            if deq.shape[-1] == in_dim:
+                out[base + ".weight"] = deq
+                out.pop(base + ".scales", None)
+                out.pop(base + ".biases", None)
+                n_deq += 1
+                break
+    if n_deq:
+        logger.info("nomic-mlx: 反量化 %d 个量化权重张量（group_size/bits 自动推断）",
+                    n_deq)
+    return out
+
+
 def load_nomic_bert(path: str, dtype: str = "float32"):
     """从 MLX 模型目录加载 NomicBert。
 
@@ -302,6 +370,8 @@ def load_nomic_bert(path: str, dtype: str = "float32"):
     weights: Dict[str, Any] = {}
     for f in sorted(st_files):
         weights.update(mx.load(os.path.join(path, f)))
+    # 量化权重先反量化再统一 dtype：直接 astype 会把打包整数当浮点用。
+    weights = _dequantize_quantized(weights, config)
 
     target = {"float32": mx.float32, "float16": mx.float16,
               "bfloat16": mx.bfloat16}.get(dtype, mx.float32)

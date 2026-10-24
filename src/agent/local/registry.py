@@ -50,7 +50,15 @@ def _project_root() -> str:
 
 
 def resolve_model_path(kind: str, value: str = "", project_root: Optional[str] = None) -> str:
-    """解析某用途的模型路径；不存在时返回默认（可能仍不存在 → 后端给出明确报错）。"""
+    """解析某用途的模型路径；不存在时返回默认（可能仍不存在 → 后端给出明确报错）。
+
+    搜索顺序（价值的是「用户把权重放在哪」）：
+      1. value 本身是已存在路径（绝对/相对）→ 原样返回；
+      2. ``<project_root>/models/<value>``（仓库自带权重的位置）；
+      3. ``<project_root>/<value>``；
+      4. ``~/models/<value>``（用户级模型目录——权重搬出项目后最常放的地方）。
+    都找不到 → 原样返回 value，让后端报「目录不存在」（信息更明确）。
+    """
     root = project_root or _project_root()
 
     def _exists(p: str) -> bool:
@@ -66,6 +74,10 @@ def resolve_model_path(kind: str, value: str = "", project_root: Optional[str] =
         rel = os.path.join(root, value)
         if _exists(rel):
             return rel
+        # 用户级模型目录：权重搬出项目（<project>/models 不存在）后的落点
+        home_models = os.path.join(os.path.expanduser("~"), "models", value)
+        if _exists(home_models):
+            return home_models
         # 未找到：返回原始值，让后端报「目录不存在」
         return value
 

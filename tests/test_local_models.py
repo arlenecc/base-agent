@@ -671,3 +671,79 @@ def test_config_migrate_normalizes_backend_and_null_kv_reuse(tmp_path):
     assert cfg.local_llm_backend == "mlx"
     assert cfg.aux_local_llm_backend == "gguf"
     assert cfg.local_llm_kv_reuse is True     # null → 默认开
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-24：MLX 量化 embedding 权重反量化 + 模型路径解析兜底
+# ---------------------------------------------------------------------------
+
+def test_dequantize_quantized_weights_infers_group_and_bits():
+    """量化三件套必须被反量化，且 group_size/bits 自动推断（不写死）。
+
+    用户今天把 nomic embedding 转成 8-bit/group64 的 MLX 量化格式后，旧加载器
+    直接 astype(float32)：打包整数当浮点、列数停在 192 → 前向在第一层
+    LayerNorm 就崩。这里用合成量化张量验证自动推断。
+    """
+    import mlx.core as mx
+    from agent.local.mlx_nomic import _dequantize_quantized
+
+    class _Cfg:                      # 只提供候选维度
+        hidden_size = 64
+        intermediate_size = 256
+        vocab_size = 128
+
+    dense = mx.random.normal((16, 64)) * 0.1
+    w, s, b = mx.quantize(dense, group_size=32, bits=8)
+    weights = {
+        "embeddings.word_embeddings.weight": w,
+        "embeddings.word_embeddings.scales": s,
+        "embeddings.word_embeddings.biases": b,
+        "encoder.layers.0.norm1.weight": mx.ones((64,)),   # 稠密张量不受影响
+    }
+    out = _dequantize_quantized(weights, _Cfg())
+    dw = out["embeddings.word_embeddings.weight"]
+    assert dw.shape == (16, 64), dw.shape          # 反量化回原始形状
+    assert dw.dtype in (mx.float32, mx.float16, mx.bfloat16)
+    # 反量化后与原始稠密张量近似（量化有损，容差放宽）
+    err = float(mx.abs(dw.astype(mx.float32) - dense).max())
+    assert err < 0.2, err
+    # 三件套的附属键应被清掉（否则会污染后续 astype）
+    assert "embeddings.word_embeddings.scales" not in out
+    # 稠密张量原样保留
+    assert out["encoder.layers.0.norm1.weight"].shape == (64,)
+
+
+def test_dequantize_noop_for_dense_weights():
+    """纯稠密权重（无三件套）必须原样返回，不做无谓复制。"""
+    import mlx.core as mx
+    from agent.local.mlx_nomic import _dequantize_quantized
+
+    class _Cfg:
+        hidden_size = 64
+        intermediate_size = 256
+        vocab_size = 128
+
+    w = {"a.weight": mx.ones((4, 4)), "b.bias": mx.zeros((4,))}
+    assert _dequantize_quantized(w, _Cfg()) is w
+
+
+def test_resolve_model_path_falls_back_to_home_models(tmp_path, monkeypatch):
+    """裸模型名在 <project>/models 不存在时，应回落到 ~/models/<name>。
+
+    用户把权重搬到 ~/models 后，嵌入/重排的裸名称解析失败 → 嵌入模型加载不了
+    → 向量检索（技能检索 / RAG）整体失效。
+    """
+    from agent.local import registry
+    fake_home = tmp_path / "home"
+    (fake_home / "models" / "nomic-embed-text-v1.5-mlx-int8").mkdir(parents=True)
+    monkeypatch.setattr(registry.os.path, "expanduser",
+                        lambda p: str(fake_home) if p == "~" else p)
+    # 项目内不存在 → 落到 ~/models
+    got = registry.resolve_model_path(
+        "embedding", "nomic-embed-text-v1.5-mlx-int8",
+        project_root=str(tmp_path / "no-such-project"))
+    assert got == str(fake_home / "models" / "nomic-embed-text-v1.5-mlx-int8")
+    # 绝对路径仍然优先
+    abs_dir = tmp_path / "abs-model"
+    abs_dir.mkdir()
+    assert registry.resolve_model_path("embedding", str(abs_dir)) == str(abs_dir)
