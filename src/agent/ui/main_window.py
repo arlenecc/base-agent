@@ -1081,6 +1081,8 @@ class MainWindow(QMainWindow):
             getattr(self.config, "rag_ocr_engine", "mlx-vlm"),
             getattr(self.config, "rag_ocr_model_name", "OvisOCR2-0.8B-MLX-4bit"),
             getattr(self.config, "rag_ocr_model_path", ""),
+            getattr(self.config, "rag_ocr_mmproj_path", ""),
+            getattr(self.config, "rag_ocr_tokenizer_path", ""),
         )
         # docling OCR scale 配置（#132：固定值默认 2.0，动态策略默认关）。
         from agent.rag.docling_parser import set_ocr_scale_config
@@ -1259,6 +1261,13 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda: self._pick_model_path(edit, combo))
             return b
 
+        def _pick_dir_btn(edit):
+            b = QPushButton("选择")
+            b.setFixedWidth(56)
+            b.setToolTip("选择目录（tokenizer 等所在目录）")
+            b.clicked.connect(lambda: self._pick_dir_path(edit))
+            return b
+
         def _params_widget(mt, temp, tp, mp, tk, rp, thinking, *extras):
             w = QWidget()
             row = QHBoxLayout(w)
@@ -1303,6 +1312,24 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("本地路径")); r.addWidget(self.local_llm_model_edit, 1)
         r.addWidget(_pick_btn(self.local_llm_model_edit, self.main_type_combo))
         alay.addWidget(self.main_local_row1_w)
+
+        # 主模型 - 第二路径（gguf→mmproj 视觉塔 / onnx→tokenizer 目录），按类型显隐
+        self.main_second_label = QLabel("mmproj 路径")
+        self.main_mmproj_edit = _path("mmproj 视觉塔路径（可选，多模态才需要）")
+        self.main_mmproj_pick = _pick_btn(self.main_mmproj_edit, self.main_type_combo)
+        self.main_tokenizer_edit = _path("tokenizer 路径（可选）")
+        self.main_tokenizer_pick = _pick_dir_btn(self.main_tokenizer_edit)
+        self.main_second_w = QWidget()
+        r = QHBoxLayout(self.main_second_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(8)
+        r.addWidget(self.main_second_label)
+        r.addWidget(self.main_mmproj_edit, 1); r.addWidget(self.main_mmproj_pick)
+        r.addWidget(self.main_tokenizer_edit, 1); r.addWidget(self.main_tokenizer_pick)
+        alay.addWidget(self.main_second_w)
+        self.main_type_combo.currentTextChanged.connect(
+            lambda _: self._sync_second_path(
+                self.main_second_w, self.main_type_combo, self.main_second_label,
+                self.main_mmproj_edit, self.main_mmproj_pick,
+                self.main_tokenizer_edit, self.main_tokenizer_pick))
 
         # 主模型 - OpenAI 模式 row1：Base URL + API Key + 模型 + 获取模型
         self.base_url_edit = QLineEdit(placeholderText="https://api.openai.com/v1")
@@ -1364,6 +1391,23 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("本地路径")); r.addWidget(self.aux_local_llm_model_edit, 1)
         r.addWidget(_pick_btn(self.aux_local_llm_model_edit, self.aux_type_combo))
         alay.addLayout(r)
+        # 辅助模型 - 第二路径（gguf→mmproj / onnx→tokenizer），按类型显隐
+        self.aux_second_label = QLabel("mmproj 路径")
+        self.aux_mmproj_edit = _path("mmproj 视觉塔路径（可选，多模态才需要）")
+        self.aux_mmproj_pick = _pick_btn(self.aux_mmproj_edit, self.aux_type_combo)
+        self.aux_tokenizer_edit = _path("tokenizer 路径（可选）")
+        self.aux_tokenizer_pick = _pick_dir_btn(self.aux_tokenizer_edit)
+        self.aux_second_w = QWidget()
+        r = QHBoxLayout(self.aux_second_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(8)
+        r.addWidget(self.aux_second_label)
+        r.addWidget(self.aux_mmproj_edit, 1); r.addWidget(self.aux_mmproj_pick)
+        r.addWidget(self.aux_tokenizer_edit, 1); r.addWidget(self.aux_tokenizer_pick)
+        alay.addWidget(self.aux_second_w)
+        self.aux_type_combo.currentTextChanged.connect(
+            lambda _: self._sync_second_path(
+                self.aux_second_w, self.aux_type_combo, self.aux_second_label,
+                self.aux_mmproj_edit, self.aux_mmproj_pick,
+                self.aux_tokenizer_edit, self.aux_tokenizer_pick))
         self.aux_max_tokens_edit = _num("32768", 80)
         self.aux_temp_edit = _num("0.7")
         self.aux_top_p_edit = _num("0.95")
@@ -1419,6 +1463,23 @@ class MainWindow(QMainWindow):
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("OCR模型")); r.addWidget(self.ocr_impl_combo)
         r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
+        # OCR 第二路径（gguf→mmproj 视觉塔 / onnx→tokenizer），按类型显隐
+        self.ocr_second_label = QLabel("mmproj 路径")
+        self.ocr_mmproj_edit = _path("mmproj 视觉塔路径（可选，多模态才需要）")
+        self.ocr_mmproj_pick = _pick_btn(self.ocr_mmproj_edit, self.ocr_impl_combo)
+        self.ocr_tokenizer_edit = _path("tokenizer 路径（可选）")
+        self.ocr_tokenizer_pick = _pick_dir_btn(self.ocr_tokenizer_edit)
+        self.ocr_second_w = QWidget()
+        r = QHBoxLayout(self.ocr_second_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(8)
+        r.addWidget(self.ocr_second_label)
+        r.addWidget(self.ocr_mmproj_edit, 1); r.addWidget(self.ocr_mmproj_pick)
+        r.addWidget(self.ocr_tokenizer_edit, 1); r.addWidget(self.ocr_tokenizer_pick)
+        klay.addLayout(r)
+        self.ocr_impl_combo.currentTextChanged.connect(
+            lambda _: self._sync_second_path(
+                self.ocr_second_w, self.ocr_impl_combo, self.ocr_second_label,
+                self.ocr_mmproj_edit, self.ocr_mmproj_pick,
+                self.ocr_tokenizer_edit, self.ocr_tokenizer_pick))
         self.ocr_impl_combo.setToolTip(
             "OvisOCR2 VLM 后端：\n"
             "· mlx-vlm：目录含 model.safetensors（Apple Silicon 推荐）\n"
@@ -1520,6 +1581,28 @@ class MainWindow(QMainWindow):
         if path:
             edit.setText(path)
 
+    def _pick_dir_path(self, edit: "QLineEdit") -> None:
+        """与 _pick_model_path 互补：选目录（tokenizer 等路径）。"""
+        path = QFileDialog.getExistingDirectory(
+            self, "选择目录", edit.text() or "models")
+        if path:
+            edit.setText(path)
+
+    def _sync_second_path(self, second_w, combo, label, mmproj_edit, mmproj_pick,
+                          tokenizer_edit, tokenizer_pick) -> None:
+        """按模型类型下拉显隐第二路径（gguf→mmproj / onnx→tokenizer）。
+
+        仅当类型含 'gguf'/'onnx' 时显示对应一组；其余（mlx / mlx-vlm 等）整体隐藏。
+        """
+        t = combo.currentText().strip().lower()
+        is_gguf = "gguf" in t
+        is_onnx = "onnx" in t
+        label.setText("mmproj 路径" if is_gguf else "tokenizer 路径")
+        label.setVisible(is_gguf or is_onnx)
+        mmproj_edit.setVisible(is_gguf); mmproj_pick.setVisible(is_gguf)
+        tokenizer_edit.setVisible(is_onnx); tokenizer_pick.setVisible(is_onnx)
+        second_w.setVisible(is_gguf or is_onnx)
+
     def _on_main_mode_changed(self, text: str) -> None:
         """主模型在「本地模式」与「OpenAI兼容接口」间切换：显示对应行与动作按钮。"""
         local = (text == "本地模式")
@@ -1528,6 +1611,14 @@ class MainWindow(QMainWindow):
         self.unload_main_btn.setVisible(local)
         self.main_openai_row1_w.setVisible(not local)
         self.connect_btn.setVisible(not local)
+        # 第二路径（gguf→mmproj / onnx→tokenizer）仅本地模式可见，且按类型显隐。
+        if local:
+            self._sync_second_path(
+                self.main_second_w, self.main_type_combo, self.main_second_label,
+                self.main_mmproj_edit, self.main_mmproj_pick,
+                self.main_tokenizer_edit, self.main_tokenizer_pick)
+        else:
+            self.main_second_w.setVisible(False)
 
     def _mark_model_loaded(self, key: str) -> None:
         btn = self.load_main_btn if key == "main" else self.load_aux_btn
@@ -1962,10 +2053,22 @@ class MainWindow(QMainWindow):
         self.main_type_combo.setCurrentText(
             _BACKEND_TO_LLM_TYPE.get(self.config.local_llm_backend, "MLX-LM"))
         self.local_llm_model_edit.setText(self.config.local_llm_model)
+        self.main_mmproj_edit.setText(
+            getattr(self.config, "local_llm_mmproj_path", ""))
+        self.main_tokenizer_edit.setText(
+            getattr(self.config, "local_llm_tokenizer_path", ""))
         # 辅助模型（本地专用）
         self.aux_type_combo.setCurrentText(
             _BACKEND_TO_LLM_TYPE.get(self.config.aux_local_llm_backend, "MLX-LM"))
         self.aux_local_llm_model_edit.setText(self.config.aux_local_llm_model)
+        self.aux_mmproj_edit.setText(
+            getattr(self.config, "aux_local_llm_mmproj_path", ""))
+        self.aux_tokenizer_edit.setText(
+            getattr(self.config, "aux_local_llm_tokenizer_path", ""))
+        self._sync_second_path(
+            self.aux_second_w, self.aux_type_combo, self.aux_second_label,
+            self.aux_mmproj_edit, self.aux_mmproj_pick,
+            self.aux_tokenizer_edit, self.aux_tokenizer_pick)
         self.aux_temp_edit.setText(str(self.config.aux_temperature))
         self.aux_max_tokens_edit.setText(str(self.config.aux_max_tokens))
         self.aux_top_p_edit.setText(str(self.config.aux_top_p))
@@ -1986,6 +2089,14 @@ class MainWindow(QMainWindow):
             getattr(self.config, "rag_ocr_engine", "mlx-vlm") or "mlx-vlm")
         self.ocr_path_edit.setText(
             getattr(self.config, "rag_ocr_model_path", ""))
+        self.ocr_mmproj_edit.setText(
+            getattr(self.config, "rag_ocr_mmproj_path", ""))
+        self.ocr_tokenizer_edit.setText(
+            getattr(self.config, "rag_ocr_tokenizer_path", ""))
+        self._sync_second_path(
+            self.ocr_second_w, self.ocr_impl_combo, self.ocr_second_label,
+            self.ocr_mmproj_edit, self.ocr_mmproj_pick,
+            self.ocr_tokenizer_edit, self.ocr_tokenizer_pick)
         self.reranker_impl_combo.setCurrentText(_provider_backend_to_impl(
             self.config.reranker_provider, self.config.local_reranker_backend))
         self.reranker_model_name_edit.setText(self.config.rag_rerank_model)
@@ -2087,11 +2198,15 @@ class MainWindow(QMainWindow):
         self.config.local_llm_backend = _LLM_TYPE_TO_BACKEND.get(
             self.main_type_combo.currentText(), "mlx")
         self.config.local_llm_model = self.local_llm_model_edit.text().strip()
+        self.config.local_llm_mmproj_path = self.main_mmproj_edit.text().strip()
+        self.config.local_llm_tokenizer_path = self.main_tokenizer_edit.text().strip()
         # 辅助模型（本地专用）
         self.config.aux_llm_provider = "local"
         self.config.aux_local_llm_backend = _LLM_TYPE_TO_BACKEND.get(
             self.aux_type_combo.currentText(), "mlx")
         self.config.aux_local_llm_model = self.aux_local_llm_model_edit.text().strip()
+        self.config.aux_local_llm_mmproj_path = self.aux_mmproj_edit.text().strip()
+        self.config.aux_local_llm_tokenizer_path = self.aux_tokenizer_edit.text().strip()
         # Embedding / Reranker：实现下拉 → (provider, backend)；模型名与本地路径分别落位
         emb_impl = self.embedding_impl_combo.currentText().strip()
         self.config.embedding_provider, self.config.local_embedding_backend = \
@@ -2116,6 +2231,8 @@ class MainWindow(QMainWindow):
         # 模型名不暴露给 UI：保持 config 默认值（OvisOCR2-0.8B-MLX-4bit），
         # 避免用户手填拼错导致 OCR 模型加载失败。
         self.config.rag_ocr_model_path = self.ocr_path_edit.text().strip()
+        self.config.rag_ocr_mmproj_path = self.ocr_mmproj_edit.text().strip()
+        self.config.rag_ocr_tokenizer_path = self.ocr_tokenizer_edit.text().strip()
 
     def _rebuild_agent(self, rebuild_aux: bool = True) -> None:
         # 常驻 worker 持有旧 agent 引用：先让它退出循环，否则重建后用户再发

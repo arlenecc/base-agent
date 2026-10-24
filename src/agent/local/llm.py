@@ -416,6 +416,8 @@ class LocalLLMClient:
         prefill_step_size: int = 0,
         kv_reuse: bool = True,
         kv_quant: bool = True,
+        mmproj: str = "",
+        tokenizer_path: str = "",
     ):
         # 跨轮 KV / 前缀复用开关（MLX 与 GGUF 都遵守，默认开）。
         # 关闭后每轮整体重建（全量预填充）——用于排查前缀错位导致的乱码，
@@ -429,6 +431,11 @@ class LocalLLMClient:
         self._kv_quant = True if kv_quant is None else bool(kv_quant)
         # KV 量化是否真正生效（部分构建/模型不支持时降级为 False，仅作状态记录）。
         self._kv_quant_applied = self._kv_quant
+        # gguf 视觉塔（mmproj）路径与 onnx 分词器路径（均可选，留空走默认）。
+        # mmproj 传给 llama.cpp 的 clip_model_path（多模态 GGUF 才需要）；
+        # tokenizer_path 覆盖 ONNX 的 AutoTokenizer 加载位置（缺则随模型目录）。
+        self._mmproj = (mmproj or "").strip()
+        self._tokenizer_path = (tokenizer_path or "").strip()
         # 量化参数：8-bit、group 64（与 llama.cpp 的 q8_0 同档，质量损失可忽略）。
         self._kv_quant_bits = 8
         self._kv_quant_group = 64
@@ -611,6 +618,10 @@ class LocalLLMClient:
                 GGML_TYPE_Q8_0 = getattr(__import__("llama_cpp"), "GGML_TYPE_Q8_0", 8)
             gguf_kwargs["type_k"] = GGML_TYPE_Q8_0
             gguf_kwargs["type_v"] = GGML_TYPE_Q8_0
+        # mmproj 视觉塔（多模态 GGUF 才需要）：传给 clip_model_path。仅当用户
+        # 显式配置时加入——纯文本 GGUF 传了反而会被 llama.cpp 拒绝。
+        if self._mmproj:
+            gguf_kwargs["clip_model_path"] = self._mmproj
         try:
             self._model = Llama(
                 model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False,
@@ -773,9 +784,15 @@ class LocalLLMClient:
         # trust_remote_code=True：带自定义 tokenizer 代码的模型目录（如 jina 系）
         # 否则会弹交互式确认——GUI 里没有 stdin，input() 直接 EOFError/卡死。
         # 与 MLX 路径（load(..., trust_remote_code=True)）保持一致的取舍。
+        # tokenizer_path 优先：当 ONNX 权重目录不含 tokenizer 文件时，可单独指定。
+        if self._tokenizer_path:
+            tok_src = self._tokenizer_path
+            logger.info("LLM: ONNX 使用独立 tokenizer 路径: %s", tok_src)
+        else:
+            tok_src = (self._path if os.path.isdir(self._path)
+                       else os.path.dirname(self._path))
         self._tokenizer = AutoTokenizer.from_pretrained(
-            self._path if os.path.isdir(self._path) else os.path.dirname(self._path),
-            trust_remote_code=True,
+            tok_src, trust_remote_code=True,
         )
 
     # ------------------------------------------------------------------

@@ -4,6 +4,56 @@
 
 ---
 
+## 2026-10-24 · 配置区：主/辅助/OCR 模型按类型显示第二路径（gguf→mmproj / onnx→tokenizer）
+
+> 用户需求：配置窗口里主模型、辅助模型、OCR 三块，模型类型选 **gguf** 或
+> **onnx** 时，类型后面变成两个路径框——`模型路径` + `mmproj 路径`（gguf，可选）
+> 或 `tokenizer 路径`（onnx，可选）；选 mlx 等时只读单个模型路径。
+
+### 改动
+- **config**：三块各加一对路径字段（默认空、可选）：
+  - 主模型 `local_llm_mmproj_path` / `local_llm_tokenizer_path`
+  - 辅助模型 `aux_local_llm_mmproj_path` / `aux_local_llm_tokenizer_path`
+  - OCR `rag_ocr_mmproj_path` / `rag_ocr_tokenizer_path`
+  （均登记进 `_STR_FIELDS`，加载时做 None→默认 兜底。）
+- **UI（main_window.py）**：三块各加「第二路径」控件组（`*_second_w`，含一个
+  随类型切换文字/显隐的 QLabel + mmproj 编辑框/选择钮 + tokenizer 编辑框/选择钮）。
+  新增 `_sync_second_path(second_w, combo, label, mmproj_edit, mmproj_pick,
+  tokenizer_edit, tokenizer_pick)`：类型含 `gguf`→显示 mmproj 组、隐藏 tokenizer
+  组并标「mmproj 路径」；含 `onnx`→反之标「tokenizer 路径」；其余（mlx 等）→整组隐藏。
+  各类型下拉 `currentTextChanged` 接该方法实时切换；主模型还随「本地/OpenAI」模式
+  显隐（`_on_main_mode_changed` 内处理）。新增 `_pick_dir_btn`/`_pick_dir_path`
+  给 tokenizer 路径选目录（mmproj 仍走 `_pick_btn` 的 `.gguf` 文件筛选）。
+- **后端真实接入**：
+  - LLM（`llm.py` `LocalLLMClient`）：`__init__` 增 `mmproj` / `tokenizer_path`；
+    gguf 加载把 `mmproj` 作为 `Llama(..., clip_model_path=...)`（仅配置时传，纯文本
+    GGUF 不传避免被拒）；onnx 加载用 `tokenizer_path` 作 `AutoTokenizer.from_pretrained`
+    来源（缺则回退模型目录）。
+  - OCR（`ovis_ocr_parser.py`）：`set_ovis_model_config` 增 `mmproj`/`tokenizer` 并
+    纳入变更判定（变了即释放模型单例）；gguf 加载改为 `_load_gguf_model(model_dir,
+    mmproj_path)`：**显式 mmproj 路径 > 目录自动发现(mmproj*.gguf) > 无（纯文本，
+    仅打 warning，图像/表格 OCR 不可用）**——mmproj 由「必填」放宽为「可选」，与
+    用户「如不需要多模态能力可不配置」一致。
+  - `factory.build_llm_client` / `build_aux_llm_client` 透传两路径；`engine.set_ovis_model_config`
+    包装同步透传。
+- **范围**：按用户确认，仅主/辅助/OCR 三块（Embedding/Reranker 的本地 onnx/gguf
+  无 mmproj/tokenizer 概念，故排除）。
+
+### 重要说明（诚实告知）
+- **OCR onnx 的 tokenizer 路径是占位/记录项**：ORT-GenAI 的 `og.Tokenizer` 从模型
+  目录统一加载分词器，不接受独立路径参数，故该字段在 OCR onnx 下**不生效**
+  （给出时打 debug 日志提示），仅 LLM onnx 真正接入。
+- mmproj 仅对**多模态 GGUF** 有意义：给纯文本 GGUF 或错误路径配 mmproj 会被
+  llama.cpp 拒绝（报错即用户配置问题，非缺陷）。
+
+### 验证
+GUI 重启无 Traceback（全程执行了 `_apply_config_to_widgets` → aux/OCR 的
+`_sync_second_path` 与主模型经 `_on_main_mode_changed` 的切换，无 AttributeError）；
+`LocalLLMClient(mmproj=, tokenizer_path=)` 与 `set_ovis_model_config(..., mmproj, tokenizer)`
+构造/调用正常；config 新增 6 字段默认空且序列化正确。
+
+---
+
 ## 2026-10-24 · 配置区精简：去掉超时项、OCR 模型名隐藏、辅助模型补 KV 开关
 
 > 用户需求：① 主/辅助模型配置里去「超时」释放空间；② kv INT8 量化与跨轮复用

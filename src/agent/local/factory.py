@@ -58,6 +58,9 @@ def build_llm_client(config) -> Any:
             # KV cache INT8 量化：主、辅助模型都启用（省显存，质量近乎无损）。
             kv_quant=(True if getattr(config, "local_llm_kv_quantize", True) is None
                       else bool(getattr(config, "local_llm_kv_quantize", True))),
+            # gguf 视觉塔（mmproj）与 onnx 分词器路径：可选，留空走默认。
+            mmproj=getattr(config, "local_llm_mmproj_path", "") or "",
+            tokenizer_path=getattr(config, "local_llm_tokenizer_path", "") or "",
         )
     # 默认：网络 API
     from ..llm_client import LLMClient
@@ -102,6 +105,9 @@ def build_aux_llm_client(config) -> Any:
         # 辅助模型 KV INT8 量化（用户需求：主/辅助都省显存），与主模型同款可配。
         kv_quant=(True if getattr(config, "aux_local_llm_kv_quantize", None) is None
                   else bool(getattr(config, "aux_local_llm_kv_quantize", True))),
+        # gguf 视觉塔（mmproj）与 onnx 分词器路径：可选，留空走默认。
+        mmproj=getattr(config, "aux_local_llm_mmproj_path", "") or "",
+        tokenizer_path=getattr(config, "aux_local_llm_tokenizer_path", "") or "",
     )
 
 

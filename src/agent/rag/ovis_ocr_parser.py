@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 _engine = "mlx-vlm"          # mlx-vlm | onnx | gguf
 _model_name = "OvisOCR2-0.8B-MLX-4bit"
 _model_path = ""             # 显式本地路径优先；空则 models/<name>
+_mmproj_path = ""            # 显式 mmproj 视觉塔路径（gguf，可选）
+_tokenizer_path = ""         # 显式 tokenizer 路径（onnx，可选；ORT-GenAI 多忽略）
 _TABLE_SCALE = 3.0           # 文本页表格裁剪的渲染倍率（细线表格要清晰）
 _IMAGE_PAGE_SCALE = 2.0      # 图片 PDF 整页渲染倍率（无内嵌图时）
 _MAX_SIDE = 1408             # 送 VLM 前的最长边。#133 实测：扫描书内嵌图普遍
@@ -66,19 +68,24 @@ _OG_OCR_PROMPT = _OVIS_PROMPT
 _OVIS_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 
 
-def set_ovis_model_config(engine: str, name: str, path: str) -> None:
+def set_ovis_model_config(engine: str, name: str, path: str,
+                          mmproj: str = "", tokenizer: str = "") -> None:
     """注入 OCR 模型配置（UI 保存设置时调用）。
 
-    配置（后端/模型名/路径）变化时释放已加载的模型单例——否则切后端后
-    仍沿用旧引擎的权重，新配置要重启才生效。
+    配置（后端/模型名/路径/mmproj/tokenizer）变化时释放已加载的模型单例——
+    否则切后端后仍是旧引擎权重，新配置要重启才生效。
     """
-    global _engine, _model_name, _model_path
+    global _engine, _model_name, _model_path, _mmproj_path, _tokenizer_path
     new_engine = (engine or "mlx-vlm").strip() or "mlx-vlm"
     new_name = (name or "OvisOCR2-0.8B-MLX-4bit").strip() or _model_name
     new_path = (path or "").strip()
+    new_mmproj = (mmproj or "").strip()
+    new_tokenizer = (tokenizer or "").strip()
     changed = (new_engine != _engine or new_name != _model_name
-               or new_path != _model_path)
+               or new_path != _model_path or new_mmproj != _mmproj_path
+               or new_tokenizer != _tokenizer_path)
     _engine, _model_name, _model_path = new_engine, new_name, new_path
+    _mmproj_path, _tokenizer_path = new_mmproj, new_tokenizer
     if changed:
         release_model()
 
@@ -181,40 +188,52 @@ def _load_mlx_model(model_dir: Path):
     return load(str(model_dir))
 
 
-def _load_gguf_model(model_dir: Path):
+def _load_gguf_model(model_dir: Path, mmproj_path: str = ""):
     """GGUF 多模态：主模型 gguf + MTMDChatHandler(mmproj)。
 
-    llama-cpp-python ≥0.3.30 用 MTMDChatHandler（通用 mtmd 接口）；更旧版本
-    回退 Llava15ChatHandler（同一构造签名）。两者都不在 → 无 chat_handler
-    直接构造 Llama，生成期会因不识别图像内容而报错（记入 _model_load_error）。
+    mmproj 视觉塔路径：显式配置 > 目录自动发现(mmproj*.gguf) > 无（纯文本，
+    视觉 OCR 不可用）。llama-cpp-python ≥0.3.30 用 MTMDChatHandler；
+    更旧版本回退 Llava15ChatHandler（同一构造签名）。
     """
     from llama_cpp import Llama
 
-    main, proj = _gguf_files(model_dir)
+    main, _ = _gguf_files(model_dir)
     if main is None:
         raise FileNotFoundError(f"目录中没有 .gguf 主模型: {model_dir}")
+    # 解析 mmproj：显式路径优先，其次目录内自动发现
+    proj = None
+    mp = (mmproj_path or "").strip()
+    if mp:
+        if os.path.isfile(mp):
+            proj = mp
+        elif os.path.isdir(mp):
+            _, proj = _gguf_files(Path(mp))
+        else:
+            logger.warning("OCR mmproj 路径不存在，忽略: %s", mp)
     if proj is None:
-        raise FileNotFoundError(
-            "目录中没有 mmproj*.gguf——GGUF 多模态必须带视觉塔投影文件"
-            f"（llama.cpp 导出时的 mmproj-*of-*.gguf）: {model_dir}")
+        proj = _gguf_files(model_dir)[1]
+    if proj is None:
+        logger.warning(
+            "OCR GGUF 未配置 mmproj 视觉塔：仅纯文本，图像/表格 OCR 不可用")
     kwargs: dict = dict(model_path=main, n_ctx=4096, n_gpu_layers=-1,
                         verbose=False)
     handler = None
-    try:
-        from llama_cpp.llama_chat_format import MTMDChatHandler
-        handler = MTMDChatHandler(clip_model_path=proj, verbose=False)
-    except Exception:
+    if proj is not None:
         try:
-            from llama_cpp.llama_chat_format import Llava15ChatHandler
-            handler = Llava15ChatHandler(clip_model_path=proj, verbose=False)
-        except Exception as e:
-            logger.warning("GGUF 多模态 chat handler 构造失败: %s", e)
+            from llama_cpp.llama_chat_format import MTMDChatHandler
+            handler = MTMDChatHandler(clip_model_path=proj, verbose=False)
+        except Exception:
+            try:
+                from llama_cpp.llama_chat_format import Llava15ChatHandler
+                handler = Llava15ChatHandler(clip_model_path=proj, verbose=False)
+            except Exception as e:
+                logger.warning("GGUF 多模态 chat handler 构造失败: %s", e)
     if handler is not None:
         kwargs["chat_handler"] = handler
     return Llama(**kwargs)
 
 
-def _load_onnx_model(model_dir: Path):
+def _load_onnx_model(model_dir: Path, tokenizer_path: str = ""):
     """ORT-GenAI 多模态模型（Model Builder 导出，目录含 genai_config.json）。"""
     try:
         import onnxruntime_genai as og
@@ -224,6 +243,10 @@ def _load_onnx_model(model_dir: Path):
             "安装：pip install onnxruntime-genai\n"
             f"原始错误: {type(e).__name__}: {e}"
         ) from e
+    if tokenizer_path and tokenizer_path.strip():
+        logger.debug(
+            "OCR onnx tokenizer path recorded (%s) but ORT-GenAI loads tokenizer "
+            "from the model dir; this field is unused", tokenizer_path.strip())
     model = og.Model(str(model_dir))
     processor = og.Processor(str(model_dir))
     tokenizer = og.Tokenizer(str(model_dir))
@@ -252,9 +275,9 @@ def _get_model():
 
             t0 = time.monotonic()
             if engine == "gguf":
-                model, processor = _load_gguf_model(model_dir), None
+                model, processor = _load_gguf_model(model_dir, _mmproj_path), None
             elif engine == "onnx":
-                m, p, t = _load_onnx_model(model_dir)
+                m, p, t = _load_onnx_model(model_dir, _tokenizer_path)
                 model, processor = m, (p, t)
             else:
                 model, processor = _load_mlx_model(model_dir)

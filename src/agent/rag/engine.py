@@ -420,11 +420,12 @@ def set_pdf_engine(engine: str) -> None:
             pass
 
 
-def set_ovis_model_config(engine: str, name: str, path: str) -> None:
-    """注入 OvisOCR2 模型配置（rag_ocr_engine/name/path）到 ovis 解析器。"""
+def set_ovis_model_config(engine: str, name: str, path: str,
+                          mmproj: str = "", tokenizer: str = "") -> None:
+    """注入 OvisOCR2 模型配置（rag_ocr_engine/name/path/mmproj/tokenizer）到 ovis 解析器。"""
     try:
         from .ovis_ocr_parser import set_ovis_model_config as _set
-        _set(engine, name, path)
+        _set(engine, name, path, mmproj, tokenizer)
     except Exception:
         pass
 

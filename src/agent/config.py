@@ -94,6 +94,10 @@ class AgentConfig:
     rag_ocr_engine: str = "mlx-vlm"
     rag_ocr_model_name: str = "OvisOCR2-0.8B-MLX-4bit"
     rag_ocr_model_path: str = ""
+    # OCR 的 GGUF mmproj 视觉塔路径（可选，留空则按目录自动发现 / 纯文本）与
+    # ONNX 的 tokenizer 路径（可选；ORT-GenAI 通常打包在模型目录内，故多留空）。
+    rag_ocr_mmproj_path: str = ""
+    rag_ocr_tokenizer_path: str = ""
     # docling OCR 渲染 scale（#132）：
     #   rag_ocr_scale_base    固定 scale 值（默认 2.0；原 3.0，位图内存 ∝ scale²）
     #   rag_ocr_scale_dynamic 动态策略开关（默认 False=固定用 base 值）
@@ -127,6 +131,11 @@ class AgentConfig:
     # 量化不适用，自动退回默认缓存（功能不降级）。GGUF 走 llama.cpp 的
     # type_k/type_v="q8_0"。None 同样按默认 True（bool(None) 会被当成 False）。
     local_llm_kv_quantize: bool = True
+    # 本地 GGUF 视觉塔（mmproj）路径与本地 ONNX 分词器路径（均可选，留空走默认）：
+    #   local_llm_mmproj_path      GGUF 的 clip_model_path（多模态 GGUF 才需要）
+    #   local_llm_tokenizer_path   ONNX 的独立 tokenizer 目录/文件（缺则随模型目录）
+    local_llm_mmproj_path: str = ""
+    local_llm_tokenizer_path: str = ""
     # RapidOCR 引擎池大小（2026-10-23 用户定版：2 个实例、纯 CPU EP 并发）。
     # 背景：ocrmac 识别不了的页会整页透传到 RapidOCR，透传请求占比不低，
     # 单实例串行是扫描书解析的吞吐瓶颈。两个实例 ≈ 2 × 0.5GB 常驻。
@@ -175,6 +184,9 @@ class AgentConfig:
     #   aux_local_llm_kv_quantize KV INT8 量化（默认 True，与主模型同款省显存）
     aux_local_llm_kv_reuse: bool = False
     aux_local_llm_kv_quantize: bool = True
+    # 同主模型：辅助 GGUF 的 mmproj 路径、辅助 ONNX 的 tokenizer 路径（均可选）。
+    aux_local_llm_mmproj_path: str = ""
+    aux_local_llm_tokenizer_path: str = ""
     # 辅助模型思考模式（同 local_llm_enable_thinking，Qwen3 系模板专用）。
     # 默认 **关闭**：辅助模型只干事实抽取、要点提炼这类轻量子任务——输入短、
     # 输出短、要的是结构化结果而不是推理链。开思考会让它先吐一长串推理再给
@@ -240,7 +252,10 @@ class AgentConfig:
                    "local_embedding_backend", "reranker_provider", "local_reranker_model",
                    "local_reranker_backend", "vlm_provider", "local_vlm_model",
                    "local_vlm_backend",
-                   "aux_llm_provider", "aux_local_llm_model", "aux_local_llm_backend")
+                   "aux_llm_provider", "aux_local_llm_model", "aux_local_llm_backend",
+                   "local_llm_mmproj_path", "local_llm_tokenizer_path",
+                   "aux_local_llm_mmproj_path", "aux_local_llm_tokenizer_path",
+                   "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
                     "rag_ocr_scale_dynamic",
