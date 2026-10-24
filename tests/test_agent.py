@@ -1430,3 +1430,9 @@ def test_system_prompt_splits_greeting_from_simple_qa():
     assert "禁止调用任何工具，禁止建计划，禁止写记忆" not in SYSTEM_PROMPT
     # 知识库查询指引在位（分布 → rag_outline）
     assert "rag_outline" in SYSTEM_PROMPT
+    # 2026-10-24 用户反馈（第三次）：本地小模型拿到明确任务却反复自问
+    # 「你没有给出具体任务内容」进入复读循环。规则必须硬性禁止这种行为。
+    assert "直接开做" in SYSTEM_PROMPT            # 有目标就执行
+    assert "你没有给出具体任务" in SYSTEM_PROMPT   # 明确禁语
+    assert "禁止复读" in SYSTEM_PROMPT             # 同一句话不许输出第二遍
+    assert "ask_user" in SYSTEM_PROMPT             # 只缺参数时问那一个参数
