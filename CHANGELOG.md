@@ -4,6 +4,41 @@
 
 ---
 
+## 2026-10-24 · 交互：主窗口「知识同步」快捷按钮 + 知识区「PDF 解析引擎」下拉
+
+> 用户需求：① 主窗口配置与日志按键之间增加「知识同步」按键，不进设置窗口即可
+> 直接同步知识；② 知识同步配置的工作/源知识库行下新增 PDF 解析引擎选择
+> （docling / marker / OvisOCR）与自定义 OCR 模型（含按类型显隐的第二路径）。
+
+### 改动
+- **主窗口顶栏新增「知识同步」按钮**（`⚙ 配置` 与 `日志` 之间，`kb_sync_btn`）：
+  - 左键 = 增量同步、右键菜单「强制全量重新处理」= 全量，与设置区「同步知识」
+    按钮走同一 `_on_sync_knowledge(force=...)` 流程（含 agent 运行互斥校验、
+    依赖检查、停止同步等既有逻辑），无需打开设置窗口。
+  - 新增 `_set_kb_sync_state(text, enabled)` 助手统一刷新顶栏 + 设置区两处按钮：
+    进行中文案一致（检查依赖…/同步中…），恢复时各自回到默认标签
+    （顶栏「知识同步」/ 设置区「同步知识」）。原 `sync_knowledge_btn` 的
+    ~12 处散落状态切换（同步开始/abort/完成/失败/去重/agent 忙闲）全部收敛
+    到该助手，按钮未创建时安全跳过。
+- **「知识同步配置」区新增「PDF 解析引擎」下拉**（`pdf_engine_combo`）：
+  - 选项 docling（默认）/ marker / OvisOCR ↔ 内部值 `rag_pdf_engine`
+    （docling/marker/ovis，新增 `_PDF_DISPLAY_TO_VALUE` / `_PDF_VALUE_TO_DISPLAY`
+    映射），apply/gather 已接入；保存配置后经既有 `set_pdf_engine` 注入生效。
+  - 与「自定义OCR模型」下拉（mlx-vlm/gguf/onnx）+ 模型路径 + 第二路径
+    （gguf→mmproj / onnx→tokenizer，沿用 `_sync_second_path`）组成一行。
+- **修复 OCR 模型行不显示的 bug**（前次改动引入）：原代码 OCR 行布局 `r` 被
+  第二路径行重赋值后从未 `klay.addLayout`，末尾的 `klay.addLayout(r)` 实际把
+  第二路径布局加了两次——导致「OCR模型」下拉 + 路径整行缺失。现改为独立
+  `r2` 变量并各添加一次。
+- **标签改名**：「知识库」→「源知识库」（含配置按钮 tooltip）；主/辅助模型的
+  「KV INT8 量化」→「KV量化」。
+
+### 验证
+编译 + lint 无错；GUI 重启无 Traceback；`_set_kb_sync_state` 行为实测
+（进行中文案同步、恢复各自默认标签、enabled 独立切换、无按钮时安全跳过）。
+
+---
+
 ## 2026-10-24 · 配置区：主/辅助/OCR 模型按类型显示第二路径（gguf→mmproj / onnx→tokenizer）
 
 > 用户需求：配置窗口里主模型、辅助模型、OCR 三块，模型类型选 **gguf** 或

@@ -52,6 +52,10 @@ logger = logging.getLogger(__name__)
 _LLM_TYPE_TO_BACKEND = {"MLX-LM": "mlx", "MLX-VLM": "mlx", "ONNX": "onnx", "GGUF": "gguf"}
 _BACKEND_TO_LLM_TYPE = {"mlx": "MLX-LM", "onnx": "ONNX", "gguf": "GGUF"}
 
+# PDF 解析引擎下拉标签 ↔ 内部标识（#133：rag_pdf_engine 取值 docling/marker/ovis）。
+_PDF_DISPLAY_TO_VALUE = {"docling": "docling", "marker": "marker", "OvisOCR": "ovis"}
+_PDF_VALUE_TO_DISPLAY = {"docling": "docling", "marker": "marker", "ovis": "OvisOCR"}
+
 # 本地模型加载成功后的按钮样式：文字改为「重新加载」+ 绿色背景，代表模型可用。
 _MODEL_READY_STYLE = "font-weight:600; background-color:#16a34a; color:#ffffff;"
 _MODEL_IDLE_STYLE = "font-weight:600;"
@@ -1361,7 +1365,7 @@ class MainWindow(QMainWindow):
             "多轮对话首字延迟显著下降（MLX 与 GGUF 后端都生效）。\n"
             "关闭后每轮整体重建（全量预填充，最慢但最保守）——用于排查前缀错位导致"
             "的罕见乱码，或在上下文/显存极紧张时以时间换空间。")
-        self.kv_quant_check = QCheckBox("KV INT8 量化")
+        self.kv_quant_check = QCheckBox("KV量化")
         self.kv_quant_check.setToolTip(
             "KV cache INT8 量化（省显存，质量近乎无损）：同等上下文长度下 KV 显存约"
             "减半。MLX 在模型默认缓存为标准 KV 缓存时生效（Qwen3.5 等线性注意力模型"
@@ -1419,7 +1423,7 @@ class MainWindow(QMainWindow):
         # 辅助模型同样暴露 KV 复用 / KV INT8 量化开关（与主模型同款）。
         self.aux_kv_reuse_check = QCheckBox("跨轮复用")
         self.aux_kv_reuse_check.setToolTip(self.kv_reuse_check.toolTip())
-        self.aux_kv_quant_check = QCheckBox("KV INT8 量化")
+        self.aux_kv_quant_check = QCheckBox("KV量化")
         self.aux_kv_quant_check.setToolTip(self.kv_quant_check.toolTip())
         r = QHBoxLayout(); r.setSpacing(6)
         r.addWidget(_params_widget(self.aux_max_tokens_edit, self.aux_temp_edit, self.aux_top_p_edit,
@@ -1450,10 +1454,17 @@ class MainWindow(QMainWindow):
         self.knowledge_base_btn = QPushButton("…"); self.knowledge_base_btn.setFixedWidth(28)
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("工作目录")); r.addWidget(self.workspace_edit, 1); r.addWidget(self.workspace_btn)
-        r.addWidget(QLabel("知识库")); r.addWidget(self.knowledge_base_edit, 1); r.addWidget(self.knowledge_base_btn)
+        r.addWidget(QLabel("源知识库")); r.addWidget(self.knowledge_base_edit, 1); r.addWidget(self.knowledge_base_btn)
         klay.addLayout(r)
 
-        # row1.5: OCR 模型（OvisOCR2 VLM，#133——统一引擎回退链第三棒）
+        # row1.5: PDF 解析引擎 + 自定义 OCR 模型（#133 统一引擎回退链）
+        self.pdf_engine_combo = _combo(["docling", "marker", "OvisOCR"], 110)
+        self.pdf_engine_combo.setToolTip(
+            "PDF/Office 统一解析引擎（rag_pdf_engine）：\n"
+            "· docling（默认）：docling 统一管线，版面/表格良好\n"
+            "· marker：marker-pdf 优先（需 pip install marker-pdf；未装静默回退 docling）\n"
+            "· OvisOCR：OvisOCR2 VLM 转 Markdown（docling/marker 之外的兜底）"
+        )
         self.ocr_impl_combo = _combo(["mlx-vlm", "onnx", "gguf"], 110)
         # 仅「类型 + 本地路径」：OCR 始终本地 VLM，模型名由 config 默认值
         # （rag_ocr_model_name=OvisOCR2-0.8B-MLX-4bit）决定，留空自动从
@@ -1461,8 +1472,11 @@ class MainWindow(QMainWindow):
         # 的 -mx-fp8 笔误事故），故不显示在设置区。
         self.ocr_path_edit = _path("本地路径（留空自动用 models/ 下的模型名）", 160)
         r = QHBoxLayout(); r.setSpacing(8)
-        r.addWidget(QLabel("OCR模型")); r.addWidget(self.ocr_impl_combo)
+        r.addWidget(QLabel("PDF解析引擎")); r.addWidget(self.pdf_engine_combo)
+        r.addWidget(QLabel("自定义OCR模型")); r.addWidget(self.ocr_impl_combo)
         r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
+        klay.addLayout(r)
+
         # OCR 第二路径（gguf→mmproj 视觉塔 / onnx→tokenizer），按类型显隐
         self.ocr_second_label = QLabel("mmproj 路径")
         self.ocr_mmproj_edit = _path("mmproj 视觉塔路径（可选，多模态才需要）")
@@ -1470,11 +1484,11 @@ class MainWindow(QMainWindow):
         self.ocr_tokenizer_edit = _path("tokenizer 路径（可选）")
         self.ocr_tokenizer_pick = _pick_dir_btn(self.ocr_tokenizer_edit)
         self.ocr_second_w = QWidget()
-        r = QHBoxLayout(self.ocr_second_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(8)
-        r.addWidget(self.ocr_second_label)
-        r.addWidget(self.ocr_mmproj_edit, 1); r.addWidget(self.ocr_mmproj_pick)
-        r.addWidget(self.ocr_tokenizer_edit, 1); r.addWidget(self.ocr_tokenizer_pick)
-        klay.addLayout(r)
+        r2 = QHBoxLayout(self.ocr_second_w); r2.setContentsMargins(0, 0, 0, 0); r2.setSpacing(8)
+        r2.addWidget(self.ocr_second_label)
+        r2.addWidget(self.ocr_mmproj_edit, 1); r2.addWidget(self.ocr_mmproj_pick)
+        r2.addWidget(self.ocr_tokenizer_edit, 1); r2.addWidget(self.ocr_tokenizer_pick)
+        klay.addLayout(r2)
         self.ocr_impl_combo.currentTextChanged.connect(
             lambda _: self._sync_second_path(
                 self.ocr_second_w, self.ocr_impl_combo, self.ocr_second_label,
@@ -1487,7 +1501,6 @@ class MainWindow(QMainWindow):
             "· onnx：目录含 genai_config.json（onnxruntime-genai 导出，"
             "需 pip install onnxruntime-genai）"
         )
-        klay.addLayout(r)
 
         # row2: Embedding（实现下拉 + 模型名 + 本地路径选择 + 同步知识）
         self.embedding_impl_combo = _combo(["fastembed", "mlx", "onnx", "gguf"], 110)
@@ -1849,12 +1862,26 @@ class MainWindow(QMainWindow):
         self.config_btn.setFixedWidth(96)
         self.config_btn.setStyleSheet("font-weight:600;")
         self.config_btn.setToolTip(
-            "打开配置窗口：Base URL / API Key / 模型 / 采样参数 / 工作目录 / 知识库"
+            "打开配置窗口：Base URL / API Key / 模型 / 采样参数 / 工作目录 / 源知识库"
         )
         self.log_btn = QPushButton("日志")
         self.log_btn.setFixedWidth(96)
         self.log_btn.setStyleSheet("font-weight:600;")
         self.log_btn.setToolTip("打开日志窗口：运行日志 / RAG 同步 / 工具调用记录")
+
+        # 知识同步快捷按钮：不必进设置窗口即可直接同步（与设置区「同步知识」同流程）。
+        self.kb_sync_btn = QPushButton("知识同步")
+        self.kb_sync_btn.setFixedWidth(96)
+        self.kb_sync_btn.setStyleSheet("font-weight:600;")
+        self.kb_sync_btn.setToolTip(
+            "直接同步知识库（无需打开设置窗口）：\n"
+            "左键：增量同步（只处理新增/修改的文件）\n"
+            "右键：强制全量重新处理"
+        )
+        self.kb_sync_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self._kb_force_sync_action = self.kb_sync_btn.addAction("强制全量重新处理")
+        self._kb_force_sync_action.triggered.connect(
+            lambda: self._on_sync_knowledge(force=True))
 
         # chat header with controls
         chat_header = QHBoxLayout()
@@ -1865,6 +1892,7 @@ class MainWindow(QMainWindow):
         chat_header.addWidget(self.stop_btn)
         chat_header.addSpacing(12)
         chat_header.addWidget(self.config_btn)
+        chat_header.addWidget(self.kb_sync_btn)
         chat_header.addWidget(self.log_btn)
         llay.addLayout(chat_header)
 
@@ -2005,6 +2033,7 @@ class MainWindow(QMainWindow):
         self.workspace_btn.clicked.connect(self._on_pick_workspace)
         self.knowledge_base_btn.clicked.connect(self._on_pick_knowledge_base)
         self.sync_knowledge_btn.clicked.connect(self._on_sync_knowledge)
+        self.kb_sync_btn.clicked.connect(self._on_sync_knowledge)
         self.stop_sync_btn.clicked.connect(self._on_stop_sync)
         self.clear_btn.clicked.connect(self._on_clear_chat)
         self.log_clear_btn.clicked.connect(self.log_view.clear)
@@ -2084,6 +2113,10 @@ class MainWindow(QMainWindow):
             self.config.embedding_provider, self.config.local_embedding_backend))
         self.embedding_model_name_edit.setText(self.config.rag_embedding_model)
         self.embedding_path_edit.setText(self.config.local_embedding_model)
+        # PDF 解析引擎（docling | marker | ovis）：内部值 → 显示标签。
+        self.pdf_engine_combo.setCurrentText(
+            _PDF_VALUE_TO_DISPLAY.get(
+                getattr(self.config, "rag_pdf_engine", "docling"), "docling"))
         # OCR 模型（OvisOCR2，#133）：仅类型 + 路径；模型名用 config 默认值
         self.ocr_impl_combo.setCurrentText(
             getattr(self.config, "rag_ocr_engine", "mlx-vlm") or "mlx-vlm")
@@ -2226,6 +2259,9 @@ class MainWindow(QMainWindow):
             if rname:
                 self.config.rag_rerank_model = rname
         self.config.local_reranker_model = self.reranker_path_edit.text().strip()
+        # PDF 解析引擎（docling | marker | ovis）：显示标签 → 内部值。
+        self.config.rag_pdf_engine = _PDF_DISPLAY_TO_VALUE.get(
+            self.pdf_engine_combo.currentText().strip(), "docling")
         # OCR 模型（OvisOCR2，#133）：实现/模型名/本地路径
         self.config.rag_ocr_engine = self.ocr_impl_combo.currentText().strip() or "mlx-vlm"
         # 模型名不暴露给 UI：保持 config 默认值（OvisOCR2-0.8B-MLX-4bit），
@@ -2433,7 +2469,7 @@ class MainWindow(QMainWindow):
         # 挂在自定义信号上会在 run() 执行途中销毁线程对象。
         self._dedup_worker.finished.connect(self._dedup_worker.deleteLater)
         self.dedup_vectors_btn.setEnabled(False)
-        self.sync_knowledge_btn.setEnabled(False)
+        self._set_kb_sync_state(enabled=False)
         self.progress.setRange(0, 0)      # busy 态（总数未知）
         self.progress.setFormat("向量去重扫描中…")
         self._dedup_worker.start()
@@ -2450,7 +2486,7 @@ class MainWindow(QMainWindow):
 
     def _on_dedup_finished(self, stats: dict) -> None:
         self.dedup_vectors_btn.setEnabled(True)
-        self.sync_knowledge_btn.setEnabled(True)
+        self._set_kb_sync_state(enabled=True)
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.progress.setFormat("%p%")
@@ -2475,7 +2511,7 @@ class MainWindow(QMainWindow):
 
     def _on_dedup_failed(self, error: str) -> None:
         self.dedup_vectors_btn.setEnabled(True)
-        self.sync_knowledge_btn.setEnabled(True)
+        self._set_kb_sync_state(enabled=True)
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.progress.setFormat("%p%")
@@ -2483,6 +2519,21 @@ class MainWindow(QMainWindow):
         self.status_label.setText("向量去重失败")
         logger.warning("向量去重失败: %s", error[:300])
         QMessageBox.critical(self, "向量去重失败", error[:500])
+
+    def _set_kb_sync_state(self, text=None, enabled=None) -> None:
+        """刷新「同步知识」按钮状态：顶栏快捷按钮 + 设置区按钮两处保持一致。
+
+        两处默认文案不同（顶栏「知识同步」/ 设置区「同步知识」），故恢复时
+        各自回到自己的默认标签；进行中的临时文案（检查依赖…/同步中…）一致。
+        按钮尚未创建时（初始化早期）安全跳过。
+        """
+        for btn, default in ((getattr(self, "sync_knowledge_btn", None), "同步知识"),
+                             (getattr(self, "kb_sync_btn", None), "知识同步")):
+            if btn is None:
+                continue
+            if enabled is not None:
+                btn.setEnabled(enabled)
+            btn.setText(default if text is None else text)
 
     def _on_sync_knowledge(self, force: bool = False) -> None:
         if self._is_worker_running(self._sync_worker):
@@ -2518,8 +2569,7 @@ class MainWindow(QMainWindow):
         logger.info("Knowledge sync triggered: kb=%s workspace=%s force=%s", kb, ws, force)
         self._sync_active = True
         # Step 1: check dependencies before starting sync
-        self.sync_knowledge_btn.setEnabled(False)
-        self.sync_knowledge_btn.setText("检查依赖…")
+        self._set_kb_sync_state("检查依赖…", False)
         # Enable stop-sync during the deps-check phase too so the user can
         # abort the whole pipeline before sync even starts.
         self.stop_sync_btn.setEnabled(True)
@@ -2552,8 +2602,7 @@ class MainWindow(QMainWindow):
             # 同步按钮从此永久脱离 busy 管理（不随 agent 忙闲翻转）。下面两个
             # 提前 return 是同一条路径，一并处理。
             self._sync_active = False
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
+            self._set_kb_sync_state(enabled=True)
             self.stop_sync_btn.setEnabled(False)
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
@@ -2564,8 +2613,7 @@ class MainWindow(QMainWindow):
             # Required deps still missing after auto-install attempt
             logger.warning("Deps check: blocking dependencies missing, aborting sync")
             self._sync_active = False
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
+            self._set_kb_sync_state(enabled=True)
             self.stop_sync_btn.setEnabled(False)
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
@@ -2582,8 +2630,7 @@ class MainWindow(QMainWindow):
             # 跑引擎，产生难懂的二次异常并吞掉真正的失败原因。
             logger.error("Deps check failed with an exception — aborting sync")
             self._sync_active = False
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
+            self._set_kb_sync_state(enabled=True)
             self.stop_sync_btn.setEnabled(False)
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
@@ -2605,8 +2652,7 @@ class MainWindow(QMainWindow):
         self._pending_sync_kb = ""
         self._pending_sync_force = False
         if not ws or not kb:
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
+            self._set_kb_sync_state(enabled=True)
             self.stop_sync_btn.setEnabled(False)
             # 防御分支同样要复位不确定态进度条——_on_sync_knowledge 已把它设
             # 为 setRange(0,0)，不恢复的话进度条会永久转圈。
@@ -2614,7 +2660,7 @@ class MainWindow(QMainWindow):
             self.progress.setValue(0)
             self.status_label.setText("未选择知识库目录")
             return
-        self.sync_knowledge_btn.setText("同步中…")
+        self._set_kb_sync_state("同步中…")
         self.status_label.setText("正在同步知识库…")
         self.progress.setRange(0, 0)
         # stop_sync_btn stays enabled (it was enabled in _on_sync_knowledge)
@@ -2662,8 +2708,7 @@ class MainWindow(QMainWindow):
         # 最后消费一次 _log_buffer，确保残余日志被显示
         self._poll_sync_logs()
         try:
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
+            self._set_kb_sync_state(enabled=True)
             self.stop_sync_btn.setEnabled(False)
             # Fully reset the progress bar: both range AND value. Without
             # setValue(0), a stale value from the last _on_sync_progress
@@ -2724,8 +2769,7 @@ class MainWindow(QMainWindow):
             logger.error("UI: _on_sync_finished error: %s", e, exc_info=True)
             # 确保按钮状态恢复，即使弹窗失败
             try:
-                self.sync_knowledge_btn.setEnabled(True)
-                self.sync_knowledge_btn.setText("同步知识")
+                self._set_kb_sync_state(enabled=True)
                 self.stop_sync_btn.setEnabled(False)
                 self.progress.setRange(0, 1)
                 self.progress.setValue(0)
@@ -2757,8 +2801,7 @@ class MainWindow(QMainWindow):
                 btn_text,
             )
             try:
-                self.sync_knowledge_btn.setEnabled(True)
-                self.sync_knowledge_btn.setText("同步知识")
+                self._set_kb_sync_state(enabled=True)
                 self.stop_sync_btn.setEnabled(False)
                 self.progress.setRange(0, 1)
                 self.progress.setValue(0)
@@ -2800,8 +2843,7 @@ class MainWindow(QMainWindow):
             logger.info("UI: sync_failed received, emit_count=%d emit_errors=%d",
                         self._log_handler._emit_count, self._log_handler._emit_errors)
         try:
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
+            self._set_kb_sync_state(enabled=True)
             self.stop_sync_btn.setEnabled(False)
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
@@ -2811,8 +2853,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error("UI: _on_sync_failed error: %s", e, exc_info=True)
             try:
-                self.sync_knowledge_btn.setEnabled(True)
-                self.sync_knowledge_btn.setText("同步知识")
+                self._set_kb_sync_state(enabled=True)
                 self.stop_sync_btn.setEnabled(False)
                 self.progress.setRange(0, 1)
                 self.progress.setValue(0)
@@ -3068,7 +3109,7 @@ class MainWindow(QMainWindow):
         # 跑就把同步按钮变回可点，用户点了之后与 agent 检索抢同一向量表。
         # 进度条也不归这里管（同步用 0..N 范围，agent 用不定范围 busy 态）。
         if not getattr(self, "_sync_active", False):
-            self.sync_knowledge_btn.setEnabled(not busy)
+            self._set_kb_sync_state(enabled=not busy)
             self.progress.setRange(0, 0 if busy else 1)
 
     # ------------------------------------------------------------------
