@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-10-24 · 功能：KV cache INT8 量化（MLX + GGUF，主模型与辅助模型都启用）
+
+> 用户需求：对 KV cache 做 INT8 量化节省显存，对 mlx 与 gguf 格式、主模型和辅助模型都采用。
+
+### 实现
+- **MLX**：`_make_prompt_cache()` 在模型默认缓存是**标准 KV 缓存**（`KVCache`/`RotatingKVCache`）时，改用 `mlx_lm.models.cache.QuantizedKVCache(group_size=64, bits=8)` 构建缓存列表传给 `stream_generate` 的 `prompt_cache`；跨轮前缀复用（form①）与裁剪复用（form②③，`QuantizedKVCache.is_trimmable()` 返回 True）均不受影响。
+- **GGUF（llama.cpp）**：`Llama(..., type_k=GGML_TYPE_Q8_0, type_v=GGML_TYPE_Q8_0)`（`type_k`/`type_v` 是**整数枚举**，不是字符串 `"q8_0"`——此坑已在实测中踩中并修正；硬编码值取自 `llama_cpp.GGML_TYPE_Q8_0`，带兜底 8）。
+- **配置 / UI**：新增 `local_llm_kv_quantize`（默认 `True`，`null` 当 `True` 处理）；`factory.build_llm_client` 与 `build_aux_llm_client` 都透传 `kv_quant=True`（主、辅助都启用）；配置区新增「KV INT8 量化」勾选框，与「跨轮复用」并列。
+
+### 优雅降级（关键）
+- **MLX 线性注意力模型**（如 Qwen3.5，默认缓存是 `ArraysCache`，无标准 KV）量化无意义 → 自动退回默认缓存并 info 级日志说明，**功能不降级**。
+- **部分 llama.cpp 构建/模型不支持 `type_k`/`type_v` 覆盖**（实测任何取值都触发 `Failed to create llama_context`）→ 捕获后**退回默认 f16 KV**，仅 warning，绝不因量化把模型加载搞挂（与上面 MLX 跳过逻辑一致）。
+
+### 验证
+- 单测 6 例（`tests/test_kv_quant.py`）：标准 KV → `QuantizedKVCache` 列表；`RotatingKVCache` 同样量化；`ArraysCache` → 原样返回（不量化）；`kv_quant=False` → 默认；非 mlx 后端 → 防御性透传；GGUF `type_k`/`type_v` 参数存在性。
+- 真实 GGUF 0.8B 模型：q8_0 尝试失败 → 降级默认 KV → 成功加载并 `eval=17` 生成，证明降级路径不阻断生成。
+
+### 对你当前环境的重要说明（诚实告知）
+- 你的**主模型 Qwen3.5 走 MLX 线性注意力**（`ArraysCache`），MLX KV 量化对本机该模型**自动跳过**（无标准 KV 可量化）——这是模型架构决定的，不是缺陷；换用标准注意力的 MLX 模型（如 Llama/Qwen 标准版）即生效。
+- 你的 **llama.cpp 构建拒绝 `type_k`/`type_v` 覆盖**（任何值都 context 创建失败），GGUF KV 量化在本机构建下**同样降级为默认 f16 KV**。需换用支持 KV 量化的 llama.cpp 构建（或该构建开启对应编译选项）才能真正拿到 GGUF 侧显存收益。
+
+### 测试
+新增 `tests/test_kv_quant.py`（6 例）。
+
+---
+
 ## 2026-10-24 · 修复：技能检索链路上的三处断层（量化权重 / 模型路径 / 技能放错工作区）
 
 > 用户要求：检查技能检索是否真的能按意图检索到需要的 skill 并读取应用。

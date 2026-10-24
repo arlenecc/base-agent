@@ -415,6 +415,7 @@ class LocalLLMClient:
         num_draft_tokens: int = 0,
         prefill_step_size: int = 0,
         kv_reuse: bool = True,
+        kv_quant: bool = True,
     ):
         # 跨轮 KV / 前缀复用开关（MLX 与 GGUF 都遵守，默认开）。
         # 关闭后每轮整体重建（全量预填充）——用于排查前缀错位导致的乱码，
@@ -422,6 +423,15 @@ class LocalLLMClient:
         # None 必须当默认值 True：配置被手工写成 null 时 bool(None)=False 会把
         # 复用静默关掉（表现为「每句都慢」）。
         self._kv_reuse = True if kv_reuse is None else bool(kv_reuse)
+        # KV cache INT8 量化开关（省显存，质量近乎无损）。None 同样当 True。
+        # MLX 仅在模型默认缓存是标准 KV 缓存时生效（线性注意力模型无意义，
+        # 自动退回默认）；GGUF 始终生效。
+        self._kv_quant = True if kv_quant is None else bool(kv_quant)
+        # KV 量化是否真正生效（部分构建/模型不支持时降级为 False，仅作状态记录）。
+        self._kv_quant_applied = self._kv_quant
+        # 量化参数：8-bit、group 64（与 llama.cpp 的 q8_0 同档，质量损失可忽略）。
+        self._kv_quant_bits = 8
+        self._kv_quant_group = 64
         self._path = path
         # 后端标识归一化：配置可能被手工编辑成 UI 显示名（"mlx-lm"）或 llama.cpp
         # 旧称（"llama_cpp"）——不归一化会在 _ensure_model 抛「未知 LLM 后端」，
@@ -502,6 +512,37 @@ class LocalLLMClient:
             self._cache_token_ids = []
             self._loaded = True
 
+    def _make_prompt_cache(self):
+        """构造 MLX 的 prompt cache；开启 KV 量化时改用 ``QuantizedKVCache`` 省显存。
+
+        仅当模型默认缓存是**标准 KV 缓存**（``KVCache`` / ``RotatingKVCache``）时
+        才量化：Qwen3.5 等线性注意力模型用 ``ArraysCache``（不存标准 KV），量化
+        无意义且会破坏注意力，此时退回默认缓存（功能不降级）。任何异常都退回
+        ``make_prompt_cache``，绝不因量化把加载/生成搞挂。
+        """
+        from mlx_lm.models.cache import (
+            make_prompt_cache, QuantizedKVCache, KVCache, RotatingKVCache)
+        if self._backend != "mlx" or not self._kv_quant:
+            return make_prompt_cache(self._model)
+        try:
+            default = make_prompt_cache(self._model)
+            if (not default
+                    or not isinstance(default[0], (KVCache, RotatingKVCache))):
+                logger.info(
+                    "LLM: 模型默认缓存非标准 KV（%s），跳过 KV 量化",
+                    type(default[0]).__name__ if default else "空")
+                return default
+            n = len(default)
+            logger.info(
+                "LLM: KV cache 启用 INT%d 量化（group=%d，%d 层）",
+                self._kv_quant_bits, self._kv_quant_group, n)
+            return [QuantizedKVCache(group_size=self._kv_quant_group,
+                                     bits=self._kv_quant_bits)
+                    for _ in range(n)]
+        except Exception as e:  # 量化缓存构造失败 → 退回默认，不影响生成
+            logger.warning("LLM: KV 量化缓存构造失败，退回默认: %s", e)
+            return make_prompt_cache(self._model)
+
     def _load_mlx(self) -> None:
         if not os.path.isdir(self._path):
             raise FileNotFoundError(f"本地 LLM 模型目录不存在: {self._path}")
@@ -559,22 +600,48 @@ class LocalLLMClient:
         # 报错，max_tokens 形同虚设且静默发生。预留 1k 给 prompt 余量，
         # 下限 8192（短 max_tokens 时也有基本的多轮空间）。
         n_ctx = max(8192, min(self._max_tokens + 1024, 131072))
+        # KV cache INT8 量化（type_k/type_v=GGML_TYPE_Q8_0=8）：同等上下文长度下
+        # KV 显存减半，质量损失可忽略。type_k/type_v 是 llama.cpp 的**整数枚举**
+        # （不是字符串 "q8_0"），传错类型会 TypeError；关闭时退回默认 f16 KV。
+        gguf_kwargs: Dict[str, Any] = {}
+        if self._kv_quant:
+            try:
+                from llama_cpp import GGML_TYPE_Q8_0  # 部分版本在顶层暴露
+            except Exception:
+                GGML_TYPE_Q8_0 = getattr(__import__("llama_cpp"), "GGML_TYPE_Q8_0", 8)
+            gguf_kwargs["type_k"] = GGML_TYPE_Q8_0
+            gguf_kwargs["type_v"] = GGML_TYPE_Q8_0
         try:
             self._model = Llama(
-                model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False
+                model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False,
+                **gguf_kwargs,
             )
+            if self._kv_quant:
+                logger.info("LLM: GGUF KV cache 启用 INT8 量化 (type_k/type_v=q8_0)")
         except Exception as e:
-            # llama.cpp 的原始报错只有 "Failed to load model from file"，
-            # 把常见原因写进信息里：文件损坏 / 非 GGUF / 量化类型不被当前
-            # llama-cpp-python 构建支持（PTQ/IQ 等特殊量化需定制构建）/
-            # n_gpu_layers=-1 显存不足。
-            raise RuntimeError(
-                f"GGUF 模型加载失败: {os.path.basename(gguf)}"
-                f"（{type(e).__name__}: {e}）。常见原因：文件损坏或不是 GGUF 格式、"
-                "量化类型不被当前 llama-cpp-python 构建支持（PTQ/IQ 等特殊量化需"
-                "对应定制构建）、或显存不足（n_gpu_layers=-1 全量 offload，可换更"
-                "小量化或减小 max_tokens）。"
-            ) from e
+            # 部分 llama.cpp 构建 / 模型不支持 type_k/type_v 覆盖（任何取值都
+            # 触发 "Failed to create llama_context"）——退回默认 f16 KV，绝不
+            # 因量化把模型加载搞挂（与 MLX 线性注意力模型的跳过逻辑一致）。
+            if self._kv_quant:
+                logger.warning(
+                    "LLM: GGUF KV INT8 量化不可用（%s: %s），退回默认 KV",
+                    type(e).__name__, e)
+                try:
+                    self._model = Llama(
+                        model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1,
+                        verbose=False)
+                except Exception as e2:
+                    e = e2  # 退回也失败 → 走下面的 RuntimeError
+                else:
+                    self._kv_quant_applied = False
+            if self._model is None:
+                raise RuntimeError(
+                    f"GGUF 模型加载失败: {os.path.basename(gguf)}"
+                    f"（{type(e).__name__}: {e}）。常见原因：文件损坏或不是 GGUF 格式、"
+                    "量化类型不被当前 llama-cpp-python 构建支持（PTQ/IQ 等特殊量化需"
+                    "对应定制构建）、或显存不足（n_gpu_layers=-1 全量 offload，可换更"
+                    "小量化或减小 max_tokens）。"
+                ) from e
         # GGUF 的对话模板由 llama.cpp 内建处理（create_chat_completion），
         # 不需要 HF tokenizer；预填/校验等路径对非 mlx 后端均提前返回。
         self._tokenizer = None
@@ -933,7 +1000,7 @@ class LocalLLMClient:
                 "LLM: KV 缓存整体重建（%s）: cached=%d, prompt=%d, fork@%d",
                 reason, len(cached_ids), len(prompt_ids), common)
         if cache is None:
-            cache = make_prompt_cache(self._model)
+            cache = self._make_prompt_cache()
             reuse = 0
         # 兜底：喂给 stream_generate 的 suffix **绝不能为空**。prompt 为空时
         # mlx-lm 会抛 "Either input_embeddings or prompt (or both) must be

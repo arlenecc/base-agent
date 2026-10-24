@@ -1259,7 +1259,7 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda: self._pick_model_path(edit, combo))
             return b
 
-        def _params_widget(mt, temp, tp, mp, tk, rp, thinking, to, extra=None):
+        def _params_widget(mt, temp, tp, mp, tk, rp, thinking, to, *extras):
             w = QWidget()
             row = QHBoxLayout(w)
             row.setContentsMargins(0, 0, 0, 0)
@@ -1272,8 +1272,9 @@ class MainWindow(QMainWindow):
             row.addWidget(QLabel("repeat-penalty")); row.addWidget(rp)
             row.addWidget(thinking)
             row.addWidget(QLabel("超时(秒)"));  row.addWidget(to)
-            if extra is not None:
-                row.addWidget(extra)
+            for ex in extras:
+                if ex is not None:
+                    row.addWidget(ex)
             return w
 
         # ==================================================================
@@ -1335,12 +1336,18 @@ class MainWindow(QMainWindow):
             "多轮对话首字延迟显著下降（MLX 与 GGUF 后端都生效）。\n"
             "关闭后每轮整体重建（全量预填充，最慢但最保守）——用于排查前缀错位导致"
             "的罕见乱码，或在上下文/显存极紧张时以时间换空间。")
+        self.kv_quant_check = QCheckBox("KV INT8 量化")
+        self.kv_quant_check.setToolTip(
+            "KV cache INT8 量化（省显存，质量近乎无损）：同等上下文长度下 KV 显存约"
+            "减半。MLX 在模型默认缓存为标准 KV 缓存时生效（Qwen3.5 等线性注意力模型"
+            "无标准 KV，自动跳过）；GGUF 通过 llama.cpp 的 type_k/type_v=q8_0 生效。"
+            "主模型与辅助模型都启用。")
         self.main_params_w = QWidget()
         r = QHBoxLayout(self.main_params_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(6)
         r.addWidget(_params_widget(self.max_tokens_edit, self.temp_edit, self.top_p_edit,
                                    self.min_p_edit, self.top_k_edit, self.repeat_penalty_edit,
                                    self.thinking_check, self.timeout_edit,
-                                   self.kv_reuse_check))
+                                   self.kv_reuse_check, self.kv_quant_check))
         r.addStretch(1)
         self.load_main_btn = QPushButton("加载模型")
         self.load_main_btn.setStyleSheet("font-weight:600;")
@@ -1427,6 +1434,13 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("Embedding")); r.addWidget(self.embedding_impl_combo)
         r.addWidget(self.embedding_model_name_edit, 2)
         r.addWidget(self.embedding_path_edit, 2); r.addWidget(_pick_btn(self.embedding_path_edit, self.embedding_impl_combo))
+        # 模型名只在 fastembed（网络模型 id）模式有意义；本地模式由「路径」决定
+        # 模型，显示一个用不到又允许编辑的字段只会制造拼写错误（实测用户把
+        # reranker 名写成 -mx-fp8，加载直接失败）。按实现下拉显隐。
+        self.embedding_impl_combo.currentTextChanged.connect(
+            lambda _t: self._sync_impl_fields(self.embedding_impl_combo,
+                                              self.embedding_model_name_edit,
+                                              self.embedding_path_edit))
         self.dedup_vectors_btn = QPushButton("向量去重")
         self.dedup_vectors_btn.setToolTip(
             "扫描向量库，清理内容完全相同的重复向量\n"
@@ -1454,6 +1468,10 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("Reranker")); r.addWidget(self.reranker_impl_combo)
         r.addWidget(self.reranker_model_name_edit, 2)
         r.addWidget(self.reranker_path_edit, 2); r.addWidget(_pick_btn(self.reranker_path_edit, self.reranker_impl_combo))
+        self.reranker_impl_combo.currentTextChanged.connect(
+            lambda _t: self._sync_impl_fields(self.reranker_impl_combo,
+                                              self.reranker_model_name_edit,
+                                              self.reranker_path_edit))
         self.stop_sync_btn = QPushButton("停止同步")
         self.stop_sync_btn.setEnabled(False)
         self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
@@ -1934,6 +1952,7 @@ class MainWindow(QMainWindow):
         self.timeout_edit.setText(str(self.config.request_timeout))
         self.thinking_check.setChecked(bool(getattr(self.config, "local_llm_enable_thinking", True)))
         self.kv_reuse_check.setChecked(bool(getattr(self.config, "local_llm_kv_reuse", True)))
+        self.kv_quant_check.setChecked(bool(getattr(self.config, "local_llm_kv_quantize", True)))
         self.workspace_edit.setText(self.config.workspace)
         self.knowledge_base_edit.setText(self.config.knowledge_base)
         # 主模型模式（本地 / OpenAI 兼容接口）+ 本地类型与路径
@@ -1971,8 +1990,27 @@ class MainWindow(QMainWindow):
             self.config.reranker_provider, self.config.local_reranker_backend))
         self.reranker_model_name_edit.setText(self.config.rag_rerank_model)
         self.reranker_path_edit.setText(self.config.local_reranker_model)
+        # Embedding / Reranker 的「模型名 ↔ 本地路径」显隐：fastembed 显示模型名、
+        # 隐藏路径；本地实现反之。按当前下拉值一次性同步初始可见性。
+        self._sync_impl_fields(self.embedding_impl_combo,
+                               self.embedding_model_name_edit,
+                               self.embedding_path_edit)
+        self._sync_impl_fields(self.reranker_impl_combo,
+                               self.reranker_model_name_edit,
+                               self.reranker_path_edit)
         # 同步主模型模式切换的可见性
         self._on_main_mode_changed(self.main_mode_combo.currentText())
+
+    def _sync_impl_fields(self, combo, name_edit, path_edit) -> None:
+        """按实现下拉显隐「模型名 / 本地路径」：fastembed 显示模型名、隐藏路径；
+        本地实现（mlx/onnx/gguf）显示路径、隐藏模型名。
+
+        本地模式下「模型名」用不到又允许编辑，曾经让用户把 reranker 名拼错成
+        -mx-fp8 导致加载失败；隐藏它从根上消除这类手填错误（见技能检索排查）。
+        """
+        is_fastembed = (combo.currentText().strip().lower() == "fastembed")
+        name_edit.setVisible(is_fastembed)
+        path_edit.setVisible(not is_fastembed)
 
     def _gather_config_from_widgets(self) -> None:
         self.config.base_url = self.base_url_edit.text().strip()
@@ -2021,6 +2059,7 @@ class MainWindow(QMainWindow):
         _num(self.timeout_edit, "request_timeout", 120, float, "超时")
         self.config.local_llm_enable_thinking = self.thinking_check.isChecked()
         self.config.local_llm_kv_reuse = self.kv_reuse_check.isChecked()
+        self.config.local_llm_kv_quantize = self.kv_quant_check.isChecked()
         # 辅助模型参数（本地专用）
         _num(self.aux_temp_edit, "aux_temperature", 0.7, float, "辅助温度")
         _num(self.aux_max_tokens_edit, "aux_max_tokens", 32768, int, "辅助最大Token")
@@ -2061,16 +2100,20 @@ class MainWindow(QMainWindow):
         emb_impl = self.embedding_impl_combo.currentText().strip()
         self.config.embedding_provider, self.config.local_embedding_backend = \
             _impl_to_provider_backend(emb_impl)
-        name = self.embedding_model_name_edit.text().strip()
-        if name:
-            self.config.rag_embedding_model = name
+        # 仅 fastembed 模式写模型名（网络模型 id）；本地模式由「路径」决定模型，
+        # 隐藏的模型名字段不参与落位，避免旧值覆盖配置（见 _sync_impl_fields）。
+        if emb_impl == "fastembed":
+            name = self.embedding_model_name_edit.text().strip()
+            if name:
+                self.config.rag_embedding_model = name
         self.config.local_embedding_model = self.embedding_path_edit.text().strip()
         rk_impl = self.reranker_impl_combo.currentText().strip()
         self.config.reranker_provider, self.config.local_reranker_backend = \
             _impl_to_provider_backend(rk_impl)
-        rname = self.reranker_model_name_edit.text().strip()
-        if rname:
-            self.config.rag_rerank_model = rname
+        if rk_impl == "fastembed":
+            rname = self.reranker_model_name_edit.text().strip()
+            if rname:
+                self.config.rag_rerank_model = rname
         self.config.local_reranker_model = self.reranker_path_edit.text().strip()
         # OCR 模型（OvisOCR2，#133）：实现/模型名/本地路径
         self.config.rag_ocr_engine = self.ocr_impl_combo.currentText().strip() or "mlx-vlm"

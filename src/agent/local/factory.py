@@ -55,6 +55,9 @@ def build_llm_client(config) -> Any:
             # 跨轮 KV 复用静默关掉。LocalLLMClient 内部也会再归一化一次。
             kv_reuse=(True if getattr(config, "local_llm_kv_reuse", True) is None
                       else bool(getattr(config, "local_llm_kv_reuse", True))),
+            # KV cache INT8 量化：主、辅助模型都启用（省显存，质量近乎无损）。
+            kv_quant=(True if getattr(config, "local_llm_kv_quantize", True) is None
+                      else bool(getattr(config, "local_llm_kv_quantize", True))),
         )
     # 默认：网络 API
     from ..llm_client import LLMClient
@@ -94,6 +97,9 @@ def build_aux_llm_client(config) -> Any:
         enable_thinking=bool(getattr(config, "aux_local_llm_enable_thinking", False)),
         # 辅助调用 prompt 每轮都变，不做跨轮复用（与 MLX 的 aux 一次性缓存同款）。
         kv_reuse=False,
+        # 辅助模型同样启用 KV INT8 量化（用户需求：主/辅助都省显存）。
+        kv_quant=(True if getattr(config, "local_llm_kv_quantize", True) is None
+                  else bool(getattr(config, "local_llm_kv_quantize", True))),
     )
 
 

@@ -121,6 +121,12 @@ class AgentConfig:
     # 关闭后每轮整体重建（全量预填充，最慢但最保守）——用于排查前缀错位导致
     # 的罕见乱码，或在上下文/显存极紧张时以时间换空间。
     local_llm_kv_reuse: bool = True
+    # KV cache INT8 量化（省显存，质量近乎无损）。2026-10-24 需求：对 MLX 与
+    # GGUF、主模型与辅助模型都启用。MLX 在模型默认缓存是标准 KV 缓存时换成
+    # QuantizedKVCache；Qwen3.5 等线性注意力模型用 ArraysCache（无标准 KV），
+    # 量化不适用，自动退回默认缓存（功能不降级）。GGUF 走 llama.cpp 的
+    # type_k/type_v="q8_0"。None 同样按默认 True（bool(None) 会被当成 False）。
+    local_llm_kv_quantize: bool = True
     # RapidOCR 引擎池大小（2026-10-23 用户定版：2 个实例、纯 CPU EP 并发）。
     # 背景：ocrmac 识别不了的页会整页透传到 RapidOCR，透传请求占比不低，
     # 单实例串行是扫描书解析的吞吐瓶颈。两个实例 ≈ 2 × 0.5GB 常驻。
@@ -366,6 +372,9 @@ class AgentConfig:
                 "config: local_llm_kv_reuse=null 已回退为默认值 True"
                 "（null 会被当成 False，导致跨轮 KV 复用被关掉）")
             self.local_llm_kv_reuse = True
+        # 同上：local_llm_kv_quantize=null → 默认 True（否则 INT8 KV 量化被静默关掉）。
+        if getattr(self, "local_llm_kv_quantize", None) is None:
+            self.local_llm_kv_quantize = True
         # Old LLMClient builds defaulted to max_tokens=4096. Only rewrite the
         # value when it is still that legacy default — an explicitly chosen
         # small budget (e.g. 4096 for a local 4K model) must survive; silently
