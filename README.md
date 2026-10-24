@@ -124,12 +124,12 @@ RAG 子系统依赖也可在首次同步知识库时通过界面自动检测并�
 
 ### 环境要求（macOS Intel）
 
-RAG 依赖（`fastembed` / `docling` / `chonkie` 等）按需安装即可；reranker 已随 fastembed 提供，无需额外的 torch / FlagEmbedding。
+RAG 依赖（`fastembed` / `docling` / `chonkie` 等）按需安装即可；reranker 已随 fastembed 提供，无需额外安装 torch。
 
 - **运行**：使用 3.12 解释器启动 `python main.py`（或用 3.12 创建 venv）。
 - **打包**：`build.sh` 已自动优先使用 `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`。
 
-> **Reranker 的 numpy 兼容性**：reranker 现由 fastembed 的 ONNX Runtime（TextCrossEncoder）提供，与 embedding 同源，**不依赖 torch / FlagEmbedding，在 numpy 2.x 下默认可用**，无需降级 numpy。首次检索时自动加载 `BAAI/bge-reranker-v2-m3-int8`（INT8 量化，约 570MB，可经依赖预下载提前缓存）。
+> **Reranker 的 numpy 兼容性**：reranker 现由 fastembed 的 ONNX Runtime（TextCrossEncoder）提供，与 embedding 同源，**不依赖 torch，在 numpy 2.x 下默认可用**，无需降级 numpy。首次检索时自动加载 `BAAI/bge-reranker-v2-m3-int8`（INT8 量化，约 570MB，可经依赖预下载提前缓存）。
 >
 > **手工预下载注意**：fastembed 的模型名与它实际拉取的 HuggingFace 仓库不是一回事——`BAAI/bge-reranker-v2-m3-int8` 实际拉的是 `onnx-community/bge-reranker-v2-m3-ONNX`（与 fp32 全量版同一个仓库，只是文件不同：`onnx/model_int8.onnx` vs `onnx/model.onnx`），缓存目录名由**仓库名**推导（`~/.cache/fastembed/models--onnx-community--bge-reranker-v2-m3-ONNX`）。下到默认的 `~/.cache/huggingface` fastembed 看不到，报错依旧。依赖检查阶段的缓存探测是纯文件系统的，不会触发下载。
 
