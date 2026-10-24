@@ -4,6 +4,25 @@
 
 ---
 
+## 2026-10-24 · 修复：手写 config.json 的后端标识导致主模型加载失败（“莫名抽风”）
+
+> 用户反馈：又开始莫名抽风。
+
+### 根因
+`~/.base-agent/config.json` 是**手工编辑**的（含 23 个本版本不认识的死键，如 `llm_kv_reuse`/`llama_gpu_layers`/`rag_fts_overfetch`），其中 `local_llm_backend` 与 `aux_local_llm_backend` 被写成了配置窗口下拉的**显示名** `mlx-lm`——而代码只认 `mlx`/`gguf`/`onnx`。`LocalLLMClient._ensure_model()` 直接抛 `未知 LLM 后端: 'mlx-lm'`，主/辅模型都加载失败，每一句对话都报错。另外 `local_llm_kv_reuse: null` 在直接构造客户端时会被 `bool(None)=False` 当成“关闭跨轮复用”。
+
+### 修复
+- 新增 `local/backends.py`：后端标识的**单一来源**（`normalize_backend` + `VALID_BACKENDS`），识别 UI 显示名（`mlx-lm`/`MLX-LM`/`mlx_vlm`）、llama.cpp 旧称（`llama_cpp`/`llama.cpp`）、onnxruntime 等写法，统一归一化为 `mlx`/`gguf`/`onnx`；无法识别返回 None 由调用方报错（错误信息带合法值列表）。
+- `LocalLLMClient.__init__` 构造时即归一化，后续 `_ensure_model` 分支一律认规范值；`kv_reuse=None` 按默认 `True` 处理（不再被静默关掉）。
+- `AgentConfig._migrate()` 加载时归一化 `*_backend` 并把 `local_llm_kv_reuse: null` 修回 `True`，两条都打 WARNING 说明改了什么。
+- `factory.build_llm_client` 对 None 的 kv_reuse 同样按 True 处理。
+- 已用代码路径重写本机 `~/.base-agent/config.json`（`mlx-lm` 改回 `mlx`、清掉 23 个死键；原文件备份 `/tmp/config.json.bak`）。
+
+### 测试
+- `test_local_models.py` 新增 4 用例：别名归一化表（显示名/旧称/大小写/空/无法识别）/ 构造时归一化 + 非法值报错带合法值列表 / `kv_reuse=None` 按默认开 / `AgentConfig.load` 修好手写配置。
+
+---
+
 ## 2026-10-24 · web_scan 增强：JSON API 直采 / 动态页端点发现 / iframe 嵌套
 
 > 用户需求：增强 web_scan 使其能处理 API 类数据源、动态页面与 iframe 嵌套页面，避免抓不到信息返回空；尽量不新增工具。

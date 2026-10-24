@@ -51,7 +51,10 @@ def build_llm_client(config) -> Any:
             enable_thinking=bool(getattr(config, "local_llm_enable_thinking", True)),
             num_draft_tokens=getattr(config, "local_llm_num_draft_tokens", 0),
             prefill_step_size=getattr(config, "local_llm_prefill_step_size", 0),
-            kv_reuse=bool(getattr(config, "local_llm_kv_reuse", True)),
+            # None（配置被写成 null）必须按默认 True 处理：bool(None)=False 会把
+            # 跨轮 KV 复用静默关掉。LocalLLMClient 内部也会再归一化一次。
+            kv_reuse=(True if getattr(config, "local_llm_kv_reuse", True) is None
+                      else bool(getattr(config, "local_llm_kv_reuse", True))),
         )
     # 默认：网络 API
     from ..llm_client import LLMClient

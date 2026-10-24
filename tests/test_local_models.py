@@ -612,3 +612,62 @@ def test_onnx_reranker_real_weights_load_and_score():
         assert scores[0] > scores[1] and scores[2] > scores[1]
     finally:
         rk.close()
+
+
+# ---------------------------------------------------------------------------
+# 后端标识归一化（2026-10-24：手写 config.json 写成 UI 显示名导致主模型加载失败）
+# ---------------------------------------------------------------------------
+
+def test_normalize_backend_accepts_display_names_and_legacy():
+    """UI 显示名 / llama.cpp 旧称 / 大小写混写都必须归一化成合法后端。"""
+    from agent.local.backends import normalize_backend, VALID_BACKENDS
+    assert normalize_backend("mlx") == "mlx"
+    assert normalize_backend("mlx-lm") == "mlx"          # 配置窗口下拉的显示名
+    assert normalize_backend("MLX-LM") == "mlx"
+    assert normalize_backend("mlx_lm") == "mlx"
+    assert normalize_backend("mlx-vlm") == "mlx"
+    assert normalize_backend("GGUF") == "gguf"
+    assert normalize_backend("llama_cpp") == "gguf"       # 旧称
+    assert normalize_backend("llama.cpp") == "gguf"
+    assert normalize_backend("onnx") == "onnx"
+    assert normalize_backend("onnxruntime") == "onnx"
+    assert normalize_backend("") == "mlx"                 # 空 → 默认
+    assert normalize_backend(None) == "mlx"
+    assert normalize_backend("bogus-backend") is None     # 无法识别 → None
+    assert set(VALID_BACKENDS) == {"mlx", "gguf", "onnx"}
+
+
+def test_localllmclient_normalizes_backend_in_ctor():
+    """构造时即归一化：后续 _ensure_model 分支一律认规范值，不会再抛未知后端。"""
+    from agent.local.llm import LocalLLMClient
+    for raw in ("mlx-lm", "MLX-LM", "mlx_lm"):
+        c = LocalLLMClient("/tmp/x", backend=raw)
+        assert c._backend == "mlx"
+    c = LocalLLMClient("/tmp/x", backend="llama_cpp")
+    assert c._backend == "gguf"
+    with pytest.raises(ValueError, match="未知 LLM 后端"):
+        LocalLLMClient("/tmp/x", backend="nonsense")
+
+
+def test_kv_reuse_none_means_default_on():
+    """kv_reuse=None（配置被写成 null）必须按默认 True，不能静默关掉复用。"""
+    from agent.local.llm import LocalLLMClient
+    assert LocalLLMClient("/tmp/x", backend="mlx", kv_reuse=None)._kv_reuse is True
+    assert LocalLLMClient("/tmp/x", backend="mlx", kv_reuse=False)._kv_reuse is False
+
+
+def test_config_migrate_normalizes_backend_and_null_kv_reuse(tmp_path):
+    """AgentConfig.load 必须把手写配置里的显示名后端与 null 开关修好。"""
+    import json
+    from agent.config import AgentConfig
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({
+        "local_llm_backend": "mlx-lm",
+        "aux_local_llm_backend": "llama_cpp",
+        "local_llm_kv_reuse": None,
+        "local_llm_model": "/tmp/model",
+    }))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.local_llm_backend == "mlx"
+    assert cfg.aux_local_llm_backend == "gguf"
+    assert cfg.local_llm_kv_reuse is True     # null → 默认开

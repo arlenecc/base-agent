@@ -419,9 +419,23 @@ class LocalLLMClient:
         # 跨轮 KV / 前缀复用开关（MLX 与 GGUF 都遵守，默认开）。
         # 关闭后每轮整体重建（全量预填充）——用于排查前缀错位导致的乱码，
         # 或在显存/上下文特别紧张时以时间换空间。
-        self._kv_reuse = bool(kv_reuse)
+        # None 必须当默认值 True：配置被手工写成 null 时 bool(None)=False 会把
+        # 复用静默关掉（表现为「每句都慢」）。
+        self._kv_reuse = True if kv_reuse is None else bool(kv_reuse)
         self._path = path
-        self._backend = (backend or "mlx").strip().lower()
+        # 后端标识归一化：配置可能被手工编辑成 UI 显示名（"mlx-lm"）或 llama.cpp
+        # 旧称（"llama_cpp"）——不归一化会在 _ensure_model 抛「未知 LLM 后端」，
+        # 主模型直接加载失败。归一化在构造时完成，后续分支一律认规范值。
+        from .backends import VALID_BACKENDS, normalize_backend
+        norm = normalize_backend(backend)
+        if norm is None:
+            raise ValueError(
+                f"未知 LLM 后端: {backend!r}（合法值: {', '.join(VALID_BACKENDS)}；"
+                f"配置窗口下拉的「MLX-LM」等是显示名，存档值应为 mlx）"
+            )
+        if str(backend).strip().lower() not in ("", norm) and str(backend) != norm:
+            logger.info("LLM: 后端标识 %r 已归一化为 %r", backend, norm)
+        self._backend = norm
         self._max_tokens = int(max_tokens)
         self._temperature = float(temperature)
         self._top_p = float(top_p)

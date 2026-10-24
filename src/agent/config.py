@@ -340,6 +340,32 @@ class AgentConfig:
         # 继续每次加载 2.27GB。
         elif self.rag_rerank_model == "BAAI/bge-reranker-v2-m3":
             self.rag_rerank_model = "BAAI/bge-reranker-v2-m3-int8"
+        # 后端标识归一化：配置被手工编辑 / 旧版本 / 外部工具写入时，*_backend
+        # 可能是 UI 显示名（"mlx-lm"）或 llama.cpp 旧称（"llama_cpp"）。不归一化
+        # 会让 LocalLLMClient 抛「未知 LLM 后端」→ 主模型加载失败、每句都报错
+        # （用户侧表现就是「莫名抽风」）。统一走 local.backends 的别名表。
+        from .local.backends import normalize_backend
+        for fname in ("local_llm_backend", "aux_local_llm_backend"):
+            raw = getattr(self, fname, None)
+            if raw is None:
+                continue
+            norm = normalize_backend(raw)
+            if norm and norm != raw:
+                logger.warning(
+                    "config: %s=%r 不是合法后端标识，已归一化为 %r",
+                    fname, raw, norm)
+                setattr(self, fname, norm)
+            elif norm is None:
+                logger.warning(
+                    "config: %s=%r 无法识别，已回退为 mlx", fname, raw)
+                setattr(self, fname, "mlx")
+        # local_llm_kv_reuse 被写成 null 时 bool(None)=False，会把跨轮 KV 复用
+        # 静默关掉（每句全量预填充、明显变慢）。None → 默认值 True。
+        if getattr(self, "local_llm_kv_reuse", None) is None:
+            logger.warning(
+                "config: local_llm_kv_reuse=null 已回退为默认值 True"
+                "（null 会被当成 False，导致跨轮 KV 复用被关掉）")
+            self.local_llm_kv_reuse = True
         # Old LLMClient builds defaulted to max_tokens=4096. Only rewrite the
         # value when it is still that legacy default — an explicitly chosen
         # small budget (e.g. 4096 for a local 4K model) must survive; silently
