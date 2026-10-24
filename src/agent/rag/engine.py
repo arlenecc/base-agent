@@ -1214,6 +1214,18 @@ class RAGEngine:
                                     del book, cleaned
                                     if self._is_cancelled():
                                         return
+                                    with ft_lock:
+                                        ft = file_times.get(filepath)
+                                        if ft is None:
+                                            file_times[filepath] = {
+                                                "extract": time.monotonic() - t0,
+                                                "clean": 0.0, "chunk": 0.0,
+                                                "embed": 0.0, "store": 0.0,
+                                            }
+                                            ft = file_times[filepath]
+                                        ft["queued_at"] = time.monotonic()
+                                        consumed_order.append(
+                                            (filepath, len(doc_chunks)))
                                     item = (filepath, doc_chunks, c_hash, len(doc_chunks))
                                     while not self._is_cancelled() and not _abort.is_set():
                                         try:
@@ -1241,6 +1253,11 @@ class RAGEngine:
                             _flush_logs(f"解析: {fname}")
                             text, is_markdown = _extract_with_docling(filepath)
                             t_extract = time.monotonic() - t0
+                            with ft_lock:
+                                file_times[filepath] = {
+                                    "extract": t_extract, "clean": 0.0,
+                                    "chunk": 0.0, "embed": 0.0, "store": 0.0,
+                                }
                             _log("    ├─ 解析完成: %s (提取 %d 字符, 耗时 %.2fs%s)",
                                  fname, len(text), t_extract, " [docling]" if is_markdown else "")
                             _flush_logs(f"解析完成: {fname}")
@@ -1268,6 +1285,7 @@ class RAGEngine:
                             # 判断仍然命中 → cleaned 保持 ""，后面既生成一份空
                             # digest 又跳过切片。这里用同一个变量，读失败即视为
                             # 缓存未命中，强制走重新清洗。
+                            t_clean_start = time.monotonic()
                             cache_is_fresh = (not force
                                     and os.path.exists(md_path)
                                     and os.path.getmtime(filepath) <= os.path.getmtime(md_path))
@@ -1326,6 +1344,12 @@ class RAGEngine:
                                     logger.debug("    ├─ Markdown 已缓存: %s", md_name)
                                 except OSError as e:
                                     logger.warning("    ├─ Markdown 缓存写入失败: %s: %s", filepath, e)
+                            # 清洗阶段结束（走缓存也算）：到此为止的耗时归入「清洗」，
+                            # 随后的缩略版生成不混入该数字。
+                            with ft_lock:
+                                ft = file_times.get(filepath)
+                                if ft is not None:
+                                    ft["clean"] = time.monotonic() - t_clean_start
                             # 无论走缓存还是重新清洗，都补写一次 sidecar：
                             # 「缓存文件名 → 原始文档名」的映射无法从文件名反推
                             # （_safe_filename 会删空格、截断），历史缓存文件也
@@ -1378,6 +1402,16 @@ class RAGEngine:
                                 fname, len(doc_chunks), self._chunk_size, self._chunk_overlap,
                                 t_chunk_end - t_chunk,
                             )
+                            with ft_lock:
+                                ft = file_times.get(filepath)
+                                if ft is not None:
+                                    # 清洗耗时已在 Markdown 落盘处记好（不含随后
+                                    # 的缩略版生成），这里只补切片。
+                                    ft["chunk"] = t_chunk_end - t_chunk
+                                    stage_totals["clean"] += ft.get("clean", 0.0)
+                                stage_totals["extract"] += file_times.get(
+                                    filepath, {}).get("extract", 0.0)
+                                stage_totals["chunk"] += t_chunk_end - t_chunk
                             _flush_logs(f"切片完成: {fname} ({len(doc_chunks)}片)")
                             del cleaned
                         except Exception as e:
@@ -1401,6 +1435,11 @@ class RAGEngine:
 
                         if self._is_cancelled():
                             return
+                        with ft_lock:
+                            ft = file_times.get(filepath)
+                            if ft is not None:
+                                ft["queued_at"] = time.monotonic()
+                            consumed_order.append((filepath, len(doc_chunks)))
                         # 背压：队列满时阻塞，避免内存堆积。
                         # 使用 timeout + 循环检查取消标志，避免主线程因
                         # 取消/异常停止消费后 worker 永久阻塞在 put 上。
@@ -1542,8 +1581,75 @@ class RAGEngine:
                     # 缓冲，防止长同步 RSS 单调爬升（见 release_mlx_pool 注释）。
                     release_mlx_pool()
 
-            def _on_batch(batch_added: int, total_added: int) -> None:
+            # 批次耗时分摊游标：已摊到第几个文件的第几个切片
+            _attr_state = {"idx": 0, "pos": 0}
+            stage_totals: Dict[str, float] = {
+                "extract": 0.0, "clean": 0.0, "chunk": 0.0,
+                "embed": 0.0, "store": 0.0,
+            }
+
+            def _attribute_batch_time(start_added: int, end_added: int,
+                                      dt_embed: float, dt_store: float,
+                                      batch_added: int) -> None:
+                """把 [start_added, end_added) 这批切片的 embed/store 耗时按切片
+                数摊回各文件；文件切片全部写完时输出一行分阶段耗时日志。"""
+                remaining = end_added - start_added
+                if remaining <= 0:
+                    return
+                now = time.monotonic()
+                with ft_lock:
+                    stage_totals["embed"] += dt_embed
+                    stage_totals["store"] += dt_store
+                    while remaining > 0 and _attr_state["idx"] < len(consumed_order):
+                        fp, n_chunks = consumed_order[_attr_state["idx"]]
+                        pos = _attr_state["pos"]
+                        take = min(remaining, n_chunks - pos)
+                        share = take / max(1, batch_added)
+                        ft = file_times.get(fp)
+                        if ft is not None:
+                            ft["embed"] = ft.get("embed", 0.0) + dt_embed * share
+                            ft["store"] = ft.get("store", 0.0) + dt_store * share
+                            if ft.get("first_write_at") is None:
+                                ft["first_write_at"] = now
+                        remaining -= take
+                        if pos + take >= n_chunks:
+                            # 该文件切片已全部入库 → 输出分阶段耗时
+                            _log_file_timing(fp, ft, n_chunks)
+                            _attr_state["idx"] += 1
+                            _attr_state["pos"] = 0
+                        else:
+                            _attr_state["pos"] = pos + take
+
+            def _log_file_timing(filepath: str, ft: Optional[Dict[str, Any]],
+                                 n_chunks: int) -> None:
+                """单文件处理完毕：一行日志给出解析/清洗/切片/向量化/入库耗时。"""
+                if not ft:
+                    return
+                e = float(ft.get("extract") or 0.0)
+                c = float(ft.get("clean") or 0.0)
+                k = float(ft.get("chunk") or 0.0)
+                em = float(ft.get("embed") or 0.0)
+                st = float(ft.get("store") or 0.0)
+                wait = 0.0
+                if ft.get("queued_at") and ft.get("first_write_at"):
+                    wait = max(0.0, ft["first_write_at"] - ft["queued_at"])
+                total = e + c + k + em + st
+                _log(
+                    "    └─ ⏱ %s: %d 切片 | 解析 %.2fs | 清洗 %.2fs | 切片 %.2fs "
+                    "| 向量化 %.2fs | 入库 %.2fs | 排队 %.2fs | 合计 %.2fs",
+                    os.path.basename(filepath), n_chunks, e, c, k, em, st, wait, total,
+                )
+                _flush_logs(f"耗时 {os.path.basename(filepath)}")
+
+            def _on_batch(batch_added: int, total_added: int, timing=None) -> None:
                 _log("  ├─ 向量化批次写入: +%d 切片 (累计 %d)", batch_added, total_added)
+                # 把本批的向量化/入库耗时按切片数摊回各文件（切片按文件顺序
+                # 产出，因此区间到文件的映射是确定的）。
+                if timing:
+                    _attribute_batch_time(total_added - batch_added, total_added,
+                                          float(timing.get("embed") or 0.0),
+                                          float(timing.get("store") or 0.0),
+                                          batch_added)
                 # 记录「已完整写入向量库」的文件：按 pending 顺序累加各文件
                 # chunk_count，一旦某文件累计 chunk 数 <= total_added，说明它的
                 # 全部切片都已落库，可安全记入同步记录（取消时仅提交这些）。
@@ -1573,6 +1679,12 @@ class RAGEngine:
                         logger.warning("RAG: on_batch callback error: %s", e)
 
             write_failed = False
+            # 每文件的分阶段耗时（worker 写解析/清洗/切片，消费端按批次摊回
+            # 向量化/入库）。用于「每个文件处理完输出一行耗时」的性能排查日志。
+            file_times: Dict[str, Dict[str, Any]] = {}
+            ft_lock = threading.Lock()
+            # 切片消费顺序（文件 → 切片数），用于把批次耗时按比例摊回各文件。
+            consumed_order: List[Tuple[str, int]] = []
             pending_manifest: Dict[str, Dict[str, Any]] = {}
             # 已「完整写入向量库」的文件（取消时只提交这些，避免半截记录）。
             # 与 pending_manifest 不同：pending 记录「已产出 chunks 的文件」，
@@ -1623,6 +1735,19 @@ class RAGEngine:
                 # 让阻塞在 q.put 上的 worker 立即退出（成功路径是空操作）。
                 _abort.set()
 
+            # 阶段汇总：定位整体卡点（解析 / 清洗 / 切片 / 向量化 / 入库）。
+            try:
+                tot = sum(stage_totals.values())
+                if tot > 0:
+                    _log(
+                        "━━━ 阶段耗时汇总: 解析 %.1fs | 清洗 %.1fs | 切片 %.1fs "
+                        "| 向量化 %.1fs | 入库 %.1fs (合计 %.1fs) ━━━",
+                        stage_totals["extract"], stage_totals["clean"],
+                        stage_totals["chunk"], stage_totals["embed"],
+                        stage_totals["store"], tot,
+                    )
+            except Exception:
+                pass
             # 只有整条写入链路成功完成才提交 manifest；失败/取消路径下这些
             # 文件下次同步会被重新处理（幂等），保证不会出现「manifest 记录
             # 了但向量库里只有半个文件」的永久性内容缺失。

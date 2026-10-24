@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import inspect
 import logging
 import math
 import os
@@ -677,6 +678,25 @@ def _cpu_only_kwargs(cls) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _call_on_batch(on_batch, n_added: int, total: int,
+                   dt_embed: float, dt_store: float) -> None:
+    """回调批次进度：**兼容两种签名**。
+
+    新签名 ``on_batch(n_added, total, timing)`` 能拿到本批的向量化（embed）
+    与入库（table.add）耗时——同步日志靠它按文件分摊出「哪一段最慢」；旧的
+    两参数回调继续按原样调用（第三方/旧调用方零影响）。
+    """
+    if on_batch is None:
+        return
+    try:
+        if len(inspect.signature(on_batch).parameters) >= 3:
+            on_batch(n_added, total, {"embed": dt_embed, "store": dt_store})
+            return
+    except (TypeError, ValueError):
+        pass
+    on_batch(n_added, total)
+
+
 class VectorStore:
     """Local vector store backed by LanceDB with FastEmbed embeddings.
 
@@ -1155,7 +1175,7 @@ class VectorStore:
         return {"scanned": scanned, "groups": dup_groups, "removed": removed}
 
     @_store_op
-    def add_streaming(
+    def add_streaming(  # noqa: C901 - 分批写入的控制流较长，保持线性可读
         self,
         chunk_iter,
         batch_size: int = 100,
@@ -1198,7 +1218,9 @@ class VectorStore:
 
         # Embed 第一批
         logger.info("  ├─ 向量化: 首批 %d 个切片正在嵌入...", len(first_batch))
+        _t_emb0 = time.monotonic()
         first_records = self._embed_chunks(first_batch, 0)
+        _dt_emb0 = time.monotonic() - _t_emb0
         logger.info("  ├─ 向量化完成: 首批 %d 个切片", len(first_records))
 
         table = self._ensure_table()
@@ -1214,7 +1236,9 @@ class VectorStore:
             total = len(first_records)
             sources_seen = {r["source"] for r in first_records}
             if on_batch:
-                on_batch(len(first_records), total)
+                # 建表即写入，embed 单独计时、store 计入建表耗时
+                _call_on_batch(on_batch, len(first_records), total,
+                               _dt_emb0, time.monotonic() - _t_emb0 - _dt_emb0)
             if exhausted:
                 logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
                 self._fts_ready = False
@@ -1236,11 +1260,14 @@ class VectorStore:
                     logger.debug("VectorStore: delete by source '%s' failed: %s", source, e)
             # 写入第一批
             try:
+                _t_add = time.monotonic()
                 table.add(first_records)
+                _dt_add = time.monotonic() - _t_add
                 total = len(first_records)
                 logger.info("  ├─ 向量库写入: 首批 %d 条记录", total)
                 if on_batch:
-                    on_batch(len(first_records), total)
+                    _call_on_batch(on_batch, len(first_records), total,
+                                   _dt_emb0, _dt_add)
             except Exception as e:
                 logger.error("  向量库写入失败(首批): %s", e)
                 self._fts_ready = False
@@ -1272,7 +1299,9 @@ class VectorStore:
                 # 再 embed 再 add——embed 耗时数秒到数分钟，这段时间里该
                 # source 在库里被删空，并发检索会返回空（「文档凭空消失」）。
                 # 调整后，删旧与写新背靠背执行，空窗缩到一次 table.add 的耗时。
+                _t_e = time.monotonic()
                 records = self._embed_chunks(batch_buf, chunk_idx)
+                _dt_e = time.monotonic() - _t_e
                 if table is not None:
                     new_sources = {c["source"] for c in batch_buf} - deleted_sources
                     if new_sources:
@@ -1284,11 +1313,13 @@ class VectorStore:
                                 pass
                         deleted_sources.update(new_sources)
                 try:
+                    _t_a = time.monotonic()
                     table.add(records)
+                    _dt_a = time.monotonic() - _t_a
                     total += len(records)
                     logger.info("  ├─ 向量库写入: 第 %d 批 %d 条 (累计 %d)", batch_num, len(records), total)
                     if on_batch:
-                        on_batch(len(records), total)
+                        _call_on_batch(on_batch, len(records), total, _dt_e, _dt_a)
                 except Exception as e:
                     logger.error("  向量库写入失败(第 %d 批): %s", batch_num, e)
                     self._fts_ready = False
