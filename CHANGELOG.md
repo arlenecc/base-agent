@@ -4,6 +4,37 @@
 
 ---
 
+## 2026-10-24 · 配置区精简：去掉超时项、OCR 模型名隐藏、辅助模型补 KV 开关
+
+> 用户需求：① 主/辅助模型配置里去「超时」释放空间；② kv INT8 量化与跨轮复用
+> 也作为辅助模型的可配项。
+
+### 改动
+- **去掉「超时(秒)」**：主模型与辅助模型参数行都移除超时编辑框（控件定义 /
+  apply / gather / 非法值钳制块全清）。模型内部仍保留默认 120s 超时
+  （`request_timeout` / `aux_request_timeout` 配置字段保留，仅不再暴露编辑），
+  行为不变。
+- **OCR 模型名隐藏**（延续前一轮）：本地 VLM 模型名由 config 默认值
+  （`rag_ocr_model_name=OvisOCR2-0.8B-MLX-4bit`）决定、路径留空自动解析，暴露
+  可编辑的「模型名」只会造成拼写错误，设置区不再显示。
+- **辅助模型新增 KV 开关**：参数行增加「跨轮复用」「KV INT8 量化」两个勾选框，
+  与主模型同款可配。新增配置字段 `aux_local_llm_kv_reuse`（默认 False：
+  辅助 prompt 每轮都变，复用通常无意义，开放按需开启）、`aux_local_llm_kv_quantize`
+  （默认 True，与主模型同款省显存），`_migrate` 内补 null→默认值兜底。
+- **factory**：`build_aux_llm_client` 的 `kv_reuse` / `kv_quant` 由硬编码改为读
+  `aux_local_llm_kv_*` 配置（原为 `kv_reuse=False` / `kv_quant=True`，默认值
+  与之前一致，行为不变）。
+- `_params_widget` 移除已无用的 `to`（超时）参数与「超时(秒)」标签，避免残留
+  错误标签与控件错位。
+
+### 验证
+GUI 重启无 Traceback；`AgentConfig` 默认 `aux_local_llm_kv_reuse=False`、
+`aux_local_llm_kv_quantize=True`，null 兜底正确；`build_aux_llm_client` 按
+config 透传（`reuse=True, quantize=False → client._kv_reuse=True, _kv_quant=False`）。
+KV 量化单测 6/6 不回归。
+
+---
+
 ## 2026-10-24 · 功能：KV cache INT8 量化（MLX + GGUF，主模型与辅助模型都启用）
 
 > 用户需求：对 KV cache 做 INT8 量化节省显存，对 mlx 与 gguf 格式、主模型和辅助模型都采用。

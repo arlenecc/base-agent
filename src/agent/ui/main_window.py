@@ -1259,7 +1259,7 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda: self._pick_model_path(edit, combo))
             return b
 
-        def _params_widget(mt, temp, tp, mp, tk, rp, thinking, to, *extras):
+        def _params_widget(mt, temp, tp, mp, tk, rp, thinking, *extras):
             w = QWidget()
             row = QHBoxLayout(w)
             row.setContentsMargins(0, 0, 0, 0)
@@ -1271,7 +1271,6 @@ class MainWindow(QMainWindow):
             row.addWidget(QLabel("top_k"));    row.addWidget(tk)
             row.addWidget(QLabel("repeat-penalty")); row.addWidget(rp)
             row.addWidget(thinking)
-            row.addWidget(QLabel("超时(秒)"));  row.addWidget(to)
             for ex in extras:
                 if ex is not None:
                     row.addWidget(ex)
@@ -1325,7 +1324,6 @@ class MainWindow(QMainWindow):
         self.min_p_edit = _num("0.05")
         self.top_k_edit = _num("20")
         self.repeat_penalty_edit = _num("1.0")
-        self.timeout_edit = _num("120")
         self.thinking_check = QCheckBox("思考模式")
         self.thinking_check.setToolTip(
             "启用 Qwen3 系思考模式（enable_thinking）。关闭后模型跳过思考直接作答，"
@@ -1346,7 +1344,7 @@ class MainWindow(QMainWindow):
         r = QHBoxLayout(self.main_params_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(6)
         r.addWidget(_params_widget(self.max_tokens_edit, self.temp_edit, self.top_p_edit,
                                    self.min_p_edit, self.top_k_edit, self.repeat_penalty_edit,
-                                   self.thinking_check, self.timeout_edit,
+                                   self.thinking_check,
                                    self.kv_reuse_check, self.kv_quant_check))
         r.addStretch(1)
         self.load_main_btn = QPushButton("加载模型")
@@ -1372,13 +1370,18 @@ class MainWindow(QMainWindow):
         self.aux_min_p_edit = _num("0.05")
         self.aux_top_k_edit = _num("20")
         self.aux_repeat_penalty_edit = _num("1.0")
-        self.aux_timeout_edit = _num("120")
         self.aux_thinking_check = QCheckBox("思考模式")
         self.aux_thinking_check.setToolTip(self.thinking_check.toolTip())
+        # 辅助模型同样暴露 KV 复用 / KV INT8 量化开关（与主模型同款）。
+        self.aux_kv_reuse_check = QCheckBox("跨轮复用")
+        self.aux_kv_reuse_check.setToolTip(self.kv_reuse_check.toolTip())
+        self.aux_kv_quant_check = QCheckBox("KV INT8 量化")
+        self.aux_kv_quant_check.setToolTip(self.kv_quant_check.toolTip())
         r = QHBoxLayout(); r.setSpacing(6)
         r.addWidget(_params_widget(self.aux_max_tokens_edit, self.aux_temp_edit, self.aux_top_p_edit,
                                    self.aux_min_p_edit, self.aux_top_k_edit, self.aux_repeat_penalty_edit,
-                                   self.aux_thinking_check, self.aux_timeout_edit))
+                                   self.aux_thinking_check,
+                                   self.aux_kv_reuse_check, self.aux_kv_quant_check))
         r.addStretch(1)
         self.load_aux_btn = QPushButton("加载模型")
         self.load_aux_btn.setStyleSheet("font-weight:600;")
@@ -1408,11 +1411,13 @@ class MainWindow(QMainWindow):
 
         # row1.5: OCR 模型（OvisOCR2 VLM，#133——统一引擎回退链第三棒）
         self.ocr_impl_combo = _combo(["mlx-vlm", "onnx", "gguf"], 110)
-        self.ocr_model_name_edit = _path("模型名", 200)
+        # 仅「类型 + 本地路径」：OCR 始终本地 VLM，模型名由 config 默认值
+        # （rag_ocr_model_name=OvisOCR2-0.8B-MLX-4bit）决定，留空自动从
+        # models/ 下解析；暴露可编辑的「模型名」只会制造拼写错误（同 reranker 旧
+        # 的 -mx-fp8 笔误事故），故不显示在设置区。
         self.ocr_path_edit = _path("本地路径（留空自动用 models/ 下的模型名）", 160)
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("OCR模型")); r.addWidget(self.ocr_impl_combo)
-        r.addWidget(self.ocr_model_name_edit, 2)
         r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
         self.ocr_impl_combo.setToolTip(
             "OvisOCR2 VLM 后端：\n"
@@ -1420,9 +1425,6 @@ class MainWindow(QMainWindow):
             "· gguf：目录含 主模型.gguf + mmproj*.gguf（llama-cpp 多模态）\n"
             "· onnx：目录含 genai_config.json（onnxruntime-genai 导出，"
             "需 pip install onnxruntime-genai）"
-        )
-        self.ocr_model_name_edit.setToolTip(
-            "默认 OvisOCR2-0.8B-MLX-4bit，自动从 models/ 目录加载"
         )
         klay.addLayout(r)
 
@@ -1949,7 +1951,6 @@ class MainWindow(QMainWindow):
         self.min_p_edit.setText(str(self.config.min_p))
         self.top_k_edit.setText(str(self.config.top_k))
         self.repeat_penalty_edit.setText(str(self.config.repetition_penalty))
-        self.timeout_edit.setText(str(self.config.request_timeout))
         self.thinking_check.setChecked(bool(getattr(self.config, "local_llm_enable_thinking", True)))
         self.kv_reuse_check.setChecked(bool(getattr(self.config, "local_llm_kv_reuse", True)))
         self.kv_quant_check.setChecked(bool(getattr(self.config, "local_llm_kv_quantize", True)))
@@ -1971,19 +1972,18 @@ class MainWindow(QMainWindow):
         self.aux_min_p_edit.setText(str(self.config.aux_min_p))
         self.aux_top_k_edit.setText(str(self.config.aux_top_k))
         self.aux_repeat_penalty_edit.setText(str(self.config.aux_repetition_penalty))
-        self.aux_timeout_edit.setText(str(self.config.aux_request_timeout))
         # 兜底与 AgentConfig 字段默认值一致：辅助模型默认关闭思考模式。
         self.aux_thinking_check.setChecked(bool(getattr(self.config, "aux_local_llm_enable_thinking", False)))
+        self.aux_kv_reuse_check.setChecked(bool(getattr(self.config, "aux_local_llm_kv_reuse", False)))
+        self.aux_kv_quant_check.setChecked(bool(getattr(self.config, "aux_local_llm_kv_quantize", True)))
         # Embedding / Reranker：实现下拉 + 模型名 + 本地路径
         self.embedding_impl_combo.setCurrentText(_provider_backend_to_impl(
             self.config.embedding_provider, self.config.local_embedding_backend))
         self.embedding_model_name_edit.setText(self.config.rag_embedding_model)
         self.embedding_path_edit.setText(self.config.local_embedding_model)
-        # OCR 模型（OvisOCR2，#133）
+        # OCR 模型（OvisOCR2，#133）：仅类型 + 路径；模型名用 config 默认值
         self.ocr_impl_combo.setCurrentText(
             getattr(self.config, "rag_ocr_engine", "mlx-vlm") or "mlx-vlm")
-        self.ocr_model_name_edit.setText(
-            getattr(self.config, "rag_ocr_model_name", "OvisOCR2-0.8B-MLX-4bit"))
         self.ocr_path_edit.setText(
             getattr(self.config, "rag_ocr_model_path", ""))
         self.reranker_impl_combo.setCurrentText(_provider_backend_to_impl(
@@ -2034,13 +2034,9 @@ class MainWindow(QMainWindow):
 
         _num(self.temp_edit, "temperature", 0.7, float, "温度")
         _num(self.max_tokens_edit, "max_tokens", 32768, int, "最大Token")
-        # 钳制：0/负值在下游都有破坏性 —— request_timeout=0 会让 httpx 立即
-        # 超时（所有请求必失败）、temperature 为负被多数 API 拒绝。钳到合法
+        # 钳制：负值在下游有破坏性（temperature 为负被多数 API 拒绝）。钳到合法
         # 下限并记录到 invalid 列表（与非法值回退共用状态栏提示）。
-        if self.config.request_timeout <= 0:
-            self.config.request_timeout = 120.0
-            self.timeout_edit.setText("120.0")
-            invalid.append("超时≤0 → 120")
+        # （request_timeout 不再暴露为 UI 项，保留默认 120s，故此项无钳制。）
         if self.config.temperature < 0:
             self.config.temperature = 0.0
             self.temp_edit.setText("0.0")
@@ -2056,7 +2052,6 @@ class MainWindow(QMainWindow):
         _num(self.min_p_edit, "min_p", 0.05, float, "min_p")
         _num(self.top_k_edit, "top_k", 20, int, "top_k")
         _num(self.repeat_penalty_edit, "repetition_penalty", 1.0, float, "重复惩罚")
-        _num(self.timeout_edit, "request_timeout", 120, float, "超时")
         self.config.local_llm_enable_thinking = self.thinking_check.isChecked()
         self.config.local_llm_kv_reuse = self.kv_reuse_check.isChecked()
         self.config.local_llm_kv_quantize = self.kv_quant_check.isChecked()
@@ -2067,8 +2062,9 @@ class MainWindow(QMainWindow):
         _num(self.aux_min_p_edit, "aux_min_p", 0.05, float, "辅助min_p")
         _num(self.aux_top_k_edit, "aux_top_k", 20, int, "辅助top_k")
         _num(self.aux_repeat_penalty_edit, "aux_repetition_penalty", 1.0, float, "辅助重复惩罚")
-        _num(self.aux_timeout_edit, "aux_request_timeout", 120, float, "辅助超时")
         self.config.aux_local_llm_enable_thinking = self.aux_thinking_check.isChecked()
+        self.config.aux_local_llm_kv_reuse = self.aux_kv_reuse_check.isChecked()
+        self.config.aux_local_llm_kv_quantize = self.aux_kv_quant_check.isChecked()
         if invalid:
             # 状态栏提示一次；不打断流程（回退值是安全的默认）。
             self.status_label.setText(
@@ -2117,9 +2113,8 @@ class MainWindow(QMainWindow):
         self.config.local_reranker_model = self.reranker_path_edit.text().strip()
         # OCR 模型（OvisOCR2，#133）：实现/模型名/本地路径
         self.config.rag_ocr_engine = self.ocr_impl_combo.currentText().strip() or "mlx-vlm"
-        ocr_name = self.ocr_model_name_edit.text().strip()
-        if ocr_name:
-            self.config.rag_ocr_model_name = ocr_name
+        # 模型名不暴露给 UI：保持 config 默认值（OvisOCR2-0.8B-MLX-4bit），
+        # 避免用户手填拼错导致 OCR 模型加载失败。
         self.config.rag_ocr_model_path = self.ocr_path_edit.text().strip()
 
     def _rebuild_agent(self, rebuild_aux: bool = True) -> None:

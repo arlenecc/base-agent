@@ -169,6 +169,12 @@ class AgentConfig:
     aux_top_k: int = 20
     aux_repetition_penalty: float = 1.0
     aux_request_timeout: float = 120.0
+    # 辅助模型 KV 缓存相关（2026-10-24 需求：主/辅助都可配）。
+    #   aux_local_llm_kv_reuse    跨轮 KV 复用（默认 False：辅助 prompt 每轮都变，
+    #                           复用通常无意义；开放给用户按需开启）
+    #   aux_local_llm_kv_quantize KV INT8 量化（默认 True，与主模型同款省显存）
+    aux_local_llm_kv_reuse: bool = False
+    aux_local_llm_kv_quantize: bool = True
     # 辅助模型思考模式（同 local_llm_enable_thinking，Qwen3 系模板专用）。
     # 默认 **关闭**：辅助模型只干事实抽取、要点提炼这类轻量子任务——输入短、
     # 输出短、要的是结构化结果而不是推理链。开思考会让它先吐一长串推理再给
@@ -375,6 +381,11 @@ class AgentConfig:
         # 同上：local_llm_kv_quantize=null → 默认 True（否则 INT8 KV 量化被静默关掉）。
         if getattr(self, "local_llm_kv_quantize", None) is None:
             self.local_llm_kv_quantize = True
+        # 同上：aux 侧 kv 字段 null → 默认值（与 main 对称）。
+        if getattr(self, "aux_local_llm_kv_reuse", None) is None:
+            self.aux_local_llm_kv_reuse = False
+        if getattr(self, "aux_local_llm_kv_quantize", None) is None:
+            self.aux_local_llm_kv_quantize = True
         # Old LLMClient builds defaulted to max_tokens=4096. Only rewrite the
         # value when it is still that legacy default — an explicitly chosen
         # small budget (e.g. 4096 for a local 4K model) must survive; silently

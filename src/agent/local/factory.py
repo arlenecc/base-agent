@@ -95,11 +95,13 @@ def build_aux_llm_client(config) -> Any:
         repetition_penalty=getattr(config, "aux_repetition_penalty", 1.0),
         # 兜底值必须与 AgentConfig 的字段默认值一致（辅助模型默认关闭思考）。
         enable_thinking=bool(getattr(config, "aux_local_llm_enable_thinking", False)),
-        # 辅助调用 prompt 每轮都变，不做跨轮复用（与 MLX 的 aux 一次性缓存同款）。
-        kv_reuse=False,
-        # 辅助模型同样启用 KV INT8 量化（用户需求：主/辅助都省显存）。
-        kv_quant=(True if getattr(config, "local_llm_kv_quantize", True) is None
-                  else bool(getattr(config, "local_llm_kv_quantize", True))),
+        # 辅助模型 KV 复用：默认关闭（辅助 prompt 每轮都变，复用通常无意义），
+        # 但作为可配项开放给用户按需开启（与主模型同款开关）。
+        kv_reuse=(False if getattr(config, "aux_local_llm_kv_reuse", None) is None
+                  else bool(getattr(config, "aux_local_llm_kv_reuse", True))),
+        # 辅助模型 KV INT8 量化（用户需求：主/辅助都省显存），与主模型同款可配。
+        kv_quant=(True if getattr(config, "aux_local_llm_kv_quantize", None) is None
+                  else bool(getattr(config, "aux_local_llm_kv_quantize", True))),
     )
 
 
