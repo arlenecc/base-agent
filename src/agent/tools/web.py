@@ -4,8 +4,10 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import socket
-from typing import Any, List
+import time
+from typing import Any, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -26,6 +28,38 @@ _MAX_FETCH_BYTES = 8 * 1024 * 1024
 _MAX_PARSE_CHARS = 2 * 1024 * 1024
 # 手动跟随的重定向上限（与 httpx 默认一致）。
 _MAX_REDIRECTS = 5
+# ---- web_scan 增强：动态页 / API 数据源 / iframe（2026-10-24）----
+# 现代站点大量内容是 JS 异步渲染的（Azure Search UI、React SPA 等），
+# 直接抓 HTML 只会得到 "Loading jobs please wait..." 这类空壳。web_scan
+# 在不引入新工具、不引浏览器的前提下做三层兜底：
+#   1) JSON 直采：响应体本身就是 JSON（模型给了 API 端点）→ 结构化摘要；
+#   2) iframe 嵌套：抓子框架内容并拼回（有深度/数量上限）；
+#   3) 端点发现：页面看着是「JS 渲染空壳」时，从内联脚本与同源 .js 里挖
+#      候选 API 端点，逐个试探，命中即返回其数据。
+_MAX_IFRAMES = 3            # 最多深入几个 iframe
+_MAX_JS_FILES = 6           # 最多下载几个同源 .js 挖端点
+_MAX_API_CANDIDATES = 8     # 最多试探几个候选 URL（含参数变体）
+_MAX_SUB_FETCHES = 10       # 单次 web_scan 的子请求总上限
+_DISCOVERY_DEADLINE_S = 25.0  # 发现阶段的总时间预算（含子请求）
+_MIN_VISIBLE_CHARS = 200    # 可见文本少于此长度视为「空壳」
+# 「空壳」特征串（加载提示/反爬挑战页）。
+_LOADER_MARKERS = (
+    "loading jobs please wait", "please wait while loading",
+    "just a moment", "enable javascript", "checking your browser",
+)
+# 从脚本里挖端点：绝对 URL 或以 / 开头、含 api/ashx/asmx/svc/json/search 的路径。
+# 注意 ``/`` 后的字符类必须用 ``*`` 不是 ``+``：``/api/...`` 里 ``/`` 与 ``api``
+# 之间没有字符，``+`` 会永远匹配不上（实测踩过）。
+_ENDPOINT_RE = re.compile(
+    r"""["']((?:https?://[^"'\s]{4,160})|(?:/[A-Za-z0-9_\-./]*"""
+    r"""(?:api|ashx|asmx|svc|json|search)[A-Za-z0-9_\-./?=&%]*))["']""",
+    re.IGNORECASE,
+)
+# 明确不是数据端点的静态资源后缀。
+_STATIC_ASSET_RE = re.compile(
+    r"\.(?:png|jpe?g|gif|svg|css|js|woff2?|ttf|eot|ico|mp4|webp)(?:\?|$)",
+    re.IGNORECASE,
+)
 
 
 def _is_blocked_host(host: str) -> bool:
@@ -187,9 +221,198 @@ def _fetch_once(client, url: str):
     return text, None
 
 
+def _visible_text(html: str) -> str:
+    """HTML → 可见文本（剥 script/style/noscript，去空行）。bs4 缺失时线性回退。"""
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(html[:_MAX_PARSE_CHARS], "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        content = soup.get_text(separator="\n")
+    else:
+        # bs4 缺失时的线性降噪回退：**不用正则**处理 script/style 块——
+        # `<script.*?</script>` 配 re.S 在超长且标签不闭合的输入上会大量回溯
+        # （ReDoS）。改用 str.find 线性扫描，任何输入都是 O(n)。
+        content = _strip_blocks_linear(html[:_MAX_PARSE_CHARS])
+        content = re.sub(r"<[^>]+>", " ", content)
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    return "\n".join(lines)
+
+
+def _looks_js_rendered(text: str) -> bool:
+    """可见文本是否薄到像「JS 渲染空壳」（或含加载提示串）。"""
+    t = (text or "").strip().lower()
+    if len(t) < _MIN_VISIBLE_CHARS:
+        return True
+    return any(marker in t for marker in _LOADER_MARKERS)
+
+
+def _summarize_json(obj: Any, max_items: int = 10,
+                    max_chars: int = 6000) -> str:
+    """把任意 JSON 响应压成「模型可读」的结构化摘要（不原样倾倒几十万字符）。"""
+    items: List[Any] = []
+    lines: List[str] = []
+    key: Optional[str] = None
+    if isinstance(obj, dict):
+        lines.append("JSON 对象，顶层键: " + ", ".join(list(obj)[:20]))
+        for k in ("Results", "results", "items", "data", "value", "jobs"):
+            v = obj.get(k)
+            if isinstance(v, list) and v:
+                items, key = v, k
+                break
+        if key is None:
+            for k, v in obj.items():
+                if isinstance(v, list) and v and k not in ("Facets", "facets"):
+                    items, key = v, k
+                    break
+        if key is not None:
+            cnt = obj.get("Count") or obj.get("count") or obj.get("total")
+            lines.append(f"列表字段「{key}」: {len(items)} 项"
+                         + (f"（总数 {cnt}）" if cnt else ""))
+    elif isinstance(obj, list):
+        items = obj
+        lines.append(f"JSON 数组: {len(items)} 项")
+    for it in items[:max_items]:
+        if isinstance(it, dict):
+            # Azure Search 之类的响应把实体嵌在内层（如 Document），自动展开
+            pick = {k: v for k, v in it.items()
+                    if isinstance(v, (str, int, float, bool)) and not k.startswith("@")}
+            if len(pick) <= 2:
+                inner = it.get("Document") or it.get("document") or it.get("doc")
+                if isinstance(inner, dict):
+                    pick = {k: v for k, v in inner.items()
+                            if isinstance(v, (str, int, float, bool))}
+            pick = {k: (v if not isinstance(v, str) or len(v) < 160 else v[:157] + "…")
+                    for k, v in list(pick.items())[:14]}
+            lines.append("- " + json.dumps(pick, ensure_ascii=False)[:400])
+        else:
+            lines.append(f"- {str(it)[:240]}")
+    if len(items) > max_items:
+        lines.append(f"… （其余 {len(items) - max_items} 项从略）")
+    out = "\n".join(lines)
+    if len(out) > max_chars:
+        out = out[:max_chars] + "\n… [摘要超过字符上限，已截断]"
+    return out or "（JSON 无可用字段）"
+
+
+def _try_parse_json(text: str) -> Optional[Any]:
+    """响应体是 JSON 时返回解析结果，否则 None（截断/HTML 都安全返回 None）。"""
+    s = (text or "").lstrip()
+    if not s or s[0] not in "{[":
+        return None
+    try:
+        return json.loads(s[:_MAX_PARSE_CHARS])
+    except (ValueError, RecursionError):
+        return None
+
+
+def _extract_iframe_urls(html: str, base_url: str) -> List[str]:
+    """挖 <iframe src>（绝对化 + 去重 + 只留 http(s)）。"""
+    urls: List[str] = []
+    seen: set = set()
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(html[:_MAX_PARSE_CHARS], "html.parser")
+        srcs = [f.get("src") for f in soup.find_all("iframe")]
+    else:
+        srcs = re.findall(r"<iframe[^>]+src=[\"']([^\"']+)[\"']", html, re.I)
+    for src in srcs:
+        if not src or not isinstance(src, str):
+            continue
+        abs_url = urljoin(base_url, src.strip())
+        p = urlparse(abs_url)
+        if p.scheme not in ("http", "https") or not p.netloc:
+            continue
+        if abs_url in seen:
+            continue
+        seen.add(abs_url)
+        urls.append(abs_url)
+    return urls
+
+
+def _same_origin(a: str, b: str) -> bool:
+    pa, pb = urlparse(a), urlparse(b)
+    return (pa.scheme, pa.netloc) == (pb.scheme, pb.netloc)
+
+
+def _sub_fetch_allowed(page_url: str, target: str) -> bool:
+    """子请求（iframe / 候选端点）目标是否放行。
+
+    同源直接放行——用户已经选择访问该站，抓它自己的子框架/接口不扩大攻击面；
+    跨源才做私网/回环/链路本地判定（防公网页把请求引向内网）。
+
+    透明代理/VPN 环境下所有域名都解析到 fake-ip 段（198.18.x.x），严格判定
+    会把一切误判成内网（实测本机就是这样，导致所有候选端点被跳过）——同源
+    豁免让这类环境可用，同时不放松对真正跨网目标的防护。
+    """
+    if _same_origin(target, page_url):
+        return True
+    return not _is_blocked_host(urlparse(target).hostname or "")
+
+
+def _scan_endpoints(blob: str, page_url: str) -> List[str]:
+    """从脚本文本里挖候选数据端点（去重、去静态资源、同源优先）。"""
+    out: List[str] = []
+    seen: set = set()
+    for raw in _ENDPOINT_RE.findall(blob or ""):
+        if isinstance(raw, tuple):
+            raw = raw[0]
+        cand = raw.strip()
+        if not cand or _STATIC_ASSET_RE.search(cand):
+            continue
+        abs_url = cand if cand.startswith("http") else urljoin(page_url, cand)
+        p = urlparse(abs_url)
+        if p.scheme not in ("http", "https") or not p.netloc:
+            continue
+        if abs_url in seen or abs_url == page_url:
+            continue
+        seen.add(abs_url)
+        out.append(abs_url)
+    # 同源的排前面（跨域端点大概率不是本站数据）
+    out.sort(key=lambda u: (not _same_origin(u, page_url),))
+    return out
+
+
+def _mining_literals(blob: str, limit: int = 4) -> List[str]:
+    """从脚本文本里挖「短标识符字面量」当查询参数值候选。
+
+    用途：端点多形如 ``/api/X?Param=``（页面用 ``+变量`` 拼值），值候选只能
+    从脚本自身找——如 Azure Search UI 的 settings 里 ``module:"job"``，
+    ``job`` 正是该站搜索接口的可用值。
+
+    优先取 **语义键的值**（module/type/category/mode/kind/entity/source/feed），
+    再退回泛化的短词扫描；后者在特性检测脚本里大量出现
+    （ontouchstart/touch…），价值低，只作补充。
+    """
+    out: List[str] = []
+    seen: set = set()
+    for key in ("module", "type", "category", "mode", "kind", "entity",
+                "source", "feed", "searchtype"):
+        for m in re.findall(rf'{key}\s*:\s*["\']([a-z][a-z0-9_\-]{{1,20}})["\']',
+                            blob or "", re.I):
+            if m not in seen:
+                seen.add(m)
+                out.append(m)
+            if len(out) >= limit:
+                return out
+    for m in re.findall(r"""["']([a-z][a-z0-9_]{2,15})["']""", blob or ""):
+        if m in seen or m in ("true", "false", "null", "none", "undefined"):
+            continue
+        seen.add(m)
+        out.append(m)
+        if len(out) >= limit:
+            break
+    return out
+
+
 class WebScanTool(Tool):
     name = "web_scan"
-    description = "Fetch a URL and return its visible text content (HTML stripped, scripts removed)."
+    description = (
+        "Fetch a URL and return its usable content. Handles three shapes: "
+        "(1) normal HTML → visible text; (2) a JSON API endpoint → structured "
+        "summary of the payload; (3) JS-rendered/empty-shell pages → follows "
+        "iframes and auto-discovers the page's own XHR/JSON endpoints (from "
+        "inline and same-origin scripts) and returns their data when found. "
+        "Use raw=true to get the original HTML."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -238,23 +461,209 @@ class WebScanTool(Tool):
             return ToolResult(False, error=f"HTTP {text[len('__HTTP_ERROR__'):]}")
         if raw:
             return ToolResult(True, output=_truncate_marked(text, 20000))
-        if BeautifulSoup is not None:
-            # 建完整 DOM 的内存峰值可达响应体的数十倍、耗时数秒。
-            # _MAX_FETCH_BYTES 只限制了下载，这里再限制解析量。
-            soup = BeautifulSoup(text[:_MAX_PARSE_CHARS], "html.parser")
-            for tag in soup(["script", "style", "noscript"]):
-                tag.decompose()
-            content = soup.get_text(separator="\n")
+
+        # ---- 形状 1：响应体本身就是 JSON（API 类数据源）----
+        # 模型直接给 JSON 端点时，旧实现会把它当 HTML 剥成一行乱码。
+        payload = _try_parse_json(text)
+        if payload is not None:
+            return ToolResult(
+                True,
+                output=_truncate_marked(
+                    f"[JSON 响应] {url}\n{_summarize_json(payload)}", 20000))
+
+        # ---- 形状 2/3：HTML ----
+        visible = _visible_text(text)
+        sections: List[str] = [visible] if visible else []
+        notes: List[str] = []
+
+        # iframe 嵌套：子框架内容拼回（站内常用 iframe 嵌搜索/列表组件）。
+        for ifr in _extract_iframe_urls(text, url)[:_MAX_IFRAMES]:
+            if not _sub_fetch_allowed(url, ifr):
+                notes.append(f"[iframe 已跳过（内网/回环目标）] {ifr}")
+                continue
+            try:
+                sub = _read_capped(http, ifr)
+            except Exception as e:
+                notes.append(f"[iframe 抓取失败] {ifr}: {type(e).__name__}")
+                continue
+            if sub.startswith("__HTTP_ERROR__"):
+                continue
+            sub_visible = _visible_text(sub)
+            if sub_visible.strip():
+                sections.append(f"[iframe: {ifr}]\n{sub_visible}")
+
+        # ---- 形状 3：JS 渲染空壳 → 自动发现站点自己的数据端点 ----
+        if _looks_js_rendered(visible):
+            sections, notes = self._discover_and_fetch(
+                http, url, text, sections, notes)
+
+        if notes:
+            sections.append("\n".join(notes))
+        out = "\n\n".join(s for s in sections if s.strip())
+        if not out.strip():
+            # 仍然空：把已发现的候选端点回给模型（比一句「无内容」有用）。
+            cands = _scan_endpoints(text, url)
+            hint = ("页面未提取到可见文本（可能是纯 JS 渲染或需要登录）。"
+                    "可尝试 raw=true 查看原始 HTML。")
+            if cands:
+                hint += " 页面脚本中发现的候选数据端点:\n" + "\n".join(
+                    f"  - {c}" for c in cands[:_MAX_API_CANDIDATES])
+            return ToolResult(True, output=_truncate_marked(hint, 20000))
+        return ToolResult(True, output=_truncate_marked(out, 20000))
+
+    # ------------------------------------------------------------------
+    # 动态页兜底：从页面脚本里挖站点自己的数据端点并试探
+    # ------------------------------------------------------------------
+
+    def _discover_and_fetch(self, http, url: str, html: str,
+                            sections: List[str], notes: List[str]):
+        """空壳页的端点发现 + 试探。
+
+        顺序：内联脚本 → 同源 .js（有数量/体积上限）。候选逐个 GET，命中
+        「有实质内容的 JSON」即采用并停止（带总时间与总子请求预算）。
+        """
+        deadline = time.monotonic() + _DISCOVERY_DEADLINE_S
+        budget = {"sub": _MAX_SUB_FETCHES}
+
+        def _sub_fetch(u: str) -> Optional[str]:
+            if budget["sub"] <= 0 or time.monotonic() > deadline:
+                return None
+            budget["sub"] -= 1
+            try:
+                return _read_capped(http, u)
+            except Exception:
+                return None
+
+        # 1) 内联脚本（整页 HTML 里的脚本段）
+        inline = "\n".join(
+            m for m in re.findall(r"<script[^>]*>(.*?)</script>", html,
+                                  re.S | re.I))
+        candidates = _scan_endpoints(inline, url)
+
+        # 2) 同源 .js 文件（挖得更深，如 azure-search-ui-settings.min.js）
+        #    注意：这里**不能**过滤 .js——端点字符串恰恰藏在 .js 里（静态资源
+        #    过滤只用于端点候选本身，不用于「要下载来挖端点的脚本」）。
+        #    排序：名字像配置/接口的脚本优先（settings/config/api/search/app），
+        #    端点声明最可能在那里；jquery 之类库脚本排最后。
+        js_urls = []
+        for m in re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", html, re.I):
+            abs_u = urljoin(url, m.strip())
+            if _same_origin(abs_u, url):
+                js_urls.append(abs_u)
+
+        def _js_priority(u: str) -> int:
+            name = u.rsplit("/", 1)[-1].lower()
+            if re.search(r"setting|config|option|api|search|main|app|bundle", name):
+                return 0
+            return 1
+
+        js_urls.sort(key=_js_priority)
+        # (endpoint, 来源脚本文本) —— 参数值候选从同一脚本里挖
+        found: List[Tuple[str, str]] = [(c, inline) for c in candidates]
+        js_blobs: List[str] = []
+        for ju in js_urls[:_MAX_JS_FILES]:
+            blob = _sub_fetch(ju)
+            if blob and not blob.startswith("__HTTP_ERROR__"):
+                js_blobs.append(blob)
+                for c in _scan_endpoints(blob, url):
+                    if c not in [u for u, _ in found]:
+                        found.append((c, blob))
+            if time.monotonic() > deadline:
+                break
+
+        # 数据类端点优先（search/list/query/job/post/get…）；页面型候选
+        # （.aspx/.html/.php…）排最后——它们是导航链接不是数据接口。
+        _PAGE_EXT_RE = re.compile(r"\.(?:aspx?|html?|php|jsp|cfm)(?:\?|$)",
+                                  re.I)
+
+        def _data_ish(u: str) -> int:
+            name = u.rsplit("/", 1)[-1].lower()
+            if _PAGE_EXT_RE.search(name):
+                return 2
+            if re.search(r"search|list|query|find|job|post|data|feed", name):
+                return 0
+            return 1
+
+        found.sort(key=lambda pair: _data_ish(pair[0]))
+
+        # 查询片段挖掘：端点路径与查询串常**分开放在不同脚本**里
+        # （如 settings js 只给 "/api/SearchIndex/GetSearch"，" ?SearchText="
+        # 写在另一个 js 的拼接处，且常嵌在更长字符串里）。从所有脚本文本中
+        # 提取 ``?Param=`` 形状的片段，供裸路径端点补全。
+        query_frags: List[str] = []
+        for blob in [inline] + list(js_blobs):
+            for m in re.findall(r"\?([A-Za-z_][A-Za-z0-9_]{1,30})=", blob or ""):
+                frag = f"?{m}="
+                if frag not in query_frags:
+                    query_frags.append(frag)
+        # 查询片段排序：参数名像「检索词」的优先（SearchText/q/query/text/
+        # keyword/filter/category…），ip/utm/token 之类靠后——前者才是列表
+        # 数据接口的入参。
+        def _frag_priority(f: str) -> int:
+            name = f.lstrip("?").split("=")[0].lower()
+            if re.search(r"search|query|^q$|keyword|text|filter|category|"
+                         r"type|term|find", name):
+                return 0
+            if re.search(r"^ip|utm|token|key|lang|locale|v$|cb$", name):
+                return 2
+            return 1
+
+        query_frags.sort(key=_frag_priority)
+        # 值字面量也跨脚本汇总：查询参数名在一个 js、它的可用值（module:"job"）
+        # 常在另一个 js 里。
+        all_blobs = "\n".join([inline] + list(js_blobs))
+
+        tried: List[str] = []
+        for cand, src_blob in found:
+            if len(tried) >= _MAX_API_CANDIDATES or time.monotonic() > deadline:
+                break
+            if not _sub_fetch_allowed(url, cand):
+                notes.append(f"[端点已跳过（内网/回环目标）] {cand}")
+                continue
+            # 端点常是「裸路径」或 ``?Param=`` 前缀（值由页面用 +变量 拼）。
+            # 每个候选最多 3 个变体（裸 / 通配 / 最佳字面量），避免一个坏候选
+            # 吃光总预算。
+            variants = [cand]
+            if "?" in cand:
+                base_part, q = cand.split("?", 1)
+                if q.endswith("=") or "=&" in q or q == "":
+                    prefix = q if q.endswith("=") else (q + "=" if q else "")
+                    variants.append(f"{base_part}?{prefix}*")
+                    for lit in _mining_literals(all_blobs, limit=1):
+                        variants.append(f"{base_part}?{prefix}{lit}")
+            elif query_frags:
+                frag = query_frags[0]
+                variants.append(cand + frag + "*")
+                for lit in _mining_literals(all_blobs, limit=1):
+                    variants.append(cand + frag + lit)
+            for attempt in variants:
+                if len(tried) >= _MAX_API_CANDIDATES or time.monotonic() > deadline:
+                    break
+                tried.append(attempt)
+                body = _sub_fetch(attempt)
+                if not body or body.startswith("__HTTP_ERROR__"):
+                    continue
+                data = _try_parse_json(body)
+                if data is None:
+                    continue
+                summary = _summarize_json(data)
+                # 「有实质内容」：至少解析出列表项或非空对象
+                substantive = (isinstance(data, list) and data) or (
+                    isinstance(data, dict) and any(
+                        isinstance(v, list) and v for v in data.values()))
+                if substantive and summary.strip() not in ("", "（JSON 无可用字段）"):
+                    sections.append(
+                        f"[自动发现的数据端点] {attempt}\n{summary}")
+                    notes.append(
+                        f"[提示] 页面为 JS 动态渲染，以上数据来自其脚本中发现的接口 {attempt}")
+                    return sections, notes
+
+        if tried:
+            notes.append("[提示] 页面为 JS 动态渲染，已试探以下脚本中的数据端点但未取得可用数据: "
+                         + ", ".join(tried))
         else:
-            # bs4 缺失时的线性降噪回退：**不用正则**处理 script/style 块——
-            # `<script.*?</script>` 配 re.S 在超长且标签不闭合的输入上会
-            # 大量回溯（ReDoS，实测秒级到分钟级，阻塞 agent 线程）。改用
-            # str.find 线性扫描，任何输入都是 O(n)。
-            content = _strip_blocks_linear(text[:_MAX_PARSE_CHARS])
-            import re
-            content = re.sub(r"<[^>]+>", " ", content)
-        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
-        return ToolResult(True, output=_truncate_marked("\n".join(lines), 20000))
+            notes.append("[提示] 页面为 JS 动态渲染，未在脚本中发现数据端点")
+        return sections, notes
 
 
 class WebExecJsTool(Tool):
