@@ -4,6 +4,17 @@
 
 ---
 
+## 2026-10-24 · 清理启动警告：tokenizer 正则修复 + MLX 缓存 API 升级
+
+> 用户贴出启动日志里的残留警告。其中 tokenizer 那条 transformers 明确提示 "will lead to incorrect tokenization"——不是噪声，是真实的分词偏差。
+
+### 修复
+- **`fix_mistral_regex=True`**：Qwen3.5 系 tokenizer 的 pre-tokenizer 正则用 Mistral 风格 `\p{...}` 类，transformers 后端不认 → 启动刷警告且分词结果确实偏差（中英混合/代码场景尤明显）。`mlx_lm.load` 的 `tokenizer_config` 会透传给 `AutoTokenizer.from_pretrained`，`_load_mlx` 显式传该参数；老版本 transformers 不认识时 `TypeError` 回退默认加载（功能不降级）。实测：警告消除、中英混排往返解码一致。
+- **`mx.set_cache_limit` 替代 `mx.metal.set_cache_limit`**：后者已标记 deprecated 并将在未来版本移除。探测式调用（有新 API 用它，没有则回退旧路径）。
+- 启动日志现已 0 条配置死键警告 / 0 条 tokenizer 警告 / 0 条 deprecation。
+
+---
+
 ## 2026-10-24 · 修复：手写 config.json 的后端标识导致主模型加载失败（“莫名抽风”）
 
 > 用户反馈：又开始莫名抽风。

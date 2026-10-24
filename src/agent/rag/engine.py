@@ -68,7 +68,13 @@ def configure_mlx_memory_limits(cache_bytes: int = 1_000_000_000) -> None:
     """
     try:
         import mlx.core as mx
-        mx.metal.set_cache_limit(cache_bytes)
+        # mlx 新 API：mx.set_cache_limit（旧 mx.metal.set_cache_limit 已标记
+        # deprecated 并将在未来版本移除）。探测式调用，老版本回退旧路径。
+        setter = getattr(mx, "set_cache_limit", None)
+        if callable(setter):
+            setter(cache_bytes)
+        else:
+            mx.metal.set_cache_limit(cache_bytes)
         logger.info("MLX cache limit set to %.1f GB", cache_bytes / 1e9)
     except Exception as e:
         logger.debug("MLX cache limit not set: %s", e)

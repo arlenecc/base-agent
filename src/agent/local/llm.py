@@ -513,7 +513,20 @@ class LocalLLMClient:
                 "安装：pip install mlx-lm\n"
                 f"原始错误: {type(e).__name__}: {e}"
             ) from e
-        self._model, self._tokenizer = load(self._path, trust_remote_code=True)
+        # fix_mistral_regex=True：Qwen3.5 系 tokenizer 的 pre-tokenizer 正则
+        # 用的是 Mistral 风格 `\p{...}` 类，transformers 的 tiktoken/rust 后端
+        # 不认，启动时刷一条 "incorrect regex pattern ... will lead to
+        # incorrect tokenization" 警告——分词结果确实会偏差（中英混合、代码
+        # 场景尤明显）。mlx_lm.load 的 tokenizer_config 会透传给
+        # AutoTokenizer.from_pretrained，这里显式修掉；老版本 transformers
+        # 不认识该参数时退回默认加载（功能不降级）。
+        try:
+            self._model, self._tokenizer = load(
+                self._path, trust_remote_code=True,
+                tokenizer_config={"fix_mistral_regex": True})
+        except TypeError:
+            self._model, self._tokenizer = load(
+                self._path, trust_remote_code=True)
 
     def _load_gguf(self) -> None:
         raw = (self._path or "").strip()
