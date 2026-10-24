@@ -488,3 +488,54 @@ def test_skill_save_rejects_path_traversal(cfg):
     assert not os.path.exists(os.path.join(cfg.workspace, "evil"))
     assert os.path.isdir(os.path.join(cfg.workspace, "skills", "evil"))
     reg.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# rollback 后任务原文不得丢失（2026-10-24 用户反馈：模型自问「你没有给出具体任务」）
+# ---------------------------------------------------------------------------
+
+def _carry_task_unit():
+    from agent.kernel.loop import _carry_task_text
+    # 提示必须自带任务原文
+    out = _carry_task_text("从 URL 获取今天的招聘信息并整理成列表", "[System] 请先建计划")
+    assert "从 URL 获取今天的招聘信息并整理成列表" in out
+    assert "[System] 请先建计划" in out
+    # 无任务时原样返回提示；无提示时返回任务
+    assert _carry_task_text("", "hint") == "hint"
+    assert _carry_task_text("task", "") == "task"
+    # 提示里已含任务时不重复拼接（幂等）
+    assert _carry_task_text("task", "task\n\nhint") == "task\n\nhint"
+
+
+def test_kernel_rollback_keeps_user_task_in_context():
+    """规划前置门 rollback 后，下一轮 messages 必须仍含原始用户消息。
+
+    旧实现：rollback 摘掉含用户消息的轮次 + pending 被提示整体覆盖 →
+    模型再也看不到任务，开始自问「你没有给出具体任务内容」并复读。
+    """
+    from agent.agent import Agent
+    from agent.config import AgentConfig
+
+    MSG = "https://example.com/jobs 从这里获取今天所有的招聘信息，并整理成列表"
+    # 第一轮：只在文本里写计划、不发工具 → 触发规划前置门（rollback + 提示）
+    # 第二轮：正常发一个工具调用收尾。
+    llm = MockLLM([
+        [_evt("content", "我的计划：1) 读取网页 2) 解析 3) 整理。现在开始第一步。")],
+        [_evt("done", tool_calls=[{
+            "id": "c1", "type": "function",
+            "function": {"name": "ask_user", "arguments": "{}"},
+        }])],
+    ])
+    agent = Agent(llm=llm, config=AgentConfig(), callbacks=Noop())
+    try:
+        agent.run(MSG)
+    except Exception:
+        pass  # 工具缺参会报错，不影响断言（我们只看 messages）
+
+    assert len(llm.calls) >= 2, "应当至少发生了两轮 LLM 调用"
+    for i, call in enumerate(llm.calls):
+        users = [m for m in call["messages"] if m.get("role") == "user"]
+        joined = "\n".join(str(m.get("content") or "") for m in users)
+        assert "example.com/jobs" in joined, (
+            f"第 {i + 1} 轮的 user 消息里丢失了原始任务（URL 不见了）——"
+            "rollback 覆盖 pending 的回归")

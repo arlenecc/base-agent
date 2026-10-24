@@ -130,6 +130,22 @@ _PLAN_GATE_HINT = (
 )
 
 
+def _carry_task_text(task_text: str, hint: str) -> str:
+    """把纠正提示拼在原始任务之后，防止任务从上下文里永久消失。
+
+    ``_rollback_turn`` 会把**含用户消息**的轮次从历史摘掉，而
+    ``anchor_prompt`` 只回注 ``extra``（即 pending）——提示若整体覆盖
+    pending，模型下一轮就再也看不到用户要什么。实测：带 URL 的明确任务在
+    两轮内消失，模型开始自问「你没有给出具体任务内容」并进入复读循环，
+    直到空响应熔断（用户侧表现为「莫名抽风/只会反问」）。
+    """
+    if not hint:
+        return task_text
+    if not (task_text or "").strip() or task_text.strip() in hint:
+        return hint
+    return f"{task_text.strip()}\n\n---\n{hint}"
+
+
 class KernelHooks:
     """经验沉淀回调。默认 no-op —— 内核本身不做任何沉淀。"""
 
@@ -344,6 +360,11 @@ class KernelLoop:
         pending = user_input
         final_text = ""
         exit_reason = ExitReason.MAX_TURNS
+        # 原始任务文本：rollback 路径的纠正提示必须自带它（见 _carry_task）。
+        task_text = user_input or ""
+
+        def _carry_task(hint: str) -> str:
+            return _carry_task_text(task_text, hint)
 
         while self._turns_used < self.max_turns:
             if self._cancelled():
@@ -499,7 +520,7 @@ class KernelLoop:
                         and not self._resume):
                     self._plan_finish_nudge += 1
                     self._rollback_turn(session)
-                    pending = _PLAN_FINISH_HINT
+                    pending = _carry_task(_PLAN_FINISH_HINT)
                     self.log("[kernel] 反思门：多步任务未写计划也未动手，强制要求先 create 并开工")
                     continue
                 # 预算分三档。「停下来问用户是否继续」在两种情况下尤其不该放行：
@@ -575,7 +596,9 @@ class KernelLoop:
                 event = self._no_tool_event(resp)
                 if event == "retry":
                     self._rollback_turn(session)
-                    pending = "[ERROR] 上一轮回复为空或流被截断，请重新生成；如需操作必须显式调用工具。"
+                    pending = _carry_task(
+                        "[ERROR] 上一轮回复为空或流被截断，请重新生成；"
+                        "如需操作必须显式调用工具。")
                     continue
                 if event == "reask":
                     self._reask_guard += 1
@@ -583,7 +606,7 @@ class KernelLoop:
                         # 第一次只是提醒：整轮作废重来（这一轮没有 assistant
                         # 输出，留着只会污染历史）。
                         self._rollback_turn(session)
-                        pending = (
+                        pending = _carry_task(
                             "[System] 检测到你上轮主要内容是大段代码却未调用工具。"
                             "若这些代码需要执行/写入/分析，请显式调用 code_run / "
                             "file_write / file_patch；"
@@ -630,7 +653,7 @@ class KernelLoop:
                           and not _MULTISTEP_VERB_RE.search(user_input or ""))
                 if not simple:
                     self._rollback_turn(session)
-                    pending = (
+                    pending = _carry_task(
                         "[System] 你准备执行实际工具，但还没有执行计划（Session 中 plan 为空）。"
                         "请先用 update_plan(op='create', goal='一句话目标', steps=[...]) 把目标与 "
                         "2~7 个可验证步骤规划好；创建后工具结果会指示『立即开始第一步』，"
