@@ -800,10 +800,12 @@ class SyncKnowledgeWorker(QThread):
                 release_mlx_pool()
             except Exception as e:  # 防御：清理失败不该中断同步
                 logger.debug("SyncKnowledgeWorker: pre-sync mlx cleanup failed: %s", e)
-            # 解析并发说明：docling 转换器是**单实例 + 全程持锁串行**
-            # （2026-10-23 从多实例池回退——两实例常驻 ~9GB + 两路转换
-            # 工作集把 16GB 机器打到系统崩溃）。PDF 解析吞吐的瓶颈在嵌入
-            # 侧（主线程单路），多开转换实例只会堆内存不提速。
+            # 解析并发说明：docling 转换器现为**并行实例池**（`_DOCLING_POOL_SIZE`，
+            # 默认 2）。2026-10-23 曾因两实例常驻 ~9GB + 工作集把 16GB 机器打崩而回退
+            # 单实例串行；本次用「50MB/50 页分批（单批文档树内存可控）+ 可调池大小」
+            # 重新打开并行。⚠️ 常驻权重约 4.6GB/实例，2 实例 ≈ 9GB 常驻，建议 RAM ≥16GB；
+            # 若仍紧张可继续调到 1（退化为串行）。嵌入侧也并行（`_EMBED_POOL_SIZE=2`，
+            # 独立实例），store 仍串行。
             self._engine = RAGEngine(
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,

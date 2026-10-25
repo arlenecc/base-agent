@@ -529,6 +529,69 @@ class _SubBatchTuner:
 _EMBED_PROVIDER: Dict[str, Any] = {"provider": "api", "path": "", "backend": "mlx"}
 _RERANK_PROVIDER: Dict[str, Any] = {"provider": "api", "path": "", "backend": "mlx"}
 
+# 并行嵌入实例池（#本任务）：embedding 计算在 add_streaming 主线程串行进行，慢库/
+# 长文本下是瓶颈之一。本地 MLX / fastembed 各起固定数量的独立实例并行嵌入子批，
+# store（LanceDB 写入）仍串行（需串行安全）。每个实例独立，避免 MLX 前向并发
+# 不安全的问题（ONNX 单实例线程安全，但本地 MLX 未必）。内存代价低（nomic MLX
+# int8 ~150MB/实例，2 实例可忽略）。
+_EMBED_POOL_SIZE = 2
+_embed_instances: List = []
+_embed_busy: List[bool] = []
+_embed_pool_lock = threading.Lock()
+_embed_pool_cond = threading.Condition(_embed_pool_lock)
+
+
+def _build_embedding_instance():
+    """构建**一个** embedding 实例（不缓存到 _EF_SINGLETONS）。"""
+    p = _EMBED_PROVIDER
+    if p.get("provider") == "local":
+        try:
+            from ..local.embedding import LocalEmbeddingFunction
+            from ..local import registry
+            path = registry.resolve_model_path("embedding", p.get("path"))
+            return LocalEmbeddingFunction(path, backend=p.get("backend"))
+        except Exception as e:
+            logger.warning("构建本地 embedding 实例失败: %s", e)
+            return None
+    try:
+        from .embedding import FastEmbedEmbeddingFunction
+        return FastEmbedEmbeddingFunction(
+            model_name=p.get("model_name") or DEFAULT_EMBEDDING_MODEL)
+    except Exception as e:
+        logger.warning("构建 fastembed embedding 实例失败: %s", e)
+        return None
+
+
+def _acquire_embed_instance():
+    """从并行池中借出一个 embedding 实例（阻塞直到有空闲）。"""
+    with _embed_pool_cond:
+        while True:
+            for i in range(len(_embed_instances)):
+                if not _embed_busy[i]:
+                    inst = _embed_instances[i]
+                    if inst is None:
+                        inst = _build_embedding_instance()
+                        if inst is None:
+                            return None
+                        _embed_instances[i] = inst
+                    _embed_busy[i] = True
+                    return inst
+            if len(_embed_instances) < _EMBED_POOL_SIZE:
+                _embed_instances.append(None)
+                _embed_busy.append(False)
+                continue
+            _embed_pool_cond.wait()
+
+
+def _release_embed_instance(inst) -> None:
+    """归还 embedding 实例到池（标记空闲并唤醒等待者）。"""
+    with _embed_pool_cond:
+        for i in range(len(_embed_instances)):
+            if _embed_instances[i] is inst:
+                _embed_busy[i] = False
+                break
+        _embed_pool_cond.notify_all()
+
 
 def _evict_local_singletons(key_prefix: str) -> int:
     """淘汰并释放某一类本地模型单例（provider 配置变更时调用）。
@@ -1219,7 +1282,7 @@ class VectorStore:
         # Embed 第一批
         logger.info("  ├─ 向量化: 首批 %d 个切片正在嵌入...", len(first_batch))
         _t_emb0 = time.monotonic()
-        first_records = self._embed_chunks(first_batch, 0)
+        first_records = self._embed_batch_parallel(first_batch, 0)
         _dt_emb0 = time.monotonic() - _t_emb0
         logger.info("  ├─ 向量化完成: 首批 %d 个切片", len(first_records))
 
@@ -1300,7 +1363,7 @@ class VectorStore:
                 # source 在库里被删空，并发检索会返回空（「文档凭空消失」）。
                 # 调整后，删旧与写新背靠背执行，空窗缩到一次 table.add 的耗时。
                 _t_e = time.monotonic()
-                records = self._embed_chunks(batch_buf, chunk_idx)
+                records = self._embed_batch_parallel(batch_buf, chunk_idx)
                 _dt_e = time.monotonic() - _t_e
                 if table is not None:
                     new_sources = {c["source"] for c in batch_buf} - deleted_sources
@@ -1342,7 +1405,7 @@ class VectorStore:
                             table.delete(f"id LIKE '{h}_%'")
                         except Exception:
                             pass
-            records = self._embed_chunks(batch_buf, chunk_idx)
+            records = self._embed_batch_parallel(batch_buf, chunk_idx)
             try:
                 table.add(records)
                 total += len(records)
@@ -1364,8 +1427,38 @@ class VectorStore:
 
         return total
 
+    def _embed_batch_parallel(self, chunks, start_idx):
+        # 并行嵌入（#本任务）：把本批拆 2 份，各用池中一个独立 embedding 实例并发
+        # 嵌入（MLX 前向未必线程安全，故用独立实例而非共享单例）。store 仍在
+        # add_streaming 主线程串行执行。小批不拆，直接单实例嵌入。
+        if len(chunks) < 8:
+            return self._embed_chunks(chunks, start_idx)
+        mid = len(chunks) // 2
+        halves = [chunks[:mid], chunks[mid:]]
+        insts = [_acquire_embed_instance() for _ in range(2)]
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                futs = [
+                    ex.submit(
+                        self._embed_chunks,
+                        halves[i],
+                        start_idx + (mid if i else 0),
+                        insts[i],
+                    )
+                    for i in range(2)
+                ]
+                recs: List[Dict[str, Any]] = []
+                for f in futs:
+                    recs.extend(f.result())
+            return recs
+        finally:
+            for inst in insts:
+                if inst is not None:
+                    _release_embed_instance(inst)
+
     def _embed_chunks(
-        self, chunks: List[Dict[str, Any]], start_idx: int,
+        self, chunks: List[Dict[str, Any]], start_idx: int, ef=None,
     ) -> List[Dict[str, Any]]:
         """Embed 一批 chunks，返回 records（含 vector）。内部辅助方法。
 
@@ -1394,11 +1487,15 @@ class VectorStore:
         # 超过 50ms 才让出一次，保证 UI 响应又不为 sleep 付出固定开销。
         _YIELD_INTERVAL = 0.05
         texts = [c["text"] for c in chunks]
+        # ef：并行嵌入时传入池中独立实例；None 则用默认单例（串行/历史路径）。
+        efn = ef or self._ef
         # 长度降序分桶：批内长度相近，padding 浪费最小（降序让最长批最先
         # 出现，提早把激活水位顶到峰值，后续批更轻）。
         order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
         vectors_by_idx: List[Optional[List[float]]] = [None] * len(texts)
-        tuner = self._subbatch_tuner
+        # 并行路径（传入独立 ef）用独立调优器，避免多个并发嵌入线程共享
+        # self._subbatch_tuner 造成竞态；串行/默认路径复用实例级调优器。
+        tuner = self._subbatch_tuner if ef is None else _SubBatchTuner()
         _last_yield = time.monotonic()
         _t_embed = time.monotonic()
         sub_idx = 0
@@ -1411,7 +1508,7 @@ class VectorStore:
             size = _shape_cap_size(size, len(texts[order[sub_start]]))
             idxs = order[sub_start:sub_start + size]
             _t_sub = time.monotonic()
-            sub_vectors = self._ef([texts[i] for i in idxs])
+            sub_vectors = efn([texts[i] for i in idxs])
             _dt = time.monotonic() - _t_sub
             for i, v in zip(idxs, sub_vectors):
                 vectors_by_idx[i] = v
