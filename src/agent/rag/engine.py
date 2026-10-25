@@ -1399,9 +1399,9 @@ class RAGEngine:
                                 chunk_overlap=self._chunk_overlap,
                                 min_chunk_size=self._min_chunk_size,
                                 overlap_percent=self._overlap_percent,
-                                # 把引擎的 EF（可能是注入的自定义 EF）透传给
-                                # 语义切片，避免它另起一份本地 ONNX 模型。
-                                embedding_function=self._custom_ef,
+                                # 语义切片强制走 model2vec 静态嵌入（见 semantic_chunker）：
+                                # 不把检索用的 nomic EF 透传下去，避免 worker 切片线程与
+                                # 主线程 add_streaming 并发争抢同一 nomic/MLX 模型。
                             )
                             t_chunk_end = time.monotonic()
                             _log(

@@ -8,10 +8,12 @@ quality for e-books and long documents.
 Embedding backends (in priority order):
   1. Explicitly injected ``embedding_function`` → wrapped via
      ``_ChonkieEmbeddingAdapter`` (tests / external callers).
-  2. model2vec static embeddings (potion-base-32M) — fast path for chunking
-     decisions, ~100x faster than BERT inference (#118).
-  3. Shared nomic-embed-text singleton → adapter (fallback when model2vec is
-     unavailable; slow but correct).
+  2. model2vec static embeddings (potion-base-32M) — the ONLY embedding backend
+     for chunking decisions, ~100x faster than BERT inference (#118), and
+     pure-numpy/CPU so it never contends with the retrieval nomic/MLX model.
+  3. When model2vec is unavailable, semantic_chunk_text returns None and the
+     caller falls back to the recursive chunker (NO nomic fallback — using the
+     retrieval model for chunking would contend with the later embed stage).
 
 If none is available (or ``chonkie`` is not installed), :func:`semantic_chunk_text`
 returns ``None`` so callers fall back to the existing recursive chunker.
@@ -92,17 +94,16 @@ def semantic_chunk_text(
             # 显式注入（测试/外部调用）：走适配器，行为与旧版一致。
             embeddings = _ChonkieEmbeddingAdapter(embedding_function)
         else:
-            # 生产路径：优先 model2vec 静态嵌入（切片决策不需要与检索向量
-            # 同空间，静态嵌入的相对相似度足够；吞吐高约两个数量级）。
-            # model2vec 缺失时回退共享 nomic 适配器（慢但正确），再不行
-            # 返回 None 交给上层递归切片兜底。
+            # 生产路径：强制 model2vec 静态嵌入（切片决策不需要与检索向量同空间，
+            # 静态嵌入的相对相似度足够；吞吐高约两个数量级，且纯 numpy/CPU，
+            # 不会与后续分片 embedding 的 nomic/MLX 在多线程下争抢 GPU/模型）。
+            # 绝不使用检索用的 nomic 模型做切片——否则 ingest worker 切片时调 nomic、
+            # 主线程 add_streaming 也调 nomic，两线程并发命中同一模型既不安全也拖慢。
+            # model2vec 不可用时直接降级递归切片（返回 None 交上层兜底）。
             embeddings = _get_static_embeddings()
             if embeddings is None:
-                ef = _shared_embedding_function()
-                if ef is None:
-                    logger.debug("semantic chunking skipped: no embedding backend available")
-                    return None
-                embeddings = _ChonkieEmbeddingAdapter(ef)
+                logger.debug("semantic chunking skipped: model2vec 不可用，降级递归切片")
+                return None
 
         # When chonkie is present, _BaseEmbeddings is the real base class and
         # the isinstance check in SemanticChunker.__init__ will pass.  When it
