@@ -251,11 +251,13 @@ def is_supported(ext: str) -> bool:
 def _build_converter():
     """构建**一个** docling DocumentConverter 实例（不缓存到模块级单例）。
 
-    docling 模型很重（布局 + TableFormer + OCR），每个实例常驻约 4.6GB。从旧的
-    `_get_converter` 抽出，供并行池按需 lazy 构建多个实例。保留「构建失败不置
-    永久禁用」的语义：ImportError → `_converter_unavailable` 置位返回 None；
-    其它异常 → 记 warning 返回 None，下次重试。
+    global 声明必须加：函数内 except ImportError 分支会赋值
+    ``_converter_unavailable = True``，Python 会据此把该名视为局部变量，导致
+    函数开头的 ``if _converter_unavailable`` 读即 UnboundLocalError（实测 docling
+    因此对全部 PDF 抛错、整体回退 marker——#本任务回归）。
     """
+    global _converter_unavailable
+
     if _converter_unavailable:
         return None
     try:
