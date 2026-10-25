@@ -69,12 +69,15 @@ _ocr_scale_dynamic = False
 _PDF_BATCH_BYTES = 50 * 1024 * 1024
 _PDF_BATCH_PAGES = 50
 # docling 并行实例池大小（#本任务）：同时转换不同文件的 converter 实例数。
-# ⚠️ 内存硬约束：每个实例常驻模型权重约 4.6GB，N 实例 ≈ 4.6×N GB 常驻。
-# 本机 16GB：2 实例（≈9.2GB）+ 应用/UI/macOS 基线会越过物理内存被 Jetsam 杀
-# 进程（实测「一点同步就崩」），故 16GB 机器**默认 1**（≈4.6GB，已验证可跑完
-# 整库）。≥32GB 才建议 2；≥64GB 可 4。分批只约束单批文档树这种瞬时内存，消除
-# 不了常驻权重，故并行度受 RAM 硬约束。用户若要求更高并行度，请先确保 RAM 足够。
-_DOCLING_POOL_SIZE = 1
+# ⚠️ 真正的硬约束是 **GPU/MPS 稳定性**，不是内存：每个实例常驻权重约 3-3.5GB
+# （实测 2 实例总占用 8-9GB，16GB 机器余量充足），但 docling 的 MPS（PyTorch-Metal）
+# 推理与 MLX embedding 同时抢同一块 GPU 时，2 实例并发会触发 GPU 重置
+# （[METAL] InnocentVictim）→ torch-MPS 状态损坏 → 原生 SIGSEGV 段错误把进程带走
+# （实测 2026-10-25 多次硬崩；崩溃报告 Malloc 仅 3.8G、无 Jetsam，确认非 OOM）。
+# 1 个 MPS 实例（≈3-3.5GB）经实测稳定；2 个 MPS 实例必崩。故 16GB 机器**默认 1**。
+# ≥32GB 可试 2（仍需观察 GPU 稳定性）；≥64GB 可 4。并行度受 GPU 并发能力约束，
+# 与 RAM 无关——关掉 docling MPS 改 CPU 推理并不能提速（2 CPU 实例 ≈ 1 MPS 实例）。
+_DOCLING_POOL_SIZE = 1  # 16GB：1 个 MPS 实例稳定；2 个 MPS 实例触发 GPU 重置硬崩
 _ocr_scale_table = 2.5
 
 
@@ -123,11 +126,11 @@ _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"
 # 实例可同时 convert 不同文件——大 PDF 已按 50MB/50 页分批（见下方常量），单批
 # 文档树内存可控，因此并行不会瞬间撑爆内存。
 #
-# ⚠️ 内存警示：每个实例常驻模型权重约 4.6GB，N 实例 ≈ 4.6×N GB 常驻（4 实例
-# ≈ 18GB+）。这是分批消除不了的——分批只约束「单批文档树」这种瞬时内存，消除
-# 不了常驻权重。故 4 实例需机器有充足 RAM（建议 ≥32GB）；16GB 机器请调小
-# _DOCLING_POOL_SIZE 到 2。2026-10-23 曾因两实例 + 工作集把 16GB 机器打崩，当时
-# 的教训是「常驻权重线性叠加」，本改动用「分批 + 可调池大小」重新打开并行。
+# ⚠️ 约束不是内存而是 GPU：每个实例常驻权重约 3-3.5GB（分批消除不了，只约束
+# 「单批文档树」瞬时内存）。真正的硬崩来自 GPU——docling 的 MPS 推理与 MLX
+# embedding 并发抢同一 GPU 时，2 实例会触发 GPU 重置（InnocentVictim）→ torch-MPS
+# 状态损坏 → 原生 SIGSEGV 把进程带走（2026-10-25 实测多次硬崩，非 OOM）。因此
+# 16GB 机器 _DOCLING_POOL_SIZE 默认 1（1 个 MPS 实例稳定）；≥32GB 可试 2。
 #
 # 池槽在模块导入时不创建；首次借出时按需在锁内 lazy 构建（最多 _DOCLING_POOL_SIZE
 # 个），避免启动即一次性加载数份权重。锁/条件变量必须在模块导入时就建好，防止

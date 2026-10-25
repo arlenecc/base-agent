@@ -801,11 +801,12 @@ class SyncKnowledgeWorker(QThread):
             except Exception as e:  # 防御：清理失败不该中断同步
                 logger.debug("SyncKnowledgeWorker: pre-sync mlx cleanup failed: %s", e)
             # 解析并发说明：docling 转换器现为**并行实例池**（`_DOCLING_POOL_SIZE`，
-            # 本机 16GB 默认 1）。2026-10-23 曾因两实例常驻 ~9GB + 工作集把 16GB 机器
-            # 打崩而回退单实例串行；本次用「50MB/50 页分批（单批文档树内存可控）+
-            # 可调池大小」重新打开并行，但 16GB 实测 2 实例直接 OOM 崩溃，故默认回到 1。
-            # ⚠️ 常驻权重约 4.6GB/实例，≥32GB 才建议 2、≥64GB 才建议 4。嵌入侧并行
-            # （`_EMBED_POOL_SIZE=2`，独立实例，仅 ~300MB，安全），store 仍串行。
+            # 本机 16GB 默认 1）。2 个 MPS 实例与 MLX embedding 并发抢 GPU 会触发 GPU 重置
+            # → torch-MPS 状态损坏 → 原生 SIGSEGV 硬崩（2026-10-25 实测多次，崩溃报告
+            # Malloc 仅 3.8G、非 OOM），故 16GB 默认回到 1（1 个 MPS 实例稳定）。
+            # ⚠️ 约束是 GPU 稳定性不是内存（每实例常驻权重约 3-3.5GB）；≥32GB 可试 2、
+            # ≥64GB 可 4。embedding 已改为单实例（self._ef 共享单例，多实例无收益且有
+            # 死锁/线程安全风险），store 仍串行。
             self._engine = RAGEngine(
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,
