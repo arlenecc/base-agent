@@ -2093,9 +2093,14 @@ class RAGEngine:
         if not chapters:
             digest = f"# 目录\n\n{os.path.basename(doc_name)}"
         # Serialize chapters (title + level) for targeted retrieval.
+        # 兼容两种形态：正常路径（build_digest）传 Chapter 对象；电子书快速
+        # 路径（ebook_parser）传 [{"level": int, "title": str}] 的 dict 列表。
+        def _chapter_to_dict(c):
+            if isinstance(c, dict):
+                return {"level": c.get("level"), "title": c.get("title")}
+            return {"level": c.level, "title": c.title}
         chapters_json = json.dumps(
-            [{"level": c.level, "title": c.title}
-             for c in chapters],
+            [_chapter_to_dict(c) for c in chapters],
             ensure_ascii=False,
         )
         store = self._get_store()
