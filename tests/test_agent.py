@@ -1436,3 +1436,19 @@ def test_system_prompt_splits_greeting_from_simple_qa():
     assert "你没有给出具体任务" in SYSTEM_PROMPT   # 明确禁语
     assert "禁止复读" in SYSTEM_PROMPT             # 同一句话不许输出第二遍
     assert "ask_user" in SYSTEM_PROMPT             # 只缺参数时问那一个参数
+
+
+def test_system_prompt_book_content_outline_then_search():
+    """问某本书内容时必须「先 outline 全书 → 再 search 针对性内容 → 组织回答」。
+
+    2026-10-25 用户反馈：重构 SYSTEM_PROMPT 后 rag_outline 不再被调用——「查内容」
+    被写成了直接 rag_search，跳过了先摸全书结构的步骤，导致检索盲目、回答发散。
+    规则必须强制「先总后分」两步，且明确禁止跳过 outline。
+    """
+    from agent.agent import SYSTEM_PROMPT
+
+    # 先摸全书结构（带书名），再针对性检索（限定 source），最后组织回答
+    assert 'rag_outline(book_name="书名")' in SYSTEM_PROMPT
+    assert 'source="书名"' in SYSTEM_PROMPT
+    assert "先总后分" in SYSTEM_PROMPT
+    assert "不要跳过 outline 直接 search" in SYSTEM_PROMPT
