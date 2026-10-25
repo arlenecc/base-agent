@@ -35,6 +35,7 @@ rag = [
     "python-pptx>=0.6.0",
     "PyMuPDF>=1.23.0",
     "ebooklib>=0.18",
+    "pymupdf4llm<2",
     "chonkie[semantic]>=1.0.0",
     # 语义切片快路径：model2vec 静态嵌入（potion-base-32M）驱动 chonkie 的
     # SemanticChunker——切片决策只比较相邻窗口的相对相似度，不需要与检索

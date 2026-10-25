@@ -166,9 +166,9 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 | `rag_rerank_model` | 重排序模型（FastEmbed cross-encoder） | `BAAI/bge-reranker-v2-m3-int8` |
 | `rag_rerank_enabled` | 是否启用重排序；关闭后不加载 reranker 权重 | `true` |
 | `rag_pdf_engine` | 统一 PDF/office 解析引擎首选：`docling` / `marker` / `ovis` | `docling` |
-| 🌐 `rag_ocr_engine` | OvisOCR2 后端：`mlx-vlm`（已实现）/ `onnx` / `gguf`（预留） | `mlx-vlm` |
-| 🌐 `rag_ocr_model_name` | OvisOCR2 模型目录名（自动从 `models/` 加载） | `OvisOCR2-0.8B-MLX-4bit` |
-| 🌐 `rag_ocr_model_path` | OvisOCR2 显式本地路径（优先于 `models/<name>`） | 空 |
+| 🌐 `rag_ocr_engine` | OvisOCR 后端：`mlx-vlm`（已实现）/ `onnx` / `gguf`（预留） | `mlx-vlm` |
+| 🌐 `rag_ocr_model_name` | OvisOCR 模型目录名（自动从 `models/` 加载） | `OvisOCR3-MLX-4bit-mixed46` |
+| 🌐 `rag_ocr_model_path` | OvisOCR 显式本地路径（优先于 `models/<name>`） | 空 |
 | 🌐 `rag_ocr_scale_base` | docling OCR 渲染固定 scale（位图内存 ∝ scale²） | `2.0` |
 | 🌐 `rag_ocr_scale_dynamic` | OCR scale 动态策略开关（表格页用 `table` 值、其余用 `base`） | `false` |
 | 🌐 `rag_ocr_scale_table` | 动态策略下表格页的 scale | `2.5` |

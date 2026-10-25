@@ -41,6 +41,7 @@ from ..skills import Skill
 from ..tools import ToolRegistry
 from ..rag.engine import RAGEngine
 from ..rag.vector_store import DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL
+from .ocr_test_dialog import OcrTestDialog
 
 
 CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
@@ -1181,6 +1182,9 @@ class MainWindow(QMainWindow):
         # 必须隐藏——否则会作为浮动控件出现在主窗口 (0,0) 左上角（盖住对话区）。
         self._config_host.hide()
         self._config_dialog: Optional[ConfigDialog] = None
+        # OCR 识别测试窗口（配置面板「识别测试」打开）：控件由对话框自己持有，
+        # 关闭即销毁，这里只保存引用以便重复打开时复用同一个实例。
+        self._ocr_test_dialog: Optional[OcrTestDialog] = None
 
         self._log_host = QWidget(self)
         log_host_lay = QVBoxLayout(self._log_host)
@@ -1232,6 +1236,67 @@ class MainWindow(QMainWindow):
         self._log_window.show()
         self._log_window.raise_()
         self._log_window.activateWindow()
+
+    def _on_save_ocr_settings(self) -> None:
+        """保存自定义 OCR 设置：落盘 + 注入 RAG 层 + 刷新测试窗口下拉。
+
+        只动 OCR 这一段（不触发整个 RAG 重建）。下拉第四项「自定义OCR」的名字
+        取自保存路径，所以保存后立刻在识别测试窗口看到该模型。
+        """
+        engine = self.ocr_impl_combo.currentText().strip() or "mlx-vlm"
+        path = self.ocr_path_edit.text().strip()
+        mmproj = self.ocr_mmproj_edit.text().strip()
+        tokenizer = self.ocr_tokenizer_edit.text().strip()
+        self.config.rag_ocr_engine = engine
+        self.config.rag_ocr_model_path = path
+        self.config.rag_ocr_mmproj_path = mmproj
+        self.config.rag_ocr_tokenizer_path = tokenizer
+        name = getattr(self.config, "rag_ocr_model_name",
+                      "OvisOCR2-0.8B-MLX-4bit")
+        try:
+            self.config.save(CONFIG_PATH)
+        except Exception as e:
+            logger.warning("保存 OCR 配置失败: %s", e)
+            QMessageBox.warning(self, "保存失败", f"{type(e).__name__}: {e}")
+            return
+        try:
+            from agent.rag import engine as _rag_engine_mod
+            _rag_engine_mod.set_ovis_model_config(
+                engine, name, path, mmproj, tokenizer)
+        except Exception as e:  # pragma: no cover - 注入失败不阻塞
+            logger.debug("注入 OCR 模型配置失败（忽略）: %s", e)
+        dlg = getattr(self, "_ocr_test_dialog", None)
+        if dlg is not None:
+            dlg.refresh_engine_items()
+        QMessageBox.information(
+            self, "已保存",
+            "自定义 OCR 设置已保存。识别测试下拉框已更新，可立即用它识别。")
+
+    def _on_open_ocr_test(self) -> None:
+        """配置面板「识别测试」：打开 OCR 识别测试窗口。
+
+        打开前先把面板里**当前填写**的 OCR 模型设置（后端 / 路径 / mmproj /
+        tokenizer）注入 RAG 层——用户填完路径就想立刻试效果，不该被要求先点
+        「应用配置」。配置确实变了会触发 release_model()，旧权重先卸掉，测试
+        用的必定是新配置。
+        """
+        try:
+            from agent.rag import engine as _rag_engine_mod
+            _rag_engine_mod.set_ovis_model_config(
+                self.ocr_impl_combo.currentText().strip() or "mlx-vlm",
+                getattr(self.config, "rag_ocr_model_name",
+                        "OvisOCR2-0.8B-MLX-4bit"),
+                self.ocr_path_edit.text().strip(),
+                self.ocr_mmproj_edit.text().strip(),
+                self.ocr_tokenizer_edit.text().strip(),
+            )
+        except Exception as e:  # pragma: no cover - 注入失败不阻塞开窗
+            logger.debug("OCR 测试：注入模型配置失败（忽略）: %s", e)
+        if self._ocr_test_dialog is None:
+            self._ocr_test_dialog = OcrTestDialog(self.config, self)
+        self._ocr_test_dialog.show()
+        self._ocr_test_dialog.raise_()
+        self._ocr_test_dialog.activateWindow()
 
     def _build_config_panel(self) -> QWidget:
         """配置窗口内容：两大区 —— Agent 模型配置 / 知识同步配置。"""
@@ -1471,10 +1536,30 @@ class MainWindow(QMainWindow):
         # models/ 下解析；暴露可编辑的「模型名」只会制造拼写错误（同 reranker 旧
         # 的 -mx-fp8 笔误事故），故不显示在设置区。
         self.ocr_path_edit = _path("本地路径（留空自动用 models/ 下的模型名）", 160)
+        # 「识别测试」：就地试跑各 OCR 引擎并左右对照原件与结果，避免每次验证
+        # 效果都要走一遍完整知识库同步。打开的窗口直接用本行当前填写的配置。
+        self.ocr_test_btn = QPushButton("识别测试")
+        self.ocr_test_btn.setFixedWidth(84)
+        self.ocr_test_btn.setToolTip(
+            "打开 OCR 识别测试窗口：\n"
+            "选一个图片/PDF，用 Apple OCR / OvisOCR2 / 混合（Vision+Ovis 表格）/"
+            "自定义 OCR 试识别；\n左侧原件、右侧结果，多页 PDF 可逐页联动对照；"
+            "确认可用后保存为 Markdown。")
+        self.ocr_test_btn.clicked.connect(self._on_open_ocr_test)
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("PDF解析引擎")); r.addWidget(self.pdf_engine_combo)
         r.addWidget(QLabel("自定义OCR模型")); r.addWidget(self.ocr_impl_combo)
         r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
+        # 「保存设置」：把当前「自定义OCR模型」行的设置落盘，并让识别测试下拉框
+        # 出现这个自定义模型（下拉第四项名字取自路径）。不重建整个 RAG。
+        self.save_ocr_settings_btn = QPushButton("保存设置")
+        self.save_ocr_settings_btn.setFixedWidth(84)
+        self.save_ocr_settings_btn.setToolTip(
+            "保存当前「自定义OCR模型」行的设置（后端/路径/mmproj/tokenizer）。\n"
+            "保存后，识别测试窗口下拉框的「自定义OCR」项即显示为该模型，可立即用它识别。")
+        self.save_ocr_settings_btn.clicked.connect(self._on_save_ocr_settings)
+        r.addWidget(self.save_ocr_settings_btn)
+        r.addWidget(self.ocr_test_btn)
         klay.addLayout(r)
 
         # OCR 第二路径（gguf→mmproj 视觉塔 / onnx→tokenizer），按类型显隐
@@ -3497,7 +3582,7 @@ class MainWindow(QMainWindow):
         # --- 先关配置/日志窗口：它们会把各自面板移回隐藏宿主。否则主窗口销毁时
         # 会连带销毁作为子窗口的对话框，而面板是对话框的子控件 —— 主窗口仍持有
         # 的引用会变成指向已释放 C++ 对象的悬空引用。
-        for _name in ("_config_dialog", "_log_window"):
+        for _name in ("_config_dialog", "_log_window", "_ocr_test_dialog"):
             try:
                 _dlg = getattr(self, _name, None)
                 if _dlg is not None:

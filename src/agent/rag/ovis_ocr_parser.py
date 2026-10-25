@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # 模型配置（模块级注入，同 parsers.set_ocr_config 模式）
 # ---------------------------------------------------------------------------
 _engine = "mlx-vlm"          # mlx-vlm | onnx | gguf
-_model_name = "OvisOCR2-0.8B-MLX-4bit"
+_model_name = "OvisOCR3-MLX-4bit-mixed46"
 _model_path = ""             # 显式本地路径优先；空则 models/<name>
 _mmproj_path = ""            # 显式 mmproj 视觉塔路径（gguf，可选）
 _tokenizer_path = ""         # 显式 tokenizer 路径（onnx，可选；ORT-GenAI 多忽略）
@@ -77,7 +77,7 @@ def set_ovis_model_config(engine: str, name: str, path: str,
     """
     global _engine, _model_name, _model_path, _mmproj_path, _tokenizer_path
     new_engine = (engine or "mlx-vlm").strip() or "mlx-vlm"
-    new_name = (name or "OvisOCR2-0.8B-MLX-4bit").strip() or _model_name
+    new_name = (name or "OvisOCR3-MLX-4bit-mixed46").strip() or _model_name
     new_path = (path or "").strip()
     new_mmproj = (mmproj or "").strip()
     new_tokenizer = (tokenizer or "").strip()
@@ -98,7 +98,7 @@ def _candidate_model_dirs() -> List[Path]:
     # models/<name>（应用根目录下的 models/）
     for root in (Path.cwd(), Path(__file__).resolve().parents[3]):
         dirs.append(root / "models" / _model_name)
-        dirs.append(root / "models" / "OvisOCR2-0.8B-MLX-4bit")
+        dirs.append(root / "models" / "OvisOCR3-MLX-4bit-mixed46")
     return dirs
 
 

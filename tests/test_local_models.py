@@ -17,7 +17,7 @@ from agent.local.llm import parse_tool_calls, _ThinkSplitter  # noqa: E402
 from agent.local import registry  # noqa: E402
 
 MODELS = os.path.join(ROOT, "models")
-NOMIC = os.path.join(MODELS, "nomic-embed-text-v1.5-mlx")
+NOMIC = os.path.join(MODELS, "nomic-embed-text-v1.5-mlx-int8")
 BGE = os.path.join(MODELS, "bge-reranker-v2-m3-mlx-mxfp8")
 QWEN = os.path.join(MODELS, "qwen3.5-4b-agentic-coder-v4-4bit-mlx")
 
@@ -79,7 +79,7 @@ def test_think_splitter_incremental():
 
 def test_registry_default_paths():
     assert registry.resolve_model_path("embedding").endswith(
-        "models/nomic-embed-text-v1.5-mlx")
+        "models/nomic-embed-text-v1.5-mlx-int8")
     assert registry.resolve_model_path("reranker").endswith(
         "models/bge-reranker-v2-m3-mlx-mxfp8")
     assert registry.resolve_model_path("llm").endswith(

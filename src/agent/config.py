@@ -85,14 +85,14 @@ class AgentConfig:
     #     作为 docling/marker 之外的第三选项与最后兜底（替换原 PyMuPDF+
     #     RapidOCR 方案，后者只能出无版面纯文本）
     # 回退链：主引擎 → 其余统一引擎 → ovis → PyMuPDF 纯文本兜底。
-    # OvisOCR2 VLM 模型配置（ovis 引擎用）：
+    # OvisOCR VLM 模型配置（ovis 引擎用）：
     #   rag_ocr_engine    实现后端：mlx-vlm（safetensors 目录）| gguf（主模型
     #                     .gguf + mmproj*.gguf，llama-cpp 多模态）| onnx
     #                     （genai_config.json 目录，onnxruntime-genai 推理）
-    #   rag_ocr_model_name 模型目录名（默认 OvisOCR2-0.8B-MLX-4bit）
+    #   rag_ocr_model_name 模型目录名（默认 OvisOCR3-MLX-4bit-mixed46，mlx-vlm 后端）
     #   rag_ocr_model_path 显式本地路径（优先于 models/<name>，留空自动）
     rag_ocr_engine: str = "mlx-vlm"
-    rag_ocr_model_name: str = "OvisOCR2-0.8B-MLX-4bit"
+    rag_ocr_model_name: str = "OvisOCR3-MLX-4bit-mixed46"
     rag_ocr_model_path: str = ""
     # OCR 的 GGUF mmproj 视觉塔路径（可选，留空则按目录自动发现 / 纯文本）与
     # ONNX 的 tokenizer 路径（可选；ORT-GenAI 通常打包在模型目录内，故多留空）。
@@ -202,11 +202,11 @@ class AgentConfig:
     local_llm_prefill_step_size: int = 4096
 
     embedding_provider: str = "local"
-    local_embedding_model: str = ""
+    local_embedding_model: str = "nomic-embed-text-v1.5-mlx-int8"
     local_embedding_backend: str = "mlx"
 
     reranker_provider: str = "local"
-    local_reranker_model: str = ""
+    local_reranker_model: str = "bge-reranker-v2-m3-mlx-mxfp8"
     local_reranker_backend: str = "mlx"
 
     vlm_provider: str = "api"
@@ -412,6 +412,20 @@ class AgentConfig:
         # so the shrink threshold follows the model's actual window.
         if self.max_context_tokens < 8192:
             self.max_context_tokens = self.max_tokens
+        # OvisOCR 默认模型升级：OvisOCR2-0.8B-MLX-4bit → OvisOCR3-MLX-4bit-mixed46。
+        # 旧配置持久化的旧默认名必须迁走，否则用户继续加载 OvisOCR2（磁盘上已
+        # 替换为 OvisOCR3 时）导致 OCR 模型加载失败。只精确匹配旧默认字符串——
+        # 用户若显式选了别的 OvisOCR2 目录名则不受影响。
+        if self.rag_ocr_model_name == "OvisOCR2-0.8B-MLX-4bit":
+            self.rag_ocr_model_name = "OvisOCR3-MLX-4bit-mixed46"
+        # 本地 embedding / reranker 默认模型升级：旧配置持久化了空路径（默认走
+        # fastembed 网络模型），现在统一改为仓库自带的 MLX 本地权重，默认即用、
+        # 默认走 mlx 后端。只填充空的本地路径——用户若显式指定了别的本地模型
+        # 目录则不受影响。
+        if not self.local_embedding_model:
+            self.local_embedding_model = "nomic-embed-text-v1.5-mlx-int8"
+        if not self.local_reranker_model:
+            self.local_reranker_model = "bge-reranker-v2-m3-mlx-mxfp8"
 
     def save(self, path: str) -> None:
         import json
