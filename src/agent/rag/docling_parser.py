@@ -70,14 +70,28 @@ _PDF_BATCH_BYTES = 50 * 1024 * 1024
 _PDF_BATCH_PAGES = 50
 # docling 并行实例池大小（#本任务）：同时转换不同文件的 converter 实例数。
 # ⚠️ 真正的硬约束是 **GPU/MPS 稳定性**，不是内存：每个实例常驻权重约 3-3.5GB
-# （实测 2 实例总占用 8-9GB，16GB 机器余量充足），但 docling 的 MPS（PyTorch-Metal）
-# 推理与 MLX embedding 同时抢同一块 GPU 时，2 实例并发会触发 GPU 重置
-# （[METAL] InnocentVictim）→ torch-MPS 状态损坏 → 原生 SIGSEGV 段错误把进程带走
+# （实测 2 实例总占用 8-9GB，16GB 机器余量充足）。崩溃根因是 docling 的 MPS
+# （PyTorch-Metal）推理与 MLX embedding 在 GPU 上并发抢资源触发 GPU 重置
+# （[METAL] InnocentVictim）→ torch-MPS 状态损坏 → 原生 SIGSEGV 把进程带走
 # （实测 2026-10-25 多次硬崩；崩溃报告 Malloc 仅 3.8G、无 Jetsam，确认非 OOM）。
-# 1 个 MPS 实例（≈3-3.5GB）经实测稳定；2 个 MPS 实例必崩。故 16GB 机器**默认 1**。
+# embedding 已降为单实例后，重新实开 2 个 docling MPS 实例，隔离验证「docling MPS
+# 双并发本身」是否为触发点：若仍崩→确认是 docling 双 MPS 问题，回退 1 即可；
+# 若不崩→说明之前是 2(docling MPS)×2(MLX) 叠加。16GB 机器默认 1，本值为实验性 2。
 # ≥32GB 可试 2（仍需观察 GPU 稳定性）；≥64GB 可 4。并行度受 GPU 并发能力约束，
 # 与 RAM 无关——关掉 docling MPS 改 CPU 推理并不能提速（2 CPU 实例 ≈ 1 MPS 实例）。
-_DOCLING_POOL_SIZE = 1  # 16GB：1 个 MPS 实例稳定；2 个 MPS 实例触发 GPU 重置硬崩
+_DOCLING_POOL_SIZE = 2  # 实验：embedding 已单实例，重测 2 个 docling MPS 实例是否仍 GPU 重置
+
+# docling VLM 模式（可选实验）：用 Granite-Docling-258M 视觉语言模型直接生成文档
+# 结构化标记（doctags），替代默认的「布局模型(Heron/TableFormer)」管线。
+# 【基准结论（M4，4 页含表格 PDF，MLX 引擎/Apple GPU）】VLM 2.0s/页 vs 标准 0.5s/页
+# （≈4× 慢）；峰值 RSS 相近（1.44 vs 1.40GB）；且轻量页面上质量提升有限，扫描件/
+# 密集页面上 VLM 是逐 token 自回归生成，耗时随页面密度急剧上升（可达 10–50×）。
+# 日常同步大库标准管线明显更优，故默认关闭。若需对扫描件/复杂表格做高保真抽取，
+# 可临时置 True（另建议 _DOCLING_POOL_SIZE=1：VLM(MLX)+MLX embedding+多实例并发
+# 极可能触发 GPU 重置硬崩）。权重走官方 MLX 版 ibm-granite/granite-docling-258M-mlx
+# （bf16 630MB，首次自动下载；HF 上无现成量化版，GGUF 量化版 docling 用不了）。
+_DOCLING_VLM_ENABLED = False
+_DOCLING_VLM_PRESET = "granite_docling"  # VlmConvertOptions.from_preset 的 preset id
 _ocr_scale_table = 2.5
 
 
@@ -269,74 +283,125 @@ def _build_converter():
         from docling.document_converter import DocumentConverter
 
         converter = None
-        try:
-            from docling.datamodel.accelerator_options import (
-                AcceleratorDevice,
-                AcceleratorOptions,
-            )
-            from docling.datamodel.base_models import InputFormat
-            from docling.datamodel.pipeline_options import PdfPipelineOptions
-            from docling.document_converter import PdfFormatOption
-
-            pdf_opts = PdfPipelineOptions()
-            # 加速器：MPS（torch Metal）。热转换快 ~35%、峰值平坦；布局模型移到
-            # GPU 后 CPU 核让给 RapidOCR/嵌入。注意：不要设
-            # PYTORCH_MPS_HIGH_WATERMARK_RATIO——docling 的 transformers 引擎
-            # 内部设 low=1.4，高水位低于它会直接报错。
-            pdf_opts.accelerator_options = AcceleratorOptions(
-                num_threads=4, device=AcceleratorDevice.MPS
-            )
-            # 单文档硬超时（#131）：convert 内部可能永久挂死。docling 原生支持
-            # document_timeout，超时抛错 → extract_markdown 捕获 → 回退轻量解析器。
-            # 3600s：图片书逐页 OCR + 布局 + TableFormer 较慢，超时只是防永久挂死。
+        # ---- VLM 模式（Granite-Docling-258M）优先 ----
+        if _DOCLING_VLM_ENABLED:
             try:
-                pdf_opts.document_timeout = 3600.0
-            except Exception:
-                pass  # 老版本无此字段
-            # OCR 后端：Apple Vision（ocrmac）优先，中文印刷体识别质量高于
-            # RapidOCR；不可用回退 RapidOCR。lang 必须显式给中文。
-            from .ocr_engine import ocrmac_available
-            if ocrmac_available():
+                from docling.datamodel.accelerator_options import (
+                    AcceleratorDevice,
+                    AcceleratorOptions,
+                )
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import (
+                    VlmPipelineOptions,
+                    VlmConvertOptions,
+                )
+                from docling.document_converter import PdfFormatOption
+                from docling.pipeline.vlm_pipeline import VlmPipeline
+                # ⚠️ 离线劫持修复：Apple Silicon 上 docling 的 AUTO_INLINE 会选
+                # MLX 引擎（走 Apple GPU），但 mlx_vlm 在加载时会把 huggingface_hub
+                # 切到离线模式，导致 Granite 权重加载报 “outgoing traffic has been
+                # disabled” 而无法初始化（→ 静默回退标准管线，VLM 等于没生效）。
+                # 这里把 is_offline_mode 中和掉，强制在线解析缓存权重（权重已缓存
+                # 则直接命中、不再下载）。注意：docling 的 transformers VLM 引擎
+                # 不支持 MPS（仅 cpu/cuda/xpu），故 VLM 在 Mac 上的 GPU 路径只有 MLX，
+                # 但这会与 MLX embedding 在 GPU 上争用。
+                import huggingface_hub
+                _orig_is_offline = getattr(huggingface_hub, "is_offline_mode", None)
                 try:
-                    from docling.datamodel.pipeline_options import OcrMacOptions
-                    # OCR 渲染 scale（#132）：默认 2.0（3.0→2.0 省 56% 位图内存）。
-                    pdf_opts.ocr_options = OcrMacOptions(
-                        lang=["zh-Hans", "en-US"], recognition="accurate",
-                        scale=_ocr_scale_base,
-                    )
-                    pdf_opts.do_ocr = True
-                    logger.info("docling OCR 后端: Apple Vision (ocrmac, zh-Hans 优先)")
-                except Exception as e:
-                    logger.info("OcrMacOptions 不可用（%s），回退 RapidOCR", e)
-            if getattr(pdf_opts, "ocr_options", None) is None:
-                try:
-                    from docling.datamodel.pipeline_options import RapidOcrOptions
-                    try:
-                        pdf_opts.ocr_options = RapidOcrOptions(scale=_ocr_scale_base)
-                    except Exception:
-                        pdf_opts.ocr_options = RapidOcrOptions()
-                    pdf_opts.do_ocr = True
-                    logger.info("docling OCR 后端: RapidOCR")
+                    huggingface_hub.is_offline_mode = lambda: False
                 except Exception:
                     pass
-            # OCR scale 动态策略（#132）：仅动态开关开启时挂载策略管线。
-            fmt_kwargs: dict = {"pipeline_options": pdf_opts}
-            if _ocr_scale_dynamic:
-                policy_pipeline_cls = make_scale_policy_pipeline_cls()
-                if policy_pipeline_cls is not None:
-                    fmt_kwargs["pipeline_cls"] = policy_pipeline_cls
-                    logger.info(
-                        "OCR scale 动态策略启用（表格页 %.1f / 其余 %.1f）",
-                        _ocr_scale_table, _ocr_scale_base,
-                    )
-            converter = DocumentConverter(
-                format_options={InputFormat.PDF: PdfFormatOption(**fmt_kwargs)}
-            )
-        except Exception as e:
-            # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到降配入口就
-            # 用默认构造——正确性不受影响，只是 macOS 上 MPS 缓存可能推高内存。
-            logger.info("docling 管线降配不可用（%s），使用默认配置", e)
-            converter = DocumentConverter()
+                vlm_options = VlmConvertOptions.from_preset(_DOCLING_VLM_PRESET)
+                pdf_opts = VlmPipelineOptions(
+                    vlm_options=vlm_options,
+                    accelerator_options=AcceleratorOptions(
+                        num_threads=4, device=AcceleratorDevice.MPS
+                    ),
+                    document_timeout=3600.0,
+                )
+                converter = DocumentConverter(
+                    format_options={
+                        InputFormat.PDF: PdfFormatOption(
+                            pipeline_cls=VlmPipeline, pipeline_options=pdf_opts
+                        )
+                    }
+                )
+                logger.info(
+                    "docling 模式: VLM (%s, AUTO_INLINE→MLX)", _DOCLING_VLM_PRESET
+                )
+            except Exception as e:
+                logger.warning("VLM 模式初始化失败（%s），回退标准 PDF 管线", e)
+                converter = None
+        # ---- 标准 PDF 管线（布局模型 + TableFormer）；VLM 已构建则跳过 ----
+        if converter is None:
+            try:
+                from docling.datamodel.accelerator_options import (
+                    AcceleratorDevice,
+                    AcceleratorOptions,
+                )
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import PdfPipelineOptions
+                from docling.document_converter import PdfFormatOption
+
+                pdf_opts = PdfPipelineOptions()
+                # 加速器：MPS（torch Metal）。热转换快 ~35%、峰值平坦；布局模型移到
+                # GPU 后 CPU 核让给 RapidOCR/嵌入。注意：不要设
+                # PYTORCH_MPS_HIGH_WATERMARK_RATIO——docling 的 transformers 引擎
+                # 内部设 low=1.4，高水位低于它会直接报错。
+                pdf_opts.accelerator_options = AcceleratorOptions(
+                    num_threads=4, device=AcceleratorDevice.MPS
+                )
+                # 单文档硬超时（#131）：convert 内部可能永久挂死。docling 原生支持
+                # document_timeout，超时抛错 → extract_markdown 捕获 → 回退轻量解析器。
+                # 3600s：图片书逐页 OCR + 布局 + TableFormer 较慢，超时只是防永久挂死。
+                try:
+                    pdf_opts.document_timeout = 3600.0
+                except Exception:
+                    pass  # 老版本无此字段
+                # OCR 后端：Apple Vision（ocrmac）优先，中文印刷体识别质量高于
+                # RapidOCR；不可用回退 RapidOCR。lang 必须显式给中文。
+                from .ocr_engine import ocrmac_available
+                if ocrmac_available():
+                    try:
+                        from docling.datamodel.pipeline_options import OcrMacOptions
+                        # OCR 渲染 scale（#132）：默认 2.0（3.0→2.0 省 56% 位图内存）。
+                        pdf_opts.ocr_options = OcrMacOptions(
+                            lang=["zh-Hans", "en-US"], recognition="accurate",
+                            scale=_ocr_scale_base,
+                        )
+                        pdf_opts.do_ocr = True
+                        logger.info("docling OCR 后端: Apple Vision (ocrmac, zh-Hans 优先)")
+                    except Exception as e:
+                        logger.info("OcrMacOptions 不可用（%s），回退 RapidOCR", e)
+                if getattr(pdf_opts, "ocr_options", None) is None:
+                    try:
+                        from docling.datamodel.pipeline_options import RapidOcrOptions
+                        try:
+                            pdf_opts.ocr_options = RapidOcrOptions(scale=_ocr_scale_base)
+                        except Exception:
+                            pdf_opts.ocr_options = RapidOcrOptions()
+                        pdf_opts.do_ocr = True
+                        logger.info("docling OCR 后端: RapidOCR")
+                    except Exception:
+                        pass
+                # OCR scale 动态策略（#132）：仅动态开关开启时挂载策略管线。
+                fmt_kwargs: dict = {"pipeline_options": pdf_opts}
+                if _ocr_scale_dynamic:
+                    policy_pipeline_cls = make_scale_policy_pipeline_cls()
+                    if policy_pipeline_cls is not None:
+                        fmt_kwargs["pipeline_cls"] = policy_pipeline_cls
+                        logger.info(
+                            "OCR scale 动态策略启用（表格页 %.1f / 其余 %.1f）",
+                            _ocr_scale_table, _ocr_scale_base,
+                        )
+                converter = DocumentConverter(
+                    format_options={InputFormat.PDF: PdfFormatOption(**fmt_kwargs)}
+                )
+            except Exception as e:
+                # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到降配入口就
+                # 用默认构造——正确性不受影响，只是 macOS 上 MPS 缓存可能推高内存。
+                logger.info("docling 管线降配不可用（%s），使用默认配置", e)
+                converter = DocumentConverter()
         logger.info("docling DocumentConverter 实例已构建（并行池）")
         _start_idle_reaper()
         return converter
