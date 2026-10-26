@@ -81,7 +81,7 @@ def test_registry_default_paths():
     assert registry.resolve_model_path("embedding").endswith(
         "models/nomic-embed-text-v1.5-mlx-int8")
     assert registry.resolve_model_path("reranker").endswith(
-        "models/bge-reranker-v2-m3-mlx-mxfp8")
+        "models/jina-reranker-v2-base-multilingual-onnx")
     assert registry.resolve_model_path("llm").endswith(
         "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx")
 

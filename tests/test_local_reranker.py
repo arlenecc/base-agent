@@ -1,13 +1,15 @@
 """本地 reranker（cross-encoder）回归测试。
 
-覆盖项目两种内置 bge reranker 的可选方案，均经 ``LocalReranker`` 同接口：
+覆盖项目多种内置 reranker 的可选方案，均经 ``LocalReranker`` 同接口：
 
 - ``bge-reranker-v2-m3-mlx-mxfp8``（backend="mlx"，Apple Silicon MLX，mxfp8 量化）
 - ``bge-reranker-base-ONNX``（backend="onnx"，强制 CPU-only，量化 onnx）
+- ``jina-reranker-v2-base-multilingual-onnx``（backend="onnx"，强制 CPU-only，
+  多语种，XLM-R 12 层 / 768 维，ONNX 仅 input_ids+attention_mask → logits）
 
 ``LocalReranker`` 已支持 mlx / onnx / gguf 三后端，并通过
 ``config.reranker_provider`` / ``local_reranker_model`` / ``local_reranker_backend``
-切换——这两条路径就是「把 bge 接进 reranker 作为可选方案」的落地形态。
+切换——这些路径就是「把 reranker 接进项目作为可选方案」的落地形态。
 
 模型权重或对应依赖（mlx_lm / onnxruntime）缺失时整组跳过（与本地权重测试
 一致策略）。
@@ -18,6 +20,7 @@ import pytest
 _ROOT = os.path.dirname(__file__)
 _MLX_DIR = os.path.join(_ROOT, "..", "models", "bge-reranker-v2-m3-mlx-mxfp8")
 _ONNX_DIR = os.path.join(_ROOT, "..", "models", "bge-reranker-base-ONNX")
+_JINA_DIR = os.path.join(_ROOT, "..", "models", "jina-reranker-v2-base-multilingual-onnx")
 
 
 def _mlx_available():
@@ -32,6 +35,14 @@ def _onnx_available():
     try:
         import onnxruntime  # noqa: F401
         return os.path.isdir(_ONNX_DIR)
+    except Exception:
+        return False
+
+
+def _jina_available():
+    try:
+        import onnxruntime  # noqa: F401
+        return os.path.isdir(_JINA_DIR)
     except Exception:
         return False
 
@@ -90,6 +101,60 @@ class TestLocalRerankerOnnx:
             scores = rr.rerank("机器学习为什么需要 GPU", [
                 "深度学习依赖 GPU 进行大规模矩阵运算，显著加速反向传播",  # 相关
                 "唐朝是中国历史上最强盛的朝代之一",                       # 不相关
+            ])
+            assert len(scores) == 2 and scores[0] > scores[1]
+        finally:
+            vs.reset_local_providers()
+
+
+@pytest.mark.skipif(not _jina_available(), reason="onnxruntime 或 jina reranker 目录不可用")
+class TestLocalRerankerJinaOnnx:
+    def test_jina_onnx_forces_cpu_only(self):
+        """jina ONNX 后端必须强制 CPUExecutionProvider（不占 GPU）。"""
+        from agent.local.reranker import LocalReranker
+
+        rr = LocalReranker(_JINA_DIR, backend="onnx")
+        rr.rerank("warmup", ["doc placeholder"])  # 触发加载
+        assert rr._session.get_providers() == ["CPUExecutionProvider"]
+
+    def test_jina_onnx_scores_and_orders_zh(self):
+        from agent.local.reranker import LocalReranker
+
+        rr = LocalReranker(_JINA_DIR, backend="onnx")
+        q = "如何用 Python 解析 JSON 文件"
+        docs = [
+            "Python 标准库的 json 模块提供 loads/dumps 来解析与序列化 JSON 字符串",  # 相关
+            "红烧肉要先用冷水下锅焯水去腥，再用小火慢炖收汁才软糯",                  # 不相关
+        ]
+        scores = rr.rerank(q, docs)
+        assert len(scores) == 2 and scores[0] > scores[1]
+
+    def test_jina_onnx_scores_and_orders_en(self):
+        """jina 是多语种 reranker：英文查询也应把相关文档排到前面。"""
+        from agent.local.reranker import LocalReranker
+
+        rr = LocalReranker(_JINA_DIR, backend="onnx")
+        q = "How to read and write JSON files in Python"
+        docs = [
+            "Python's standard json module provides json.loads and json.dumps",  # 相关
+            "Braised pork should be blanched in cold water first",               # 不相关
+        ]
+        scores = rr.rerank(q, docs)
+        assert len(scores) == 2 and scores[0] > scores[1]
+
+    def test_jina_onnx_via_provider_path(self):
+        """经真实 provider 路径（reranker_provider=local + onnx 后端）产出 jina。"""
+        from agent.local import registry
+        from agent.rag import vector_store as vs
+
+        path = registry.resolve_model_path("reranker", "jina-reranker-v2-base-multilingual-onnx")
+        vs.set_reranker_provider("local", "jina-reranker-v2-base-multilingual-onnx", "onnx")
+        try:
+            rr = vs.get_or_create_reranker()
+            assert rr.name() == "local-rerank:onnx:jina-reranker-v2-base-multilingual-onnx"
+            scores = rr.rerank("Why does deep learning need a GPU", [
+                "Deep learning relies on GPUs for massive parallel matrix operations",  # 相关
+                "The Tang dynasty was one of China's greatest eras",                    # 不相关
             ])
             assert len(scores) == 2 and scores[0] > scores[1]
         finally:

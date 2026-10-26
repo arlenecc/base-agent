@@ -206,8 +206,8 @@ class AgentConfig:
     local_embedding_backend: str = "mlx"
 
     reranker_provider: str = "local"
-    local_reranker_model: str = "bge-reranker-v2-m3-mlx-mxfp8"
-    local_reranker_backend: str = "mlx"
+    local_reranker_model: str = "jina-reranker-v2-base-multilingual-onnx"
+    local_reranker_backend: str = "onnx"
 
     vlm_provider: str = "api"
     local_vlm_model: str = ""
@@ -425,7 +425,12 @@ class AgentConfig:
         if not self.local_embedding_model:
             self.local_embedding_model = "nomic-embed-text-v1.5-mlx-int8"
         if not self.local_reranker_model:
-            self.local_reranker_model = "bge-reranker-v2-m3-mlx-mxfp8"
+            # 默认 reranker 改为 jina（onnx / CPU-only）。仅在「未显式指定本地
+            # 模型」时填充——显式指定了其它模型（如 bge-mxfp8）的用户保持原样。
+            # jina 必须走 onnx 后端，故后端一并归一到 onnx，避免「模型=jina 但
+            # 后端=mlx」让 mlx_lm 误加载 onnx 权重而失败。
+            self.local_reranker_model = "jina-reranker-v2-base-multilingual-onnx"
+            self.local_reranker_backend = "onnx"
 
     def save(self, path: str) -> None:
         import json
