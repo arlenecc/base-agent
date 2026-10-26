@@ -1149,7 +1149,7 @@ class MainWindow(QMainWindow):
         self._setup_log_bridge()
         self._apply_config_to_widgets()
         self._rebuild_agent()
-        # 启动主动加载：本地模式自动加载主模型；辅助模型恒为本地、启动即加载。
+        # 启动主动加载：本地模式自动加载主模型；辅助模型仅在勾选「启用」时加载。
         self._auto_load_startup()
 
     # ------------------------------------------------------------------
@@ -1455,7 +1455,20 @@ class MainWindow(QMainWindow):
         alay.addWidget(self.main_params_w)
 
         # ---- 辅助模型（本地专用）----
-        alay.addWidget(QLabel("辅助模型（本地专用，用于事实抽取等轻量子任务）"))
+        aux_head = QHBoxLayout(); aux_head.setSpacing(8)
+        aux_head.addWidget(QLabel("辅助模型（本地专用，用于事实抽取等轻量子任务）"))
+        aux_head.addStretch(1)
+        # 启用开关：默认不启用。关闭时应用启动不自动加载、知识库同步结束后
+        # 不自动重载（开始/停止同步链路都会检查此选择）；「加载模型」按钮
+        # 仍可手动临时加载。
+        self.aux_enabled_check = QCheckBox("启用")
+        self.aux_enabled_check.setChecked(False)
+        self.aux_enabled_check.setToolTip(
+            "启用后才会自动加载辅助模型（事实抽取 / RAG 检索结果归纳 / 投机解码草稿）。\n"
+            "关闭时：应用启动不自动加载，知识库同步结束后也不会自动重载；\n"
+            "「加载模型」按钮仍可手动临时加载。")
+        aux_head.addWidget(self.aux_enabled_check)
+        alay.addLayout(aux_head)
         self.aux_type_combo = _combo(["MLX-LM", "MLX-VLM", "ONNX", "GGUF"], 110)
         self.aux_local_llm_model_edit = _path("留空=默认 Qwen3.5-2B-MLX-4bit")
         r = QHBoxLayout(); r.setSpacing(8)
@@ -1815,8 +1828,9 @@ class MainWindow(QMainWindow):
 
         · 主模型：仅本地模式（``llm_provider == "local"``）下自动加载——API 模式
           无本地权重可加载，跳过（按钮保持未加载态，由网络调用兜底）。
-        · 辅助模型：恒为本地模型（无 OpenAI 模式），无论主模型是什么模式，启动
-          即加载，用于事实抽取 / RAG 归纳等子任务，避免首次用到才冷启动。
+        · 辅助模型：恒为本地模型（无 OpenAI 模式）。**默认不启用**——仅在
+          「启用」勾选框勾选（``aux_llm_enabled``）时启动即加载，用于事实
+          抽取 / RAG 归纳等子任务，避免首次用到才冷启动；未勾选绝不加载。
         """
         if getattr(self, "_busy", False):
             return
@@ -1826,10 +1840,16 @@ class MainWindow(QMainWindow):
             if main is not None and getattr(main, "_ensure_model", None) is not None:
                 self._preload_client(main, "主模型", "main")
                 started = True
-        aux = getattr(self, "_aux_llm", None)
-        if aux is not None and getattr(aux, "_ensure_model", None) is not None:
-            self._preload_client(aux, "辅助模型", "aux")
-            started = True
+        # 辅助模型自动加载必须以「启用」勾选为前提——用户未启用时启动绝不
+        # 偷偷把权重拉进内存。优先读勾选框当前状态（可能已改未应用）。
+        chk = getattr(self, "aux_enabled_check", None)
+        aux_enabled = bool(chk.isChecked()) if chk is not None else bool(
+            getattr(self.config, "aux_llm_enabled", False))
+        if aux_enabled:
+            aux = getattr(self, "_aux_llm", None)
+            if aux is not None and getattr(aux, "_ensure_model", None) is not None:
+                self._preload_client(aux, "辅助模型", "aux")
+                started = True
         if started:
             self.status_label.setText("正在后台加载模型…")
 
@@ -2175,6 +2195,7 @@ class MainWindow(QMainWindow):
         self.main_tokenizer_edit.setText(
             getattr(self.config, "local_llm_tokenizer_path", ""))
         # 辅助模型（本地专用）
+        self.aux_enabled_check.setChecked(bool(getattr(self.config, "aux_llm_enabled", False)))
         self.aux_type_combo.setCurrentText(
             _BACKEND_TO_LLM_TYPE.get(self.config.aux_local_llm_backend, "MLX-LM"))
         self.aux_local_llm_model_edit.setText(self.config.aux_local_llm_model)
@@ -2322,6 +2343,7 @@ class MainWindow(QMainWindow):
         self.config.local_llm_mmproj_path = self.main_mmproj_edit.text().strip()
         self.config.local_llm_tokenizer_path = self.main_tokenizer_edit.text().strip()
         # 辅助模型（本地专用）
+        self.config.aux_llm_enabled = self.aux_enabled_check.isChecked()
         self.config.aux_llm_provider = "local"
         self.config.aux_local_llm_backend = _LLM_TYPE_TO_BACKEND.get(
             self.aux_type_combo.currentText(), "mlx")
@@ -2452,12 +2474,21 @@ class MainWindow(QMainWindow):
             new_agent = Agent(llm=new_llm, config=self.config, callbacks=self._callbacks)
             new_agent.max_iterations = self.config.max_iterations
             # 辅助模型（本地）：用于事实抽取等轻量子任务。加载失败不影响主流程。
+            # 未勾选「启用」时完全不构建——启动/应用配置/发送触发重建都不误启动
+            # （client 本身惰性加载权重，但草稿解码接线也会一并跳过）。
             if rebuild_aux:
-                try:
-                    new_aux = build_aux_llm_client(self.config)
-                except Exception as aux_err:
-                    logger.warning("辅助模型加载失败（不影响主流程）: %s", aux_err)
+                chk = getattr(self, "aux_enabled_check", None)
+                aux_enabled = bool(chk.isChecked()) if chk is not None else bool(
+                    getattr(self.config, "aux_llm_enabled", False))
+                if not aux_enabled:
+                    logger.info("辅助模型未启用（启用勾选框未勾选），跳过构建")
                     new_aux = None
+                else:
+                    try:
+                        new_aux = build_aux_llm_client(self.config)
+                    except Exception as aux_err:
+                        logger.warning("辅助模型加载失败（不影响主流程）: %s", aux_err)
+                        new_aux = None
                 new_agent.aux_llm = new_aux
                 self._aux_llm = new_aux
                 # 主模型复用已加载的辅助模型当投机解码草稿（不另起权重）。
@@ -2765,10 +2796,17 @@ class MainWindow(QMainWindow):
         # API 模式主模型无本地权重，不处理。
         _local_mode = getattr(self.config, "llm_provider", "local") == "local"
         self._sync_unloaded_main = bool(_local_mode and getattr(self, "_llm", None) is not None)
-        self._sync_unloaded_aux = bool(getattr(self, "_aux_llm", None) is not None)
+        # 辅助模型：只要已加载就照常临时卸载（同步要吃内存）；但「同步结束后
+        # 自动重载」的标记只在「启用」勾选时置位——用户未启用/已取消勾选时，
+        # 同步一结束就把辅助模型悄悄拉回来属于误启动。
+        chk = getattr(self, "aux_enabled_check", None)
+        _aux_enabled = bool(chk.isChecked()) if chk is not None else bool(
+            getattr(self.config, "aux_llm_enabled", False))
+        _aux_was_loaded = getattr(self, "_aux_llm", None) is not None
+        self._sync_unloaded_aux = bool(_aux_enabled and _aux_was_loaded)
         if self._sync_unloaded_main:
             self._on_unload_main_model()
-        if self._sync_unloaded_aux:
+        if _aux_was_loaded:
             self._on_unload_aux_model()
         self._append_log("[rag] 已临时卸载对话模型以释放资源，同步结束后将自动重载")
         self._sync_worker = SyncKnowledgeWorker(
@@ -2900,7 +2938,14 @@ class MainWindow(QMainWindow):
         # 主模型重载后会自动预热（预填系统提示 KV + warm_up 编译）。仅当该模型仍
         # 处于未加载态时才重载——若用户在同步期间手动重载过，则不重复操作。
         _reload_main = getattr(self, "_sync_unloaded_main", False) and getattr(self, "_llm", None) is None
-        _reload_aux = getattr(self, "_sync_unloaded_aux", False) and getattr(self, "_aux_llm", None) is None
+        # 重载辅助模型前再查一次「启用」勾选的当前状态：用户可能在同步期间
+        # （或停止同步前）把勾选取消——以勾选框为准，未启用绝不自动拉起。
+        chk = getattr(self, "aux_enabled_check", None)
+        _aux_enabled_now = bool(chk.isChecked()) if chk is not None else bool(
+            getattr(self.config, "aux_llm_enabled", False))
+        _reload_aux = (_aux_enabled_now
+                       and getattr(self, "_sync_unloaded_aux", False)
+                       and getattr(self, "_aux_llm", None) is None)
         if _reload_aux or _reload_main:
             self.status_label.setText("同步完成，正在重新加载对话模型…")
             self._append_log("[rag] 同步结束，开始重新加载对话模型（含主模型预热）")
