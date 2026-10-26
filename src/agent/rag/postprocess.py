@@ -52,8 +52,12 @@ def condense_retrieved_chunks(
     chunks: List[Dict[str, Any]],
     llm: Any,
     max_chars: int = DEFAULT_MAX_CHARS,
+    max_input_chars: int = _MAX_AUX_INPUT_CHARS,
 ) -> str:
     """把检索到的多个分片交给辅助模型归纳精简到 ``max_chars`` 字以内。
+
+    ``max_input_chars`` 是送进辅助模型的总输入上限（可配置项
+    ``rag_condense_max_chars``），超出按相关性顺序截断尾部。
 
     返回精简后的摘要文本；辅助模型不可用或调用失败时返回空串（调用方应回退到
     原始格式化结果，不影响 RAG 功能）。
@@ -69,8 +73,8 @@ def condense_retrieved_chunks(
     doc = "\n\n".join(parts)
 
     # 送进辅助模型的输入做上限保护，避免超出其上下文窗口。
-    if len(doc) > _MAX_AUX_INPUT_CHARS:
-        doc = doc[:_MAX_AUX_INPUT_CHARS].rstrip() + "\n…（输入过长，已截断尾部低相关片段）"
+    if len(doc) > max_input_chars:
+        doc = doc[:max_input_chars].rstrip() + "\n…（输入过长，已截断尾部低相关片段）"
 
     prompt = (
         f"检索查询：{query}\n\n"

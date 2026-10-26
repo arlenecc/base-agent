@@ -110,13 +110,68 @@ def chunk_documents(
             text, chunk_size, chunk_overlap, min_chunk_size, overlap_percent,
             embedding_function,
         )
-        for i, chunk in enumerate(chunks):
-            all_chunks.append({
-                "source": source,
-                "chunk_index": i,
-                "text": chunk,
-            })
+        doc_chunks = [
+            {"source": source, "chunk_index": i, "text": chunk}
+            for i, chunk in enumerate(chunks)
+        ]
+        # 句末收口按文档进行：需要原文 text 定位「残句 → 下一片」的真实跨度。
+        all_chunks.extend(_snap_to_sentence_end(doc_chunks, source=text))
     return all_chunks
+
+
+# 句末判定：句号/问号/叹号/省略号/换行，或英文句点后跟空白（". "）。
+# 仅用于收口判断与边界查找，不要求覆盖全部标点风格。
+_SENTENCE_END_RE = re.compile(r"[。！？!?…\n]|\.(?=\s|$)")
+# 残句与下一片之间在原文里的间隔上限：超过视为误定位（跨章节重名等），放弃收口。
+_SNAP_MAX_GAP = 256
+
+
+def _snap_to_sentence_end(chunks: List[Dict[str, Any]],
+                          source: Optional[str] = None) -> List[Dict[str, Any]]:
+    """保证每个分片（除末片外）都结束在句子边界。
+
+    语义/混合主路径的边界本就按句切（chonkie ``_DELIM`` 按句拆分、
+    ``_tail_by_tokens`` 句末对齐重叠），但递归兜底 ``_split_by_tokens``
+    在窗口内找不到任何句末标点时仍可能句中截断。这里做统一兜底：把片尾
+    残句并入下一片。
+
+    关键约束：**分片必须是原文的连续子串**（下游按原文命中展示）。因此并入
+    残句时不做字符串拼接（那会插入原文里不存在的分隔符），而是回到原文定位
+    「残句起点 → 下一片终点」的真实跨度，整段原文重建下一片——二者之间的
+    空白/换行保持原样。
+
+    定位失败（原文中找不到残句 / 间隔异常）或残句过长（多半是单个长句被硬切）
+    时不强拆，保持原样——宁可句中截断也不产出原文里不存在的文本。
+    """
+    if not source:
+        return chunks
+    for i in range(len(chunks) - 1):
+        cur = chunks[i].get("text") or ""
+        nxt = chunks[i + 1].get("text") or ""
+        if not cur or not nxt or _SENTENCE_END_RE.search(cur[-2:]):
+            continue  # 已以句末标点/换行收尾
+        ends = [m.end() for m in _SENTENCE_END_RE.finditer(cur)]
+        if not ends:
+            continue  # 整片无句末标点（代码/表格等），不强拆
+        cut = ends[-1]
+        tail = cur[cut:]
+        if not tail.strip() or len(tail.strip()) > max(120, len(cur) // 3):
+            continue  # 残句过长（多半是单个长句被硬切），保持原样最安全
+        t_pos = source.find(tail)
+        if t_pos < 0:
+            continue  # 原文里定位不到（分片被深度改写），放弃收口
+        tail_end = t_pos + len(tail)
+        if tail.strip() in nxt:
+            # 下一片头部已带上这段残句（重叠切片的常态）：直接收口，零丢失。
+            chunks[i]["text"] = cur[:cut].rstrip()
+            continue
+        # 非重叠相邻：下一片应紧跟残句之后（允许 ≤ _SNAP_MAX_GAP 的间隔）。
+        n_pos = source.find(nxt, t_pos)
+        if n_pos < 0 or not (tail_end <= n_pos <= tail_end + _SNAP_MAX_GAP):
+            continue  # 间隔异常（跨章节误匹配等），保持原样
+        chunks[i]["text"] = cur[:cut].rstrip()
+        chunks[i + 1]["text"] = source[t_pos:n_pos + len(nxt)]
+    return chunks
 
 
 def _chunk_with_hybrid_fallback(

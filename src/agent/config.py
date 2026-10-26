@@ -54,8 +54,23 @@ class AgentConfig:
     kernel_max_digest_lines: int = 40
 
     # RAG settings
-    rag_chunk_size: int = 1000      # tokens per chunk
-    rag_chunk_overlap: int = 50     # 5% of chunk_size
+    # 切片大小：内部按 chunker.estimate_tokens 估算（2 个汉字 ≈ 1 token、
+    # 3 个英文字符 ≈ 1 token），250 ≈ 500 汉字/片。取 500 字是为配合
+    # bge-small-zh 的 512 token 位置上限——更大的片会在嵌入时被截断丢内容。
+    rag_chunk_size: int = 250
+    # 相邻分片重叠：overlap_percent 生效时按 chunk_size 百分比计算
+    # （250 × 10% = 25 token ≈ 50 汉字）；rag_chunk_overlap 仅作无百分比时的
+    # 兜底，两者保持同一比例（10%）。
+    rag_chunk_overlap: int = 25
+    rag_chunk_overlap_percent: float = 0.10
+    # rag_search 默认返回条数（重排后的最终结果数）。
+    rag_search_top_k: int = 5
+    # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：
+    # 总量落在 [min, max] 区间才调用辅助模型浓缩；低于 min 原样注入（内容少，
+    # 精简只会丢细节、白耗一次辅助模型调用）；高于 max 也不送辅助模型（超出
+    # 其舒适上下文），交由格式化路径按相关度截断。
+    rag_condense_min_chars: int = 4000
+    rag_condense_max_chars: int = 12000
     rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
     # 重排序模型：**INT8 量化版**（~570MB）。fp32 全量是 2.27GB，4 倍体积
     # 4 倍内存，而 cross-encoder 只输出排序分数，INT8 的排序质量损失可忽略
@@ -168,6 +183,9 @@ class AgentConfig:
 
     # 辅助 LLM（本地专用，用于事实抽取等轻量子任务）：默认加载
     # models/Qwen3.5-2B-MLX-4bit。不带 OpenAI 模式（辅助任务始终本地）。
+    # 辅助模型启用开关（设置窗口「启用」勾选框）：默认不启用。关闭时应用启动
+    # 不自动加载、知识库同步结束后不自动重载；「加载模型」按钮仍可手动临时加载。
+    aux_llm_enabled: bool = False
     aux_llm_provider: str = "local"
     aux_local_llm_model: str = ""
     aux_local_llm_backend: str = "mlx"
@@ -202,7 +220,7 @@ class AgentConfig:
     local_llm_prefill_step_size: int = 4096
 
     embedding_provider: str = "local"
-    local_embedding_model: str = "nomic-embed-text-v1.5-mlx-int8"
+    local_embedding_model: str = "bge-small-zh-v1.5-mlx"
     local_embedding_backend: str = "mlx"
 
     reranker_provider: str = "local"
@@ -231,6 +249,8 @@ class AgentConfig:
     # 直接喂给 dataclass 会让后续算术/比较在运行时炸掉。
     _INT_FIELDS = ("max_tokens", "top_k", "max_iterations", "max_history",
                    "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
+                   "rag_search_top_k", "rag_condense_min_chars",
+                   "rag_condense_max_chars",
                    "kernel_max_context_tokens", "kernel_raw_turns",
                    "kernel_consolidate_every", "kernel_max_tool_chars",
                    "kernel_max_digest_lines",
@@ -238,6 +258,7 @@ class AgentConfig:
                    "local_llm_num_draft_tokens", "local_llm_prefill_step_size")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
+                     "rag_chunk_overlap_percent",
                      "aux_temperature", "aux_top_p", "aux_min_p",
                      "aux_repetition_penalty", "aux_request_timeout",
                      # 这些是 float/bool 却被错分进 _STR_FIELDS —— config.json
@@ -258,7 +279,7 @@ class AgentConfig:
                    "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
-                    "rag_ocr_scale_dynamic",
+                    "rag_ocr_scale_dynamic", "aux_llm_enabled",
                     "local_llm_enable_thinking", "aux_local_llm_enable_thinking")
 
     @classmethod
@@ -423,7 +444,7 @@ class AgentConfig:
         # 默认走 mlx 后端。只填充空的本地路径——用户若显式指定了别的本地模型
         # 目录则不受影响。
         if not self.local_embedding_model:
-            self.local_embedding_model = "nomic-embed-text-v1.5-mlx-int8"
+            self.local_embedding_model = "bge-small-zh-v1.5-mlx"
         if not self.local_reranker_model:
             # 默认 reranker 改为 jina（onnx / CPU-only）。仅在「未显式指定本地
             # 模型」时填充——显式指定了其它模型（如 bge-mxfp8）的用户保持原样。

@@ -50,7 +50,7 @@ class RagSearchTool(Tool):
             },
             "top_k": {
                 "type": "integer",
-                "description": "返回结果数，默认 3，范围 1-10。",
+                "description": "返回结果数，默认 5，范围 1-10。",
             },
             "source": {
                 "type": "string",
@@ -68,9 +68,11 @@ class RagSearchTool(Tool):
         self._aux_llm_getter = aux_llm_getter
 
     def bind(self, config: Any, registry: ToolRegistry) -> None:
-        pass
+        # 保存 config 引用：默认 top_k 与辅助模型精简阈值都做成可配置项，
+        # 运行时从这里读（bind 在工具注册时被调用，早于任何 run）。
+        self._config = config
 
-    def run(self, query: str = "", top_k: int = 3, source: str = "") -> ToolResult:
+    def run(self, query: str = "", top_k: Any = None, source: str = "") -> ToolResult:
         # 模型可能传 null（JSON null → None），None.strip() 会抛异常并被
         # registry 兜底误报成 "Invalid arguments"，模型会原样重试。这里统一
         # 归一化成空串再判断。
@@ -78,11 +80,16 @@ class RagSearchTool(Tool):
         if not query:
             return ToolResult(success=False, error="请提供搜索查询词")
 
-        # 限制 top_k 上限，防止模型传入过大值导致返回海量内容撑爆上下文窗口。
+        # 默认 top_k 从配置读取（rag_search_top_k，默认 5）；模型未传/传 null
+        # 时走配置默认，传了非法值也回退到配置默认。_config 由 bind() 注入，
+        # 直接构造（测试/旁路）时可能缺失，一律走 getattr 默认值。
+        cfg = getattr(self, "_config", None)
+        default_top_k = int(getattr(cfg, "rag_search_top_k", 5) or 5)
         try:
             top_k = int(top_k)
         except (TypeError, ValueError):
-            top_k = 3
+            top_k = default_top_k
+        # 限制 top_k 上限，防止模型传入过大值导致返回海量内容撑爆上下文窗口。
         top_k = max(1, min(top_k, 10))
 
         source = (source or "").strip()
@@ -94,20 +101,40 @@ class RagSearchTool(Tool):
             # 先取重排后的原始分片（含完整 text，未截断），供辅助模型通读归纳。
             chunks = self._engine.search(query, top_k=top_k, source=source or None)
             aux = self._aux_llm_getter() if self._aux_llm_getter else None
+            condensed = ""
             if chunks and aux is not None:
-                try:
-                    condensed = condense_retrieved_chunks(query, chunks, aux, max_chars=2000)
-                except Exception as e:  # 精简异常不应让检索整体失败
-                    logger.warning("RAG 辅助模型精简异常，回退原始结果: %s", e)
-                    condensed = ""
-                if condensed:
-                    output = build_condensed_output(query, chunks, condensed)
+                total_chars = sum(len(r.get("text") or "") for r in chunks)
+                min_chars = int(getattr(cfg, "rag_condense_min_chars", 4000) or 4000)
+                max_in = int(getattr(cfg, "rag_condense_max_chars", 12000) or 12000)
+                # 仅当检索总量落在 [min, max] 区间才调用辅助模型归纳精简：
+                #   * 低于 min → 原样注入。内容本来就少，精简只会丢细节，
+                #     还白耗一次辅助模型调用（慢）；
+                #   * 高于 max → 也不送辅助模型（超出其舒适上下文，效果差），
+                #     交由下方格式化路径按相关度截断。
+                if total_chars < min_chars:
                     logger.info(
-                        "✅ RAG 检索 %d 条 → 辅助模型精简为 %d 字注入主模型",
-                        len(chunks), len(condensed),
+                        "  ├─ 检索总量 %d 字 < 精简下限 %d 字 → 跳过辅助模型归纳（原样注入）",
+                        total_chars, min_chars,
                     )
-                    return ToolResult(success=True, output=output)
-            # 回退：辅助模型不可用 / 精简失败 / 结果为空时，维持原格式化行为。
+                elif total_chars > max_in:
+                    logger.info(
+                        "  ├─ 检索总量 %d 字 > 精简上限 %d 字 → 跳过辅助模型归纳（格式化截断）",
+                        total_chars, max_in,
+                    )
+                else:
+                    try:
+                        condensed = condense_retrieved_chunks(query, chunks, aux, max_chars=2000)
+                    except Exception as e:  # 精简异常不应让检索整体失败
+                        logger.warning("RAG 辅助模型精简异常，回退原始结果: %s", e)
+                        condensed = ""
+            if condensed:
+                output = build_condensed_output(query, chunks, condensed)
+                logger.info(
+                    "✅ RAG 检索 %d 条 → 辅助模型精简为 %d 字注入主模型",
+                    len(chunks), len(condensed),
+                )
+                return ToolResult(success=True, output=output)
+            # 回退：辅助模型不可用 / 总量不在精简区间 / 精简失败时，维持原格式化行为。
             results = self._engine.search_formatted(
                 query, top_k=top_k, source=source or None,
             )

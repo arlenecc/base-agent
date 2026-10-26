@@ -282,6 +282,12 @@ class ToolRegistry:
                 rerank_model=getattr(self.config, "rag_rerank_model",
                                      DEFAULT_RERANK_MODEL),
                 rerank_enabled=bool(getattr(self.config, "rag_rerank_enabled", True)),
+                # 切片参数此前从未从 config 接线（引擎一直用自身默认 1000/50/5%），
+                # rag_chunk_size / rag_chunk_overlap / rag_chunk_overlap_percent
+                # 是死配置。补上传参，让切片大小/重叠真正可配置。
+                chunk_size=int(getattr(self.config, "rag_chunk_size", 250)),
+                chunk_overlap=int(getattr(self.config, "rag_chunk_overlap", 25)),
+                overlap_percent=float(getattr(self.config, "rag_chunk_overlap_percent", 0.10)),
             )
             self._rag_engine = engine
 

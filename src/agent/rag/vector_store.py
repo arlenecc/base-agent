@@ -1845,7 +1845,7 @@ class VectorStore:
 
         candidates 的 score 已由 search() 转换为相似度 [0,1]（越高越好）。
         回退模式下分数是余弦距离的近似（非 reranker 语义分），因此不做
-        0.7 阈值过滤——阈值仅对 reranker 的语义分数有意义。
+        0.5 阈值过滤——阈值仅对 reranker 的语义分数有意义。
         """
         logger.info("  ├─ 重排序: Reranker 不可用, 使用向量距离排序 (回退模式)")
         for c in candidates:
@@ -1868,8 +1868,8 @@ class VectorStore:
         self,
         query: str,
         candidates: List[Dict[str, Any]],
-        top_k: int = 3,
-        min_similarity: float = 0.7,
+        top_k: int = 5,
+        min_similarity: float = 0.5,
     ) -> List[Dict[str, Any]]:
         """Re-rank candidates using FastEmbed reranker for precise scoring.
 
@@ -1903,7 +1903,7 @@ class VectorStore:
             # 归一化按**模型固定**（首次探测一次并缓存结论），不再按「本批候选」
             # 自适应：旧实现用 any(abs(s) > 1.0) 决定是否对整个 batch 做 sigmoid，
             # 同一个 chunk 在不同查询下可能走/不走归一化，绝对值之间不可比，而
-            # min_similarity=0.7 是绝对语义的阈值 —— 语义会随查询漂移。
+            # min_similarity=0.5 是绝对语义的阈值 —— 语义会随查询漂移。
             #
             # 数值稳定 sigmoid：s 为很大负数时 1/(1+e^-s) 会 OverflowError
             # （被外层 except 吞掉后静默回退到向量排序，精排形同失效）。
@@ -1988,10 +1988,10 @@ class VectorStore:
     def search_with_rerank(
         self,
         query: str,
-        top_k: int = 3,
+        top_k: int = 5,
         candidate_multiplier: int = 4,
         where: Optional[str] = None,
-        min_similarity: float = 0.7,
+        min_similarity: float = 0.5,
     ) -> List[Dict[str, Any]]:
         """Hybrid retrieval: vector similarity + BM25 keyword, then BGE rerank.
 
@@ -2000,7 +2000,7 @@ class VectorStore:
           2. BM25 keyword search: top_k * candidate_multiplier candidates.
           3. Merge & dedupe by (source, chunk_index).
           4. BGE rerank the merged candidate set.
-          5. Drop any result whose rerank score < min_similarity (0.7).
+          5. Drop any result whose rerank score < min_similarity (0.5).
           6. Return up to top_k results.
 
         Args:

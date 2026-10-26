@@ -1954,14 +1954,14 @@ class RAGEngine:
     def search(
         self,
         query: str,
-        top_k: int = 3,
+        top_k: int = 5,
         source: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Search the knowledge base with hybrid retrieval + reranking.
 
         Retrieves top_k * 4 candidates each from vector-similarity search and
         BM25 keyword search, merges/dedupes, then uses FastEmbed reranker to pick
-        the most relevant results.  Results below the 0.7 similarity threshold
+        the most relevant results.  Results below the 0.5 similarity threshold
         are dropped before returning.
 
         ``source`` 为可选文档名/关键词过滤：定向检索某本书/文档内的切片
@@ -2007,7 +2007,7 @@ class RAGEngine:
     def search_formatted(
         self,
         query: str,
-        top_k: int = 3,
+        top_k: int = 5,
         source: Optional[str] = None,
         max_chars_per_result: int = 1500,
         max_total_chars: int = 8000,

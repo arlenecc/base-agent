@@ -79,7 +79,7 @@ def test_think_splitter_incremental():
 
 def test_registry_default_paths():
     assert registry.resolve_model_path("embedding").endswith(
-        "models/nomic-embed-text-v1.5-mlx-int8")
+        "models/bge-small-zh-v1.5-mlx")
     assert registry.resolve_model_path("reranker").endswith(
         "models/jina-reranker-v2-base-multilingual-onnx")
     assert registry.resolve_model_path("llm").endswith(
