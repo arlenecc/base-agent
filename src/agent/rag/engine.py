@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, clean_docling_markdown, normalize_markdown
-from .chunker import chunk_documents
+from .chunker import chunk_documents, estimate_tokens, _clamp_chunk_budget
 from .document_outline import (
     build_digest,
     has_markdown_headings,
@@ -578,6 +578,27 @@ def _shard_files_balanced(files: List[str], num_workers: int) -> List[List[str]]
     return shards
 
 
+def _clamp_chunk_size_to_model_window(chunk_size: int, embedding_model: str) -> int:
+    """把切片预算夹紧到 embedding 模型的上下文窗口（-2 留给 [CLS]/[SEP]）。
+
+    切片预算超过模型窗口时，切片会在嵌入阶段被静默截断（bge-small-zh 仅 512
+    token）——这正是之前 GUI 同步路径用引擎默认 1000 时发生的。nomic 等 RoPE
+    模型窗口达 8K，无需收紧。本地模型目录读 ``config.json`` 取真实上限；fastembed
+    的 hub 模型名在本地无 config.json，回退 8192（RoPE 默认）。
+    """
+    if chunk_size <= 0:
+        return chunk_size
+    try:
+        from ..local import registry
+        path = registry.resolve_model_path("embedding", embedding_model)
+        window = registry.resolve_model_max_length(path)  # 无本地 config.json → 8192
+    except Exception:
+        window = 8192
+    if window and window > 2:
+        return min(chunk_size, window - 2)
+    return chunk_size
+
+
 class RAGEngine:
     """Local knowledge base engine.
 
@@ -610,7 +631,11 @@ class RAGEngine:
         self._vector_dir = os.path.join(self._rag_dir, "vectors")
         self._embedding_model = embedding_model or "nomic-ai/nomic-embed-text-v1.5-Q"
         self._custom_ef = embedding_function  # for testing injection
-        self._chunk_size = chunk_size
+        # 模型窗口硬上限：切片预算超过 embedding 模型上下文窗口时，切片会在嵌入
+        # 阶段被静默截断（bge-small-zh 仅 512 token）。nomic 等 RoPE 模型窗口
+        # 达 8K 不受限。与指纹机制联动——换模型后窗口随之变化。
+        self._chunk_size = _clamp_chunk_size_to_model_window(
+            chunk_size, self._embedding_model)
         self._chunk_overlap = chunk_overlap
         self._min_chunk_size = min_chunk_size
         self._overlap_percent = overlap_percent
@@ -1194,13 +1219,19 @@ class RAGEngine:
                                         logger.warning("    ├─ ⚠ 目录缩略版写入失败: %s: %s", fname, e)
                                     # 章节即切片；超长章节再用通用切块器二次切分
                                     # （避免单块超出 embedding 模型 token 上限）。
-                                    # _chunk_size 单位为 token 且中文 ≈1 字/token，
-                                    # 整章保留阈值直接取该值（500 token ≈ ≤512 窗口）。
+                                    # max_chars = self._chunk_size 已被夹紧到模型窗口
+                                    # （bge 510），整章保留阈值按字符数取该值（中文
+                                    # ≈1 字/token，510 字 ≈ ≤512 窗口）。直通支仍过
+                                    # 一遍 _clamp_chunk_budget：极端情形（罕见字符每个
+                                    # 占 2 token）下整章也会硬切，不依赖字数≤token 的近似。
                                     doc_chunks: List[Dict[str, str]] = []
                                     max_chars = self._chunk_size
                                     for ch in book["chapters"]:
                                         if len(ch) <= max_chars:
-                                            doc_chunks.append({"source": filepath, "text": ch})
+                                            doc_chunks.extend(_clamp_chunk_budget(
+                                                [{"source": filepath, "text": ch}],
+                                                self._chunk_size,
+                                            ))
                                         else:
                                             doc_chunks.extend(chunk_documents(
                                                 [{"source": filepath, "text": ch}],
@@ -1406,9 +1437,17 @@ class RAGEngine:
                                 # 主线程 add_streaming 并发争抢同一 nomic/MLX 模型。
                             )
                             t_chunk_end = time.monotonic()
+                            # 真实测算每片 token 数（而非打印配置预算，后者会误导：
+                            # 此前日志写「每片约 1000 tokens」实际只是 rag_chunk_size，
+                            # 并非切片真实大小）。中文近似 1 字/token，bge 上限 512。
+                            _chunk_toks = [estimate_tokens(c["text"]) for c in doc_chunks]
+                            _max_tok = max(_chunk_toks) if _chunk_toks else 0
+                            _avg_tok = sum(_chunk_toks) // max(1, len(_chunk_toks))
                             _log(
-                                "    ├─ 文档切片: %s → %d 个切片 (每片约 %d tokens, 重叠 %d tokens, 耗时 %.2fs)",
-                                fname, len(doc_chunks), self._chunk_size, self._chunk_overlap,
+                                "    ├─ 文档切片: %s → %d 个切片 (单段均值 %d / 最大 %d tokens"
+                                ", 预算 %d, 重叠 %d, 耗时 %.2fs)",
+                                fname, len(doc_chunks), _avg_tok, _max_tok,
+                                self._chunk_size, self._chunk_overlap,
                                 t_chunk_end - t_chunk,
                             )
                             with ft_lock:

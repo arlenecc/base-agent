@@ -18,7 +18,7 @@ import re
 import threading
 import time
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,13 @@ _TABLE_NAME = "knowledge_base"
 # 文档元数据表：存储每个文档的缩略版本（目录结构 + 章节标题）与完整 Markdown，
 # 用于 Meta-context + Targeted RAG（先返回全文档结构概览，再按需检索细节）。
 _DOCUMENTS_TABLE_NAME = "documents"
+
+# Embedding 指纹表：记录每个向量表由哪个 embedding 模型（``ef.name()``）、
+# 多少维建成。换模型后打开旧库时据此拒绝 add/search——不同模型的向量不在
+# 同一语义空间，维度不同时 LanceDB 只会抛难懂的 Arrow 字节长度错误，维度
+# 相同时更是静默混用、检索质量劣化而无任何告警。行按 table_name 区分，
+# 与同库其它表（knowledge_base / documents）互不干扰。
+_META_TABLE_NAME = "_embedding_meta"
 
 # nomic-embed-text-v1.5 requires query/document prefixes for best results
 _DOC_PREFIX = "search_document: "
@@ -236,6 +243,11 @@ _EF_SINGLETONS_LOCK = threading.Lock()
 _TABLE_CREATE_LOCK = threading.Lock()
 # FTS 建索引的跨实例互斥（见 _ensure_fts_index 内注释）。
 _FTS_CREATE_LOCK = threading.Lock()
+# embedding 指纹表的读改写互斥（读→比对→采用回写必须原子，否则两个并发
+# search 都看到「无指纹」时会产生交替的 delete/add，可能残留重复行）。
+# 用 RLock：_check_embedding_compat 持锁调用 _write_stored_fingerprint（内部
+# 也要拿锁），非可重入 Lock 会自锁。
+_META_TABLE_LOCK = threading.RLock()
 
 
 def _store_op(func):
@@ -267,16 +279,29 @@ def _store_op(func):
 # 2.14GB，size12 = 1163 @ 4.99GB。调优范围按用户规格改为 [2, 64]，步进 2，
 # 初始 16：下限 2 仍避开「单条最省内存」的过碎批，上限放开给长切片/高带宽
 # 机器爬升空间，爬山步长 2 在更宽区间内更快收敛。
-_SUBBATCH_MIN = 2
+_SUBBATCH_MIN = 4  # 下限（最小子批）；抬高到 4 防 RSS 墙等异常降档路径仍把吞吐打到地板 2
 _SUBBATCH_MAX = 64
 _SUBBATCH_START = 16
 _SUBBATCH_STEP = 2
-# RSS 软墙（#129，用户定参 8GB）：内存偶尔冲高是正常的（OCR 缓存、压缩
-# 计费），只要求「超墙时降档避让、回墙下即停」——无闩锁。旧 5GB 闩锁版
-# 会在真实同步基线（6-10GB）下首个子批就触发且永不解除，是「降到 1 再
-# 也不回去」的根因之一。注意：wall 只影响运行中的进程，改这里不会让
+# RSS 软墙（#129 修订为「相对基线 + 余量」）：内存偶尔冲高是正常的（OCR
+# 缓存、压缩计费），只要求「超墙时降档避让、回墙下即停」——无闩锁。旧 5GB
+# 闩锁版会在真实同步基线（6-10GB）下首个子批就触发且永不解除，是「降到 1
+# 再也不回去」的根因之一。注意：wall 只影响运行中的进程，改这里不会让
 # 已启动的应用生效，需要完全重启。
-_SUBBATCH_RSS_LIMIT = 8.0  # GB
+#
+# 修订（#本任务）：旧绝对阈值 8GB 落在同进程 docling 转换器（~7-9GB）+ MLX
+# 主/辅 LLM + LanceDB 的稳定基线（6-10GB，#129 注释自陈）区间内 → 每个子批
+# 都触发 force_down、把子批钉死在最小 2；而缩小子批**并不能**降低 docling/LLM
+# 占用的 RSS（嵌入激活已被 _SUBBATCH_SHAPE_BUDGET 钳死 ~2GB），于是永远回不到
+# 墙下 → 永久卡死在 2（与旧 5GB 闩锁版同形）。改为相对基线（见
+# _SubBatchTuner.rss_over_limit）：首测 RSS 记基线（高水位，吸收同步中后加载的
+# 常驻内存），仅当 RSS 高出 _SUBBATCH_RSS_HEADROOM（嵌入激活预算）才降档。
+# docling/LLM 的内存是基线一部分，其波动不触发降档；嵌入循环自身只贡献被形状
+# 预算限制的激活，正常不会越过「基线+余量」，墙退化为「仅对真正异常的 RSS 尖峰」
+# 报警。_SUBBATCH_RSS_LIMIT 保留为绝对应急地板（16GB 机器临近 OOM 的硬红线），
+# 日常不生效。
+_SUBBATCH_RSS_LIMIT = 13.0  # GB（绝对应急地板；日常由相对基线接管）
+_SUBBATCH_RSS_HEADROOM = 2.5  # GB：嵌入激活预算（被形状预算钳死，故正常不越线）
 # 恢复阈值（#129）：monitor 下速率回到历史最优 95% 且当前尺寸低于最优
 # 尺寸时，回到最优尺寸重新爬升——消除「降档单向棘轮」（降需连续 2 窗口
 # <75%，回却需 >110%，一次短暂内存尖峰会永久降档）。低于 100% 是安全
@@ -299,8 +324,16 @@ def _shape_cap_size(size: int, max_len: int) -> int:
     return max(1, min(size, budget))
 
 
-# 每个窗口聚合的子批数：太小易被单批噪声带偏，太大响应迟钝。
-_SUBBATCH_WINDOW = 2
+# 窗口闭合策略（#125 修订）：原按固定子批数（2）闭合窗口，快模型（bge-small 等）
+# 单子批耗时可低至微秒级、甚至被计时器量化成 0——逐子批 ``max(dt, 1e-6)`` 兜底会
+# 注入巨分，相邻窗口比率被噪声主导 → 误判「变慢」一路下探到最小子批 2。改为
+# 「累计真实耗时达阈值（保证比率估计有稳定时间基准）或子批数达上限」才闭合窗口。
+#   · _SUBBATCH_MIN_WINDOW_DT：窗口累计耗时下限，低于此值比率估计噪声过大；
+#     20ms 对 ≥10ms/子批 的慢模型仍保持「2 子批/窗口」原行为，对快模型则累积更多
+#     子批直到时间基准稳定。
+#   · _SUBBATCH_MAX_WINDOW：极端快模型（单子批 dt 恒为 0）的最后兜底，避免无限累积。
+_SUBBATCH_MIN_WINDOW_DT = 0.02   # 20ms
+_SUBBATCH_MAX_WINDOW = 32
 # 爬升判定：候选子批的算力速率需比基线高 3% 才采纳——低于该阈值的波动
 # 视为噪声，避免在吞吐平坦段来回抖动。
 _SUBBATCH_IMPROVE = 1.03
@@ -367,6 +400,7 @@ class _SubBatchTuner:
         self._best_size = self.size
         self._degrade_streak = 0
         self._warmed = False  # 预热窗口是否已丢弃
+        self._rss_baseline = None  # RSS 软墙相对基线（高水位，见 rss_over_limit）
 
     def propose(self) -> int:
         """返回下一个子批应使用的大小。"""
@@ -374,15 +408,26 @@ class _SubBatchTuner:
             return self.size
 
     def report(self, n: int, max_len: int, dt: float) -> None:
-        """上报一个子批的实测结果（条数、批内最长字符数、耗时）。"""
+        """上报一个子批的实测结果（条数、批内最长字符数、耗时）。
+
+        窗口闭合用「累计真实耗时达阈值 或 子批数达上限」而非固定子批数：快模型
+        单子批 dt≈0（被计时器量化成 0）时，原来的 ``max(dt, 1e-6)`` 逐子批兜底会注入
+        巨分、且相邻窗口比率被噪声主导 → 误判「变慢」一路下探到最小子批 2。现改为
+        累加**真实** dt（不在此处 floor），窗口级才做最后兜底；窗口累计耗时足够稳定
+        （≥ ``_SUBBATCH_MIN_WINDOW_DT``）或子批数到上限（``_SUBBATCH_MAX_WINDOW``，极端
+        快模型的最后兜底）才闭合，保证比率估计有稳定时间基准。
+        """
         ops = float(n) * float(max(max_len, 1)) ** 2
         with self._lock:
             self._win_ops += ops
-            self._win_dt += max(dt, 1e-6)
+            self._win_dt += dt  # 真实 dt 累加，不在逐子批 floor
             self._win_n += 1
-            if self._win_n < _SUBBATCH_WINDOW:
+            # 窗口闭合：累计真实耗时达到稳定阈值，或子批数到上限（快模型 dt 恒为 0 时）。
+            if self._win_dt < _SUBBATCH_MIN_WINDOW_DT and self._win_n < _SUBBATCH_MAX_WINDOW:
                 return
-            score = self._win_ops / self._win_dt
+            # 窗口级兜底：正常累计 dt 已 ≥ 阈值不会触发；仅极端快模型 dt 恒为 0 时，
+            # 此时各窗口 score 同样巨大且一致，比率估计不会噪声化（ratio≈子批条数比）。
+            score = self._win_ops / max(self._win_dt, 1e-9)
             self._win_ops = 0.0
             self._win_dt = 0.0
             self._win_n = 0
@@ -504,6 +549,8 @@ class _SubBatchTuner:
         RSS 自然回落），回墙下即停，之后由恢复分支 / 重爬把尺寸带回来。
         旧 5GB 闩锁版（mem_pressed 永不解除）会在真实同步基线 6-10GB 下
         首个子批就触发并永久卡死在下限，是「降到 1 再也不回去」的根因。
+        现 RSS 判定改为相对基线（见 rss_over_limit），docling/LLM 常驻内存
+        属基线、不再误触发。
         """
         with self._lock:
             self._win_ops = 0.0
@@ -513,13 +560,42 @@ class _SubBatchTuner:
                 return
             new_size = max(_SUBBATCH_MIN, self.size - _SUBBATCH_STEP)
             logger.info(
-                "  ├─ 子批自适应: RSS 超 %.0fGB, %d → %d 降档避让",
-                _SUBBATCH_RSS_LIMIT, self.size, new_size,
+                "  ├─ 子批自适应: RSS 超软墙(相对基线), %d → %d 降档避让",
+                self.size, new_size,
             )
             self.size = new_size
             self._phase = "monitor"
             self._ema = None
             self._degrade_streak = 0
+
+    def rss_over_limit(self, rss_gb: float) -> bool:
+        """RSS 软墙判定（#129 修订为相对基线）。
+
+        旧实现用绝对阈值 8GB，但同进程内 docling 转换器（~7-9GB）+ MLX 主/辅
+        LLM + LanceDB 的稳定基线本就在 6-10GB（#129 注释自陈），绝对阈值落在
+        基线区间内 → 每个子批都触发 force_down、把子批钉死在最小 2；而缩小子批
+        **并不能**降低 docling/LLM 占用的 RSS（嵌入激活已被 ``_SUBBATCH_SHAPE_BUDGET``
+        钳死在 ~2GB），于是永远回不到墙下 → 永久卡死在 2，与旧 5GB 闩锁版同形。
+
+        改为相对基线：首次观测到的 RSS 记为基线（**高水位**，只升不降，吸收同步中
+        后加载的 docling/LLM 等常驻内存——避免「先嵌入后加载」使基线偏低、加载后
+        误触发）。仅当 RSS 高出基线 ``_SUBBATCH_RSS_HEADROOM``（嵌入激活预算）才判
+        超墙。docling/LLM 的内存是基线一部分，其波动不触发降档；嵌入循环自身只
+        贡献被形状预算限制的激活，正常不会越过「基线+余量」，故墙退化为「仅对真正
+        异常的 RSS 尖峰」报警，不再误钉子批。绝对地板 ``_SUBBATCH_RSS_LIMIT`` 仅在
+        临近 OOM 时兜底。
+        """
+        if self._rss_baseline is None:
+            self._rss_baseline = rss_gb
+            return False
+        # 先用「旧基线」算有效上限并判定，再把基线抬到高水位——若先抬后比，
+        # 任何观测值都会变成新基线、上限随之抬升，导致永远不触发（判定失效）。
+        effective = max(_SUBBATCH_RSS_LIMIT,
+                        self._rss_baseline + _SUBBATCH_RSS_HEADROOM)
+        over = rss_gb > effective
+        if rss_gb > self._rss_baseline:
+            self._rss_baseline = rss_gb  # 高水位：吸收后加载的常驻内存
+        return over
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +779,36 @@ def _call_on_batch(on_batch, n_added: int, total: int,
     on_batch(n_added, total)
 
 
+def _embedding_model_name(ef: Any) -> str:
+    """从 embedding 函数提取稳定的模型标识（embedding 指纹）。
+
+    FastEmbed / 本地实现都提供 ``name()``（如 ``fastembed:nomic-...`` /
+    ``local:mlx:bge-small-zh-v1.5-mlx``）。测试注入的假 ef 可能没有
+    ``name()`` —— 用类限定名兜底（跨实例稳定，同类两次注入视为同一模型）。
+    """
+    name = getattr(ef, "name", None)
+    if callable(name):
+        try:
+            s = name()
+            if isinstance(s, str) and s.strip():
+                return s.strip()
+        except Exception:
+            pass
+    return f"{type(ef).__module__}.{type(ef).__qualname__}"
+
+
+def _table_vector_dim(table: Any) -> Optional[int]:
+    """读取向量表 schema 中 vector 列的 fixed_size_list 维度；读不到返回 None。"""
+    try:
+        for field in table.schema:
+            if field.name == "vector":
+                size = int(getattr(field.type, "list_size", 0) or 0)
+                return size or None
+    except Exception:
+        pass
+    return None
+
+
 class VectorStore:
     """Local vector store backed by LanceDB with FastEmbed embeddings.
 
@@ -757,6 +863,9 @@ class VectorStore:
         self._fts_ready = False  # BM25 全文索引是否已就绪
         self._fts_checked = False  # 是否已尝试创建过 FTS 索引
         self._fts_failed = False  # 建索引曾失败 → 不再重试（见 _ensure_fts_index）
+        # 当前打开的表是否已通过 embedding 指纹校验（通过后不再重复读 meta 表）。
+        # 建表 / 表被 clear 或 close 后复位，下次 add/search 重新校验。
+        self._fingerprint_checked = False
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -846,6 +955,8 @@ class VectorStore:
         # （close 后本应永久拒绝新操作）。但本引擎的实例支持复活重连，
         # 不复位会让复活后的实例被 _begin_op 永久拒绝（「clear in progress」）。
         self._closing = False
+        # 重新初始化后表句柄会重新打开，指纹校验必须重跑（当前 ef 可能已变）。
+        self._fingerprint_checked = False
 
         # Use injected embedding function (for testing) or create FastEmbed one
         if self._custom_ef is not None:
@@ -949,6 +1060,12 @@ class VectorStore:
             try:
                 self._table = self._db.create_table(_TABLE_NAME, first_records)
                 self._table_checked = True
+                # 建表即记录 embedding 指纹（模型 + 维度）：换模型后打开旧库
+                # 时据此拒绝 add/search，而不是静默混用或抛 Arrow 字节长度错误。
+                self._write_stored_fingerprint(
+                    self._get_fingerprint(),
+                    len(first_records[0]["vector"]) if first_records else None,
+                )
                 return self._table, True
             except Exception as e:
                 if "exist" in str(e).lower():
@@ -959,6 +1076,117 @@ class VectorStore:
                     except Exception:
                         pass
                 raise
+
+    # ------------------------------------------------------------------
+    # embedding 指纹校验（换模型后防止旧库静默混用 / 维度不匹配）
+    # ------------------------------------------------------------------
+
+    def _get_fingerprint(self) -> str:
+        """当前 embedding 函数的模型指纹。"""
+        return _embedding_model_name(self._ef)
+
+    def _read_stored_fingerprint(self) -> Optional[Tuple[str, Optional[int]]]:
+        """读取主表的 embedding 指纹，返回 ``(model, dim)``；无记录返回 None。
+
+        指纹存放在同库的 ``_embedding_meta`` 表里（按 table_name 区分行）。
+        表不存在 / 行缺失 / 内容损坏都按 None（老库语义）处理。
+        调用方须已完成 ``_ensure_initialized()``。
+        """
+        try:
+            if _META_TABLE_NAME not in self._db.table_names():
+                return None
+            meta = self._db.open_table(_META_TABLE_NAME)
+            for row in meta.to_arrow().to_pylist():
+                if row.get("table_name") != _TABLE_NAME:
+                    continue
+                model = str(row.get("model") or "").strip()
+                if not model:
+                    return None
+                dim = int(row.get("dim") or 0)
+                return model, (dim or None)
+        except Exception as e:
+            logger.warning("VectorStore: 读取 embedding 指纹失败（按无指纹处理）: %s", e)
+        return None
+
+    def _write_stored_fingerprint(self, model: str, dim: Optional[int] = None) -> None:
+        """写入/覆盖主表的 embedding 指纹。调用方须已完成 ``_ensure_initialized()``。
+
+        写失败只记日志降级——指纹缺失的下轮打开会重新「采用」，不能因为它
+        阻塞正常的业务写入。
+        """
+        row = {"table_name": _TABLE_NAME, "model": model, "dim": int(dim or 0)}
+        with _META_TABLE_LOCK:
+            try:
+                if _META_TABLE_NAME in self._db.table_names():
+                    meta = self._db.open_table(_META_TABLE_NAME)
+                    meta.delete(f"table_name = '{_TABLE_NAME}'")
+                    meta.add([row])
+                else:
+                    self._db.create_table(_META_TABLE_NAME, [row])
+            except Exception as e:
+                logger.warning("VectorStore: 写入 embedding 指纹失败: %s", e)
+
+    def _check_embedding_compat(self, table: Any) -> None:
+        """库与当前 embedding 模型的指纹校验，不匹配抛 RuntimeError。
+
+        - 指纹一致 → 通过（结果按实例缓存，add/search 不再重复读 meta 表）。
+        - 无指纹（老版本建的库，历史模型无从得知）→ 采用当前模型为基线并回写。
+        - 指纹不一致 → 明确报错，给出「清空重建 / 切回原模型」两条出路。
+
+        注意：**不在初始化时抛错** —— 否则 ``clear()`` 也会被拦住，用户失去
+        自愈通道；只在真正读写向量的路径（add / search）拦截。
+        """
+        if self._fingerprint_checked:
+            return
+        fp = self._get_fingerprint()
+        with _META_TABLE_LOCK:
+            stored = self._read_stored_fingerprint()
+            if stored is None:
+                # 老库（无指纹）：历史模型无从得知，采用当前模型为基线；
+                # 维度从表 schema 读出一并记录（后续不匹配的报错可显示真实值）。
+                self._write_stored_fingerprint(fp, _table_vector_dim(table))
+                logger.info(
+                    "VectorStore: 向量库无 embedding 指纹（旧版本数据），"
+                    "已按当前模型 %s 建立基线", fp)
+                self._fingerprint_checked = True
+                return
+            stored_model, stored_dim = stored
+            if stored_model == fp:
+                self._fingerprint_checked = True
+                return
+        dim_txt = f"{stored_dim} 维" if stored_dim else "维度未知"
+        raise RuntimeError(
+            "向量库与当前 embedding 模型不匹配，已拒绝操作：\n"
+            f"  库内向量由 {stored_model!r}（{dim_txt}）生成，当前模型为 {fp!r}。\n"
+            "不同模型的向量不在同一语义空间，混用会静默污染检索结果；"
+            "维度不同时也无法写入。\n"
+            "处理方式（二选一）：\n"
+            "  1. 清空知识库后重新同步（设置界面「清空知识库」，全部文档将用"
+            "当前模型重新嵌入）；\n"
+            "  2. 在配置中切回原模型。"
+        )
+
+    def _check_vector_dim(self, table: Any, vector_len: int) -> None:
+        """实际向量长度 vs 表 schema 维度校验。
+
+        兜底场景：老库（无指纹）被当前模型「采用」后，若两者维度不同，指纹
+        校验发现不了——这里用 schema 里真实的 list_size 拦下，给出可读的
+        错误（否则 LanceDB 抛的是 Arrow 字节长度错误，用户无从下手）。
+        """
+        expected = _table_vector_dim(table)
+        if not expected or not vector_len or vector_len == expected:
+            return
+        raise RuntimeError(
+            f"向量维度不匹配：向量库列为 {expected} 维，当前 embedding 模型产出 "
+            f"{vector_len} 维。向量库很可能是用旧模型建的——请清空知识库后重新"
+            "同步，或在配置中切回原模型。"
+        )
+
+    def _validate_existing_table(self, table: Any, sample_vector=None) -> None:
+        """对已存在的向量表做一致性校验：指纹 +（可选）首个向量的维度。"""
+        self._check_embedding_compat(table)
+        if sample_vector is not None:
+            self._check_vector_dim(table, len(sample_vector))
 
     # ------------------------------------------------------------------
     # CRUD
@@ -978,6 +1206,12 @@ class VectorStore:
         self._ensure_initialized()
         if not chunks:
             return 0
+
+        # 库已存在时先校验 embedding 指纹（fail fast）：模型不匹配就别浪费
+        # 嵌入——大库一批嵌入可达数分钟，嵌完才发现不匹配纯属白烧。
+        table = self._ensure_table()
+        if table is not None:
+            self._check_embedding_compat(table)
 
         # Build records (embed in batches to avoid OOM on large knowledge bases)
         records: List[Dict[str, Any]] = []
@@ -999,12 +1233,15 @@ class VectorStore:
                     _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
                 })
 
-        table = self._ensure_table()
-
         created = False
         if table is None:
             # First add: create table (race-safe — another instance may have won)
             table, created = self._create_or_open_table(records)
+        if not created:
+            # 已有表（含嵌入期间被其它实例建好的竞态）：校验指纹与首个向量
+            # 维度，把不匹配拦在写入之前，而不是让 LanceDB 抛 Arrow 字节长度
+            # 错误或（同维度时）静默混用。
+            self._validate_existing_table(table, records[0]["vector"])
         if created:
             logger.info("LanceDB table '%s' created with %d records", _TABLE_NAME, len(records))
             return len(records)
@@ -1222,6 +1459,12 @@ class VectorStore:
         if is_cancelled is not None and is_cancelled():
             return 0
 
+        # 库已存在时先校验 embedding 指纹（fail fast）：模型不匹配就别把整批
+        # 嵌入完才报错。
+        table = self._ensure_table()
+        if table is not None:
+            self._check_embedding_compat(table)
+
         # Embed 第一批
         logger.info("  ├─ 向量化: 首批 %d 个切片正在嵌入...", len(first_batch))
         _t_emb0 = time.monotonic()
@@ -1229,7 +1472,9 @@ class VectorStore:
         _dt_emb0 = time.monotonic() - _t_emb0
         logger.info("  ├─ 向量化完成: 首批 %d 个切片", len(first_records))
 
-        table = self._ensure_table()
+        if table is None:
+            # 嵌入期间可能已被其它实例建好，重查一次。
+            table = self._ensure_table()
         # 跟踪已删除过旧数据的 source，避免后续批次重复写入时新旧数据共存。
         sources_seen: set = set()
         created = False
@@ -1237,6 +1482,9 @@ class VectorStore:
             # 首次：创建表（用第一批 records），无需删除旧数据。竞态安全：
             # 若另一实例已建好，created=False，改走下面的「已有表」删除+写入。
             table, created = self._create_or_open_table(first_records)
+        if not created:
+            # 已有表：校验指纹与首个向量维度（覆盖老库被采用后维度不同的场景）。
+            self._validate_existing_table(table, first_records[0]["vector"])
         if created:
             logger.info("  ├─ 向量库: 新建 LanceDB 表 '%s', 写入 %d 条记录", _TABLE_NAME, len(first_records))
             total = len(first_records)
@@ -1438,17 +1686,16 @@ class VectorStore:
                 time.monotonic() - _t_embed,
             )
             tuner.report(len(idxs), max(len(texts[i]) for i in idxs), _dt)
-            # RSS 软墙（#129，8GB）：内存偶尔冲高是正常波动，超墙只要求降档
-            # 避让——每子批检查一次，降 1 档、激活变小、RSS 自然回落，回墙
-            # 下即停。无闩锁（旧 5GB 闩锁版是「卡死在 1」的根因），恢复交给
-            # 调优器自身的恢复分支 / 重爬。psutil 缺失时静默跳过。
+            # RSS 软墙（#129 修订：相对基线）：内存偶尔冲高是正常波动，超墙只要求
+            # 降档避让——每子批检查一次，降 1 档、激活变小、RSS 自然回落，回墙下即
+            # 停。无闩锁（旧 5GB 闩锁版是「卡死在 1」的根因）。判定改为相对基线：
+            # docling/LLM 等常驻内存属基线，其波动不再触发降档，避免把子批钉死在
+            # 最小 2（见 rss_over_limit 注释）。psutil 缺失时静默跳过。
             try:
                 import psutil as _psutil
 
-                if (
-                    _psutil.Process().memory_info().rss / 1024**3
-                    > _SUBBATCH_RSS_LIMIT
-                ):
+                _rss_gb = _psutil.Process().memory_info().rss / 1024**3
+                if tuner.rss_over_limit(_rss_gb):
                     tuner.force_down()
             except Exception:
                 pass
@@ -1668,12 +1915,19 @@ class VectorStore:
             logger.info("  向量检索: 向量表为空 (查询=%r)", query[:60])
             return []
 
+        # 指纹校验放在 row_count 之后：空库直接返回空结果（换模型后尚未重建
+        # 的空库不该报错，下一次 add 会用新模型重建指纹）。用当前模型查询
+        # 旧模型的库会静默污染结果，必须拦下。
+        self._check_embedding_compat(table)
+
         # Embed query (use embed_query for proper prefix handling)
         logger.info("  ├─ 查询向量化: 将查询文本转为向量...")
         if hasattr(self._ef, 'embed_query'):
             query_vec = _normalize(self._ef.embed_query(query))
         else:
             query_vec = _normalize(self._ef([query])[0])
+        # 维度兜底校验（覆盖老库被采用后维度不同的场景）。
+        self._check_vector_dim(table, len(query_vec))
 
         # Vector search
         logger.info("  ├─ 向量相似度搜索: 在 %d 条向量中检索 top %d...", row_count, top_k)
@@ -2068,6 +2322,12 @@ class VectorStore:
         add/search 并发，会让后者打到一张已被删除的表上。
         """
         self._ensure_initialized()
+        # 指纹表一并删除：清空后库是空的，下次 add 会用当前模型重建指纹。
+        # 必须放在「主表不存在就提前返回」之前——否则残留的旧指纹会把下一次
+        # 换模型后的写入挡在门外（库明明是空的）。
+        if _META_TABLE_NAME in self._db.table_names():
+            self._db.drop_table(_META_TABLE_NAME)
+        self._fingerprint_checked = False
         table = self._ensure_table()
         if table is None:
             return

@@ -74,12 +74,26 @@ _PDF_BATCH_PAGES = 50
 # （PyTorch-Metal）推理与 MLX embedding 在 GPU 上并发抢资源触发 GPU 重置
 # （[METAL] InnocentVictim）→ torch-MPS 状态损坏 → 原生 SIGSEGV 把进程带走
 # （实测 2026-10-25 多次硬崩；崩溃报告 Malloc 仅 3.8G、无 Jetsam，确认非 OOM）。
-# embedding 已降为单实例后，重新实开 2 个 docling MPS 实例，隔离验证「docling MPS
-# 双并发本身」是否为触发点：若仍崩→确认是 docling 双 MPS 问题，回退 1 即可；
-# 若不崩→说明之前是 2(docling MPS)×2(MLX) 叠加。16GB 机器默认 1，本值为实验性 2。
-# ≥32GB 可试 2（仍需观察 GPU 稳定性）；≥64GB 可 4。并行度受 GPU 并发能力约束，
-# 与 RAM 无关——关掉 docling MPS 改 CPU 推理并不能提速（2 CPU 实例 ≈ 1 MPS 实例）。
-_DOCLING_POOL_SIZE = 2  # 实验：embedding 已单实例，重测 2 个 docling MPS 实例是否仍 GPU 重置
+# 实验结论（2026-10-26）：embedding 已单实例后重开 2 个 docling MPS 实例，
+# 同步中仍段错误（崩溃报告 SIGSEGV 于 torch-MPS arange → AGXMetal
+# setComputePipelineState，与 10-25 同签名）——确认「docling 双 MPS 并发本身」
+# 即触发点。按预案回退 1。16GB 机器保持 1；≥32GB 若要再试 2，需重新观察。
+# 并行度受 GPU 并发能力约束，与 RAM 无关——关掉 docling MPS 改 CPU 推理
+# 并不能提速（2 CPU 实例 ≈ 1 MPS 实例）。
+# 【根因定论 2026-10-26】无头隔离实验（_repro_gpu.py，无 Qt/无 MLX 参与）：
+#   阶段 A：纯 2×docling MPS 并发（线程）→ **必崩**，Metal 断言
+#     "_status < MTLCommandBufferStatusCommitted (IOGPUMetalCommandBuffer
+#     setCurrentCommandEncoder)" —— torch-MPS **不是线程安全的**，同进程
+#     两线程并发 MPS 推理即损坏 command buffer（SIGABRT/SIGSEGV 随时序变化，
+#     此前 10-25/10-26 多次"GPU 争用"归因有误，MLX 是无辜旁观者）。
+#   阶段 B（双 CPU 实例）实测稳定 → 结论：**MPS 模式下进程内只允许 1 实例**。
+#   用户另一实现"2×docling+MPS 不崩"应为多进程隔离（各自独立 Metal 上下文）
+#   或实际串行——进程内线程并发无解，除非 docling 上游修复 torch-MPS 线程安全。
+# 最终配置二选一（吞吐实测相当：2 CPU 实例 ≈ 1 MPS 实例）：
+#   a) pool=2 + CPU（默认采用）：双核吃满、与 MLX embedding 并发无忧；
+#   b) pool=1 + MPS：单文件转换快 ~35%，但解析串行。
+_DOCLING_POOL_SIZE = 2
+_DOCLING_USE_MPS = False
 
 # docling VLM 模式（可选实验）：用 Granite-Docling-258M 视觉语言模型直接生成文档
 # 结构化标记（doctags），替代默认的「布局模型(Heron/TableFormer)」管线。
@@ -349,7 +363,9 @@ def _build_converter():
                 # PYTORCH_MPS_HIGH_WATERMARK_RATIO——docling 的 transformers 引擎
                 # 内部设 low=1.4，高水位低于它会直接报错。
                 pdf_opts.accelerator_options = AcceleratorOptions(
-                    num_threads=4, device=AcceleratorDevice.MPS
+                    num_threads=4,
+                    device=(AcceleratorDevice.MPS if _DOCLING_USE_MPS
+                            else AcceleratorDevice.CPU),
                 )
                 # 单文档硬超时（#131）：convert 内部可能永久挂死。docling 原生支持
                 # document_timeout，超时抛错 → extract_markdown 捕获 → 回退轻量解析器。
@@ -402,7 +418,10 @@ def _build_converter():
                 # 用默认构造——正确性不受影响，只是 macOS 上 MPS 缓存可能推高内存。
                 logger.info("docling 管线降配不可用（%s），使用默认配置", e)
                 converter = DocumentConverter()
-        logger.info("docling DocumentConverter 实例已构建（并行池）")
+        logger.info(
+            "docling DocumentConverter 实例已构建（并行池 x%d, 设备=%s）",
+            _DOCLING_POOL_SIZE, "MPS" if _DOCLING_USE_MPS else "CPU",
+        )
         _start_idle_reaper()
         return converter
     except ImportError:

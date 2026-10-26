@@ -1,6 +1,185 @@
 # Changelog
 
+---
+
+## 2026-10-27 · 调整：子批下限 2 → 4（防御性抬高地板）
+
+> 即使 RSS 软墙等异常降档路径仍触发 `force_down`，也不应把吞吐打到地板 2。
+> 将 `_SUBBATCH_MIN` 由 2 抬到 4；上限 64 / 步进 2 / 启动 16 维持不变。
+> `force_down`、clamp、`test_subbatch_never_below_min` 等均以该常量为准，自动生效。
+> `tests/test_subbatch_tuner.py` 全过（7/7）。
+
+## 2026-10-27 · 修复：RSS 软墙把 bge 嵌入子批钉死在最小 2（绝对阈值过激）
+
+> 现象：真实同步日志里嵌入子批稳定在 `size=2`（最小），吞吐平坦（~40-50k 字符/s），
+> 即「快模型沉底」的旧症状重现。但本次根因与上次（窗口比率噪声）不同。
+
+### 根因
+`_embed_chunks` 每子批查 RSS，只要 `rss > 8GB` 就调 `tuner.force_down()`；而同进程内
+docling 转换器（~7-9GB）+ MLX 主/辅 LLM + LanceDB 的**稳定基线本就在 6-10GB**（#129
+注释自陈）。绝对阈值 8GB 落在区间内 → **每个子批都触发 `force_down`**，把子批一路压到 2。
+更致命的是：嵌入激活已被 `_SUBBATCH_SHAPE_BUDGET` 钳死在 ~2GB，缩小子批**并不能**降低
+docling/LLM 占用的 RSS → RSS 永远 >8GB → 永远触发 → 永久卡死在 2。与旧 5GB 闩锁版同形
+（#129 注释已预警）。
+
+### 改动（`vector_store.py`）
+- `rss_over_limit(rss_gb)` 改**相对基线**判定：首次观测记基线（**高水位**只升不降，吸收同步中
+  后加载的 docling/LLM 常驻内存）；仅当 RSS 高出 `_SUBBATCH_RSS_HEADROOM`（2.5GB，嵌入
+  激活预算）**且**越过绝对地板 `_SUBBATCH_RSS_LIMIT`（现 13GB，16GB 机器临近 OOM 的硬红线）
+  才降档。docling/LLM 占的内存是基线一部分，其波动不再触发降档；嵌入循环自身只贡献被形状
+  预算限制的激活，正常不越线，墙退化为「仅对真正异常 RSS 尖峰」报警。
+- 判定顺序修正：先按旧基线算有效上限并判定，**再**把基线抬到高水位（否则任何观测值都会先变成
+  新基线、上限随之抬升，导致永远不触发）。
+- `force_down` 日志去掉硬编码的 8GB 数字（改为「相对基线」表述）。
+
+### 验证
+`tests/test_subbatch_tuner.py` 新增：稳态 9GB RSS 下相对基线逻辑**不触发**、子批停在 16；
+对照用旧「绝对 8GB」逻辑复刻，确证它会把子批钉死在 2；`rss_over_limit` 语义单测（记基线 /
+同基线不触发 / 越绝对地板触发 / 高水位吸收后加载内存 / 回落不触发）。相关 RAG 套件全过。
+## 2026-10-26 · 验证：bge-small 的 MLX 缓存上限生效且全程不爆内存
+
+> 用户确认 bge-small（默认 `local`+`mlx` 后端）嵌入时的 MLX Metal buffer 缓存上限
+> 是否真正生效、不会爆内存。
+
+### 结论（已用测试实证）
+- bge-small 默认走 `LocalEmbeddingFunction` 的 **MLX 后端**，前向激活进入 MLX 的
+  Metal buffer 缓存池，正是 `configure_mlx_memory_limits` 管的那块内存。
+- 上限 = **1GB**，在应用初始化（`factory.py` `configure_local_models`）与每轮同步
+  起点（`engine.py` `build_index` 内）两处调用 `configure_mlx_memory_limits()` 设下。
+- 关键：每文件后 `release_mlx_pool()` 里的 `mx.clear_cache()` **只释放未使用 buffer，
+  不重置 `set_cache_limit` 的全局上限**（MLX 标准行为，本仓库代码也依赖此——若会
+  重置，#131 修复在第一个文件后就失效）。故 1GB 上限**全程持续生效**，bge 的缓存
+  池被钉死在 1GB 内，不可能无限涨。
+- 1GB 远宽松于 bge-small 所需（权重 ~90MB fp32，单批激活仅数十 MB），故**可用、不
+  会 thrashing/报错**；同时子批 `_SUBBATCH_SHAPE_BUDGET`（6M 单位）与
+  `_SUBBATCH_RSS_LIMIT`（8GB 软墙）还独立约束激活内存，双保险。
+
+### 验证
+新增 `tests/test_mlx_cache_limit.py`：monkeypatch 证明 `configure_mlx_memory_limits`
+接到 `mx.set_cache_limit(1e9)`；断言默认配置 bge 走 mlx；并实测 `clear_cache` 多次
+后 `set` 调用序列仍为单次（证明不重置上限）。仅 macOS/装 mlx 时跑（importorskip）。
 本文件记录每次提交的可见行为变更。格式参考 Conventional Commits，按时间倒序排列。
+
+---
+
+## 2026-10-26 · 修复：切片内容保真兜底（任何路径/EF 下都不丢原文）
+
+> 在修复 bge 512 窗口截断（切片不超窗、不截断）之后，进一步确认「切片本身不丢字符」。
+> 排查发现：语义/混合分片器在退化 embedding（全零、截断、与真实语义不符的伪 EF）
+> 下可能产出未覆盖全文的切片——相邻片之间存在真实内容间隔（如整句
+> "Retrieval augmented generation..." 被漏切）。退化 EF 是测试伪影，但生产若遇
+> 异常 EF 同样会丢内容，需硬保证。
+
+### 改动（`chunker.py`）
+- 新增 `_covers_source(chunks, source)`：用**布尔覆盖数组**权威判定每片是否覆盖原文所有
+  非空白字符（重叠、重复、边界空白被 `.strip()` 掉均不影响；只有「某段非空白内容从未
+  出现在任何切片中」才判未覆盖 = 真实丢内容）。早期 `str.find` 贪心定位版本对重叠/重复
+  文本会误判为已覆盖（假阳性），已弃用。
+- `chunk_documents` 每个文档分片后调用 `_covers_source` 校验；若发现真实内容间隔，
+  **回退到确定性递归分片**（`chunk_text`，已单独验证无损），再句末收口。正常路径
+  （真实 EF，chonkie 返回覆盖全文的子串）校验通过、不触发回退，该检查仅 O(n) 扫描。
+
+### 验证
+新增 `tests/test_chunk_content_preservation.py`：非重复文本（中/英/代码/URL/混合）+ 逼真
+哈希 EF，断言 `chunk_documents` 输出 `_covers_source` 为真且每片 `estimate_tokens ≤ 500`
+（不超 bge 窗口）；并单测 `_covers_source` 对真实间隔判否、对纯空白间隔判真；
+以及全零退化 EF 下兜底仍保证不丢内容。相关 RAG 套件全过。
+
+---
+
+## 2026-10-26 · 修复：bge-small 等快模型嵌入子批被误压到最小子批 2
+
+> 现象：bge-small 嵌入快，单子批耗时被计时器量化成 0，子批自适应控制器一路
+> 下探，最终以最小子批 2 工作，吞吐远低于最优。
+
+### 根因
+`_SubBatchTuner.report` 对每个子批做 `self._win_dt += max(dt, 1e-6)`：快模型单子批
+`dt≈0` 被兜底成 `1e-6`，使 `score = ops / dt` 变成天文数字且**噪声极大**；相邻窗口
+比率被噪声主导，爬山反复误判「变慢」→ monitor 里连续触发降档，一路降到最小子批 2。
+
+### 改动（`vector_store.py`）
+- 窗口闭合不再按固定子批数（旧 `_SUBBATCH_WINDOW=2`），改为「累计真实耗时达
+  `_SUBBATCH_MIN_WINDOW_DT=20ms`（保证比率有稳定时间基准）**或**子批数达
+  `_SUBBATCH_MAX_WINDOW=32`（极端快模型 dt 恒为 0 的最后兜底）」才闭合。
+- `dt` 改为**真实累加**，不再逐子批 `max(dt, 1e-6)` floor；仅在窗口级、作为最后兜底
+  floor（正常累计 dt 已 ≥ 阈值不会触发）。消除单子批 dt=0 注入巨分与比率抖动。
+
+### 验证
+新增 `tests/test_subbatch_tuner.py`：模拟快模型（单子批亚毫秒、偶发 dt=0）——
+计算受限（吞吐平坦）停在起点 16、开销受限爬升至 50、慢模型行为不变（16）；任何
+噪声 profile 都不跌破最小子批。相关 RAG 测试套件全过。
+
+---
+
+## 2026-10-26 · 修复：切片预算超 embedding 模型窗口（GUI 同步路径用引擎默认 1000 导致静默截断）
+
+> 用户反馈：同步 PDF 后日志显示「每片约 1000 tokens」。bge-small-zh 上下文窗口仅
+> 512 token，切片被静默截断丢内容。根因有两层。
+
+### 改动
+- **`estimate_tokens` 按字符类别计权（方案 1）**：数字/全角标点/ASCII 标点此前统一
+  按 3 字符/token 折算，标点/代码/URL 密集文档切片真实 token 被低估 30%+（实测 450→627），
+  嵌入时被截断。改为 CJK/假名/全角/数字/标点均 1 token/字符、英文 ≈3 字符/token，
+  估算恒 ≥ 真实值。同步修正 `chunker._split_by_tokens` 内联计数器以匹配新规则。
+- **`RAGEngine` 加模型窗口硬上限（方案 2）**：`_clamp_chunk_size_to_model_window`
+  把切片预算夹紧到 embedding 模型上下文窗口 −2（bge 512→510，nomic 等 RoPE 8K 不受影响）。
+  无论配置或引擎默认值多大，切片预算都不超模型窗口。
+- **GUI 同步路径接线 config 切片参数**：`main_window.py` 构造 `RAGEngine` 此前**未传
+  `chunk_size`**，走引擎默认 1000（config 的 `rag_chunk_size=500` 在 GUI 路径是死配置），
+  这是日志显示 1000 的直接原因。现传入 `rag_chunk_size`/`rag_chunk_overlap`/`rag_chunk_overlap_percent`。
+- **`chunk_text` 新增 `_clamp_chunk_budget` 最终收口**：语义/混合分片在退化情形下
+  （无句末标点的长文、chonkie 拿到退化 EF 整体返回）与 `_snap_to_sentence_end` 残句并入
+  都可能产出超预算切片——此前完全漏出。现用与 `estimate_tokens` 一致的、不依赖 EF 的
+  token 硬切兜底，保证每片估算 ≤ chunk_size ⇒ 真实 ≤ chunk_size+2 ≤ 模型窗口。
+- **修正误导日志**：切片日志原打印 `self._chunk_size`（配置预算）冒充「每片约 X tokens」，
+  现改为真实测算的每片均值/最大 token 数。
+- **电子书直通支补齐收口**：`engine.py` 电子书快速路径（epub/mobi）原对「章节 ≤
+  `max_chars`」的整章直接 `append` 切片、绕过 `chunk_documents`/`_clamp_chunk_budget`，
+  完全依赖「字数 ≤ token 数」近似（罕见多 token 字符可漏窗）。现直通支也过一遍
+  `_clamp_chunk_budget`，安全网统一；`max_chars = self._chunk_size` 已被窗口夹紧到 510
+  （bge），故整章直通 ≤ 510 字 ≈ ≤ 512 token。这就是日志里「1000 字直通」的来源——
+  此前 `max_chars` 等于引擎默认 1000，≤1000 字章节整体切片 → 超窗截断。
+- **新增 500 字硬上限（小窗口模型）**：`_clamp_chunk_budget` 原有 token 预算收口只保证
+  `估算 ≤ chunk_size`（bge=510），对中文够用（≈510 字），但对英文/URL/代码——
+  一个 510 token 的英文片 ≈ 1700 字符，超出「切片 ≤ 500 字」的字数要求。现对小窗口
+  模型（`chunk_size ≤ 512`，此时 1 字≈1 token）额外保证每片字符数 ≤ 500；追加
+  `_split_by_chars` 字符级兜底切分器处理 token 已达标但字数仍超限的长串。大窗口模型
+  （nomic RoPE 8K，`chunk_size > 512`）不卡字符，避免英文被无谓碎裂。经验证：bge 路径下
+  中/英/URL/代码四类文档最终切片最大字符 = 500、最大真实 token = 502，无一片超限。
+
+### 验证
+`pytest tests/test_estimate_tokens.py tests/test_vector_fingerprint.py tests/test_hybrid_chunker.py
+tests/test_semantic_chunker.py tests/test_rag_e2e.py …` 全部通过（196 用例）。
+用 `models/bge-small-zh-v1.5-mlx` 真实 tokenizer 复验：中文无标点长文、标点/代码/URL/混合
+文档的每片真实 token 均 ≤ 512。
+
+---
+
+## 2026-10-26 · 修复：换 embedding 模型后旧向量库的静默混用 / 维度报错
+
+> 用户需求：更换 embedding 模型后，旧向量库（LanceDB）没有防护——维度不同时
+> `add`/`search` 抛难懂的 Arrow 字节长度错误；维度相同时（如 nomic fp32→Q）
+> 新旧模型的向量静默混在同一语义空间，检索质量劣化且无任何告警。
+
+### 改动
+- **VectorStore 新增 embedding 指纹校验**（`vector_store.py`）：
+  - 建表时把当前 embedding 指纹（`ef.name()`，如 `local:mlx:bge-small-zh-v1.5-mlx` /
+    `fastembed:nomic-ai/nomic-embed-text-v1.5-Q`）+ 维度写入同库的
+    `_embedding_meta` 表（按 table_name 区分行，与 documents 表共存）。
+  - `add` / `add_streaming` 在嵌入前、`search` 在检索前校验指纹：不一致抛
+    RuntimeError，明确给出「清空知识库重新同步 / 切回原模型」两条出路；
+    同维度换模型不再静默混用。校验结果按实例缓存，通过后不重复读 meta 表。
+  - 老库（无指纹表）打开时采用当前模型为基线并回写（历史模型无从得知）；
+    维度兜底校验（schema 的 vector 列 `list_size` vs 实际向量长度）拦下
+    「采用后维度不同」的场景，报可读错误而非 Arrow 字节长度错误。
+  - `clear()` 同步删除指纹表：清空后换模型可直接重建，不被旧指纹挡住。
+  - 指纹校验只在真正读写向量的路径拦截，`clear()` 永远可用（用户有自愈通道）。
+- 新增测试 `tests/test_vector_fingerprint.py`：建表记录指纹、同模型重开正常、
+  换模型报错（含错误信息出路）、老库采用、维度兜底、clear 后换模型重建。
+
+### 验证
+`pytest tests/test_vector_fingerprint.py` 全部通过；既有
+`test_vector_dedup.py` / `test_rag_e2e.py` 等向量相关测试无回归。
 
 ---
 

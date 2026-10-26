@@ -1,7 +1,8 @@
 """Text chunker — splits documents into overlapping chunks for RAG.
 
-Chunk sizes are measured in *tokens* (estimated via character-based heuristic:
-~2 chars/token for Chinese, ~3 chars/token for English).
+Chunk sizes are measured in *tokens* estimated by ``estimate_tokens``
+(character-class weighted, calibrated against bge-small-zh-v1.5's WordPiece —
+see that function for the per-class rules).
 """
 from __future__ import annotations
 
@@ -16,22 +17,77 @@ logger = logging.getLogger(__name__)
 # token estimation
 # ---------------------------------------------------------------------------
 
-# 预编译正则 + 用 finditer 计数：estimate_tokens() 在切片热路径上被调用
-# 非常频繁，re.findall 会把所有匹配物化成一个列表（整篇文档几万个中文字符
-# = 几万个临时单字符串对象），纯属浪费。
-_CJK_RE = re.compile(r'[\u4e00-\u9fff]')
+# 按字符类别计权的 token 估算（bge-small-zh-v1.5 的 WordPiece 校准）。
+# 旧实现把「非 CJK」统一按 3 字符/token 折算，但数字与标点（ASCII + 全角 +
+# General Punctuation）在 BERT 词表里是**每字符独立 token**——标点/代码/URL
+# 密集的切片真实 token 数超出估算 30%+（实测 450 → 627），嵌入时被 512 窗口
+# 静默截断。分类保证「估算 ≥ 真实值」：切片只会偏小，绝不超窗。
+#
+#   * CJK 汉字（含扩展 A）/ 假名 / CJK 标点 / 全角形式 → 每字符 1 token
+#   * 其余字符（数字、ASCII 标点、引号破折号等符号、希腊/西里尔等）→ 每字符
+#     1 token（BERT 词表内单 token 或最坏 [UNK]，均不合并）
+#   * ASCII 字母 → ≈3.39 字符/token（英文正文实测），按 3 取整略保守；
+#     字母段数（缩写词如 API/UI 每词 1 token）参与兜底
+#   * 空白 / 控制字符 → 0 token（BasicTokenizer 分词前丢弃）
+#
+# 实现：单次 str.translate（C 层）把字符分桶成标记字符 + str.count 统计，
+# 不物化 per-match 对象——estimate_tokens() 在切片热路径上被极高频调用，
+# finditer/findall 会为整篇文档产生几万个临时对象（与 kernel.budget 同款优化）。
+
+_WIDE_MARK, _LETTER_MARK, _SPACE_MARK = "\x01", "\x02", "\x03"
+
+
+def _build_bucket_table() -> dict:
+    """字符码点 → 分桶标记的 translate 表（模块级构建一次）。
+
+    \\x01-\\x03 本身是 C0 控制字符，已在表内映射为空白桶，不会与正文冲突。
+    """
+    table: dict = {}
+
+    def _mark(lo: int, hi: int, mark: str) -> None:
+        for cp in range(lo, hi + 1):
+            table[cp] = mark
+
+    # C0 控制字符 + ASCII 空白 + DEL → 空白桶（0 token）
+    _mark(0x00, 0x20, _SPACE_MARK)
+    table[0x7F] = _SPACE_MARK
+    # ASCII 字母
+    _mark(0x41, 0x5A, _LETTER_MARK)
+    _mark(0x61, 0x7A, _LETTER_MARK)
+    # CJK 标点(3000-303F) / 假名(3040-30FF) / 汉字扩展A / 汉字 / 兼容表意 / 全角
+    _mark(0x3000, 0x30FF, _WIDE_MARK)
+    _mark(0x3400, 0x4DBF, _WIDE_MARK)
+    _mark(0x4E00, 0x9FFF, _WIDE_MARK)
+    _mark(0xF900, 0xFAFF, _WIDE_MARK)
+    _mark(0xFF00, 0xFFEF, _WIDE_MARK)
+    return table
+
+
+_BUCKET_TABLE = _build_bucket_table()
+_LETTER_RUN_RE = re.compile("\x02+")  # 字母桶标记的连续段（= 英文单词/缩写）
 
 
 def estimate_tokens(text: str) -> int:
-    """Roughly estimate token count.
+    """估算文本的 embedding token 数（按 bge-small-zh-v1.5 校准，见上）。
 
-    按默认 embedding 模型 bge-small-zh-v1.5 实测校准：
-    中文 ≈ 1.0 字/token（BERT 中文词表逐字/常用词分词）；
-    英文 ≈ 3.39 字符/token，取 3 略保守（切片偏小，不会超窗）。
+    任何文本的真实值 ≤ 估算值 + 2（[CLS]/[SEP]），因此
+    ``rag_chunk_size ≤ 510`` 时切片必不超出 bge 的 512 窗口。
     """
-    chinese_chars = sum(1 for _ in _CJK_RE.finditer(text))
-    other_chars = len(text) - chinese_chars
-    return chinese_chars + other_chars // 3
+    if not text:
+        return 0
+    bucketed = text.translate(_BUCKET_TABLE)
+    letter_chars = bucketed.count(_LETTER_MARK)
+    # 字母段折叠成单标记（C 层 sub，不物化 run 对象）：折叠后的计数 = 段数，
+    # wide/space 计数不受影响，直接在折叠串上取。
+    collapsed = _LETTER_RUN_RE.sub(_LETTER_MARK, bucketed)
+    wide = collapsed.count(_WIDE_MARK)         # CJK/假名/全角 → 1 token/字符
+    spaces = collapsed.count(_SPACE_MARK)      # 0 token
+    # 其余 = 数字/标点/符号/其它文字 → 每字符 1 token
+    other = len(text) - wide - letter_chars - spaces
+    # 字母段数兜底：缩写词（API/UI/SDK）在词表内是整词 1 token，但两三个
+    # 字母的短词按 chars//3 会算出 0——按段数取较大者。
+    letters = max(letter_chars // 3, collapsed.count(_LETTER_MARK))
+    return wide + other + letters
 
 
 def _token_count(text: str) -> int:
@@ -127,8 +183,54 @@ def chunk_documents(
             for i, chunk in enumerate(chunks)
         ]
         # 句末收口按文档进行：需要原文 text 定位「残句 → 下一片」的真实跨度。
-        all_chunks.extend(_snap_to_sentence_end(doc_chunks, source=text))
-    return all_chunks
+        snapped = _snap_to_sentence_end(doc_chunks, source=text)
+        # 覆盖性兜底（#内容保真）：若语义/混合分片在退化 EF 下漏切（出现真实内容
+        # 间隔），回退到确定性递归分片——后者已验证无损。正常路径（真实 EF）覆盖
+        # 完整，此检查仅 O(n) 扫描，几乎零开销。
+        if not _covers_source(snapped, text):
+            logger.warning(
+                "chunker: 分片未覆盖原文全文（疑似丢内容），回退递归分片: %s", source
+            )
+            fallback = chunk_text(text, body_budget, eff_overlap)
+            doc_chunks = [
+                {"source": source, "chunk_index": i, "text": c}
+                for i, c in enumerate(fallback)
+            ]
+            snapped = _snap_to_sentence_end(doc_chunks, source=text)
+        all_chunks.extend(snapped)
+    # 最终预算收口：兜底任何超 budget 的切片（语义分片退化 / 残句并入下一片），
+    # 确保每片估算 ≤ chunk_size ⇒ 真实 ≤ chunk_size+2 ≤ embedding 模型窗口
+    # （bge 512）。token 硬切不依赖 EF，确定性。
+    return _clamp_chunk_budget(all_chunks, chunk_size)
+
+
+def _covers_source(chunks: List[Dict[str, Any]], source: str) -> bool:
+    """用布尔覆盖数组权威判定切片是否覆盖原文所有非空白字符。
+
+    之前用 ``str.find`` 从游标贪心定位，对重叠/重复文本会误判为已覆盖（假阳性），
+    导致丢内容兜底不触发。现改为：把每片文本在原文的（贪心）出现位置标记到覆盖
+    数组，最后要求每个非空白字符都已被覆盖。重叠、重复、边界空白被 ``.strip()``
+    掉均无影响；只有「某段非空白内容从未出现在任何切片中」才会判未覆盖——即真实
+    丢内容（语义/混合分片在退化 EF 下可能发生）。
+    """
+    if not source.strip():
+        return True
+    covered = bytearray(len(source))
+    cursor = 0
+    for c in chunks:
+        t = (c.get("text") or "").strip()
+        if not t:
+            continue
+        # 从已覆盖末尾继续找，失败再退回全文首现——重叠片起点在前一片之内也能命中。
+        p = source.find(t, cursor)
+        if p < 0:
+            p = source.find(t)
+        if p < 0:
+            return False
+        covered[p:p + len(t)] = b"\x01" * len(t)
+        cursor = p + len(t)
+    # 非空白字符须全部被覆盖
+    return all(covered[i] or ch.isspace() for i, ch in enumerate(source))
 
 
 # 句末判定：句号/问号/叹号/省略号/换行，或英文句点后跟空白（". "）。
@@ -184,6 +286,52 @@ def _snap_to_sentence_end(chunks: List[Dict[str, Any]],
         chunks[i]["text"] = cur[:cut].rstrip()
         chunks[i + 1]["text"] = source[t_pos:n_pos + len(nxt)]
     return chunks
+
+
+def _clamp_chunk_budget(
+    chunks: List[Dict[str, Any]], chunk_size: int,
+) -> List[Dict[str, Any]]:
+    """最终预算收口：任何超预算的切片用确定性硬切兜底。
+
+    两道独立保险：
+      1. token 预算：每片估算 ``estimate_tokens`` ≤ chunk_size ⇒ 真实 ≤
+         chunk_size+2 ≤ embedding 模型窗口（bge 512）。上游语义/混合分片在退化
+         情形下可能产出超大切片，或 ``_snap_to_sentence_end`` 残句并入下一片把
+         切片推过预算——这里统一收口。
+      2. 字数硬上限：小窗口模型（bge 等，chunk_size 已被夹到 ≤512，此时 1 字≈1
+         token）额外保证每片字符数 ≤ 500——即「切片（含其头部重叠）≤ 500 字」。
+         大窗口模型（nomic RoPE 8K 等）token 预算已远小于窗口，不再卡字符以免
+         英文/代码被无谓碎裂成 500 字小片。
+
+    token 硬切用 ``_split_by_tokens``（无重叠）；若仍有长串（英文 510 token ≈
+    1700 字符）超字数上限，再用 ``_split_by_chars`` 按字符兜底。丢失的是语义边界
+    连续性而非内容。
+    """
+    # 小窗口（char≈token）模型才卡 500 字；大窗口模型交给 token 预算即可。
+    max_chars = 500 if chunk_size <= 512 else None
+    out: List[Dict[str, Any]] = []
+    for c in chunks:
+        est = estimate_tokens(c["text"])
+        over = est > chunk_size or (max_chars is not None and len(c["text"]) > max_chars)
+        if not over:
+            out.append(c)
+            continue
+        logger.info(
+            "chunker: 切片超预算（估算 %d token / %d 字 > %d token / %s 字），兜底硬切",
+            est, len(c["text"]), chunk_size, max_chars,
+        )
+        for piece in _split_by_tokens(c["text"], chunk_size, 0):
+            if max_chars is None or len(piece) <= max_chars:
+                out.append({"source": c["source"], "chunk_index": 0, "text": piece})
+            else:
+                out.extend(
+                    {"source": c["source"], "chunk_index": 0, "text": p}
+                    for p in _split_by_chars(piece, max_chars)
+                )
+    # 重排 chunk_index（硬切插入了新片；下游依赖连续索引）
+    for i, c in enumerate(out):
+        c["chunk_index"] = i
+    return out
 
 
 def _chunk_with_hybrid_fallback(
@@ -339,9 +487,9 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
     """Split text by character positions, respecting token budget.
 
     Uses incremental token counting: O(n) overall instead of O(n²).
-    Maintains running CJK/other character counts and computes tokens
-    as ``cjk + other // 3`` — matching ``estimate_tokens`` exactly
-    but without rescanning the substring on every step.
+    分类规则与 ``estimate_tokens`` 完全一致（字符桶 + 字母段兜底）——旧实现
+    在此维护了一份 ``cjk + other // 3`` 的独立计数器，估算器改按类别计权后
+    会重新低估数字/标点，故统一走 _BUCKET_TABLE。
     """
     chunks: List[str] = []
     pos = 0  # character position
@@ -351,15 +499,24 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
         # Find a character window that fits within token budget.
         # Incremental: add one char at a time, update running counts.
         end = pos
-        cjk = 0
-        other = 0
+        wide = letter_chars = others = runs = 0
+        prev_letter = False
         while end < text_len:
-            ch = text[end]
-            if 0x4e00 <= ord(ch) <= 0x9fff:
-                cjk += 1
+            mark = _BUCKET_TABLE.get(ord(text[end]))
+            if mark is _WIDE_MARK:
+                wide += 1
+                prev_letter = False
+            elif mark is _LETTER_MARK:
+                letter_chars += 1
+                if not prev_letter:
+                    runs += 1  # 段首：字母段数兜底（API/UI 整词 1 token）
+                prev_letter = True
+            elif mark is _SPACE_MARK:
+                prev_letter = False  # 空白/控制字符：0 token
             else:
-                other += 1
-            if cjk + other // 3 > chunk_size:
+                others += 1
+                prev_letter = False
+            if wide + others + max(letter_chars // 3, runs) > chunk_size:
                 break
             end += 1
 
@@ -402,6 +559,38 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
                 break
         pos = max(overlap_start, pos + 1)  # ensure forward progress
 
+    return chunks
+
+
+def _split_by_chars(text: str, max_chars: int) -> List[str]:
+    """字符级兜底硬切：保证每片字符数 ≤ ``max_chars``。
+
+    仅用于预算收口对「token 已达标但字符数仍超限」的最后兜底——英文/URL/代码
+    等长串（510 token 英文 ≈ 1700 字符）在 token 预算下不触发拆分，但违反
+    「切片 ≤ 500 字」的字数硬上限。在换行/句号/空白边界断开，找不到边界则硬切；
+    不附加重叠（安全网，语义连续性已不可达）。
+    """
+    if max_chars <= 0 or not text:
+        return []
+    chunks: List[str] = []
+    n = len(text)
+    pos = 0
+    while pos < n:
+        end = min(pos + max_chars, n)
+        if end < n:
+            # 向后找最近的自然边界，但不得回退超一半，且不得越过 max_chars。
+            for brk in ("\n", "。", " ", ". "):
+                lb = text.rfind(brk, pos + max_chars // 2, end)
+                if lb > pos and lb + len(brk) <= pos + max_chars:
+                    end = lb + len(brk)
+                    break
+        piece = text[pos:end].strip()
+        if piece:
+            chunks.append(piece)
+            pos = end
+        else:
+            # 整段是空白：前进 1 字符，避免死循环
+            pos = pos + 1
     return chunks
 
 

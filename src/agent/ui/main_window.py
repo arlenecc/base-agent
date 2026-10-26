@@ -814,6 +814,12 @@ class SyncKnowledgeWorker(QThread):
                 rerank_model=getattr(self._config, "rag_rerank_model",
                                      DEFAULT_RERANK_MODEL),
                 rerank_enabled=bool(getattr(self._config, "rag_rerank_enabled", True)),
+                # 切片大小/重叠从 config 接线（此前 GUI 同步路径没传，导致引擎
+                # 用默认 1000，远超 bge 的 512 窗口、切片被静默截断——见
+                # _clamp_chunk_size_to_model_window 兜底，但这里仍尊重用户配置）。
+                chunk_size=getattr(self._config, "rag_chunk_size", 500),
+                chunk_overlap=getattr(self._config, "rag_chunk_overlap", 50),
+                overlap_percent=getattr(self._config, "rag_chunk_overlap_percent", 0.10),
             )
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
@@ -2705,14 +2711,26 @@ class MainWindow(QMainWindow):
         # deleteLater 必须挂到 QThread 内建的 finished（run() 返回后触发），
         # 挂在自定义信号上会在 run() 执行途中销毁线程对象。
         self._deps_worker.finished.connect(self._deps_worker.deleteLater)
+        # worker 引用也只在 built-in finished（run() 已返回）时清理。
+        # deps_finished 是 run() 内部 emit 的自定义信号，槽里把
+        # self._deps_worker 置 None 会让最后的 Python 引用归零 → sip 立刻
+        # 析构**仍在运行**的 C++ QThread → qFatal → SIGABRT（2026-10-26
+        # 崩溃报告实证：PyObject_SetAttr → subtype_dealloc → QThread::~QThread）。
+        self._deps_worker.finished.connect(self._on_deps_thread_finished)
         self._deps_worker.start()
+
+    def _on_deps_thread_finished(self) -> None:
+        """QThread 内建 finished（run() 已返回）——此刻清 worker 引用才安全。"""
+        self._deps_worker = None
 
     def _on_deps_progress(self, msg: str) -> None:
         self.status_label.setText(msg)
         self._append_log(f"[deps] {msg}")
 
     def _on_deps_finished(self, report) -> None:
-        self._deps_worker = None
+        # 注意：这里**不能**置 self._deps_worker = None——deps_finished 是
+        # run() 内部 emit 的，此刻 C++ 线程多半还活着；引用由
+        # _on_deps_thread_finished（built-in finished）统一清理。
         # 检查用户是否在依赖检查期间点击了停止同步
         if self._deps_cancelled:
             self._deps_cancelled = False
@@ -2846,7 +2864,11 @@ class MainWindow(QMainWindow):
             if hasattr(self, '_log_handler') and self._log_handler is not None:
                 logger.info("UI: sync_finished received, emit_count=%d emit_errors=%d",
                             self._log_handler._emit_count, self._log_handler._emit_errors)
-            self._sync_worker = None
+            # 这里**不能**置 self._sync_worker = None：sync_finished 是 run()
+            # 内部 emit 的自定义信号，此刻 C++ 线程还在收尾（释放 docling
+            # converter 等），清掉最后的 Python 引用会立即 sip 析构运行中的
+            # QThread → qFatal → SIGABRT（2026-10-26 崩溃报告实证）。引用由
+            # _on_sync_thread_finished（built-in finished，run() 已返回）清理。
             # 刷新 agent 的 RAG 引擎表句柄，让下一次搜索看到新写入的数据。
             # LanceDB 表对象在打开时获取版本快照，同步后不重新打开会看到旧数据。
             if self._agent is not None:
@@ -2899,8 +2921,8 @@ class MainWindow(QMainWindow):
                 self.stop_sync_btn.setEnabled(False)
                 self.progress.setRange(0, 1)
                 self.progress.setValue(0)
-                self._sync_worker = None
                 self.status_label.setText("同步完成（显示结果时出错）")
+                # 引用清理不在异常路径做（同上），由 _on_sync_thread_finished 收尾。
             except Exception:
                 pass
 
@@ -2981,7 +3003,8 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self.status_label.setText("知识库同步失败")
-            self._sync_worker = None
+            # 不在此处清引用（sync_failed 是 run() 内部 emit 的自定义信号），
+            # 由 _on_sync_thread_finished（built-in finished）统一清理。
             QMessageBox.critical(self, "同步失败", f"知识库同步失败：\n{error}")
         except Exception as e:
             logger.error("UI: _on_sync_failed error: %s", e, exc_info=True)
@@ -2990,7 +3013,6 @@ class MainWindow(QMainWindow):
                 self.stop_sync_btn.setEnabled(False)
                 self.progress.setRange(0, 1)
                 self.progress.setValue(0)
-                self._sync_worker = None
             except Exception:
                 pass
 
