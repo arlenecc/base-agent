@@ -24,6 +24,7 @@
 """
 import inspect
 import json
+import os
 import sys
 
 import pytest
@@ -430,3 +431,57 @@ class TestModelCacheProbe:
         # vocab.txt 是 BERT 式遗留项：fastembed 的 additional_files 为空，
         # 不会下载它，列进清单 = 探测永远 False
         assert "vocab.txt" not in deps._EMBEDDING_REQUIRED_FILES
+
+
+# ---------------------------------------------------------------------------
+# 本地 MLX embedding：bge-small-zh-v1.5-mlx 作为 nomic 的可选替代方案。
+# 仓库里的 bge MLX 权重是 mlx-lm 格式键名（query_proj/linear1/ln1/pooler），
+# mlx-embeddings 不认，项目用本包的 MLX BERT 实现（local/mlx_bert.py）加载，
+# 并自动套用 bge v1.5 的 query 指令前缀。MLX / 权重缺失时跳过（与本地权重
+# 测试一致的策略）。
+# ---------------------------------------------------------------------------
+_BGE_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "models", "bge-small-zh-v1.5-mlx"
+)
+
+
+def _bge_available():
+    try:
+        import mlx.core  # noqa: F401
+        return os.path.isdir(_BGE_DIR)
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _bge_available(), reason="MLX 或 bge 模型目录不可用")
+class TestLocalBgeMlx:
+    def test_bge_loads_and_dims(self):
+        """bge 经本地 MLX 路径加载，输出 512 维、L2 归一化的向量。"""
+        from agent.local.embedding import LocalEmbeddingFunction
+
+        ef = LocalEmbeddingFunction(_BGE_DIR, backend="mlx")
+        v = ef.embed_query("如何在 Python 里读写 JSON 文件")
+        assert len(v) == 512, f"bge 应为 512 维，实际 {len(v)}"
+        norm = sum(x * x for x in v) ** 0.5
+        assert abs(norm - 1.0) < 1e-3, f"bge 输出未 L2 归一化: {norm}"
+
+    def test_bge_query_instruction_applied(self):
+        """bert 族自动套 bge query 指令前缀（仅 query 用，document 不加）。"""
+        from agent.local.embedding import LocalEmbeddingFunction
+
+        ef = LocalEmbeddingFunction(_BGE_DIR, backend="mlx")
+        # family 应识别为 bert → 默认带 bge query 指令
+        assert ef._family == "bert"
+        assert ef._query_prefix.startswith("Represent this sentence")
+        assert ef._doc_prefix == ""
+
+    def test_bge_end_to_end_via_provider(self):
+        """经真实 provider 路径（local_embedding_model=bge 名）也能产出 512 维。"""
+        from agent.local import registry
+
+        path = registry.resolve_model_path("embedding", "bge-small-zh-v1.5-mlx")
+        from agent.local.embedding import LocalEmbeddingFunction
+
+        ef = LocalEmbeddingFunction(path, backend="mlx")
+        v = ef.embed_documents(["知识库里关于机器学习的章节内容。"])[0]
+        assert len(v) == 512

@@ -26,10 +26,14 @@ logger = logging.getLogger(__name__)
 _NOMIC_DOC_PREFIX = "search_document: "
 _NOMIC_QUERY_PREFIX = "search_query: "
 
-# 各模型族的 (doc_prefix, query_prefix)。未知族 → 空前缀（bge-m3 / e5 等
-# 对称模型不需要前缀；需要 query instruction 的模型可后续在此扩展）。
+# bge v1.5 官方 query 指令（仅 query 用，document 不加）。同源模型（bge 系列
+# 对称/非对称 embedding）复用；非 bge 的 bert 类模型若不需要指令可忽略。
+_BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
+
+# 各模型族的 (doc_prefix, query_prefix)。未知族 → 空前缀（对称模型不需要前缀）。
 _FAMILY_PREFIXES = {
     "nomic_bert": (_NOMIC_DOC_PREFIX, _NOMIC_QUERY_PREFIX),
+    "bert": ("", _BGE_QUERY_INSTRUCTION),
 }
 
 
@@ -133,6 +137,14 @@ class LocalEmbeddingFunction:
             from transformers import AutoTokenizer
             self._tokenizer = AutoTokenizer.from_pretrained(self._path)
             return
+        if self._family == "bert":
+            # 仓库里的 bge MLX 权重是 mlx-lm 格式键名（query_proj/linear1/ln1/
+            # pooler），mlx-embeddings 不认 → 用本包的 MLX BERT 实现。
+            from .mlx_bert import load_bert
+            self._model, _cfg = load_bert(self._path, dtype=self._dtype)
+            from transformers import AutoTokenizer
+            self._tokenizer = AutoTokenizer.from_pretrained(self._path)
+            return
         try:
             from mlx_embeddings import load as _load
         except Exception as e:
@@ -206,6 +218,14 @@ class LocalEmbeddingFunction:
         import mlx.core as mx
         if self._family == "nomic_bert":
             from .mlx_nomic import l2_normalize, mean_pool
+            enc = self._tokenizer(texts, padding=True, truncation=True,
+                                  max_length=self._max_length, return_tensors="np")
+            hidden = self._model(mx.array(enc["input_ids"]),
+                                 mx.array(enc["attention_mask"]))
+            pooled = l2_normalize(mean_pool(hidden, mx.array(enc["attention_mask"])))
+            return [list(map(float, row)) for row in pooled.tolist()]
+        if self._family == "bert":
+            from .mlx_bert import l2_normalize, mean_pool
             enc = self._tokenizer(texts, padding=True, truncation=True,
                                   max_length=self._max_length, return_tensors="np")
             hidden = self._model(mx.array(enc["input_ids"]),
