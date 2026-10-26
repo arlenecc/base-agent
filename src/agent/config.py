@@ -54,14 +54,15 @@ class AgentConfig:
     kernel_max_digest_lines: int = 40
 
     # RAG settings
-    # 切片大小：内部按 chunker.estimate_tokens 估算（2 个汉字 ≈ 1 token、
-    # 3 个英文字符 ≈ 1 token），250 ≈ 500 汉字/片。取 500 字是为配合
-    # bge-small-zh 的 512 token 位置上限——更大的片会在嵌入时被截断丢内容。
-    rag_chunk_size: int = 250
+    # 切片大小，单位 = token（估算器 chunker.estimate_tokens 已按默认 embedding
+    # bge-small-zh-v1.5 实测校准：中文 ≈1 字/token、英文 ≈3 字符/token，配置值
+    # 直接等于真实 token 预算）。500 token 贴着 bge 的 512 位置上限，嵌入时
+    # 几乎不截断；再调大就会在嵌入阶段丢内容。
+    rag_chunk_size: int = 500
     # 相邻分片重叠：overlap_percent 生效时按 chunk_size 百分比计算
-    # （250 × 10% = 25 token ≈ 50 汉字）；rag_chunk_overlap 仅作无百分比时的
-    # 兜底，两者保持同一比例（10%）。
-    rag_chunk_overlap: int = 25
+    # （500 × 10% = 50 token）；rag_chunk_overlap 仅作无百分比时的兜底，
+    # 两者保持同一比例（10%）。
+    rag_chunk_overlap: int = 50
     rag_chunk_overlap_percent: float = 0.10
     # rag_search 默认返回条数（重排后的最终结果数）。
     rag_search_top_k: int = 5

@@ -25,11 +25,13 @@ _CJK_RE = re.compile(r'[\u4e00-\u9fff]')
 def estimate_tokens(text: str) -> int:
     """Roughly estimate token count.
 
-    Chinese: ~2 chars per token.  English: ~3 chars per token.
+    按默认 embedding 模型 bge-small-zh-v1.5 实测校准：
+    中文 ≈ 1.0 字/token（BERT 中文词表逐字/常用词分词）；
+    英文 ≈ 3.39 字符/token，取 3 略保守（切片偏小，不会超窗）。
     """
     chinese_chars = sum(1 for _ in _CJK_RE.finditer(text))
     other_chars = len(text) - chinese_chars
-    return chinese_chars // 2 + other_chars // 3
+    return chinese_chars + other_chars // 3
 
 
 def _token_count(text: str) -> int:
@@ -83,7 +85,10 @@ def chunk_documents(
 
     Args:
         documents: List of dicts with 'source' (filepath) and 'text' keys.
-        chunk_size: Target maximum chunk size in **tokens** (1000).
+        chunk_size: **最终切片**（含下一片头部的重叠）的 token 预算上限。
+            切分器实际拿到的正文预算为 ``chunk_size - overlap``，因此相邻片
+            「重叠 + 正文」不会超过该值——直接对应 embedding 模型的 token
+            窗口（如 bge-small-zh 的 512）。
         chunk_overlap: Overlap between chunks in **tokens** (default 5% of
             ``chunk_size`` = 50).
         min_chunk_size: Target minimum chunk size in **tokens** (100) — used by
@@ -101,13 +106,20 @@ def chunk_documents(
     chunker.
     """
     all_chunks: List[Dict[str, Any]] = []
+    # 重叠头部是**追加**在下一片之上的、不占该片自身的切块预算——若不补偿，
+    # 最终切片会达到 chunk_size + overlap，超出 embedding 模型的 token 窗口
+    # （如 500+50=550 > 512）。这里把正文预算压为 chunk_size - overlap，使
+    # 「重叠头 + 正文 ≤ chunk_size」，并把显式 overlap 传下去（percent=None，
+    # 避免底层再用 body 预算反推 overlap 导致数值漂移）。
+    eff_overlap = int(chunk_size * overlap_percent) if overlap_percent else chunk_overlap
+    body_budget = max(min_chunk_size, chunk_size - eff_overlap)
     for doc in documents:
         source = doc.get("source", "unknown")
         text = doc.get("text", "")
         total_tokens = estimate_tokens(text)
         logger.debug("      文档切片: %s (%d 字符, 约 %d tokens)", source, len(text), total_tokens)
         chunks = _chunk_with_hybrid_fallback(
-            text, chunk_size, chunk_overlap, min_chunk_size, overlap_percent,
+            text, body_budget, eff_overlap, min_chunk_size, None,
             embedding_function,
         )
         doc_chunks = [
@@ -264,7 +276,7 @@ def _split_recursive(
                 part_cjk, part_other = _char_counts(part)
                 new_cjk = cur_cjk + sep_cjk + part_cjk
                 new_other = cur_other + sep_other + part_other
-                new_tokens = new_cjk // 2 + new_other // 3
+                new_tokens = new_cjk + new_other // 3
                 if new_tokens <= chunk_size:
                     cur_cjk = new_cjk
                     cur_other = new_other
@@ -288,7 +300,7 @@ def _split_recursive(
             else:
                 # First part
                 part_cjk, part_other = _char_counts(part)
-                if part_cjk // 2 + part_other // 3 <= chunk_size:
+                if part_cjk + part_other // 3 <= chunk_size:
                     current = part
                     cur_cjk = part_cjk
                     cur_other = part_other
@@ -328,7 +340,7 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
 
     Uses incremental token counting: O(n) overall instead of O(n²).
     Maintains running CJK/other character counts and computes tokens
-    as ``cjk // 2 + other // 3`` — matching ``estimate_tokens`` exactly
+    as ``cjk + other // 3`` — matching ``estimate_tokens`` exactly
     but without rescanning the substring on every step.
     """
     chunks: List[str] = []
@@ -347,7 +359,7 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
                 cjk += 1
             else:
                 other += 1
-            if cjk // 2 + other // 3 > chunk_size:
+            if cjk + other // 3 > chunk_size:
                 break
             end += 1
 
@@ -386,7 +398,7 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
             else:
                 ov_other += 1
             overlap_start -= 1
-            if ov_cjk // 2 + ov_other // 3 >= chunk_overlap:
+            if ov_cjk + ov_other // 3 >= chunk_overlap:
                 break
         pos = max(overlap_start, pos + 1)  # ensure forward progress
 
@@ -496,7 +508,7 @@ def _merge_overlap(chunks: List[str], overlap: int, sep: str,
                 else:
                     m_other += 1
                 boundary -= 1
-                if m_cjk // 2 + m_other // 3 >= overlap:
+                if m_cjk + m_other // 3 >= overlap:
                     break
             prev_end = prev[boundary:]
 

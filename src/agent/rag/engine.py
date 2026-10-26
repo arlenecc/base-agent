@@ -1193,9 +1193,11 @@ class RAGEngine:
                                     except Exception as e:
                                         logger.warning("    ├─ ⚠ 目录缩略版写入失败: %s: %s", fname, e)
                                     # 章节即切片；超长章节再用通用切块器二次切分
-                                    # （避免单块超出 embedding 模型 token 上限）
+                                    # （避免单块超出 embedding 模型 token 上限）。
+                                    # _chunk_size 单位为 token 且中文 ≈1 字/token，
+                                    # 整章保留阈值直接取该值（500 token ≈ ≤512 窗口）。
                                     doc_chunks: List[Dict[str, str]] = []
-                                    max_chars = self._chunk_size * 6
+                                    max_chars = self._chunk_size
                                     for ch in book["chapters"]:
                                         if len(ch) <= max_chars:
                                             doc_chunks.append({"source": filepath, "text": ch})
