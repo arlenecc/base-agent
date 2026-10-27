@@ -1659,7 +1659,11 @@ class MainWindow(QMainWindow):
         r2.addWidget(self.ocr_second_label)
         r2.addWidget(self.ocr_mmproj_edit, 1); r2.addWidget(self.ocr_mmproj_pick)
         r2.addWidget(self.ocr_tokenizer_edit, 1); r2.addWidget(self.ocr_tokenizer_pick)
-        klay.addLayout(r2)
+        # 注意：r2 已在上面通过 QHBoxLayout(self.ocr_second_w) 设为该容器的布局，
+        # 这里必须 addWidget（添加容器控件），不能 addLayout(r2)——后者会把已有
+        # 父对象的布局再挂到 klay，触发 "QHBoxLayout already has a parent" 警告，
+        # 且会让 ocr_second_w 变成没有布局的孤儿控件（显隐切换失效）。
+        klay.addWidget(self.ocr_second_w)
         self.ocr_impl_combo.currentTextChanged.connect(
             lambda _: self._sync_second_path(
                 self.ocr_second_w, self.ocr_impl_combo, self.ocr_second_label,

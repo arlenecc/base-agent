@@ -351,12 +351,11 @@ class AgentConfig:
         kwargs = {}
         for k, v in data.items():
             if k not in known:
-                # 手写 config.json 打错字段名（如 rag_chunk_size 写成
-                # rag_chunksize）时不该静默用默认值 —— 那会让「明明改了配置
-                # 却没生效」变成一道没有线索的题。
-                logger.warning(
-                    "config: ignoring unknown key %r (check for typos)", k
-                )
+                # config.json 可能与另一个共用 ~/.base-agent 的软件共享同一文件，
+                # 对方会写入本方不识别的键（参数定义不同）——这些不是拼写错误，
+                # 不该刷 "ignoring unknown key" 噪音，也不能在 save() 时被冲掉。
+                # 仅在 debug 级别记录，便于排查真正的拼写错误。
+                logger.debug("config: 忽略外部软件写入的键 %r（共享配置文件）", k)
                 continue
             coerced = cls._coerce(k, v)
             if coerced is not None:
@@ -464,6 +463,21 @@ class AgentConfig:
         import tempfile
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # 保留「本软件不认识的键」：config.json 可能与另一个共用 ~/.base-agent
+        # 的软件共享同一文件，对方会写入本方不识别的键（参数定义不同）。旧实现
+        # 直接 dump self.__dict__ 会把那些外来键冲掉，导致另一个软件的配置丢失。
+        # 因此先读回现有文件，把本方管理的已知字段覆盖上去，其余键原样保留。
+        out: dict = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    out = dict(existing)
+            except (OSError, json.JSONDecodeError):
+                pass
+        for name in type(self).__dataclass_fields__:
+            out[name] = getattr(self, name)
         # 原子写：先写临时文件再 os.replace。旧实现直接 open(path, "w")，
         # 写一半崩溃（断电/强杀）会留下截断的 JSON，下次启动 load() 直接抛
         # JSONDecodeError 导致程序无法启动。
@@ -472,7 +486,7 @@ class AgentConfig:
                                    dir=os.path.dirname(path) or ".")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self.__dict__, f, ensure_ascii=False, indent=2)
+                json.dump(out, f, ensure_ascii=False, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
