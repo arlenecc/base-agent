@@ -42,6 +42,7 @@ from ..tools import ToolRegistry
 from ..rag.engine import RAGEngine
 from ..rag.vector_store import DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL
 from .ocr_test_dialog import OcrTestDialog
+from .convert_tool_dialog import ConvertToolDialog
 
 
 CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
@@ -820,6 +821,7 @@ class SyncKnowledgeWorker(QThread):
                 chunk_size=getattr(self._config, "rag_chunk_size", 500),
                 chunk_overlap=getattr(self._config, "rag_chunk_overlap", 50),
                 overlap_percent=getattr(self._config, "rag_chunk_overlap_percent", 0.10),
+                use_semantic=getattr(self._config, "rag_chunk_semantic", True),
             )
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
@@ -1194,6 +1196,8 @@ class MainWindow(QMainWindow):
         # OCR 识别测试窗口（配置面板「识别测试」打开）：控件由对话框自己持有，
         # 关闭即销毁，这里只保存引用以便重复打开时复用同一个实例。
         self._ocr_test_dialog: Optional[OcrTestDialog] = None
+        # 文件转 Markdown 转换工具窗口（配置面板「转换工具」打开）。
+        self._convert_tool_dialog = None
 
         self._log_host = QWidget(self)
         log_host_lay = QVBoxLayout(self._log_host)
@@ -1306,6 +1310,53 @@ class MainWindow(QMainWindow):
         self._ocr_test_dialog.show()
         self._ocr_test_dialog.raise_()
         self._ocr_test_dialog.activateWindow()
+
+    def _on_open_convert_tool(self) -> None:
+        """配置面板「转换工具」：打开「文件转 Markdown」独立窗口。
+
+        转换窗口在「开始转换」时会调用 :meth:`sync_rag_config_to_rag_layer`
+        自动采用当前面板里的 PDF 引擎 / OCR 模型等设置，所以这里无需提前注入，
+        只负责创建 / 置顶窗口。
+        """
+        if getattr(self, "_convert_tool_dialog", None) is None:
+            self._convert_tool_dialog = ConvertToolDialog(self, self)
+        self._convert_tool_dialog.show()
+        self._convert_tool_dialog.raise_()
+        self._convert_tool_dialog.activateWindow()
+
+    def sync_rag_config_to_rag_layer(self) -> None:
+        """把面板当前控件值写入 config 并重新注入 RAG 解析层全局（不重建 Agent）。
+
+        转换工具「开始转换」时调用：用户可能改了 PDF 引擎 / OCR 模型等却还没点
+        「应用配置」，这里把最新面板值落进 config 对象并重新注入 ``rag`` 层的
+        模块级全局（set_pdf_engine / set_ovis_model_config / set_ocr_config /
+        set_ocr_scale_config），确保转换过程与「应用配置」后完全一致。与
+        ``_rebuild_agent`` 内的同款注入一致，但不触发 Agent 重建（解析链路与
+        LLM Agent 互不依赖）。
+        """
+        self._gather_config_from_widgets()
+        try:
+            from agent.rag import engine as _rag_engine_mod
+            _rag_engine_mod.set_pdf_engine(
+                getattr(self.config, "rag_pdf_engine", "docling"))
+            _rag_engine_mod.set_ovis_model_config(
+                getattr(self.config, "rag_ocr_engine", "mlx-vlm"),
+                getattr(self.config, "rag_ocr_model_name",
+                        "OvisOCR2-0.8B-MLX-4bit"),
+                getattr(self.config, "rag_ocr_model_path", ""),
+                getattr(self.config, "rag_ocr_mmproj_path", ""),
+                getattr(self.config, "rag_ocr_tokenizer_path", ""),
+            )
+            from agent.rag import parsers as _rag_parsers
+            _rag_parsers.set_ocr_config(self.config)
+            from agent.rag.docling_parser import set_ocr_scale_config
+            set_ocr_scale_config(
+                base=getattr(self.config, "rag_ocr_scale_base", 2.0),
+                dynamic=getattr(self.config, "rag_ocr_scale_dynamic", False),
+                table=getattr(self.config, "rag_ocr_scale_table", 2.5),
+            )
+        except Exception as e:  # pragma: no cover - 注入失败不阻塞转换
+            logger.debug("转换工具：RAG 配置注入失败（忽略）: %s", e)
 
     def _build_config_panel(self) -> QWidget:
         """配置窗口内容：两大区 —— Agent 模型配置 / 知识同步配置。"""
@@ -1582,6 +1633,19 @@ class MainWindow(QMainWindow):
         self.save_ocr_settings_btn.clicked.connect(self._on_save_ocr_settings)
         r.addWidget(self.save_ocr_settings_btn)
         r.addWidget(self.ocr_test_btn)
+        # 「转换工具」：打开独立的「文件转 Markdown」窗口，单独把各类文件批量
+        # 提取转换成 Markdown 并保存到指定目录（解析/提取/图片识别/清洗/MD
+        # 转换均复用 RAG 入库链路同一套处理逻辑）。
+        self.convert_tool_btn = QPushButton("转换工具")
+        self.convert_tool_btn.setFixedWidth(84)
+        self.convert_tool_btn.setToolTip(
+            "打开「文件转 Markdown 转换工具」：\n"
+            "选单个文件或指定目录（支持 PDF/EPUB/Word/Excel/PPT/HTML/图片/TXT 等），"
+            "设置保存目录后一键批量转换成 Markdown；\n"
+            "自动采用当前配置面板里的 PDF 引擎 / OCR 模型等设置，进度条实时显示当前"
+            "文件、处理环节与总进度。")
+        self.convert_tool_btn.clicked.connect(self._on_open_convert_tool)
+        r.addWidget(self.convert_tool_btn)
         klay.addLayout(r)
 
         # OCR 第二路径（gguf→mmproj 视觉塔 / onnx→tokenizer），按类型显隐
@@ -1659,6 +1723,39 @@ class MainWindow(QMainWindow):
         self.stop_sync_btn.setEnabled(False)
         self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
         r.addWidget(self.stop_sync_btn)
+        klay.addLayout(r)
+
+        # row3.5: 切片参数（大小 / 重叠）—— 同步到所有文本分片环节。
+        # 解析 / 提取得到的 Markdown 文本会经「递归分片 → 语义分片 → 混合分片」
+        # 三级回退切分，最后统一过 _clamp_chunk_budget 预算收口；这四处的切片
+        # 大小与重叠都来自下面的同一组配置（rag_chunk_size / rag_chunk_overlap），
+        # 不会出现「用户设了长分片、却在某个环节被切成短片」的脱节。
+        # 语义切片点选框：默认选中；去掉则跳过混合/语义分片，直接按字数递归切分。
+        self.semantic_chunk_chk = QCheckBox("语义切片")
+        self.semantic_chunk_chk.setChecked(
+            bool(getattr(self.config, "rag_chunk_semantic", True)))
+        self.semantic_chunk_chk.setToolTip(
+            "勾选（默认）：按语义边界切分（混合分片 → 语义分片 → 递归分片三级回退，"
+            "会使用嵌入模型）。\n取消勾选：不做语义切片，直接按字数（token）递归切分，"
+            "确定性、可离线、不加载任何嵌入模型。")
+        klay.addWidget(self.semantic_chunk_chk)
+        self.chunk_size_edit = _num(str(getattr(self.config, "rag_chunk_size", 500)), 64)
+        self.chunk_size_edit.setToolTip(
+            "切片大小（单位：token）。送入 embedding 前的单块预算上限；\n"
+            "实际切片 = 正文预算 + 重叠头，均不超过该值。\n"
+            "若 embedding 模型上下文窗口较小（如 bge 512），引擎会自动夹紧到窗口上限，"
+            "避免嵌入阶段静默截断。")
+        self.chunk_overlap_edit = _num(str(getattr(self.config, "rag_chunk_overlap", 50)), 64)
+        self.chunk_overlap_edit.setToolTip(
+            "相邻分片重叠（单位：token）。用于保持分片边界处的上下文连续性；\n"
+            "值过大会浪费嵌入算力，过小会丢失跨边界语义。建议为切片大小的 5%~15%。")
+        r = QHBoxLayout(); r.setSpacing(8)
+        r.addWidget(QLabel("切片大小")); r.addWidget(self.chunk_size_edit)
+        r.addSpacing(10)
+        r.addWidget(QLabel("重叠")); r.addWidget(self.chunk_overlap_edit)
+        r.addSpacing(12)
+        r.addWidget(QLabel("（单位：token；同步应用于递归 / 语义 / 混合分片与预算收口）", ))
+        r.addStretch(1)
         klay.addLayout(r)
 
         lay.addWidget(kb_box)
@@ -2249,6 +2346,13 @@ class MainWindow(QMainWindow):
             self.config.reranker_provider, self.config.local_reranker_backend))
         self.reranker_model_name_edit.setText(self.config.rag_rerank_model)
         self.reranker_path_edit.setText(self.config.local_reranker_model)
+        # 切片参数：语义切片开关 / 大小 / 重叠（token）。重叠以显式 token 为准
+        # （关闭百分比驱动），使「重叠」输入直接生效，并随切片大小一起同步到所有
+        # 分片环节。
+        self.semantic_chunk_chk.setChecked(
+            bool(getattr(self.config, "rag_chunk_semantic", True)))
+        self.chunk_size_edit.setText(str(getattr(self.config, "rag_chunk_size", 500)))
+        self.chunk_overlap_edit.setText(str(getattr(self.config, "rag_chunk_overlap", 50)))
         # Embedding / Reranker 的「模型名 ↔ 本地路径」显隐：fastembed 显示模型名、
         # 隐藏路径；本地实现反之。按当前下拉值一次性同步初始可见性。
         self._sync_impl_fields(self.embedding_impl_combo,
@@ -2375,6 +2479,15 @@ class MainWindow(QMainWindow):
             if rname:
                 self.config.rag_rerank_model = rname
         self.config.local_reranker_model = self.reranker_path_edit.text().strip()
+        # 切片参数：语义切片开关 / 大小 / 重叠（单位 token）。重叠以显式 token 为
+        # 准（关闭百分比驱动），使「重叠」输入直接生效，并随切片大小同步到所有
+        # 文本分片环节（递归 / 语义 / 混合分片 + _clamp_chunk_budget 预算收口），
+        # 避免脱节。取消「语义切片」时，chunk_documents 直接走确定性递归分片，
+        # 不加载任何嵌入模型。
+        self.config.rag_chunk_semantic = self.semantic_chunk_chk.isChecked()
+        _num(self.chunk_size_edit, "rag_chunk_size", 500, int, "切片大小")
+        _num(self.chunk_overlap_edit, "rag_chunk_overlap", 50, int, "重叠")
+        self.config.rag_chunk_overlap_percent = 0.0
         # PDF 解析引擎（docling | marker | ovis）：显示标签 → 内部值。
         self.config.rag_pdf_engine = _PDF_DISPLAY_TO_VALUE.get(
             self.pdf_engine_combo.currentText().strip(), "docling")

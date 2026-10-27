@@ -65,6 +65,10 @@ class AgentConfig:
     # 两者保持同一比例（10%）。
     rag_chunk_overlap: int = 50
     rag_chunk_overlap_percent: float = 0.10
+    # 是否启用语义切片：True（默认）走「混合分片 → 语义分片 → 递归分片」三级回退，
+    # 按语义边界切分；False 时跳过语义/混合分片，直接按字数（token）递归切分，
+    # 不加载任何嵌入模型，适合追求确定性 / 离线 / 不希望语义切片的场景。
+    rag_chunk_semantic: bool = True
     # rag_search 默认返回条数（重排后的最终结果数）。
     rag_search_top_k: int = 5
     # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：

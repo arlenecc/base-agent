@@ -131,6 +131,7 @@ def chunk_documents(
     min_chunk_size: int = 100,
     overlap_percent: float = 0.05,
     embedding_function=None,
+    use_semantic: bool = True,
 ) -> List[Dict[str, Any]]:
     """Chunk multiple documents with metadata.
 
@@ -174,10 +175,16 @@ def chunk_documents(
         text = doc.get("text", "")
         total_tokens = estimate_tokens(text)
         logger.debug("      文档切片: %s (%d 字符, 约 %d tokens)", source, len(text), total_tokens)
-        chunks = _chunk_with_hybrid_fallback(
-            text, body_budget, eff_overlap, min_chunk_size, None,
-            embedding_function,
-        )
+        if use_semantic:
+            chunks = _chunk_with_hybrid_fallback(
+                text, body_budget, eff_overlap, min_chunk_size, None,
+                embedding_function,
+            )
+        else:
+            # 关闭语义切片：跳过混合/语义分片（不加载任何嵌入模型），直接按字数
+            # （token）递归切分。递归分片确定性、可离线，且已保证切片是原文连续
+            # 子串、不丢内容——适合用户明确不想做语义切片的场景。
+            chunks = chunk_text(text, body_budget, eff_overlap)
         doc_chunks = [
             {"source": source, "chunk_index": i, "text": chunk}
             for i, chunk in enumerate(chunks)
@@ -307,8 +314,11 @@ def _clamp_chunk_budget(
     1700 字符）超字数上限，再用 ``_split_by_chars`` 按字符兜底。丢失的是语义边界
     连续性而非内容。
     """
-    # 小窗口（char≈token）模型才卡 500 字；大窗口模型交给 token 预算即可。
-    max_chars = 500 if chunk_size <= 512 else None
+    # 小窗口（char≈token）模型才卡字数上限；大窗口模型交给 token 预算即可。
+    # 上限直接跟随（已被模型窗口夹紧后的）chunk_size，而非写死的 500：用户在
+    # 大窗口模型上设长分片时，这里绝不再把切片压回 500 字（避免「设了长分片却
+    # 在预算收口环节被切短」），小窗口模型则与 token 预算持平、不超出窗口。
+    max_chars = chunk_size if chunk_size <= 512 else None
     out: List[Dict[str, Any]] = []
     for c in chunks:
         est = estimate_tokens(c["text"])

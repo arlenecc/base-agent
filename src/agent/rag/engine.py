@@ -620,6 +620,7 @@ class RAGEngine:
         chunk_overlap: int = 50,
         min_chunk_size: int = 100,
         overlap_percent: float = 0.05,
+        use_semantic: bool = True,
         rerank_model: str = DEFAULT_RERANK_MODEL,
         rerank_enabled: bool = True,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
@@ -639,6 +640,9 @@ class RAGEngine:
         self._chunk_overlap = chunk_overlap
         self._min_chunk_size = min_chunk_size
         self._overlap_percent = overlap_percent
+        # 语义切片总开关：False 时 chunk_documents 直接走确定性递归分片，不加载
+        # 任何嵌入模型（离线 / 追求确定性 / 不希望语义切片场景）。
+        self._use_semantic = bool(use_semantic)
         self._rerank_model = rerank_model
         # 重排序总开关。config.rag_rerank_enabled 此前从未被读取——用户在配置里
         # 关掉重排序或换模型都完全无效（README / 设计文档却宣称可用）。这里接线：
@@ -1239,6 +1243,7 @@ class RAGEngine:
                                                 chunk_overlap=self._chunk_overlap,
                                                 min_chunk_size=self._min_chunk_size,
                                                 overlap_percent=self._overlap_percent,
+                                                use_semantic=self._use_semantic,
                                             ))
                                     if not doc_chunks:
                                         raise ValueError("no chapters produced")
@@ -1432,6 +1437,7 @@ class RAGEngine:
                                 chunk_overlap=self._chunk_overlap,
                                 min_chunk_size=self._min_chunk_size,
                                 overlap_percent=self._overlap_percent,
+                                use_semantic=self._use_semantic,
                                 # 语义切片强制走 model2vec 静态嵌入（见 semantic_chunker）：
                                 # 不把检索用的 nomic EF 透传下去，避免 worker 切片线程与
                                 # 主线程 add_streaming 并发争抢同一 nomic/MLX 模型。

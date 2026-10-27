@@ -289,6 +289,7 @@ class ToolRegistry:
                 chunk_size=int(getattr(self.config, "rag_chunk_size", 500)),
                 chunk_overlap=int(getattr(self.config, "rag_chunk_overlap", 50)),
                 overlap_percent=float(getattr(self.config, "rag_chunk_overlap_percent", 0.10)),
+                use_semantic=bool(getattr(self.config, "rag_chunk_semantic", True)),
             )
             self._rag_engine = engine
 
