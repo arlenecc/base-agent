@@ -1688,6 +1688,34 @@ class MainWindow(QMainWindow):
             lambda _t: self._sync_impl_fields(self.embedding_impl_combo,
                                               self.embedding_model_name_edit,
                                               self.embedding_path_edit))
+        # 切片参数（语义切片开关 + 大小 / 重叠，单位 token）：与 Embedding 同处切片
+        # 链路，故置于 Embedding 行内——模型目录选择框后、向量去重前。切片大小 /
+        # 重叠同步到所有分片环节（递归 / 语义 / 混合分片 + 预算收口）；关闭语义
+        # 切片时直接按字数递归切分，不加载任何嵌入模型。
+        self.semantic_chunk_chk = QCheckBox("语义切片")
+        self.semantic_chunk_chk.setChecked(
+            bool(getattr(self.config, "rag_chunk_semantic", True)))
+        self.semantic_chunk_chk.setToolTip(
+            "勾选（默认）：按语义边界切分（混合分片 → 语义分片 → 递归分片三级回退，"
+            "会使用嵌入模型）。\n取消勾选：不做语义切片，直接按字数（token）递归切分，"
+            "确定性、可离线、不加载任何嵌入模型。")
+        r.addWidget(self.semantic_chunk_chk)
+        r.addSpacing(8)
+        r.addWidget(QLabel("切片大小"))
+        self.chunk_size_edit = _num(str(getattr(self.config, "rag_chunk_size", 500)), 64)
+        self.chunk_size_edit.setToolTip(
+            "切片大小（单位：token）。送入 embedding 前的单块预算上限；\n"
+            "实际切片 = 正文预算 + 重叠头，均不超过该值。\n"
+            "若 embedding 模型上下文窗口较小（如 bge 512），引擎会自动夹紧到窗口上限，"
+            "避免嵌入阶段静默截断。")
+        r.addWidget(self.chunk_size_edit)
+        r.addSpacing(6)
+        r.addWidget(QLabel("重叠"))
+        self.chunk_overlap_edit = _num(str(getattr(self.config, "rag_chunk_overlap", 50)), 64)
+        self.chunk_overlap_edit.setToolTip(
+            "相邻分片重叠（单位：token）。用于保持分片边界处的上下文连续性；\n"
+            "值过大会浪费嵌入算力，过小会丢失跨边界语义。建议为切片大小的 5%~15%。")
+        r.addWidget(self.chunk_overlap_edit)
         self.dedup_vectors_btn = QPushButton("向量去重")
         self.dedup_vectors_btn.setToolTip(
             "扫描向量库，清理内容完全相同的重复向量\n"
@@ -1719,43 +1747,21 @@ class MainWindow(QMainWindow):
             lambda _t: self._sync_impl_fields(self.reranker_impl_combo,
                                               self.reranker_model_name_edit,
                                               self.reranker_path_edit))
+        # TopN：reranker 重排后最终保留的结果条数（对应 rag_search_top_k，
+        # engine.search(top_k=...) → store.search_with_rerank(top_k=...)）。
+        # 模型未显式传 top_k 时，rag_search 默认就用这一配置值。
+        r.addWidget(QLabel("TopN"))
+        self.reranker_topn_edit = _num(
+            str(getattr(self.config, "rag_search_top_k", 5)), 56)
+        self.reranker_topn_edit.setToolTip(
+            "重排序（及最终检索）后保留的结果条数。\n"
+            "对应 rag_search_top_k（默认 5）；检索时若未显式指定 top_k 即采用此值。\n"
+            "取值 1~10（引擎在检索时会夹紧到该范围）。")
+        r.addWidget(self.reranker_topn_edit)
         self.stop_sync_btn = QPushButton("停止同步")
         self.stop_sync_btn.setEnabled(False)
         self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
         r.addWidget(self.stop_sync_btn)
-        klay.addLayout(r)
-
-        # row3.5: 切片参数（大小 / 重叠）—— 同步到所有文本分片环节。
-        # 解析 / 提取得到的 Markdown 文本会经「递归分片 → 语义分片 → 混合分片」
-        # 三级回退切分，最后统一过 _clamp_chunk_budget 预算收口；这四处的切片
-        # 大小与重叠都来自下面的同一组配置（rag_chunk_size / rag_chunk_overlap），
-        # 不会出现「用户设了长分片、却在某个环节被切成短片」的脱节。
-        # 语义切片点选框：默认选中；去掉则跳过混合/语义分片，直接按字数递归切分。
-        self.semantic_chunk_chk = QCheckBox("语义切片")
-        self.semantic_chunk_chk.setChecked(
-            bool(getattr(self.config, "rag_chunk_semantic", True)))
-        self.semantic_chunk_chk.setToolTip(
-            "勾选（默认）：按语义边界切分（混合分片 → 语义分片 → 递归分片三级回退，"
-            "会使用嵌入模型）。\n取消勾选：不做语义切片，直接按字数（token）递归切分，"
-            "确定性、可离线、不加载任何嵌入模型。")
-        klay.addWidget(self.semantic_chunk_chk)
-        self.chunk_size_edit = _num(str(getattr(self.config, "rag_chunk_size", 500)), 64)
-        self.chunk_size_edit.setToolTip(
-            "切片大小（单位：token）。送入 embedding 前的单块预算上限；\n"
-            "实际切片 = 正文预算 + 重叠头，均不超过该值。\n"
-            "若 embedding 模型上下文窗口较小（如 bge 512），引擎会自动夹紧到窗口上限，"
-            "避免嵌入阶段静默截断。")
-        self.chunk_overlap_edit = _num(str(getattr(self.config, "rag_chunk_overlap", 50)), 64)
-        self.chunk_overlap_edit.setToolTip(
-            "相邻分片重叠（单位：token）。用于保持分片边界处的上下文连续性；\n"
-            "值过大会浪费嵌入算力，过小会丢失跨边界语义。建议为切片大小的 5%~15%。")
-        r = QHBoxLayout(); r.setSpacing(8)
-        r.addWidget(QLabel("切片大小")); r.addWidget(self.chunk_size_edit)
-        r.addSpacing(10)
-        r.addWidget(QLabel("重叠")); r.addWidget(self.chunk_overlap_edit)
-        r.addSpacing(12)
-        r.addWidget(QLabel("（单位：token；同步应用于递归 / 语义 / 混合分片与预算收口）", ))
-        r.addStretch(1)
         klay.addLayout(r)
 
         lay.addWidget(kb_box)
@@ -2346,6 +2352,8 @@ class MainWindow(QMainWindow):
             self.config.reranker_provider, self.config.local_reranker_backend))
         self.reranker_model_name_edit.setText(self.config.rag_rerank_model)
         self.reranker_path_edit.setText(self.config.local_reranker_model)
+        # TopN：reranker 之后保留的结果条数（rag_search_top_k）。
+        self.reranker_topn_edit.setText(str(getattr(self.config, "rag_search_top_k", 5)))
         # 切片参数：语义切片开关 / 大小 / 重叠（token）。重叠以显式 token 为准
         # （关闭百分比驱动），使「重叠」输入直接生效，并随切片大小一起同步到所有
         # 分片环节。
@@ -2479,6 +2487,11 @@ class MainWindow(QMainWindow):
             if rname:
                 self.config.rag_rerank_model = rname
         self.config.local_reranker_model = self.reranker_path_edit.text().strip()
+        # TopN：reranker 之后保留的结果条数（rag_search_top_k）。先走统一数值校验
+        # （非法值回退 5 并在状态栏提示），再夹紧到 1~10，与 rag_search 检索时的
+        # clamp 上限一致，避免用户误填后检索被静默截断到 10。
+        _num(self.reranker_topn_edit, "rag_search_top_k", 5, int, "TopN")
+        self.config.rag_search_top_k = max(1, min(int(self.config.rag_search_top_k), 10))
         # 切片参数：语义切片开关 / 大小 / 重叠（单位 token）。重叠以显式 token 为
         # 准（关闭百分比驱动），使「重叠」输入直接生效，并随切片大小同步到所有
         # 文本分片环节（递归 / 语义 / 混合分片 + _clamp_chunk_budget 预算收口），
