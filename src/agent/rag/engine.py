@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, clean_docling_markdown, normalize_markdown
-from .chunker import chunk_documents, estimate_tokens, _clamp_chunk_budget
+from .chunker import chunk_documents, estimate_tokens, configure_tokenizer
 from .document_outline import (
     build_digest,
     has_markdown_headings,
@@ -96,6 +96,17 @@ def release_mlx_pool() -> None:
     try:
         import mlx.core as mx
         mx.clear_cache()
+    except Exception:
+        pass
+    # torch 侧（docling / marker）的 MPS caching allocator 同理：权重摘引用后
+    # 空闲块仍留在自己的池里，必须显式 empty_cache 才还给系统。仅在 torch 已经
+    # 被解析器加载过时才碰它——为清理而 import torch 会白搭 1~2GB。
+    try:
+        import sys
+        if "torch" in sys.modules:
+            import torch
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
     except Exception:
         pass
 
@@ -599,6 +610,22 @@ def _clamp_chunk_size_to_model_window(chunk_size: int, embedding_model: str) -> 
     return chunk_size
 
 
+def effective_embedding_model(config) -> str:
+    """实际生效的 embedding 模型标识（供切片窗口夹紧使用）。
+
+    local 模式下真正加载的是 ``local_embedding_model``；``rag_embedding_model``
+    可能只是 fastembed 的 hub id 或历史遗留值（例如 bge 的本地目录名）。拿它去
+    解析窗口会把 800 token 的预算误夹到 bge 的 512 窗口（510）——表现为「明明把
+    切片设成 800，日志里仍是 500/510」。故 local 模式优先用本地模型。
+    """
+    provider = str(getattr(config, "embedding_provider", "local") or "local").strip().lower()
+    if provider == "local":
+        local = getattr(config, "local_embedding_model", "") or ""
+        if local:
+            return local
+    return getattr(config, "rag_embedding_model", "") or ""
+
+
 class RAGEngine:
     """Local knowledge base engine.
 
@@ -624,6 +651,7 @@ class RAGEngine:
         rerank_model: str = DEFAULT_RERANK_MODEL,
         rerank_enabled: bool = True,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
+        clamp_model: str = "",
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -635,8 +663,17 @@ class RAGEngine:
         # 模型窗口硬上限：切片预算超过 embedding 模型上下文窗口时，切片会在嵌入
         # 阶段被静默截断（bge-small-zh 仅 512 token）。nomic 等 RoPE 模型窗口
         # 达 8K 不受限。与指纹机制联动——换模型后窗口随之变化。
+        # 夹紧用「实际生效模型」：local 模式传 clamp_model（本地模型路径），
+        # 避免用 rag_embedding_model 的遗留值（如 bge 目录名）把 800 夹成 510。
         self._chunk_size = _clamp_chunk_size_to_model_window(
-            chunk_size, self._embedding_model)
+            chunk_size, clamp_model or self._embedding_model)
+        # 切片预算按**真实 token** 计：绑定生效 embedding 模型的 tokenizer.json。
+        # fastembed hub 模型名 / 精简权重目录没有该文件时自动退回字符类别启发式
+        # （不报错）。与窗口夹紧用同一个模型标识，避免两边看不同的模型。
+        try:
+            configure_tokenizer(clamp_model or self._embedding_model)
+        except Exception:  # pragma: no cover - 绑定失败不应影响引擎可用性
+            logger.warning("RAG: 绑定切片分词器失败，退回启发式估算", exc_info=True)
         self._chunk_overlap = chunk_overlap
         self._min_chunk_size = min_chunk_size
         self._overlap_percent = overlap_percent
@@ -1223,19 +1260,15 @@ class RAGEngine:
                                         logger.warning("    ├─ ⚠ 目录缩略版写入失败: %s: %s", fname, e)
                                     # 章节即切片；超长章节再用通用切块器二次切分
                                     # （避免单块超出 embedding 模型 token 上限）。
-                                    # max_chars = self._chunk_size 已被夹紧到模型窗口
-                                    # （bge 510），整章保留阈值按字符数取该值（中文
-                                    # ≈1 字/token，510 字 ≈ ≤512 窗口）。直通支仍过
-                                    # 一遍 _clamp_chunk_budget：极端情形（罕见字符每个
-                                    # 占 2 token）下整章也会硬切，不依赖字数≤token 的近似。
-                                    doc_chunks: List[Dict[str, str]] = []
-                                    max_chars = self._chunk_size
+                                    # 判断标准必须是**真实 token 数**，不能用字符数
+                                    # 近似：代码/数字/罕见字符密集的章节 800 字可能
+                                    # 远超 800 token，直通后只能被 _clamp_chunk_budget
+                                    # 硬切（正文被切碎且多一次无谓分片）。
+                                    doc_chunks: List[Dict[str, Any]] = []
                                     for ch in book["chapters"]:
-                                        if len(ch) <= max_chars:
-                                            doc_chunks.extend(_clamp_chunk_budget(
-                                                [{"source": filepath, "text": ch}],
-                                                self._chunk_size,
-                                            ))
+                                        if estimate_tokens(ch) <= self._chunk_size:
+                                            doc_chunks.append(
+                                                {"source": filepath, "text": ch})
                                         else:
                                             doc_chunks.extend(chunk_documents(
                                                 [{"source": filepath, "text": ch}],
@@ -1245,6 +1278,11 @@ class RAGEngine:
                                                 overlap_percent=self._overlap_percent,
                                                 use_semantic=self._use_semantic,
                                             ))
+                                    # 直通片与各章二次切分混在一起，chunk_index 必须
+                                    # 按整篇文档重排：记录 id 是 hash(source)_index，
+                                    # 重复索引会让 LanceDB 主键冲突、整片被覆盖。
+                                    for i, c in enumerate(doc_chunks):
+                                        c["chunk_index"] = i
                                     if not doc_chunks:
                                         raise ValueError("no chapters produced")
                                     c_hash = _content_hash(cleaned)
@@ -2390,6 +2428,10 @@ class RAGEngine:
             release_model()
         except Exception as e:
             logger.debug("RAG: release ovis model error: %s", e)
+        # 最后一刀：上面各 release 只是「摘引用」，docling 的对象图带引用循环、
+        # marker/ocr 的 torch 张量也在 MPS 池里。不同步 gc + 清缓存池，数 GB
+        # 会一直挂在进程 footprint 上直到下次 GC（同步结束后 RSS 不降的主因）。
+        release_mlx_pool()
 
     def reload(self) -> None:
         """Drop the cached table handle so the next search sees fresh data.

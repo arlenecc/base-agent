@@ -75,7 +75,7 @@ def test_extract_markdown_returns_none_when_converter_unavailable(monkeypatch, t
     pdf.write_bytes(b"%PDF-1.4 dummy")
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter", lambda: None)
+    monkeypatch.setattr(dp, "_acquire_converter", lambda: None)
     assert dp.extract_markdown(str(pdf)) is None
 
 
@@ -98,7 +98,7 @@ def test_extract_markdown_converts_via_docling(monkeypatch, tmp_path):
             return _FakeResult()
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter", lambda: _FakeConverter())
+    monkeypatch.setattr(dp, "_acquire_converter", lambda: _FakeConverter())
 
     md = dp.extract_markdown(str(pdf))
     assert md == "# Title\n\nSome content."
@@ -112,7 +112,7 @@ def test_extract_markdown_converter_init_failure(monkeypatch, tmp_path):
     pdf.write_bytes(b"%PDF-1.4 dummy")
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter", lambda: None)
+    monkeypatch.setattr(dp, "_acquire_converter", lambda: None)
 
     assert dp.extract_markdown(str(pdf)) is None
 
@@ -136,5 +136,5 @@ def test_extract_markdown_empty_output_returns_none(monkeypatch, tmp_path):
             return _FakeResult()
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter", lambda: _FakeConverter())
+    monkeypatch.setattr(dp, "_acquire_converter", lambda: _FakeConverter())
     assert dp.extract_markdown(str(pdf)) is None

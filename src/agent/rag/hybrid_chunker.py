@@ -176,6 +176,18 @@ def _split_by_paragraph(text: str, max_tokens: Optional[int]) -> List[str]:
     if max_tokens is None:
         return paragraphs
 
+    # 单个段落就超预算（整章代码、无空行的长文）时先硬切：旧实现在 group
+    # 循环里无条件把超预算段落当成新组，超预算切片会一路带到兜底硬切。
+    from .chunker import chunk_text
+
+    expanded: List[str] = []
+    for p in paragraphs:
+        if estimate_tokens(p) > max_tokens:
+            expanded.extend(chunk_text(p, max_tokens, 0))
+        else:
+            expanded.append(p)
+    paragraphs = expanded
+
     groups: List[str] = []
     current = ""
     # 增量维护当前组的 token 数：旧写法在每次追加时重新估算整个 current，

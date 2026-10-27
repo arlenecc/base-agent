@@ -39,7 +39,7 @@ from ..config import AgentConfig
 from ..llm_client import LLMClient, LLMError
 from ..skills import Skill
 from ..tools import ToolRegistry
-from ..rag.engine import RAGEngine
+from ..rag.engine import RAGEngine, effective_embedding_model
 from ..rag.vector_store import DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL
 from .ocr_test_dialog import OcrTestDialog
 from .convert_tool_dialog import ConvertToolDialog
@@ -818,10 +818,13 @@ class SyncKnowledgeWorker(QThread):
                 # 切片大小/重叠从 config 接线（此前 GUI 同步路径没传，导致引擎
                 # 用默认 1000，远超 bge 的 512 窗口、切片被静默截断——见
                 # _clamp_chunk_size_to_model_window 兜底，但这里仍尊重用户配置）。
-                chunk_size=getattr(self._config, "rag_chunk_size", 500),
+                chunk_size=getattr(self._config, "rag_chunk_size", 800),
                 chunk_overlap=getattr(self._config, "rag_chunk_overlap", 50),
                 overlap_percent=getattr(self._config, "rag_chunk_overlap_percent", 0.10),
                 use_semantic=getattr(self._config, "rag_chunk_semantic", True),
+                # 窗口夹紧用实际生效的本地模型（local 模式取 local_embedding_model），
+                # 避免 rag_embedding_model 的遗留值（如 bge 目录名）把 800 夹成 510。
+                clamp_model=effective_embedding_model(self._config),
             )
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
@@ -1603,6 +1606,15 @@ class MainWindow(QMainWindow):
             "· marker：marker-pdf 优先（需 pip install marker-pdf；未装静默回退 docling）\n"
             "· OvisOCR：OvisOCR2 VLM 转 Markdown（docling/marker 之外的兜底）"
         )
+        # 并发实例：解析/OCR 引擎池大小（rag_ocr_pool_size）。
+        # 1 = 单实例串行（最省内存，旧行为）；2-4 = 多实例并发（吞吐更高，
+        # 常驻内存/显存同比上升）。扫描件、图片型 PDF 的 OCR 阶段收益最明显。
+        self.parse_concurrency_combo = _combo(["1", "2", "3", "4"], 56)
+        self.parse_concurrency_combo.setToolTip(
+            "解析时的并发实例数（rag_ocr_pool_size）：\n"
+            "1 = 单实例串行（最省内存）；\n"
+            "2-4 = 多实例并发解析，吞吐更高但常驻内存同比上升。\n"
+            "对扫描件/图片型 PDF 的 OCR 阶段收益最明显，纯文本 PDF 基本无感。")
         self.ocr_impl_combo = _combo(["mlx-vlm", "onnx", "gguf"], 110)
         # 仅「类型 + 本地路径」：OCR 始终本地 VLM，模型名由 config 默认值
         # （rag_ocr_model_name=OvisOCR2-0.8B-MLX-4bit）决定，留空自动从
@@ -1621,14 +1633,15 @@ class MainWindow(QMainWindow):
         self.ocr_test_btn.clicked.connect(self._on_open_ocr_test)
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("PDF解析引擎")); r.addWidget(self.pdf_engine_combo)
-        r.addWidget(QLabel("自定义OCR模型")); r.addWidget(self.ocr_impl_combo)
+        r.addWidget(QLabel("并发实例")); r.addWidget(self.parse_concurrency_combo)
+        r.addWidget(QLabel("自定义OCR")); r.addWidget(self.ocr_impl_combo)
         r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
-        # 「保存设置」：把当前「自定义OCR模型」行的设置落盘，并让识别测试下拉框
+        # 「保存设置」：把当前「自定义OCR」行的设置落盘，并让识别测试下拉框
         # 出现这个自定义模型（下拉第四项名字取自路径）。不重建整个 RAG。
         self.save_ocr_settings_btn = QPushButton("保存设置")
         self.save_ocr_settings_btn.setFixedWidth(84)
         self.save_ocr_settings_btn.setToolTip(
-            "保存当前「自定义OCR模型」行的设置（后端/路径/mmproj/tokenizer）。\n"
+            "保存当前「自定义OCR」行的设置（后端/路径/mmproj/tokenizer）。\n"
             "保存后，识别测试窗口下拉框的「自定义OCR」项即显示为该模型，可立即用它识别。")
         self.save_ocr_settings_btn.clicked.connect(self._on_save_ocr_settings)
         r.addWidget(self.save_ocr_settings_btn)
@@ -1706,7 +1719,7 @@ class MainWindow(QMainWindow):
         r.addWidget(self.semantic_chunk_chk)
         r.addSpacing(8)
         r.addWidget(QLabel("切片大小"))
-        self.chunk_size_edit = _num(str(getattr(self.config, "rag_chunk_size", 500)), 64)
+        self.chunk_size_edit = _num(str(getattr(self.config, "rag_chunk_size", 800)), 64)
         self.chunk_size_edit.setToolTip(
             "切片大小（单位：token）。送入 embedding 前的单块预算上限；\n"
             "实际切片 = 正文预算 + 重叠头，均不超过该值。\n"
@@ -1720,6 +1733,18 @@ class MainWindow(QMainWindow):
             "相邻分片重叠（单位：token）。用于保持分片边界处的上下文连续性；\n"
             "值过大会浪费嵌入算力，过小会丢失跨边界语义。建议为切片大小的 5%~15%。")
         r.addWidget(self.chunk_overlap_edit)
+        r.addSpacing(6)
+        r.addWidget(QLabel("向量维度"))
+        self.embedding_dims_edit = _num(
+            str(getattr(self.config, "rag_embedding_dims", 512)), 56)
+        self.embedding_dims_edit.setToolTip(
+            "Matryoshka 向量维度（仅 nomic-embed-text 系列生效）：\n"
+            "对完整向量截取前 N 维、**重新归一化**后量化到 int8 入库/查询。\n"
+            "512（默认）：实测与 768 全维效果统计等价，向量体积省 1/3；\n"
+            "256：更省体积，中文 top-1 约低 5 个百分点；\n"
+            "0：不截断，保留模型原始维度。\n"
+            "其它 embedding 模型忽略本项。改动后旧向量库需清空重建。")
+        r.addWidget(self.embedding_dims_edit)
         self.dedup_vectors_btn = QPushButton("向量去重")
         self.dedup_vectors_btn.setToolTip(
             "扫描向量库，清理内容完全相同的重复向量\n"
@@ -2339,6 +2364,9 @@ class MainWindow(QMainWindow):
         self.pdf_engine_combo.setCurrentText(
             _PDF_VALUE_TO_DISPLAY.get(
                 getattr(self.config, "rag_pdf_engine", "docling"), "docling"))
+        # 并发实例（rag_ocr_pool_size）：夹在 1-4（下拉框只有这四项）。
+        _pool = int(getattr(self.config, "rag_ocr_pool_size", 2) or 2)
+        self.parse_concurrency_combo.setCurrentText(str(min(max(_pool, 1), 4)))
         # OCR 模型（OvisOCR2，#133）：仅类型 + 路径；模型名用 config 默认值
         self.ocr_impl_combo.setCurrentText(
             getattr(self.config, "rag_ocr_engine", "mlx-vlm") or "mlx-vlm")
@@ -2363,8 +2391,9 @@ class MainWindow(QMainWindow):
         # 分片环节。
         self.semantic_chunk_chk.setChecked(
             bool(getattr(self.config, "rag_chunk_semantic", True)))
-        self.chunk_size_edit.setText(str(getattr(self.config, "rag_chunk_size", 500)))
+        self.chunk_size_edit.setText(str(getattr(self.config, "rag_chunk_size", 800)))
         self.chunk_overlap_edit.setText(str(getattr(self.config, "rag_chunk_overlap", 50)))
+        self.embedding_dims_edit.setText(str(getattr(self.config, "rag_embedding_dims", 512)))
         # Embedding / Reranker 的「模型名 ↔ 本地路径」显隐：fastembed 显示模型名、
         # 隐藏路径；本地实现反之。按当前下拉值一次性同步初始可见性。
         self._sync_impl_fields(self.embedding_impl_combo,
@@ -2502,12 +2531,19 @@ class MainWindow(QMainWindow):
         # 避免脱节。取消「语义切片」时，chunk_documents 直接走确定性递归分片，
         # 不加载任何嵌入模型。
         self.config.rag_chunk_semantic = self.semantic_chunk_chk.isChecked()
-        _num(self.chunk_size_edit, "rag_chunk_size", 500, int, "切片大小")
+        _num(self.chunk_size_edit, "rag_chunk_size", 800, int, "切片大小")
         _num(self.chunk_overlap_edit, "rag_chunk_overlap", 50, int, "重叠")
+        _num(self.embedding_dims_edit, "rag_embedding_dims", 512, int, "向量维度")
         self.config.rag_chunk_overlap_percent = 0.0
         # PDF 解析引擎（docling | marker | ovis）：显示标签 → 内部值。
         self.config.rag_pdf_engine = _PDF_DISPLAY_TO_VALUE.get(
             self.pdf_engine_combo.currentText().strip(), "docling")
+        # 并发实例（rag_ocr_pool_size）：下拉只有 1-4，仍夹紧兜底。
+        try:
+            _pool = int(self.parse_concurrency_combo.currentText())
+        except (TypeError, ValueError):
+            _pool = 2
+        self.config.rag_ocr_pool_size = min(max(_pool, 1), 4)
         # OCR 模型（OvisOCR2，#133）：实现/模型名/本地路径
         self.config.rag_ocr_engine = self.ocr_impl_combo.currentText().strip() or "mlx-vlm"
         # 模型名不暴露给 UI：保持 config 默认值（OvisOCR2-0.8B-MLX-4bit），

@@ -119,8 +119,11 @@ def semantic_chunk_text(
         )
         chunks = chunker.chunk(text)
         result = [c.text.strip() for c in chunks if c.text.strip()]
-        # 传入原文 text，合并/重叠时用「源码里真实的间隔」拼接，保证产出的
-        # chunk 一定是原文的连续子串（见 _gap_between）。
+        # chonkie 的 _split_groups 只按「句」分组，遇到单句超预算（EPUB 里实测
+        # 有 7000+ 字符的整段代码/无标点长行）会整句成片，不再遵守 chunk_size。
+        # 先补一刀硬切，避免后续 merge/overlap 在超预算基础上继续叠加。
+        result = _split_oversized(result, chunk_size)
+        # 传入原文 text：合并/重叠按原文跨度重建，保证产出是原文连续子串。
         merged = _merge_to_target_size(result, chunk_size, min_chunk_size, source=text)
         return _apply_overlap(
             merged, chunk_size, chunk_overlap, overlap_percent, source=text,
@@ -209,6 +212,25 @@ def _gap_between(source: Optional[str], left: str, right: str) -> str:
     return _SourceLocator(source).gap(left, right)
 
 
+def _split_oversized(chunks: List[str], chunk_size: int) -> List[str]:
+    """把超过 ``chunk_size`` 的切片用确定性递归分片拆开。
+
+    chonkie 的 ``_split_groups`` 只在**句子之间**切；单个句子（无标点的长行、
+    整段代码）超预算时它直接整句成片。不补这一刀，超预算切片会一路带到
+    ``chunk_documents`` 的兜底硬切，重叠之后再切还会进一步放大。
+    """
+    from .chunker import chunk_text, estimate_tokens
+
+    out: List[str] = []
+    for c in chunks:
+        if estimate_tokens(c) <= chunk_size:
+            out.append(c)
+            continue
+        pieces = chunk_text(c, chunk_size, 0)
+        out.extend(pieces or [c])
+    return out
+
+
 def _merge_to_target_size(
     chunks: List[str],
     chunk_size: int,
@@ -223,23 +245,45 @@ def _merge_to_target_size(
     contiguous, since semantic splitting only cuts at low-similarity points)
     until each reaches ``min_chunk_size`` tokens, without exceeding
     ``chunk_size``.
+
+    合并优先按原文跨度切片（``source[start:end]``）而不是字符串拼接：书里
+    重复的代码块/样板段落会让 ``str.find`` 命中更早的实例，拼出来的 chunk
+    既不是原文子串，又会把真正的那段内容挤掉（实测丢 0.5% 正文）。
     """
-    from .chunker import estimate_tokens
+    from .chunker import estimate_tokens, _locate_spans
 
     if not chunks:
         return chunks
 
+    spans = _locate_spans(chunks, source)
     locator = _SourceLocator(source)
     merged: List[str] = []
     current = chunks[0]
+    current_span = spans[0]
+    current_tokens = estimate_tokens(current)
 
-    for nxt in chunks[1:]:
-        if estimate_tokens(current) < min_chunk_size and \
-                estimate_tokens(current) + estimate_tokens(nxt) <= chunk_size:
-            current = current + locator.gap(current, nxt) + nxt
-        else:
+    for i in range(1, len(chunks)):
+        nxt = chunks[i]
+        nxt_tokens = estimate_tokens(nxt)
+        joined: Optional[str] = None
+        joined_span = None
+        if current_tokens < min_chunk_size and current_tokens + nxt_tokens <= chunk_size:
+            if (current_span is not None and spans[i] is not None
+                    and spans[i][0] >= current_span[1]):
+                cand = source[current_span[0]:spans[i][1]]
+                # 真实间隔（换行/缩进）也计入预算，超了就不合并。
+                if estimate_tokens(cand) <= chunk_size:
+                    joined, joined_span = cand, (current_span[0], spans[i][1])
+            else:
+                cand = current + locator.gap(current, nxt) + nxt
+                if estimate_tokens(cand) <= chunk_size:
+                    joined = cand
+        if joined is None:
             merged.append(current)
-            current = nxt
+            current, current_span, current_tokens = nxt, spans[i], nxt_tokens
+        else:
+            current, current_span = joined, joined_span
+            current_tokens = estimate_tokens(joined)
     merged.append(current)
     return merged
 
@@ -261,9 +305,8 @@ def _apply_overlap(
 
     The overlap size is ``int(chunk_size * overlap_percent)`` when
     ``overlap_percent`` is set, otherwise the explicit ``chunk_overlap``.
+    重叠同样按原文跨度重建（``source[tail_start:curr_end]``），不再拼接。
     """
-    from .chunker import estimate_tokens
-
     if len(chunks) <= 1:
         return chunks
 
@@ -271,17 +314,29 @@ def _apply_overlap(
     if overlap <= 0:
         return chunks
 
+    from .chunker import estimate_tokens, _locate_spans, _sliced_overlap
+
+    max_total = chunk_size + overlap
+    spans = _locate_spans(chunks, source)
     locator = _SourceLocator(source)
     result: List[str] = [chunks[0]]
     for i in range(1, len(chunks)):
         # Overlap is always derived from the *original* previous chunk (not the
         # overlap-padded one), so overlap never compounds across boundaries.
         tail = _tail_by_tokens(chunks[i - 1], overlap)
-        if tail:
-            # 用源码里真实的间隔拼接，保证结果仍是原文的连续子串。
-            result.append(tail + locator.gap(tail, chunks[i]) + chunks[i])
-        else:
+        if not tail:
             result.append(chunks[i])
+            continue
+        piece = _sliced_overlap(source, spans[i - 1], spans[i], chunks[i - 1], tail)
+        if piece is None:
+            # 兜底：定位不到跨度时按真实间隔拼接。
+            piece = tail + locator.gap(tail, chunks[i]) + chunks[i]
+        # 重叠是追加在正文之上的：正文已贴近预算时叠加会超上限，进而被下游
+        # _clamp_chunk_budget 硬切。放不下就牺牲这一片的重叠，保住正文。
+        if estimate_tokens(piece) > max_total:
+            result.append(chunks[i])
+            continue
+        result.append(piece)
     return result
 
 

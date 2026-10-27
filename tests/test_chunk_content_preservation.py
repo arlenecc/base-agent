@@ -123,3 +123,139 @@ def test_degenerate_ef_falls_back_to_lossless():
         embedding_function=_ZeroEF(),
     )
     assert _covers_source(chunks, zh), "退化 EF 下兜底应保证不丢内容"
+
+
+def _assert_strictly_lossless(chunks, source):
+    """比 _covers_source 更严：每片必须是原文子串，且顺序定位后覆盖所有非空白字符。
+
+    ``_covers_source`` 对重复文本有容错（区间文本出现在任一分片里即算覆盖），
+    这里不放宽——专测「重复代码块导致定位错位、中间内容被吞」这类真实丢失。
+    分片带重叠，定位起点允许落在上一片之内（回看 ≤ len(chunk)）。
+    """
+    covered = bytearray(len(source))
+    cursor = 0
+    for c in chunks:
+        t = c["text"]
+        assert source.find(t) >= 0, f"切片不是原文子串: {t[:40]!r}"
+        p = source.find(t, max(0, cursor - len(t)))
+        assert p >= 0 and p <= cursor, f"切片顺序与原文不一致: {t[:40]!r}"
+        covered[p:p + len(t)] = b"\x01" * len(t)
+        cursor = max(cursor, p + len(t))
+    gap = [i for i, ch in enumerate(source) if not covered[i] and not ch.isspace()]
+    assert not gap, f"内容丢失 @{gap[0]}"
+
+
+def test_duplicate_blocks_do_not_swallow_content():
+    """书里重复的代码块/样板行不应让中间的正文从所有切片里消失。
+
+    背景：合并/重叠用 ``str.find`` 定位时命中更早的同名实例，会把不相邻的两段
+    拼成一个 chunk——既不是原文子串，中间那段真实内容也再没被任何切片覆盖
+    （真实 EPUB 实测丢 0.5% 正文）。修复后按原文跨度重建，结果必须严格无损。
+    """
+    block = "function demo(){\n  return 42;//示例代码\n}\n\n"
+    body = "".join(
+        f"第{i}节：JavaScript 的作用域链与闭包，函数会记住它定义时的作用域环境。"
+        for i in range(60)
+    )
+    doc = block + body + block + body + block
+
+    chunks = chunk_documents(
+        [{"source": "dup.txt", "text": doc}],
+        chunk_size=500, chunk_overlap=50, min_chunk_size=100, overlap_percent=0.10,
+        embedding_function=_HashEF(),
+    )
+    assert chunks
+    for c in chunks:
+        assert estimate_tokens(c["text"]) <= 500, "切片超 token 预算"
+    _assert_strictly_lossless(chunks, doc)
+
+
+def test_oversized_single_sentence_is_split_not_passed_through():
+    """chonkie 不切「单句超预算」，语义路径必须补一刀（EPUB 里有 7000+ 字符长行）。"""
+    pytest.importorskip("chonkie")
+    from agent.rag.semantic_chunker import _split_oversized
+
+    giant = "x" * 5000  # 无标点、无换行 → chonkie 会当成一个句子
+    pieces = _split_oversized([giant], 500)
+    assert len(pieces) > 1
+    assert "".join(pieces) == giant, "拆句不得丢字符"
+    assert all(estimate_tokens(p) <= 500 for p in pieces)
+
+
+def test_sentence_snap_respects_budget():
+    """句末收口不能把下一片撑过预算——否则交给兜底硬切，等于白收口。"""
+    from agent.rag.chunker import _snap_to_sentence_end
+
+    cur = "句子到此结束。" + "残句" * 30 + "，"
+    nxt = "下一段正文" + "内容" * 100
+    src = cur + "\n" + nxt
+
+    def fresh():
+        return [{"source": "s", "text": cur}, {"source": "s", "text": nxt}]
+
+    tight = _snap_to_sentence_end(fresh(), source=src,
+                                  max_tokens=estimate_tokens(nxt) + 5)
+    assert tight[1]["text"] == nxt, "并入后超预算时应放弃收口"
+
+    loose = _snap_to_sentence_end(fresh(), source=src, max_tokens=10_000)
+    assert loose[1]["text"] != nxt, "预算足够时应把残句并入下一片"
+    _assert_strictly_lossless(loose, src)
+
+
+def test_pipeline_holds_budget_without_final_clamp(monkeypatch):
+    """关掉最后一道硬切，上游各环节也必须自己守住 token 预算。
+
+    以前 ``_clamp_chunk_budget`` 是「日常接活」的：语义分片放过超长单句、
+    句末收口无预算检查、重叠直接叠加，都要靠它兜底。现在各环节自己收口，
+    关掉 clamp 也不该出现超预算切片。
+    """
+    import agent.rag.chunker as ch
+
+    monkeypatch.setattr(ch, "_clamp_chunk_budget", lambda chunks, size: chunks)
+
+    doc = "".join(
+        f"第{i}段开头。这里是一段很长的描述，用逗号连接、没有句号的句子一直延续下去，"
+        * 4
+        for i in range(120)
+    )
+    for use_semantic in (False,):
+        chunks = chunk_documents(
+            [{"source": "t.txt", "text": doc}],
+            chunk_size=500, chunk_overlap=50, min_chunk_size=100,
+            overlap_percent=0.0, use_semantic=use_semantic,
+        )
+        assert chunks
+        assert all(estimate_tokens(c["text"]) <= 500 for c in chunks), \
+            "无最终硬切时仍有切片超预算 → 上游某环节没守预算"
+        _assert_strictly_lossless(chunks, doc)
+
+
+def test_tokenizer_backed_estimator_counts_real_tokens(tmp_path):
+    """绑定模型自带分词器后，预算按真实 token 计（不再是字符类别近似）。"""
+    pytest.importorskip("tokenizers")
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    from agent.rag.chunker import configure_tokenizer, chunk_text, tokenizer_path
+
+    tok = Tokenizer(models.WordLevel(
+        {"[UNK]": 0, "hello": 1, "world": 2, "你好": 3}, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    path = tmp_path / "tokenizer.json"
+    tok.save(str(path))
+
+    try:
+        assert configure_tokenizer(str(path)), "本地 tokenizer.json 应绑定成功"
+        assert tokenizer_path() == str(path)
+        assert estimate_tokens("hello world") == 2
+        # chunk_text 的 chunk_size 是正文预算（重叠由 _merge_overlap 追加），
+        # 这里用零重叠验证「每片 ≤ 预算」本身。
+        chunks = chunk_text("hello world 你好 " * 400, 64, 0)
+        assert chunks
+        assert all(estimate_tokens(c) <= 64 for c in chunks), "切片必须守住 token 预算"
+    finally:
+        configure_tokenizer(None)
+
+    assert tokenizer_path() == "", "未绑定时应退回启发式估算"
+    empty = tmp_path / "no_tokenizer"
+    empty.mkdir()
+    assert not configure_tokenizer(str(empty)), "目录无 tokenizer.json 时不应绑定"

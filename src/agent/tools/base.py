@@ -266,7 +266,7 @@ class ToolRegistry:
             # initialization doesn't fail on a missing path.
             os.makedirs(kb, exist_ok=True)
 
-            from ..rag.engine import RAGEngine
+            from ..rag.engine import RAGEngine, effective_embedding_model
             from ..rag.vector_store import DEFAULT_RERANK_MODEL
             from .rag_tool import RagSearchTool, RagStatusTool, RagIngestTool, RagOutlineTool
 
@@ -286,10 +286,13 @@ class ToolRegistry:
                 # rag_chunk_size / rag_chunk_overlap / rag_chunk_overlap_percent
                 # 是死配置。补上传参，让切片大小/重叠真正可配置。
                 # 单位 = token（估算器已按 bge-small-zh 校准：中文 1 字/token）。
-                chunk_size=int(getattr(self.config, "rag_chunk_size", 500)),
+                chunk_size=int(getattr(self.config, "rag_chunk_size", 800)),
                 chunk_overlap=int(getattr(self.config, "rag_chunk_overlap", 50)),
                 overlap_percent=float(getattr(self.config, "rag_chunk_overlap_percent", 0.10)),
                 use_semantic=bool(getattr(self.config, "rag_chunk_semantic", True)),
+                # 窗口夹紧用实际生效的本地模型（local 模式取 local_embedding_model），
+                # 避免 rag_embedding_model 的遗留值把 800 夹成 bge 的 510。
+                clamp_model=effective_embedding_model(self.config),
             )
             self._rag_engine = engine
 

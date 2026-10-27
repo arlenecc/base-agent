@@ -54,12 +54,13 @@ class AgentConfig:
     kernel_max_digest_lines: int = 40
 
     # RAG settings
-    # 切片大小，单位 = token（估算器 chunker.estimate_tokens 按默认 embedding
-    # bge-small-zh-v1.5 的 WordPiece 按字符类别计权：汉字/假名/全角/数字/标点
-    # 均 1 token/字符，英文 ≈3 字符/token——估算恒 ≥ 真实值，切片只小不大）。
-    # 500 token 贴着 bge 的 512 位置上限，嵌入时几乎不截断；再调大（>510）
-    # 就会在嵌入阶段丢内容。
-    rag_chunk_size: int = 500
+    # 切片大小，单位 = token。chunker.estimate_tokens 优先用生效 embedding 模型
+    # 自带的分词器（RAGEngine 初始化时从 tokenizer.json 绑定，计数与嵌入阶段
+    # 完全一致）；模型没有本地分词器时才退回字符类别启发式估算。
+    # 默认 800：默认 embedding 为 nomic-embed-text-v1.5（RoPE 8192 窗口），
+    # 800 token 远小于窗口，嵌入不会被截断；更大分片能保留更完整语义、减少
+    # 分片数与检索噪声。切到 bge（512 窗口）时请把本值调回 ≤510。
+    rag_chunk_size: int = 800
     # 相邻分片重叠：overlap_percent 生效时按 chunk_size 百分比计算
     # （500 × 10% = 50 token）；rag_chunk_overlap 仅作无百分比时的兜底，
     # 两者保持同一比例（10%）。
@@ -69,6 +70,14 @@ class AgentConfig:
     # 按语义边界切分；False 时跳过语义/混合分片，直接按字数（token）递归切分，
     # 不加载任何嵌入模型，适合追求确定性 / 离线 / 不希望语义切片的场景。
     rag_chunk_semantic: bool = True
+    # Matryoshka 向量维度（**仅 nomic-embed-text 系列生效**）：入库/查询都在
+    # 计算完整向量后截取前 N 维、重新归一化、再量化到 int8。
+    #   512（默认）：实测与 768 全维效果统计等价，向量体积省 1/3；
+    #   256：更省体积，中文检索略降（top-1 约 -5 个百分点）；
+    #   ≤0：不截断，保留模型原始维度。
+    # 其它 embedding 模型忽略本项（只做 int8 量化）。改动后向量维度变化，
+    # 旧库需清空重建。
+    rag_embedding_dims: int = 512
     # rag_search 默认返回条数（重排后的最终结果数）。
     rag_search_top_k: int = 5
     # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：
@@ -226,7 +235,11 @@ class AgentConfig:
     local_llm_prefill_step_size: int = 4096
 
     embedding_provider: str = "local"
-    local_embedding_model: str = "bge-small-zh-v1.5-mlx"
+    # 默认 embedding：nomic-embed-text-v1.5 的 MLX int8 权重（768 维，RoPE
+    # 8192 窗口）。路径相对项目根解析（<root>/models/...）。nomic 支持
+    # Matryoshka 表示学习：向量库层会截取前 256 维、重新归一化后量化到 int8
+    # 入库，既保语义又显著压缩体积（见 rag/vector_store.py）。
+    local_embedding_model: str = "models/nomic-embed-text-v1.5-mlx-int8"
     local_embedding_backend: str = "mlx"
 
     reranker_provider: str = "local"
@@ -255,11 +268,12 @@ class AgentConfig:
     # 直接喂给 dataclass 会让后续算术/比较在运行时炸掉。
     _INT_FIELDS = ("max_tokens", "top_k", "max_iterations", "max_history",
                    "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
-                   "rag_search_top_k", "rag_condense_min_chars",
+                   "rag_search_top_k", "rag_embedding_dims",
+                   "rag_condense_min_chars",
                    "rag_condense_max_chars",
                    "kernel_max_context_tokens", "kernel_raw_turns",
                    "kernel_consolidate_every", "kernel_max_tool_chars",
-                   "kernel_max_digest_lines",
+                   "kernel_max_digest_lines", "rag_ocr_pool_size",
                    "aux_max_tokens", "aux_top_k",
                    "local_llm_num_draft_tokens", "local_llm_prefill_step_size")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
@@ -433,6 +447,11 @@ class AgentConfig:
         # bumping every sub-8192 value would fight the user on every start.
         if self.max_tokens == 4096:
             self.max_tokens = 32768
+        # 切片旧默认 500 → 新默认 800：默认 embedding 已切到 nomic（RoPE 8192
+        # 窗口，800 token 不会被截断）。仅当仍是旧默认值时迁移，用户显式设置的
+        # 其它值保持不变（若仍用 bge，引擎会按其 512 窗口把 800 夹回 ~510）。
+        if self.rag_chunk_size == 500:
+            self.rag_chunk_size = 800
         # max_context_tokens was introduced at 32000; older configs that
         # saved a stale small value should also be bumped. Track max_tokens
         # so the shrink threshold follows the model's actual window.
@@ -444,12 +463,14 @@ class AgentConfig:
         # 用户若显式选了别的 OvisOCR2 目录名则不受影响。
         if self.rag_ocr_model_name == "OvisOCR2-0.8B-MLX-4bit":
             self.rag_ocr_model_name = "OvisOCR3-MLX-4bit-mixed46"
-        # 本地 embedding / reranker 默认模型升级：旧配置持久化了空路径（默认走
-        # fastembed 网络模型），现在统一改为仓库自带的 MLX 本地权重，默认即用、
-        # 默认走 mlx 后端。只填充空的本地路径——用户若显式指定了别的本地模型
-        # 目录则不受影响。
-        if not self.local_embedding_model:
-            self.local_embedding_model = "bge-small-zh-v1.5-mlx"
+        # 本地 embedding 默认模型切回 nomic-embed-text-v1.5（MLX int8 权重，
+        # 768 维）。空路径（旧配置默认走 fastembed 网络模型）与历史默认
+        # bge-small-zh-v1.5-mlx 都迁到新默认——bge 只有 512 窗口，与新的
+        # 800 token 切片不匹配。用户显式指定的其它本地模型目录保持原样。
+        if not self.local_embedding_model or self.local_embedding_model in (
+            "bge-small-zh-v1.5-mlx", "models/bge-small-zh-v1.5-mlx",
+        ):
+            self.local_embedding_model = "models/nomic-embed-text-v1.5-mlx-int8"
         if not self.local_reranker_model:
             # 默认 reranker 改为 jina（onnx / CPU-only）。仅在「未显式指定本地
             # 模型」时填充——显式指定了其它模型（如 bge-mxfp8）的用户保持原样。

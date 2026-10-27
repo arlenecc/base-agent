@@ -229,22 +229,51 @@ def _start_idle_reaper() -> None:
                 for i in range(len(_converters)):
                     _converters[i] = None
                     _converter_busy[i] = False
+            # 出锁后再 gc：回收可能要几百毫秒，别在这期间挡住等池的 worker。
+            _free_torch_memory()
 
     threading.Thread(
         target=_reap, name="docling-idle-reaper", daemon=True
     ).start()
 
 
+def _free_torch_memory() -> None:
+    """把已经摘掉引用的 docling/torch 权重真正还给系统。
+
+    「置 None」只是第一步：docling 的 DocumentConverter 对象图带引用循环，
+    仅靠引用计数不会析构；torch 的 MPS caching allocator 还会把释放的块留在
+    自己的池里。不显式 ``gc.collect()`` + ``torch.mps.empty_cache()``，那
+    3~4.6GB 会一直挂在进程 footprint 上（同步结束后 RSS 不降的实测主因）。
+    """
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        # 只在 torch 已经被解析器加载过后才碰它：纯 txt/epub 同步里 docling 根本
+        # 没跑，为清理而 import torch 会白搭 1~2s 并常驻 ~1GB。
+        import sys
+        if "torch" in sys.modules:
+            import torch
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 def release_converter() -> None:
     """释放 docling converter 池的全部实例，归还模型权重占用的内存。
 
-    同步结束 / 配置变更时由 engine 调用。仅清空池槽引用；正在进行的转换持有
-    局部引用，不受影响。
+    同步结束 / 配置变更时由 engine 调用。先清空池槽引用（正在进行的转换持有
+    局部引用，不受影响），再显式 gc + 清 MPS 缓存池——只摘引用的话内存不会
+    立刻回到系统。
     """
     with _converter_pool_lock:
         for i in range(len(_converters)):
             _converters[i] = None
             _converter_busy[i] = False
+    _free_torch_memory()
 
 
 def reset_unavailable() -> None:

@@ -48,7 +48,9 @@ def test_docling_converts_are_serialized(tmp_path, monkeypatch):
             raise RuntimeError("stop-after-overlap-check")
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter", lambda: _FakeConv())
+    # 池化后由 _acquire_converter 负责互斥：这里让池自己构建 fake 实例，
+    # 并发度上限就是池大小（16GB 默认 1，即严格串行）。
+    monkeypatch.setattr(dp, "_build_converter", lambda: _FakeConv())
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"%PDF-1.4")
     errs = []
@@ -64,21 +66,35 @@ def test_docling_converts_are_serialized(tmp_path, monkeypatch):
         t.start()
     for t in ts:
         t.join(timeout=5)
-    assert peak == 1                            # 三个调用严格串行
-    assert errs == []                           # 异常被吞，回退链继续
+    try:
+        pool_size = max(1, int(getattr(dp, "_DOCLING_POOL_SIZE", 1)))
+        assert peak <= pool_size                # 并发度不超过池大小
+        assert errs == []                       # 异常被吞，回退链继续
+    finally:
+        dp.release_converter()
 
 
 def test_singleton_release_clears_converter(monkeypatch):
-    """release_converter() 必须真正清掉单例引用（否则 ~4.6GB 常驻）。"""
+    """release_converter() 必须清掉池里的实例引用，并显式 gc + 清缓存池。
+
+    只摘引用不够：docling 的对象图带引用循环、torch 的 MPS caching allocator
+    还会把释放的块留在池里——不同步回收，~3-4.6GB 会一直挂在 footprint 上。
+    """
     from agent.rag import docling_parser as dp
 
-    monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter",
-                        lambda: "fake-converter-sentinel")
-    # 直接验证释放语义：置位后 release_converter 清空
-    dp._converter = "fake-converter-sentinel"
-    dp.release_converter()
-    assert dp._converter is None
+    freed = []
+    monkeypatch.setattr(dp, "_free_torch_memory", lambda: freed.append(1))
+    with dp._converter_pool_lock:
+        dp._converters[:] = ["fake-converter-sentinel"]
+        dp._converter_busy[:] = [False]
+    try:
+        dp.release_converter()
+        assert all(c is None for c in dp._converters)
+        assert freed == [1], "摘引用后必须 gc.collect() + torch.mps.empty_cache()"
+    finally:
+        with dp._converter_pool_lock:
+            dp._converters[:] = []
+            dp._converter_busy[:] = []
 
 
 def test_ingest_does_not_inject_concurrency_config(rag_engine_factory, tmp_path):

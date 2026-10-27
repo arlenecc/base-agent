@@ -93,6 +93,20 @@ def _reset_global_model_providers():
     _vs.reset_local_providers()
 
 
+@pytest.fixture(autouse=True)
+def _reset_chunk_tokenizer():
+    """每个测试前后解绑切片分词器（chunker 的进程级全局状态）。
+
+    RAGEngine 构造时会 ``chunker.configure_tokenizer(模型目录)`` 绑定真实分词器。
+    不复位的话，任何构造过 RAGEngine 的用例都会把「真实 token 计数」泄漏给后续
+    用例——依赖启发式估算数值的断言（切片预算、超长句拆分）会随机失败。
+    """
+    from agent.rag import chunker as _chunker
+    _chunker.configure_tokenizer(None)
+    yield
+    _chunker.configure_tokenizer(None)
+
+
 @pytest.fixture()
 def tmp_workspace(tmp_path):
     """An isolated working directory used as the agent's filesystem root."""

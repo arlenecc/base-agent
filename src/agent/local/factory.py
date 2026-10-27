@@ -135,6 +135,8 @@ def configure_local_models(config) -> None:
         path=getattr(config, "local_embedding_model", ""),
         backend=_backend(getattr(config, "local_embedding_backend", "mlx"), "mlx"),
     )
+    # Matryoshka 截断维度（仅 nomic-embed-text 系列生效；<=0 不截断）。
+    vs.set_matryoshka_dims(int(getattr(config, "rag_embedding_dims", 512)))
     vs.set_reranker_provider(
         _provider(getattr(config, "reranker_provider", "local"), "local"),
         path=getattr(config, "local_reranker_model", ""),

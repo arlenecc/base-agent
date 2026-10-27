@@ -19,7 +19,7 @@ from typing import Dict, Optional
 
 # 应用内自带权重的默认相对路径（相对项目根）
 _DEFAULTS: Dict[str, str] = {
-    "embedding": "models/bge-small-zh-v1.5-mlx",
+    "embedding": "models/nomic-embed-text-v1.5-mlx-int8",
     "reranker": "models/jina-reranker-v2-base-multilingual-onnx",
     "llm": "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx",
     "aux": "models/Qwen3.5-2B-MLX-4bit",
