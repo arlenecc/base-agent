@@ -50,7 +50,7 @@ _OCR_ACQUIRE_TIMEOUT = 300.0
 
 
 def set_ocr_pool_size(size: int) -> None:
-    """注入 OCR 引擎池大小（config.rag_ocr_pool_size，默认 2）。
+    """注入 OCR 引擎池大小（config.rag_ocr_pool_size，UI 可选 1-6，默认 1）。
 
     调小会立刻丢弃多出来的空闲实例（借出中的归还时若超出新上限同样淘汰）；
     调大只放宽上限，实例按需惰性创建。

@@ -5,7 +5,9 @@ FastEmbed/ONNX）——无 API server 依赖。Reranking uses FastEmbed's TextCr
 (bge-reranker-v2-m3)，与 embedding 同栈、无 torch/FlagEmbedding 依赖。
 
 向量编码（入库与查询共用同一条链路，见 ``_prepare_vector_for_index``）：
-  1. nomic-embed-text 系列：Matryoshka 截取前 256 维；
+  1. 支持 Matryoshka 的模型（nomic-embed-text 系列、jina-embeddings-v3 等）：
+     按配置维度（128/256/512，由 rag_embedding_dims 指定，开关 rag_matryoshka_enabled
+     控制是否启用）截取前 N 维；不支持或关闭则保留原始维度；
   2. **重新归一化**（截断后必须重做，否则 L2 距离不再等价余弦）；
   3. 量化到 int8 网格 [-127,127]。
 LanceDB 0.40 无法检索真正的 int8 向量列，故 int8 量化值以 float16 列存储
@@ -38,14 +40,17 @@ DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
 DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3-int8"
 
 # ---- 向量量化 / Matryoshka（俄罗斯套娃）----
-# nomic-embed-text-v1.5 支持 Matryoshka 表示学习：截断到前 N 维后**重新归一化**
-# 仍保留绝大部分语义（官方推荐 64/128/256/512）。
-# 默认 512：实测与 768 全维的中文检索效果统计等价（AUC/top-1 置信区间重合），
-# 同时省 1/3 向量体积；256 更省但中文 top-1 约低 5 个百分点。
-# 运行期由 config.rag_embedding_dims 经 set_matryoshka_dims() 覆盖；
-# <= 0 表示不截断（保留模型原始维度）。
-_DEFAULT_MATRYOSHKA_DIMS = 512
+# 支持 Matryoshka 表示学习的 embedding 模型（nomic-embed-text-v1.5、
+# jina-embeddings-v3 等）：截断到前 N 维后**重新归一化**仍保留绝大部分语义
+# （官方推荐 64/128/256/512）。入库与查询同步执行「截断 → 重新 L2 归一化 →
+# int8 量化」，详见 _prepare_vector_for_index。
+# 默认 256：体积与质量均衡；128 更省更快、512 质量最高。维度由 config.
+# rag_embedding_dims 经 set_matryoshka_dims() 覆盖；<= 0 表示不截断（保留
+# 模型原始维度）。是否启用由 config.rag_matryoshka_enabled 经
+# set_matryoshka_enabled() 控制（关闭则即便模型支持也不裁剪）。
+_DEFAULT_MATRYOSHKA_DIMS = 256
 _MATRYOSHKA_DIMS = _DEFAULT_MATRYOSHKA_DIMS
+_MATRYOSHKA_ENABLED = True
 # int8 量化比例：归一化后分量 ∈ [-1,1]，乘 127 取整映射到 int8 网格
 # [-127,127]（对称，不用 -128）。
 # 为什么以 float16 列存储：LanceDB 0.40 无法检索真正的 int8 向量列（建索引用
@@ -72,9 +77,8 @@ _DOCUMENTS_TABLE_NAME = "documents"
 # 与同库其它表（knowledge_base / documents）互不干扰。
 _META_TABLE_NAME = "_embedding_meta"
 
-# nomic-embed-text-v1.5 requires query/document prefixes for best results
-_DOC_PREFIX = "search_document: "
-_QUERY_PREFIX = "search_query: "
+# 任务前缀策略已统一收敛到 local/embedding.py 的族表（_FAMILY_TASK_PREFIXES），
+# fastembed 路径经 resolve_task_prefixes() 取同一份数据，不再各自硬编码。
 
 # BM25 全文检索的预分词列名（jieba 分词后空格连接，供原生 FTS 的 simple
 # tokenizer 按空格切分索引，解决中文无空格无法分词的问题）。
@@ -155,6 +159,9 @@ class FastEmbedEmbeddingFunction:
     def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL):
         self._model_name = model_name
         self._model = None  # lazy-init
+        # 任务前缀与本地路径同源：按模型族统一判断（local/embedding.py）
+        from ..local.embedding import resolve_task_prefixes
+        self._prefixes = resolve_task_prefixes(model_name)
 
     def _ensure_model(self):
         if self._model is not None:
@@ -226,15 +233,19 @@ class FastEmbedEmbeddingFunction:
         if not input:
             return []
         self._ensure_model()
-        # Add document prefix for nomic-embed-text-v1.5
-        prefixed = [_DOC_PREFIX + t if not t.startswith(_DOC_PREFIX) else t for t in input]
+        # Add document prefix per model family (unified prefix strategy)
+        doc_prefix = self._prefixes.get("doc", "")
+        prefixed = [doc_prefix + t if doc_prefix and not t.startswith(doc_prefix) else t
+                    for t in input]
         embeddings = list(self._model.embed(prefixed))
         return [e.tolist() for e in embeddings]
 
     def embed_query(self, text: str) -> List[float]:
         """Embed a single query text with the query prefix."""
         self._ensure_model()
-        prefixed = _QUERY_PREFIX + text if not text.startswith(_QUERY_PREFIX) else text
+        query_prefix = self._prefixes.get("query", "")
+        prefixed = (query_prefix + text if query_prefix and not text.startswith(query_prefix)
+                    else text)
         embeddings = list(self._model.embed([prefixed]))
         return embeddings[0].tolist()
 
@@ -675,9 +686,10 @@ def set_embedding_provider(provider: str, path: str = "", backend: str = "mlx") 
 def set_matryoshka_dims(dims: int) -> None:
     """配置 Matryoshka 截断维度（``<= 0`` 表示不截断）。
 
-    仅对 nomic-embed-text 系列生效；由 ``local.factory.configure_local_models``
-    从 ``config.rag_embedding_dims`` 同步过来。维度参与 embedding 指纹，
-    改动后旧向量库会因维度/指纹不一致被拒绝，需清空重建。
+    对所有支持 Matryoshka 的模型（nomic-embed-text 系列、jina-embeddings-v3
+    等）生效，由 ``local.factory.configure_local_models`` 从
+    ``config.rag_embedding_dims`` 同步过来。维度参与 embedding 指纹，改动后
+    旧向量库会因维度/指纹不一致被拒绝，需清空重建。
     """
     global _MATRYOSHKA_DIMS
     try:
@@ -685,6 +697,17 @@ def set_matryoshka_dims(dims: int) -> None:
     except (TypeError, ValueError):
         d = _DEFAULT_MATRYOSHKA_DIMS
     _MATRYOSHKA_DIMS = d if d > 0 else 0
+
+
+def set_matryoshka_enabled(enabled: bool) -> None:
+    """配置是否对支持 Matryoshka 的模型启用维度裁剪。
+
+    由 ``local.factory.configure_local_models`` 从 ``config.rag_matryoshka_enabled``
+    同步过来。为 False 时即便模型支持 Matryoshka 也不裁剪，保留原始维度
+    （仍做 int8 量化）。维度指纹随之变化，旧库会被拒绝，需清空重建。
+    """
+    global _MATRYOSHKA_ENABLED
+    _MATRYOSHKA_ENABLED = bool(enabled)
 
 
 def set_reranker_provider(provider: str, path: str = "", backend: str = "mlx") -> None:
@@ -704,10 +727,11 @@ def reset_local_providers() -> None:
     ``LocalEmbeddingFunction`` / ``LocalReranker``。本函数供测试夹具与
     「恢复默认配置」路径调用，避免全局开关跨上下文泄漏。
     """
-    global _MATRYOSHKA_DIMS
+    global _MATRYOSHKA_DIMS, _MATRYOSHKA_ENABLED
     _EMBED_PROVIDER.update(provider="api", path="", backend="mlx")
     _RERANK_PROVIDER.update(provider="api", path="", backend="mlx")
     _MATRYOSHKA_DIMS = _DEFAULT_MATRYOSHKA_DIMS
+    _MATRYOSHKA_ENABLED = True
 
 
 def get_or_create_embedding_function(
@@ -1139,12 +1163,15 @@ class VectorStore:
     # ------------------------------------------------------------------
 
     def _is_matryoshka(self) -> bool:
-        """当前 embedding 是否走 Matryoshka 截断（nomic-embed-text 系列）。
+        """当前 embedding 是否走 Matryoshka 截断。
 
-        ef.name() 形如 ``local:mlx:nomic-embed-text-v1.5-mlx-int8`` /
-        ``fastembed:nomic-ai/nomic-embed-text-v1.5-Q``，按子串判定即可覆盖
-        本地与 fastembed 两条路径。
+        需同时满足：① 全局开关 ``_MATRYOSHKA_ENABLED``（由 config.
+        rag_matryoshka_enabled 同步）开启；② 实际加载的 ef 是支持 Matryoshka
+        的模型（nomic-embed-text 系列 / jina-embeddings-v3 等，按子串判定，
+        覆盖本地与 fastembed 两条路径）。
         """
+        if not _MATRYOSHKA_ENABLED:
+            return False
         if self._matryoshka_cache is None:
             # 只依据**实际加载的** ef 名称判定：self._embedding_model 是
             # fastembed 模型 id，local 模式下可能与真正加载的本地权重不一致
@@ -1159,14 +1186,19 @@ class VectorStore:
         """原始 FP32 向量 → 入库/查询用的 int8 量化向量（两条路径唯一收口）。
 
         截断维度取模块级 ``_MATRYOSHKA_DIMS``（由 config.rag_embedding_dims
-        经 ``set_matryoshka_dims`` 同步，默认 512；<=0 不截断）。
+        经 ``set_matryoshka_dims`` 同步，默认 256；<=0 不截断）；是否截断还受
+        全局开关 ``_MATRYOSHKA_ENABLED``（config.rag_matryoshka_enabled）节制。
         """
         return _prepare_vector_for_index(
-            vec, self._is_matryoshka(), _MATRYOSHKA_DIMS)
+            vec, self._is_matryoshka(), self._effective_matryoshka_dims())
+
+    def _effective_matryoshka_dims(self) -> int:
+        """当前模型实际 Matryoshka 截断维度（统一取配置维度，<=0 表示不截断）。"""
+        return _matryoshka_dims_for(_embedding_model_name(self._ef), _MATRYOSHKA_DIMS)
 
     def _get_fingerprint(self) -> str:
         """当前 embedding 函数的模型指纹（含向量编码版本/截断维度）。"""
-        dims = _MATRYOSHKA_DIMS if self._is_matryoshka() else 0
+        dims = self._effective_matryoshka_dims() if self._is_matryoshka() else 0
         return f"{_embedding_model_name(self._ef)}|{_VECTOR_CODEC_TAG}|m{dims}"
 
     def _read_stored_fingerprint(self) -> Optional[Tuple[str, Optional[int]]]:
@@ -2006,7 +2038,7 @@ class VectorStore:
 
         # Embed query (use embed_query for proper prefix handling)
         logger.info("  ├─ 查询向量化: 将查询文本转为向量...")
-        # 与入库**完全相同的变换**：Matryoshka 截断(256) → 重新归一化 → int8
+        # 与入库**完全相同的变换**：Matryoshka 截断(配置维度) → 重新归一化 → int8
         # 量化。两条路径必须严格一致，否则查询向量与库内向量不在同一量化空间。
         if hasattr(self._ef, 'embed_query'):
             query_vec = self._prepare_stored_vector(self._ef.embed_query(query))
@@ -2961,8 +2993,19 @@ def _normalize(vec: List[float]) -> List[float]:
 
 
 def _is_matryoshka_model(name: str) -> bool:
-    """是否为支持 Matryoshka 截断的 nomic-embed-text 系列模型。"""
-    return "nomic-embed-text" in (name or "").lower()
+    """是否为支持 Matryoshka 截断的模型（nomic-embed-text / jina-embeddings-v3）。"""
+    n = (name or "").lower()
+    return "nomic-embed-text" in n or "jina-embeddings" in n
+
+
+def _matryoshka_dims_for(name: str, configured: int) -> int:
+    """模型实际 Matryoshka 截断维度（由配置统一指定，``<= 0`` 不截断）。
+
+    不再按模型名特判维度：nomic-embed-text 系列、jina-embeddings-v3 等支持
+    Matryoshka 的模型都统一使用 ``config.rag_embedding_dims``（128/256/512），
+    由调用方 ``_effective_matryoshka_dims`` 透传。
+    """
+    return configured
 
 
 def _quantize_int8(vec: List[float]) -> List[int]:

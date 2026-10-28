@@ -53,7 +53,7 @@ def _is_stale_digest(old_digest: str) -> bool:
 DEFAULT_PARALLEL_WORKERS = 2
 
 
-def configure_mlx_memory_limits(cache_bytes: int = 1_000_000_000) -> None:
+def configure_mlx_memory_limits(cache_bytes: int = 2_000_000_000) -> None:
     """给 MLX 显式设 Metal 缓冲缓存上限（#131：同步 8→18GB 的根因）。
 
     MLX 0.32 在 macOS 上默认 ``cache_limit = recommendedMaxWorkingSetSize``
@@ -65,6 +65,10 @@ def configure_mlx_memory_limits(cache_bytes: int = 1_000_000_000) -> None:
     只限缓存：``clear_cache`` 后的空闲缓冲超过 cache_bytes 就立即归还系统。
     活跃内存（模型权重 + 推理激活）不受影响，不设 memory_limit 以免干扰
     同进程的 aux LLM 长上下文推理。同步开始时调用一次即可。
+
+    默认 2GB（而非 1GB）：在控制 idle 内存暴涨的前提下，给 embedding/LLM
+    编译后的核更宽松的缓存，减少核被挤出后重复编译的开销（实测对重复
+    embedding 吞吐有小幅正向作用）。上限可调：调大省重编译、调小省内存。
     """
     try:
         import mlx.core as mx

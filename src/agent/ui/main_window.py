@@ -796,8 +796,10 @@ class SyncKnowledgeWorker(QThread):
                 from ..rag.engine import configure_mlx_memory_limits, release_mlx_pool
                 # MLX 默认 cache_limit = 统一内存的 ~75%，空闲 Metal buffer 会
                 # 一路涨到上限才归还——16GB 机器上光缓存就能到 ~12GB（实测
-                # 同步峰值 footprint 19GB 的主因）。压到 1GB，空闲即还。
-                configure_mlx_memory_limits()
+                # 同步峰值 footprint 19GB 的主因）。按配置压到指定上限（默认
+                # 2GB），空闲即还；2GB 比 1GB 给编译核更宽松缓存、略提速度。
+                _cache_mb = int(getattr(self.config, "mlx_cache_limit_mb", 2000))
+                configure_mlx_memory_limits(_cache_mb * 1_000_000)
                 release_mlx_pool()
             except Exception as e:  # 防御：清理失败不该中断同步
                 logger.debug("SyncKnowledgeWorker: pre-sync mlx cleanup failed: %s", e)
@@ -1092,6 +1094,9 @@ class MainWindow(QMainWindow):
         # _OCR_CONFIG 是模块级全局，SyncKnowledgeWorker 同进程运行，全局注入一次即可生效。
         from agent.rag import parsers as _rag_parsers
         _rag_parsers.set_ocr_config(self.config)
+        # docling 转换器池大小（UI「并发实例」），默认 1。
+        from agent.rag.docling_parser import set_docling_pool_size
+        set_docling_pool_size(getattr(self.config, "rag_docling_pool_size", 1))
         # PDF 统一解析引擎选择（docling | marker | ovis），同上全局注入一次。
         from agent.rag import engine as _rag_engine_mod
         _rag_engine_mod.set_pdf_engine(getattr(self.config, "rag_pdf_engine", "docling"))
@@ -1352,6 +1357,8 @@ class MainWindow(QMainWindow):
             )
             from agent.rag import parsers as _rag_parsers
             _rag_parsers.set_ocr_config(self.config)
+            from agent.rag.docling_parser import set_docling_pool_size
+            set_docling_pool_size(getattr(self.config, "rag_docling_pool_size", 1))
             from agent.rag.docling_parser import set_ocr_scale_config
             set_ocr_scale_config(
                 base=getattr(self.config, "rag_ocr_scale_base", 2.0),
@@ -1598,6 +1605,45 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("源知识库")); r.addWidget(self.knowledge_base_edit, 1); r.addWidget(self.knowledge_base_btn)
         klay.addLayout(r)
 
+        # row1.2: 知识同步动作行（紧跟「工作目录配置行」）。按需求，在「应用配置」
+        # 之后依次排列：开始同步 / 停止同步 / 向量去重。
+        self.kb_apply_btn = QPushButton("应用配置")
+        self.kb_apply_btn.setStyleSheet("font-weight:600;")
+        self.kb_apply_btn.setToolTip(
+            "保存当前所有设置并重新注入 RAG 解析层 / 重建 Agent（含知识同步区的\n"
+            "Embedding / Reranker 选择），使新建向量库立即采用所选实现。")
+        self.kb_apply_btn.clicked.connect(self._on_apply_config)
+
+        self.sync_knowledge_btn = QPushButton("开始同步")
+        self.sync_knowledge_btn.setToolTip(
+            "解析知识库文档、建立向量索引，支持 RAG 检索\n"
+            "左键：增量同步（只处理新增/修改的文件）\n"
+            "右键：强制全量重新处理"
+        )
+        self.sync_knowledge_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
+        self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
+
+        self.stop_sync_btn = QPushButton("停止同步")
+        self.stop_sync_btn.setEnabled(False)
+        self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
+        self.stop_sync_btn.clicked.connect(self._on_stop_sync)
+
+        self.dedup_vectors_btn = QPushButton("向量去重")
+        self.dedup_vectors_btn.setToolTip(
+            "扫描向量库，清理内容完全相同的重复向量\n"
+            "（每组只保留最早入库的一份，降低检索噪声）"
+        )
+        self.dedup_vectors_btn.clicked.connect(self._on_dedup_vectors)
+
+        r = QHBoxLayout(); r.setSpacing(8); r.setContentsMargins(0, 0, 0, 0)
+        r.addStretch(1)
+        r.addWidget(self.kb_apply_btn)
+        r.addWidget(self.sync_knowledge_btn)
+        r.addWidget(self.stop_sync_btn)
+        r.addWidget(self.dedup_vectors_btn)
+        klay.addLayout(r)
+
         # row1.5: PDF 解析引擎 + 自定义 OCR 模型（#133 统一引擎回退链）
         self.pdf_engine_combo = _combo(["docling", "marker", "OvisOCR"], 110)
         self.pdf_engine_combo.setToolTip(
@@ -1606,14 +1652,23 @@ class MainWindow(QMainWindow):
             "· marker：marker-pdf 优先（需 pip install marker-pdf；未装静默回退 docling）\n"
             "· OvisOCR：OvisOCR2 VLM 转 Markdown（docling/marker 之外的兜底）"
         )
-        # 并发实例：解析/OCR 引擎池大小（rag_ocr_pool_size）。
-        # 1 = 单实例串行（最省内存，旧行为）；2-4 = 多实例并发（吞吐更高，
-        # 常驻内存/显存同比上升）。扫描件、图片型 PDF 的 OCR 阶段收益最明显。
-        self.parse_concurrency_combo = _combo(["1", "2", "3", "4"], 56)
+        # 并发实例：docling 转换器池大小（rag_docling_pool_size）。可选 1-6，默认 1。
+        # 控制 docling 解析器同时 convert 几个文件；⚠️ docling 的 MPS 推理非线程安全，
+        # 进程内多实例在 16GB 机器上会触发 GPU 重置硬崩——默认 1 最稳，≥32GB 可试 2-6。
+        self.parse_concurrency_combo = _combo(["1", "2", "3", "4", "5", "6"], 56)
         self.parse_concurrency_combo.setToolTip(
-            "解析时的并发实例数（rag_ocr_pool_size）：\n"
-            "1 = 单实例串行（最省内存）；\n"
-            "2-4 = 多实例并发解析，吞吐更高但常驻内存同比上升。\n"
+            "docling 解析器的并发实例数（rag_docling_pool_size）：\n"
+            "1 = 单实例串行（最省内存，默认，16GB 机器最稳）；\n"
+            "2-6 = 多实例并发解析，吞吐更高但常驻显存/内存同比上升。\n"
+            "⚠️ docling 的 MPS 推理非线程安全，进程内多实例在 16GB 机器上\n"
+            "可能触发 GPU 重置硬崩；仅 ≥32GB 内存时建议尝试 2 及以上。")
+        # OCR并发：RapidOCR 引擎池大小（rag_ocr_pool_size）。可选 1-6，默认 1。
+        # 控制 ocrmac 透传页的 RapidOCR 并发识别数；纯 CPU EP，多实例安全。
+        self.ocr_concurrency_combo = _combo(["1", "2", "3", "4", "5", "6"], 56)
+        self.ocr_concurrency_combo.setToolTip(
+            "OCR 并发数（rag_ocr_pool_size，RapidOCR 引擎池）：\n"
+            "1 = 单实例串行（最省内存，默认）；\n"
+            "2-6 = 多实例并发识别，吞吐更高但常驻内存同比上升。\n"
             "对扫描件/图片型 PDF 的 OCR 阶段收益最明显，纯文本 PDF 基本无感。")
         self.ocr_impl_combo = _combo(["mlx-vlm", "onnx", "gguf"], 110)
         # 仅「类型 + 本地路径」：OCR 始终本地 VLM，模型名由 config 默认值
@@ -1635,6 +1690,7 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("PDF解析引擎")); r.addWidget(self.pdf_engine_combo)
         r.addWidget(QLabel("并发实例")); r.addWidget(self.parse_concurrency_combo)
         r.addWidget(QLabel("自定义OCR")); r.addWidget(self.ocr_impl_combo)
+        r.addWidget(QLabel("OCR并发")); r.addWidget(self.ocr_concurrency_combo)
         r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
         # 「保存设置」：把当前「自定义OCR」行的设置落盘，并让识别测试下拉框
         # 出现这个自定义模型（下拉第四项名字取自路径）。不重建整个 RAG。
@@ -1734,34 +1790,30 @@ class MainWindow(QMainWindow):
             "值过大会浪费嵌入算力，过小会丢失跨边界语义。建议为切片大小的 5%~15%。")
         r.addWidget(self.chunk_overlap_edit)
         r.addSpacing(6)
-        r.addWidget(QLabel("向量维度"))
-        self.embedding_dims_edit = _num(
-            str(getattr(self.config, "rag_embedding_dims", 512)), 56)
-        self.embedding_dims_edit.setToolTip(
-            "Matryoshka 向量维度（仅 nomic-embed-text 系列生效）：\n"
-            "对完整向量截取前 N 维、**重新归一化**后量化到 int8 入库/查询。\n"
-            "512（默认）：实测与 768 全维效果统计等价，向量体积省 1/3；\n"
-            "256：更省体积，中文 top-1 约低 5 个百分点；\n"
-            "0：不截断，保留模型原始维度。\n"
-            "其它 embedding 模型忽略本项。改动后旧向量库需清空重建。")
-        r.addWidget(self.embedding_dims_edit)
-        self.dedup_vectors_btn = QPushButton("向量去重")
-        self.dedup_vectors_btn.setToolTip(
-            "扫描向量库，清理内容完全相同的重复向量\n"
-            "（每组只保留最早入库的一份，降低检索噪声）"
-        )
-        self.dedup_vectors_btn.clicked.connect(self._on_dedup_vectors)
-        r.addWidget(self.dedup_vectors_btn)
-        self.sync_knowledge_btn = QPushButton("同步知识")
-        self.sync_knowledge_btn.setToolTip(
-            "解析知识库文档、建立向量索引，支持 RAG 检索\n"
-            "左键：增量同步（只处理新增/修改的文件）\n"
-            "右键：强制全量重新处理"
-        )
-        self.sync_knowledge_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
-        self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
-        self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
-        r.addWidget(self.sync_knowledge_btn)
+        self.matryoshka_chk = QCheckBox("Matryoshka")
+        self.matryoshka_chk.setChecked(
+            bool(getattr(self.config, "rag_matryoshka_enabled", True)))
+        self.matryoshka_chk.setToolTip(
+            "对支持 Matryoshka（俄罗斯套娃）表示的 embedding 模型\n"
+            "（nomic-embed-text-v1.5、jina-embeddings-v3 等）启用维度裁剪：\n"
+            "截取前 N 维、**重新 L2 归一化**后量化到 int8 入库/查询。\n"
+            "关闭则保留模型原始维度（仍做 int8 量化）。")
+        r.addWidget(self.matryoshka_chk)
+        r.addSpacing(6)
+        r.addWidget(QLabel("裁剪维度"))
+        self.embedding_dims_combo = _combo(["128", "256", "512"])
+        _dims_init = str(getattr(self.config, "rag_embedding_dims", 256))
+        if _dims_init not in ("128", "256", "512"):
+            _dims_init = "256"
+        self.embedding_dims_combo.setCurrentText(_dims_init)
+        self.embedding_dims_combo.setToolTip(
+            "Matryoshka 裁剪维度（仅对支持 Matryoshka 的模型生效）：\n"
+            "128：最小体积/最快，检索质量最低；\n"
+            "256：体积与质量均衡（默认）；\n"
+            "512：质量最高，体积最大。\n"
+            "设置后自动完成 L2 归一化 + int8 量化，入库与查询同步。\n"
+            "改动后旧向量库需清空重建。")
+        r.addWidget(self.embedding_dims_combo)
         klay.addLayout(r)
 
         # row3: Reranker（实现下拉 + 模型名 + 本地路径选择 + 停止同步）
@@ -1787,10 +1839,6 @@ class MainWindow(QMainWindow):
             "对应 rag_search_top_k（默认 5）；检索时若未显式指定 top_k 即采用此值。\n"
             "取值 1~10（引擎在检索时会夹紧到该范围）。")
         r.addWidget(self.reranker_topn_edit)
-        self.stop_sync_btn = QPushButton("停止同步")
-        self.stop_sync_btn.setEnabled(False)
-        self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
-        r.addWidget(self.stop_sync_btn)
         klay.addLayout(r)
 
         lay.addWidget(kb_box)
@@ -2280,7 +2328,6 @@ class MainWindow(QMainWindow):
         self.knowledge_base_btn.clicked.connect(self._on_pick_knowledge_base)
         self.sync_knowledge_btn.clicked.connect(self._on_sync_knowledge)
         self.kb_sync_btn.clicked.connect(self._on_sync_knowledge)
-        self.stop_sync_btn.clicked.connect(self._on_stop_sync)
         self.clear_btn.clicked.connect(self._on_clear_chat)
         self.log_clear_btn.clicked.connect(self.log_view.clear)
         self.send_btn.clicked.connect(self._on_send)
@@ -2364,9 +2411,12 @@ class MainWindow(QMainWindow):
         self.pdf_engine_combo.setCurrentText(
             _PDF_VALUE_TO_DISPLAY.get(
                 getattr(self.config, "rag_pdf_engine", "docling"), "docling"))
-        # 并发实例（rag_ocr_pool_size）：夹在 1-4（下拉框只有这四项）。
-        _pool = int(getattr(self.config, "rag_ocr_pool_size", 2) or 2)
-        self.parse_concurrency_combo.setCurrentText(str(min(max(_pool, 1), 4)))
+        # 并发实例（rag_docling_pool_size，docling 转换器池）：夹在 1-6（下拉框只有这六项）。
+        _dl_pool = int(getattr(self.config, "rag_docling_pool_size", 1) or 1)
+        self.parse_concurrency_combo.setCurrentText(str(min(max(_dl_pool, 1), 6)))
+        # OCR并发（rag_ocr_pool_size，RapidOCR 引擎池）：同样夹在 1-6。
+        _ocr_pool = int(getattr(self.config, "rag_ocr_pool_size", 1) or 1)
+        self.ocr_concurrency_combo.setCurrentText(str(min(max(_ocr_pool, 1), 6)))
         # OCR 模型（OvisOCR2，#133）：仅类型 + 路径；模型名用 config 默认值
         self.ocr_impl_combo.setCurrentText(
             getattr(self.config, "rag_ocr_engine", "mlx-vlm") or "mlx-vlm")
@@ -2393,7 +2443,12 @@ class MainWindow(QMainWindow):
             bool(getattr(self.config, "rag_chunk_semantic", True)))
         self.chunk_size_edit.setText(str(getattr(self.config, "rag_chunk_size", 800)))
         self.chunk_overlap_edit.setText(str(getattr(self.config, "rag_chunk_overlap", 50)))
-        self.embedding_dims_edit.setText(str(getattr(self.config, "rag_embedding_dims", 512)))
+        self.matryoshka_chk.setChecked(
+            bool(getattr(self.config, "rag_matryoshka_enabled", True)))
+        _dims_load = str(getattr(self.config, "rag_embedding_dims", 256))
+        if _dims_load not in ("128", "256", "512"):
+            _dims_load = "256"
+        self.embedding_dims_combo.setCurrentText(_dims_load)
         # Embedding / Reranker 的「模型名 ↔ 本地路径」显隐：fastembed 显示模型名、
         # 隐藏路径；本地实现反之。按当前下拉值一次性同步初始可见性。
         self._sync_impl_fields(self.embedding_impl_combo,
@@ -2533,17 +2588,26 @@ class MainWindow(QMainWindow):
         self.config.rag_chunk_semantic = self.semantic_chunk_chk.isChecked()
         _num(self.chunk_size_edit, "rag_chunk_size", 800, int, "切片大小")
         _num(self.chunk_overlap_edit, "rag_chunk_overlap", 50, int, "重叠")
-        _num(self.embedding_dims_edit, "rag_embedding_dims", 512, int, "向量维度")
+        self.config.rag_matryoshka_enabled = self.matryoshka_chk.isChecked()
+        _dims_save = self.embedding_dims_combo.currentText().strip()
+        self.config.rag_embedding_dims = (
+            int(_dims_save) if _dims_save in ("128", "256", "512") else 256)
         self.config.rag_chunk_overlap_percent = 0.0
         # PDF 解析引擎（docling | marker | ovis）：显示标签 → 内部值。
         self.config.rag_pdf_engine = _PDF_DISPLAY_TO_VALUE.get(
             self.pdf_engine_combo.currentText().strip(), "docling")
-        # 并发实例（rag_ocr_pool_size）：下拉只有 1-4，仍夹紧兜底。
+        # 并发实例（rag_docling_pool_size，docling 转换器池）：下拉只有 1-6，仍夹紧兜底。
         try:
-            _pool = int(self.parse_concurrency_combo.currentText())
+            _dl_pool = int(self.parse_concurrency_combo.currentText())
         except (TypeError, ValueError):
-            _pool = 2
-        self.config.rag_ocr_pool_size = min(max(_pool, 1), 4)
+            _dl_pool = 1
+        self.config.rag_docling_pool_size = min(max(_dl_pool, 1), 6)
+        # OCR并发（rag_ocr_pool_size，RapidOCR 引擎池）：同样夹紧 1-6。
+        try:
+            _ocr_pool = int(self.ocr_concurrency_combo.currentText())
+        except (TypeError, ValueError):
+            _ocr_pool = 1
+        self.config.rag_ocr_pool_size = min(max(_ocr_pool, 1), 6)
         # OCR 模型（OvisOCR2，#133）：实现/模型名/本地路径
         self.config.rag_ocr_engine = self.ocr_impl_combo.currentText().strip() or "mlx-vlm"
         # 模型名不暴露给 UI：保持 config 默认值（OvisOCR2-0.8B-MLX-4bit），
@@ -2591,6 +2655,13 @@ class MainWindow(QMainWindow):
                 dynamic=getattr(self.config, "rag_ocr_scale_dynamic", False),
                 table=getattr(self.config, "rag_ocr_scale_table", 2.5),
             )
+            # OCR 引擎池 + docling 转换器池（UI「OCR并发」/「并发实例」）：此前主应用
+            # 路径漏了 set_ocr_config，导致改 OCR 并发数只能靠重启生效；这里补齐，
+            # 与 __init__ / 转换工具前置注入保持一致。
+            from agent.rag import parsers as _rag_parsers
+            _rag_parsers.set_ocr_config(self.config)
+            from agent.rag.docling_parser import set_docling_pool_size
+            set_docling_pool_size(getattr(self.config, "rag_docling_pool_size", 1))
         except Exception:
             pass
         # 重建会换掉主模型，先把主按钮复位为「加载模型」未就绪态，待后台预加载
@@ -2812,13 +2883,13 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "向量去重失败", error[:500])
 
     def _set_kb_sync_state(self, text=None, enabled=None) -> None:
-        """刷新「同步知识」按钮状态：顶栏快捷按钮 + 设置区按钮两处保持一致。
+        """刷新「开始同步」按钮状态：顶栏快捷按钮 + 设置区按钮两处保持一致。
 
-        两处默认文案不同（顶栏「知识同步」/ 设置区「同步知识」），故恢复时
+        两处默认文案不同（顶栏「知识同步」/ 设置区「开始同步」），故恢复时
         各自回到自己的默认标签；进行中的临时文案（检查依赖…/同步中…）一致。
         按钮尚未创建时（初始化早期）安全跳过。
         """
-        for btn, default in ((getattr(self, "sync_knowledge_btn", None), "同步知识"),
+        for btn, default in ((getattr(self, "sync_knowledge_btn", None), "开始同步"),
                              (getattr(self, "kb_sync_btn", None), "知识同步")):
             if btn is None:
                 continue

@@ -466,13 +466,12 @@ class TestLocalBgeMlx:
         assert abs(norm - 1.0) < 1e-3, f"bge 输出未 L2 归一化: {norm}"
 
     def test_bge_query_instruction_applied(self):
-        """bert 族自动套 bge query 指令前缀（仅 query 用，document 不加）。"""
+        """bge 族自动套中文 query 指令前缀（仅 query 用，document 不加）。"""
         from agent.local.embedding import LocalEmbeddingFunction
 
         ef = LocalEmbeddingFunction(_BGE_DIR, backend="mlx")
-        # family 应识别为 bert → 默认带 bge query 指令
-        assert ef._family == "bert"
-        assert ef._query_prefix.startswith("Represent this sentence")
+        # 目录名含 bge → 前缀族 bge：query 带中文指令，document 不加
+        assert ef._query_prefix.startswith("为这个句子生成表示以检索相关文档")
         assert ef._doc_prefix == ""
 
     def test_bge_end_to_end_via_provider(self):
@@ -485,3 +484,78 @@ class TestLocalBgeMlx:
         ef = LocalEmbeddingFunction(path, backend="mlx")
         v = ef.embed_documents(["知识库里关于机器学习的章节内容。"])[0]
         assert len(v) == 512
+
+
+# ---------------------------------------------------------------------------
+# 任务前缀策略统一收敛：各模型族一张权威表（_FAMILY_TASK_PREFIXES），
+# 本地路径与 fastembed 路径经 resolve_task_prefixes() 同源取用。纯 Python
+# 判定逻辑，不依赖模型权重 / MLX。
+# ---------------------------------------------------------------------------
+class TestTaskPrefixStrategy:
+    def test_nomic_family(self):
+        from agent.local.embedding import resolve_task_prefixes
+
+        p = resolve_task_prefixes("nomic-ai/nomic-embed-text-v1.5-Q")
+        assert p["doc"] == "search_document: "
+        assert p["query"] == "search_query: "
+
+    def test_bge_family_chinese_instruction(self):
+        from agent.local.embedding import resolve_task_prefixes
+
+        p = resolve_task_prefixes("models/bge-small-zh-v1.5-mlx")
+        assert p["query"].startswith("为这个句子生成表示以检索相关文档")
+        assert p["doc"] == ""
+
+    def test_e5_family(self):
+        from agent.local.embedding import resolve_task_prefixes
+
+        p = resolve_task_prefixes("intfloat/e5-base-v2")
+        assert p["doc"] == "passage: "
+        assert p["query"] == "query: "
+
+    def test_jina_family_with_task_prefixes(self):
+        from agent.local.embedding import resolve_task_prefixes
+
+        p = resolve_task_prefixes("jinaai/jina-embeddings-v3")
+        assert p["doc"] == "passage: "
+        assert p["query"] == "query: "
+        assert p["clustering"] == "clustering: "
+        assert p["classification"] == "classification: "
+
+    def test_unknown_family_empty(self):
+        from agent.local.embedding import resolve_task_prefixes
+
+        assert resolve_task_prefixes("models/some-symmetric-model") == {}
+
+    def test_unknown_task_falls_back_to_doc(self, tmp_path):
+        """族表未定义的任务（如 nomic 的 clustering）回退 doc 前缀。"""
+        import json as _json
+
+        from agent.local.embedding import LocalEmbeddingFunction
+
+        d = tmp_path / "some-e5-model"
+        d.mkdir()
+        (d / "config.json").write_text(_json.dumps({"model_type": "bert"}))
+        ef = LocalEmbeddingFunction(str(d))
+        assert ef._task_prefix("clustering") == "passage: "
+
+    def test_local_ef_reads_unified_table(self, tmp_path):
+        """LocalEmbeddingFunction 默认前缀来自统一族表（而非旧 bert 硬编码）。"""
+        import json as _json
+
+        from agent.local.embedding import LocalEmbeddingFunction
+
+        d = tmp_path / "jina-like-model"
+        d.mkdir()
+        (d / "config.json").write_text(_json.dumps({"model_type": "bert"}))
+        ef = LocalEmbeddingFunction(str(d))
+        assert ef._doc_prefix == "passage: "
+        assert ef._query_prefix == "query: "
+
+    def test_fastembed_path_uses_unified_table(self):
+        """fastembed 路径不再硬编码 nomic 前缀，与本地路径同源。"""
+        ef = FastEmbedEmbeddingFunction(DEFAULT_EMBEDDING_MODEL)
+        assert ef._prefixes.get("doc") == "search_document: "
+        assert ef._prefixes.get("query") == "search_query: "
+        assert ef._prefixes.get("clustering") is None  # nomic 未定义 → 回退 doc
+

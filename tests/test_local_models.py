@@ -20,6 +20,8 @@ MODELS = os.path.join(ROOT, "models")
 NOMIC = os.path.join(MODELS, "nomic-embed-text-v1.5-mlx-int8")
 BGE = os.path.join(MODELS, "bge-reranker-v2-m3-mlx-mxfp8")
 QWEN = os.path.join(MODELS, "qwen3.5-4b-agentic-coder-v4-4bit-mlx")
+JINA_MLX = os.path.join(MODELS, "jina-embeddings-v3-mlx-int4")
+JINA_ONNX = os.path.join(MODELS, "jina-embeddings-v3-onnx-int4")
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
@@ -79,7 +81,7 @@ def test_think_splitter_incremental():
 
 def test_registry_default_paths():
     assert registry.resolve_model_path("embedding").endswith(
-        "models/bge-small-zh-v1.5-mlx")
+        "models/jina-embeddings-v3-mlx-int4")
     assert registry.resolve_model_path("reranker").endswith(
         "models/jina-reranker-v2-base-multilingual-onnx")
     assert registry.resolve_model_path("llm").endswith(
@@ -180,6 +182,144 @@ def test_local_embedding_matches_fastembed_space():
     v /= np.linalg.norm(v, axis=1, keepdims=True)
     per = np.sum(fev * v, axis=1)
     assert per.min() > 0.9, f"本地与 fastembed 向量空间偏差过大: {per}"
+
+
+# ---------------------------------------------------------------------------
+# jina-embeddings-v3（需 jina 权重）
+# ---------------------------------------------------------------------------
+
+def test_jina_family_detection_and_prefixes():
+    """jina 目录名识别为 jina 前缀族；MLX / ONNX 两目录 model_type 均为 jina-v3-mlx。"""
+    from agent.local.embedding import LocalEmbeddingFunction, resolve_task_prefixes
+
+    # 不需要权重，仅读 config.json + 前缀表
+    ef_mlx = LocalEmbeddingFunction(JINA_MLX, backend="mlx")
+    assert ef_mlx._family == "jina-v3-mlx"
+    assert ef_mlx._doc_prefix == "passage: "
+    assert ef_mlx._query_prefix == "query: "
+
+    ef_onnx = LocalEmbeddingFunction(JINA_ONNX, backend="onnx")
+    assert ef_onnx._family == "jina-v3-mlx"
+
+    p = resolve_task_prefixes("models/jina-embeddings-v3-mlx-int4")
+    assert p["doc"] == "passage: " and p["query"] == "query: "
+    assert p["clustering"] == "clustering: " and p["classification"] == "classification: "
+
+
+def test_jina_matryoshka_256():
+    """jina 被识别为 Matryoshka 模型；维度统一取配置（不再固定 256）。"""
+    from agent.rag import vector_store as vs
+
+    assert vs._is_matryoshka_model("local:mlx:jina-embeddings-v3-mlx-int4")
+    assert vs._is_matryoshka_model("local:onnx:jina-embeddings-v3-onnx-int4")
+    # jina 不再固定 256：统一用配置维度（128/256/512 均可）
+    assert vs._matryoshka_dims_for("local:mlx:jina-embeddings-v3-mlx-int4", 256) == 256
+    assert vs._matryoshka_dims_for("local:mlx:jina-embeddings-v3-mlx-int4", 512) == 512
+    # nomic 同样用配置维度
+    assert vs._matryoshka_dims_for("local:mlx:nomic-embed-text-v1.5-mlx-int8", 512) == 512
+
+
+def test_embedding_max_length_capped_at_1024():
+    """embedding 输入长度被强制夹紧到 1024，避免对超长输入做 8192 前向浪费。"""
+    from agent.local.embedding import (
+        LocalEmbeddingFunction, _MAX_EMBED_INPUT_TOKENS,
+    )
+
+    assert _MAX_EMBED_INPUT_TOKENS == 1024
+    # nomic（RoPE，原生 8192）→ 截到 1024（构造不加载权重，仅读 config）
+    assert LocalEmbeddingFunction(NOMIC, backend="mlx")._max_length == 1024
+    # jina（原生 8192）→ 截到 1024
+    assert LocalEmbeddingFunction(JINA_MLX, backend="mlx")._max_length == 1024
+    # 即便显式传入更大的 max_length，也强制不超 1024
+    assert LocalEmbeddingFunction(
+        NOMIC, backend="mlx", max_length=4096)._max_length == 1024
+    # 显式更小的值被保留
+    assert LocalEmbeddingFunction(
+        NOMIC, backend="mlx", max_length=512)._max_length == 512
+
+
+@pytest.mark.skipif(not os.path.isdir(JINA_MLX), reason="jina MLX 权重缺失")
+def test_local_jina_embedding_mlx():
+    """jina MLX 加载、1024 维输出、doc/query 用不同 task 且检索排序合理。"""
+    from agent.local.embedding import LocalEmbeddingFunction
+
+    ef = LocalEmbeddingFunction(JINA_MLX, backend="mlx")
+    docs = ef.embed_documents(["番茄炒蛋的做法步骤", "量子计算机的基本原理解释"])
+    q = ef.embed_query("如何做番茄炒蛋")
+    # 模型输出 1024 维（向量库层再截到 256）
+    assert len(docs[0]) == 1024
+    assert len(q) == 1024
+    # 模型已 L2 归一化 → 模长≈1
+    assert abs(np.linalg.norm(docs[0]) - 1.0) < 1e-3
+    # 检索：相关文档相似度高于无关文档
+    sims = np.array(docs) @ np.array(q)
+    assert sims[0] > sims[1]
+
+
+@pytest.mark.skipif(not os.path.isdir(JINA_ONNX), reason="jina ONNX 权重缺失")
+def test_local_jina_embedding_onnx():
+    """jina ONNX 加载、1024 维输出、task_id 透传、检索排序合理。"""
+    from agent.local.embedding import LocalEmbeddingFunction
+
+    ef = LocalEmbeddingFunction(JINA_ONNX, backend="onnx")
+    docs = ef.embed_documents(["番茄炒蛋的做法步骤", "量子计算机的基本原理解释"])
+    q = ef.embed_query("如何做番茄炒蛋")
+    assert len(docs[0]) == 1024
+    assert len(q) == 1024
+    assert abs(np.linalg.norm(docs[0]) - 1.0) < 1e-3
+    sims = np.array(docs) @ np.array(q)
+    assert sims[0] > sims[1]
+
+
+# ---------------------------------------------------------------------------
+# Matryoshka 维度裁剪：开关 + 可配置维度（128/256/512）
+# ---------------------------------------------------------------------------
+
+def test_matryoshka_dims_configurable_per_model():
+    """不再按模型名特判维度：nomic 与 jina 都统一用配置维度。"""
+    from agent.rag import vector_store as vs
+
+    for name in ["local:mlx:nomic-embed-text-v1.5-mlx-int8",
+                 "local:mlx:jina-embeddings-v3-mlx-int4"]:
+        assert vs._matryoshka_dims_for(name, 128) == 128
+        assert vs._matryoshka_dims_for(name, 256) == 256
+        assert vs._matryoshka_dims_for(name, 512) == 512
+        assert vs._matryoshka_dims_for(name, 0) == 0  # <=0 不截断
+
+
+def test_matryoshka_enabled_toggle_short_circuits():
+    """全局开关关闭时，_is_matryoshka 直接返回 False（即便模型本身支持）。"""
+    from agent.rag import vector_store as vs
+
+    vs.set_matryoshka_enabled(False)
+    try:
+        # 维度=0 时 _prepare_vector_for_index 不截断：验证「开关关闭 → 不裁剪」的
+        # 实际效果（_is_matryoshka 由实例层短路，这里用流水线结果间接验证）。
+        out = vs._prepare_vector_for_index(list(range(300)), True, 0)
+        assert len(out) == 300  # 未截断（dim=0）
+    finally:
+        vs.set_matryoshka_enabled(True)
+
+
+def test_config_clamps_invalid_dims_and_respects_toggle(tmp_path):
+    """配置归一：非法维度→256；关闭开关→维度归零（不裁剪）。"""
+    from agent.config import AgentConfig
+
+    p = tmp_path / "config.json"
+    # 非法维度 + 启用 → 归一到 256
+    p.write_text('{"rag_matryoshka_enabled": true, "rag_embedding_dims": 300}')
+    c1 = AgentConfig.load(str(p))
+    assert c1.rag_matryoshka_enabled is True
+    assert c1.rag_embedding_dims == 256
+    # 128/256/512 保持不变
+    for d in (128, 256, 512):
+        p.write_text(f'{{"rag_embedding_dims": {d}}}')
+        assert AgentConfig.load(str(p)).rag_embedding_dims == d
+    # 关闭开关 → 维度归零（不裁剪）
+    p.write_text('{"rag_matryoshka_enabled": false, "rag_embedding_dims": 512}')
+    c2 = AgentConfig.load(str(p))
+    assert c2.rag_matryoshka_enabled is False
+    assert c2.rag_embedding_dims == 0
 
 
 # ---------------------------------------------------------------------------

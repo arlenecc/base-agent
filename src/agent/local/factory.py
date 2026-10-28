@@ -124,10 +124,11 @@ def configure_local_models(config) -> None:
     """
     from ..rag import vector_store as vs
     # MLX 默认 cache_limit 是统一内存的 ~75%：聊天/嵌入的空闲 Metal buffer
-    # 会一路涨到上限才归还系统（16GB 机器上 ~12GB）。压到 1GB，空闲即还。
+    # 会一路涨到上限才归还系统（16GB 机器上 ~12GB）。按配置压到指定上限，空闲即还。
     try:
         from ..rag.engine import configure_mlx_memory_limits
-        configure_mlx_memory_limits()
+        _cache_mb = int(getattr(config, "mlx_cache_limit_mb", 2000))
+        configure_mlx_memory_limits(_cache_mb * 1_000_000)
     except Exception:  # mlx 未装 / 非 macOS：跳过
         pass
     vs.set_embedding_provider(
@@ -135,8 +136,10 @@ def configure_local_models(config) -> None:
         path=getattr(config, "local_embedding_model", ""),
         backend=_backend(getattr(config, "local_embedding_backend", "mlx"), "mlx"),
     )
-    # Matryoshka 截断维度（仅 nomic-embed-text 系列生效；<=0 不截断）。
-    vs.set_matryoshka_dims(int(getattr(config, "rag_embedding_dims", 512)))
+    # Matryoshka 维度裁剪：开关（rag_matryoshka_enabled）+ 维度（rag_embedding_dims）。
+    # 对所有支持 Matryoshka 的模型（nomic-embed-text 系列、jina-embeddings-v3 等）生效。
+    vs.set_matryoshka_enabled(bool(getattr(config, "rag_matryoshka_enabled", True)))
+    vs.set_matryoshka_dims(int(getattr(config, "rag_embedding_dims", 256)))
     vs.set_reranker_provider(
         _provider(getattr(config, "reranker_provider", "local"), "local"),
         path=getattr(config, "local_reranker_model", ""),

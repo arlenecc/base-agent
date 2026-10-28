@@ -70,14 +70,19 @@ class AgentConfig:
     # 按语义边界切分；False 时跳过语义/混合分片，直接按字数（token）递归切分，
     # 不加载任何嵌入模型，适合追求确定性 / 离线 / 不希望语义切片的场景。
     rag_chunk_semantic: bool = True
-    # Matryoshka 向量维度（**仅 nomic-embed-text 系列生效**）：入库/查询都在
-    # 计算完整向量后截取前 N 维、重新归一化、再量化到 int8。
-    #   512（默认）：实测与 768 全维效果统计等价，向量体积省 1/3；
-    #   256：更省体积，中文检索略降（top-1 约 -5 个百分点）；
-    #   ≤0：不截断，保留模型原始维度。
-    # 其它 embedding 模型忽略本项（只做 int8 量化）。改动后向量维度变化，
+    # Matryoshka（俄罗斯套娃）维度裁剪开关：对支持该特性的 embedding 模型
+    # （nomic-embed-text-v1.5、jina-embeddings-v3 等）启用「截取前 N 维 → 重新
+    # L2 归一化 → int8 量化」入库/查询。关闭则保留模型原始维度（仍做 int8 量化）。
+    # 详见 rag/vector_store.py 的 _prepare_vector_for_index。
+    rag_matryoshka_enabled: bool = True
+    # Matryoshka 裁剪维度（仅 rag_matryoshka_enabled 为 True 时生效，且仅作用于
+    # 支持 Matryoshka 的模型）。可选 128 / 256 / 512；其它值（含 <=0）视为不裁剪。
+    #   256（默认）：体积与质量均衡；
+    #   128：最小体积/最快，检索质量最低；
+    #   512：质量最高，体积最大。
+    # 设置后自动完成 L2 归一化 + int8 量化，入库与查询同步。改动后向量维度变化，
     # 旧库需清空重建。
-    rag_embedding_dims: int = 512
+    rag_embedding_dims: int = 256
     # rag_search 默认返回条数（重排后的最终结果数）。
     rag_search_top_k: int = 5
     # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：
@@ -166,13 +171,17 @@ class AgentConfig:
     #   local_llm_tokenizer_path   ONNX 的独立 tokenizer 目录/文件（缺则随模型目录）
     local_llm_mmproj_path: str = ""
     local_llm_tokenizer_path: str = ""
-    # RapidOCR 引擎池大小（2026-10-23 用户定版：2 个实例、纯 CPU EP 并发）。
+    # RapidOCR 引擎池大小（设置区「并发实例」下拉，可选 1-6，默认 1）。
     # 背景：ocrmac 识别不了的页会整页透传到 RapidOCR，透传请求占比不低，
-    # 单实例串行是扫描书解析的吞吐瓶颈。两个实例 ≈ 2 × 0.5GB 常驻。
+    # 单实例串行是扫描书解析的吞吐瓶颈；2+ 实例可并发提速（≈2 × 0.5GB 常驻）。
     # 固定纯 CPU EP——CoreML 单实例基线 1.7GB 且按输入形状 67MB/页爬升，
     # 并发会翻倍；CPU EP 的 arena 增量实测为 0 且更快（见 parsers 模块头）。
-    # 设 1 退化为单实例串行（旧行为）。
-    rag_ocr_pool_size: int = 2
+    # 设 1 退化为单实例串行（最省内存）；用户定版默认 1，需要时可在 UI 调到 2-6。
+    rag_ocr_pool_size: int = 1
+    # docling 转换器池大小（设置区「并发实例」下拉，可选 1-6，默认 1）。
+    # 控制 docling 解析器同时 convert 几个文件；⚠️ docling 的 MPS 推理非线程安全，
+    # 进程内多实例在 16GB 机器上会触发 GPU 重置硬崩，故默认 1 最稳；≥32GB 可试 2-6。
+    rag_docling_pool_size: int = 1
     # OCR 前的图像归一化与增强（尺寸归一化 + 灰度 CLAHE + 锐化）。
     # 关掉则把渲染出的原始位图直接送进引擎（旧行为）。
     rag_ocr_preprocess: bool = True
@@ -235,12 +244,20 @@ class AgentConfig:
     local_llm_prefill_step_size: int = 4096
 
     embedding_provider: str = "local"
-    # 默认 embedding：nomic-embed-text-v1.5 的 MLX int8 权重（768 维，RoPE
-    # 8192 窗口）。路径相对项目根解析（<root>/models/...）。nomic 支持
-    # Matryoshka 表示学习：向量库层会截取前 256 维、重新归一化后量化到 int8
-    # 入库，既保语义又显著压缩体积（见 rag/vector_store.py）。
-    local_embedding_model: str = "models/nomic-embed-text-v1.5-mlx-int8"
+    # 默认 embedding：jina-embeddings-v3 的 MLX int4 权重（1024 维，XLM-RoBERTa
+    # + RoPE + 任务 LoRA；统一模型，按 retrieval.query/passage 选适配器）。
+    # 路径相对项目根解析（<root>/models/...）。jina 支持 Matryoshka：向量库层
+    # 截取前 256 维、重新归一化后量化到 int8 入库（见 rag/vector_store.py）。
+    # 跨平台 / 无 Apple Silicon 时改用 ONNX 版：local_embedding_model 指向
+    # models/jina-embeddings-v3-onnx-int4、local_embedding_backend="onnx"。
+    local_embedding_model: str = "models/jina-embeddings-v3-mlx-int4"
     local_embedding_backend: str = "mlx"
+    # MLX Metal 缓冲缓存上限（MB）。MLX 默认 cache_limit = 统一内存的 ~75%，空闲
+    # Metal buffer 不归还系统、一路涨到上限（16GB 机器上 ~12GB，是 #131 同步内存
+    # 爆炸的根因）。压到 2GB：空闲即还、避免暴涨；同时给 embedding/LLM 编译后的
+    # 核更宽松的缓存，减少重复编译开销。调大可略提速度但 idle 内存占用上升，调小
+    # 省内存但可能因核被挤出而重编译变慢。2GB 是内存安全与速度的平衡点。
+    mlx_cache_limit_mb: int = 2000
 
     reranker_provider: str = "local"
     local_reranker_model: str = "jina-reranker-v2-base-multilingual-onnx"
@@ -269,11 +286,12 @@ class AgentConfig:
     _INT_FIELDS = ("max_tokens", "top_k", "max_iterations", "max_history",
                    "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
                    "rag_search_top_k", "rag_embedding_dims",
-                   "rag_condense_min_chars",
+                   "rag_condense_min_chars", "mlx_cache_limit_mb",
                    "rag_condense_max_chars",
                    "kernel_max_context_tokens", "kernel_raw_turns",
                    "kernel_consolidate_every", "kernel_max_tool_chars",
                    "kernel_max_digest_lines", "rag_ocr_pool_size",
+                   "rag_docling_pool_size",
                    "aux_max_tokens", "aux_top_k",
                    "local_llm_num_draft_tokens", "local_llm_prefill_step_size")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
@@ -300,7 +318,8 @@ class AgentConfig:
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
                     "rag_ocr_scale_dynamic", "aux_llm_enabled",
-                    "local_llm_enable_thinking", "aux_local_llm_enable_thinking")
+                    "local_llm_enable_thinking", "aux_local_llm_enable_thinking",
+                    "rag_matryoshka_enabled")
 
     @classmethod
     def _coerce(cls, name: str, value):
@@ -463,14 +482,15 @@ class AgentConfig:
         # 用户若显式选了别的 OvisOCR2 目录名则不受影响。
         if self.rag_ocr_model_name == "OvisOCR2-0.8B-MLX-4bit":
             self.rag_ocr_model_name = "OvisOCR3-MLX-4bit-mixed46"
-        # 本地 embedding 默认模型切回 nomic-embed-text-v1.5（MLX int8 权重，
-        # 768 维）。空路径（旧配置默认走 fastembed 网络模型）与历史默认
-        # bge-small-zh-v1.5-mlx 都迁到新默认——bge 只有 512 窗口，与新的
-        # 800 token 切片不匹配。用户显式指定的其它本地模型目录保持原样。
+        # 本地 embedding 默认模型定为 jina-embeddings-v3（MLX int4 权重，1024 维、
+        # 多语/中文强、支持 Matryoshka）。空路径（旧配置默认走 fastembed 网络模型）
+        # 与历史默认 bge-small-zh-v1.5-mlx 都迁到新默认——bge 只有 512 窗口，与
+        # 新的 800 token 切片不匹配；nomic 用户（非 bge/空）保持原样。用户显式
+        # 指定的其它本地模型目录保持原样。
         if not self.local_embedding_model or self.local_embedding_model in (
             "bge-small-zh-v1.5-mlx", "models/bge-small-zh-v1.5-mlx",
         ):
-            self.local_embedding_model = "models/nomic-embed-text-v1.5-mlx-int8"
+            self.local_embedding_model = "models/jina-embeddings-v3-mlx-int4"
         if not self.local_reranker_model:
             # 默认 reranker 改为 jina（onnx / CPU-only）。仅在「未显式指定本地
             # 模型」时填充——显式指定了其它模型（如 bge-mxfp8）的用户保持原样。
@@ -478,6 +498,13 @@ class AgentConfig:
             # 后端=mlx」让 mlx_lm 误加载 onnx 权重而失败。
             self.local_reranker_model = "jina-reranker-v2-base-multilingual-onnx"
             self.local_reranker_backend = "onnx"
+        # Matryoshka 裁剪维度归一：仅在启用且为受支持的 128/256/512 时保留，
+        # 其它值（含 <=0）归一到 256，避免无效维度导致截断逻辑异常。关闭时不裁剪。
+        if getattr(self, "rag_matryoshka_enabled", True):
+            if self.rag_embedding_dims not in (128, 256, 512):
+                self.rag_embedding_dims = 256
+        else:
+            self.rag_embedding_dims = 0
 
     def save(self, path: str) -> None:
         import json

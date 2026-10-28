@@ -90,9 +90,11 @@ _PDF_BATCH_PAGES = 50
 #   用户另一实现"2×docling+MPS 不崩"应为多进程隔离（各自独立 Metal 上下文）
 #   或实际串行——进程内线程并发无解，除非 docling 上游修复 torch-MPS 线程安全。
 # 最终配置二选一（吞吐实测相当：2 CPU 实例 ≈ 1 MPS 实例）：
-#   a) pool=2 + CPU（默认采用）：双核吃满、与 MLX embedding 并发无忧；
+#   a) pool=2 + CPU：双核吃满、与 MLX embedding 并发无忧；
 #   b) pool=1 + MPS：单文件转换快 ~35%，但解析串行。
-_DOCLING_POOL_SIZE = 2
+# 现池大小由 UI「并发实例」（config.rag_docling_pool_size，可选 1-6）注入，
+# 默认 1（16GB 机器最稳）；≥32GB 可试 2-6（仍有 MPS 线程安全硬崩风险）。
+_DOCLING_POOL_SIZE = 1
 _DOCLING_USE_MPS = False
 
 # docling VLM 模式（可选实验）：用 Granite-Docling-258M 视觉语言模型直接生成文档
@@ -139,6 +141,31 @@ def set_ocr_scale_config(base: float = 2.0, dynamic: bool = False,
             new_base, new_dynamic, new_table,
         )
         release_converter()
+
+
+def set_docling_pool_size(size: int) -> None:
+    """注入 docling 转换器池大小（config.rag_docling_pool_size，UI 可选 1-6，默认 1）。
+
+    调小会立刻淘汰多出来的空闲 None 槽（借出中的实例归还时若仍超额，由
+    ``_release_converter_instance`` 路径自然退出）；调大只放宽上限，实例按需惰性创建
+    （见 ``_acquire_converter``）。在池锁内操作，与借出/归还/空闲回收线程互斥安全。
+
+    ⚠️ docling 的 MPS 推理**不是线程安全的**：进程内多实例并发在 16GB 机器上会触发
+    GPU 重置（InnocentVictim）→ torch-MPS 状态损坏 → SIGSEGV 硬崩。因此默认 1 最稳；
+    ≥32GB 内存、且确认走 CPU 推理时才建议尝试 2 及以上。
+    """
+    global _DOCLING_POOL_SIZE
+    n = max(1, int(size or 1))
+    with _converter_pool_cond:
+        _DOCLING_POOL_SIZE = n
+        # 收缩：把超出新上限的尾部空闲（实例为 None 且未占用）槽直接淘汰，
+        # 不打断正在使用的实例；借出中的超额槽待归还后再被回收。
+        while (len(_converters) > n and len(_converters) > 0
+               and not _converter_busy[-1] and _converters[-1] is None):
+            _converters.pop()
+            _converter_busy.pop()
+        _converter_pool_cond.notify_all()
+
 
 # Formats docling can handle natively.  Text/markdown/csv/html are handled by
 # the lightweight parsers (docling is overkill and slower for them).
