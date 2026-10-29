@@ -270,15 +270,61 @@ class ToolRegistry:
             from ..rag.vector_store import DEFAULT_RERANK_MODEL
             from .rag_tool import RagSearchTool, RagStatusTool, RagIngestTool, RagOutlineTool
 
+            # 打印 RAG 管线「实际采用」的各模型：local 模式优先 *_local_* 字段，
+            # 与 engine 的 effective_embedding_model 同口径；api 模式才用
+            # fastembed 网络模型名。否则会出现「日志显示 nomic 实际跑 jina」这类误导。
+            _cfg = self.config
+
+            def _prov(field: str, default: str = "local") -> str:
+                return str(getattr(_cfg, field, default) or default).strip().lower()
+
+            # embedding：local → local_embedding_model；api → rag_embedding_model
+            if _prov("embedding_provider") == "local":
+                _emb_model = getattr(_cfg, "local_embedding_model", "") or ""
+                _emb_prov = "local"
+            else:
+                _emb_model = getattr(_cfg, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q")
+                _emb_prov = "api"
+            if not _emb_model:
+                _emb_model = "nomic-ai/nomic-embed-text-v1.5-Q"
+
+            # reranker：local → local_reranker_model；api → rag_rerank_model
+            if _prov("reranker_provider") == "local":
+                _rr_model = getattr(_cfg, "local_reranker_model", "") or ""
+                _rr_prov = "local"
+            else:
+                _rr_model = getattr(_cfg, "rag_rerank_model", "BAAI/bge-reranker-v2-m3-int8")
+                _rr_prov = "api"
+            _rr_enabled = bool(getattr(_cfg, "rag_rerank_enabled", True))
+
+            # pdf 解析引擎 / OCR 后端+模型 / VLM
+            _pdf = getattr(_cfg, "rag_pdf_engine", "docling") or "docling"
+            _ocr_engine = getattr(_cfg, "rag_ocr_engine", "mlx-vlm") or "mlx-vlm"
+            _ocr_model = getattr(_cfg, "rag_ocr_model_name", "") or ""
+            _ocr = f"{_ocr_engine} / {_ocr_model}" if _ocr_model else _ocr_engine
+            if _prov("vlm_provider") == "local":
+                _vlm = getattr(_cfg, "local_vlm_model", "") or "(本地默认)"
+            else:
+                _vlm = "api (云端)"
+
             logger.info(
-                "RAG: initializing engine (workspace=%s kb=%s embedding=%s)",
+                "RAG: initializing engine\n"
+                "  workspace : %s\n"
+                "  kb        : %s\n"
+                "  embedding : %s  [provider=%s]\n"
+                "  reranker  : %s  [provider=%s, %s]\n"
+                "  pdf       : %s\n"
+                "  ocr       : %s\n"
+                "  vlm       : %s",
                 self.config.workspace, kb,
-                getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
+                _emb_model, _emb_prov,
+                _rr_model, _rr_prov, "enabled" if _rr_enabled else "disabled",
+                _pdf, _ocr, _vlm,
             )
             engine = RAGEngine(
                 workspace=self.config.workspace,
                 knowledge_base=kb,
-                embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
+                embedding_model=_emb_model,
                 rerank_model=getattr(self.config, "rag_rerank_model",
                                      DEFAULT_RERANK_MODEL),
                 rerank_enabled=bool(getattr(self.config, "rag_rerank_enabled", True)),

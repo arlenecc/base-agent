@@ -201,16 +201,24 @@ class DependencyReport:
             for d in self.missing_required:
                 lines.append(f"  - {d.label} (pip install {d.pip_spec})")
         if self.embedding_model_missing:
-            lines.append(f"缺少嵌入模型：{EMBEDDING_MODEL_LABEL}")
-            lines.append(f"  → fastembed 模型名: {FASTEMBED_MODEL_NAME}")
-            lines.append(f"  → HuggingFace 仓库: {_EMBEDDING_HF_REPO} (仅需 {len(_EMBEDDING_REQUIRED_FILES)} 个文件)")
-            lines.append("  → 手动下载命令（必须落到 fastembed 自己的缓存目录，")
-            lines.append("     下到默认 ~/.cache/huggingface 的话 fastembed 看不到，报错依旧）：")
-            lines.append("     export HF_ENDPOINT=https://hf-mirror.com")
-            lines.append("     export HF_HUB_DISABLE_XET=1")
-            lines.append(f'     python3 -c "from fastembed import TextEmbedding; '
-                         f"TextEmbedding(model_name='{FASTEMBED_MODEL_NAME}', "
-                         f"cache_dir='{_get_fastembed_cache_dir()}')\"")
+            _eprov, _epath, _ebackend = _local_provider_state("embedding")
+            if _eprov == "local" and _epath:
+                lines.append(
+                    f"缺少本地 embedding 权重：{_epath} (backend={_ebackend})")
+                lines.append(f"  → 解析后的目录: {_resolve_local_model('embedding', _epath)}")
+                lines.append("  → 本地权重不走 fastembed 下载：请把模型文件放到上述目录，")
+                lines.append("    或在知识库设置中改选 embedding 模型 / provider。")
+            else:
+                lines.append(f"缺少嵌入模型：{EMBEDDING_MODEL_LABEL}")
+                lines.append(f"  → fastembed 模型名: {FASTEMBED_MODEL_NAME}")
+                lines.append(f"  → HuggingFace 仓库: {_EMBEDDING_HF_REPO} (仅需 {len(_EMBEDDING_REQUIRED_FILES)} 个文件)")
+                lines.append("  → 手动下载命令（必须落到 fastembed 自己的缓存目录，")
+                lines.append("     下到默认 ~/.cache/huggingface 的话 fastembed 看不到，报错依旧）：")
+                lines.append("     export HF_ENDPOINT=https://hf-mirror.com")
+                lines.append("     export HF_HUB_DISABLE_XET=1")
+                lines.append(f'     python3 -c "from fastembed import TextEmbedding; '
+                             f"TextEmbedding(model_name='{FASTEMBED_MODEL_NAME}', "
+                             f"cache_dir='{_get_fastembed_cache_dir()}')\"")
 
         if self.has_image_pdf and not self.ocr_installed:
             lines.append("知识库包含图片版 PDF，但 OCR 引擎未安装：")
@@ -380,12 +388,64 @@ def _model_file_cached(model_dir: str, filename: str) -> bool:
     return False
 
 
+def _local_provider_state(kind: str) -> Tuple[str, str, str]:
+    """读取进程级 provider 状态（``configure_local_models`` 在同步前已写入）。
+
+    返回 ``(provider, path, backend)``。读取失败（vector_store 不可导入等）
+    时退回 ``("api", "", "")``——与历史行为一致，走 fastembed 检查/下载。
+    """
+    try:
+        from . import vector_store as _vs
+        attr = "_EMBED_PROVIDER" if kind == "embedding" else "_RERANK_PROVIDER"
+        state = dict(getattr(_vs, attr, {}) or {})
+    except Exception:
+        return ("api", "", "")
+    return (str(state.get("provider", "api") or "api"),
+            str(state.get("path", "") or ""),
+            str(state.get("backend", "mlx") or "mlx"))
+
+
+def _local_weights_present(model_dir: str, backend: str) -> bool:
+    """检查本地权重目录是否包含对应后端可加载的权重文件。
+
+    与 ``local/embedding.py`` / ``local/reranker.py`` 的加载逻辑对齐：
+      mlx  → 目录内有 ``*.safetensors`` 或 ``*.npz``
+      onnx → ``model.onnx`` 或 ``model_quantized.onnx``
+      gguf → 目录内有 ``*.gguf``
+    纯文件系统探测，无任何下载副作用。
+    """
+    if not model_dir or not os.path.isdir(model_dir):
+        return False
+    try:
+        files = [f for f in os.listdir(model_dir)
+                 if os.path.isfile(os.path.join(model_dir, f))]
+    except OSError:
+        return False
+    if backend == "onnx":
+        return any(f in ("model.onnx", "model_quantized.onnx") for f in files)
+    if backend == "gguf":
+        return any(f.endswith(".gguf") for f in files)
+    # mlx（默认）：safetensors 权重（老版 MLX 量化权重也可能是 npz）
+    return any(f.endswith(".safetensors") or f.endswith(".npz") for f in files)
+
+
+def _resolve_local_model(kind: str, path: str) -> str:
+    """按 registry 的搜索顺序解析本地模型目录（失败时原样返回）。"""
+    try:
+        from ..local.registry import resolve_model_path
+        return resolve_model_path(kind, path)
+    except Exception:
+        return path
+
+
 def _is_embedding_model_cached() -> bool:
     """Check whether the embedding model is already cached locally.
 
-    FastEmbed uses its OWN cache directory (NOT the standard HuggingFace
-    cache).  We check the persistent cache dir (~/.cache/fastembed) that
-    we configure in vector_store.py and _download_embedding_model().
+    **Provider 感知**：``embedding_provider=local``（默认）时，引擎实际加载的是
+    ``local_embedding_model`` 指向的本地权重目录——检查它；只有 ``api`` 模式
+    （fastembed 网络模型）才检查 fastembed 缓存。旧实现无感知地检查 fastembed
+    的 nomic 缓存，会出现「日志说模型就绪、实际加载的 jina 权重却缺失」或反过
+    来「白白下载从未使用的 nomic」的错位。
 
     **不实例化模型**：旧实现用 ``TextEmbedding(..., lazy_load=True)`` 探路径，
     但 fastembed 部分版本的下载逻辑位于基类 ``__init__`` 而非
@@ -393,6 +453,17 @@ def _is_embedding_model_cached() -> bool:
     —— 最坏情况下「依赖检查」这一步就会在 UI 线程上开始下载 137MB / 2.3GB。
     纯文件系统探测没有任何下载副作用。
     """
+    provider, path, backend = _local_provider_state("embedding")
+    if provider == "local" and path:
+        resolved = _resolve_local_model("embedding", path)
+        ok = _local_weights_present(resolved, backend)
+        if ok:
+            logger.debug("RAG deps: 本地 embedding 模型就绪: %s (backend=%s)",
+                         resolved, backend)
+        else:
+            logger.warning("RAG deps: 本地 embedding 模型缺失: %s (backend=%s)",
+                           resolved, backend)
+        return ok
     cache_dir = _get_fastembed_cache_dir()
     for model_dir in _model_cache_dirs(cache_dir, _EMBEDDING_HF_REPO):
         if not os.path.isdir(model_dir):
@@ -761,20 +832,42 @@ def ensure_dependencies(
 
     # ---- Step 2: Pre-download embedding model ----
     if report.embedding_model_missing:
-        if progress_callback:
-            progress_callback(f"嵌入模型未缓存，开始下载 {EMBEDDING_MODEL_LABEL}…")
-        success, msg = _download_embedding_model(progress_callback)
-        if success:
-            report.embedding_model_missing = False
-            installed_anything = True
+        emb_provider, emb_path, _eb = _local_provider_state("embedding")
+        if emb_provider == "local":
+            # 本地权重缺失：没有自动下载通道（fastembed 下载的是网络模型，与
+            # 实际加载的本地权重无关）。明确报错并给出指引——embedding 缺失
+            # 属 has_blocking，同步会被拦下，不会带着坏配置往下跑。
+            resolved = _resolve_local_model("embedding", emb_path)
+            msg = (f"本地 embedding 权重缺失: {resolved} (backend={_eb}) — "
+                   "请把模型文件放到该目录，或在知识库设置中切换 embedding 模型/provider")
+            report.install_errors.append(msg)
+            if progress_callback:
+                progress_callback(msg)
         else:
-            report.install_errors.append(f"嵌入模型下载失败: {msg}")
+            if progress_callback:
+                progress_callback(f"嵌入模型未缓存，开始下载 {EMBEDDING_MODEL_LABEL}…")
+            success, msg = _download_embedding_model(progress_callback)
+            if success:
+                report.embedding_model_missing = False
+                installed_anything = True
+            else:
+                report.install_errors.append(f"嵌入模型下载失败: {msg}")
 
     # ---- Step 3: Pre-download reranker model (optional, non-blocking) ----
     # 不依赖 report.reranker_model_missing：它是在 pip 安装**之前**判定的，
     # fastembed 刚被 Step 1 从旧版升级上来的场景里该标志会被跳过，模型下载
     # 就要延迟到下一轮同步。这里用安装完成后的实时状态重新判定。
-    if _is_importable("fastembed") and not _is_reranker_cached():
+    # 注意：reranker_provider=local 时实际加载本地权重，fastembed 的 bge 下载
+    # 完全无意义——本地权重缺失只提示（重排序是可选能力，检索自动回退距离
+    # 排序），绝不去下载用不上的网络模型。
+    rr_provider, rr_path, _rb = _local_provider_state("reranker")
+    if rr_provider == "local":
+        if report.reranker_model_missing:
+            resolved = _resolve_local_model("reranker", rr_path)
+            report.install_errors.append(
+                f"本地 reranker 权重缺失: {resolved}（可选，不影响同步；"
+                "检索将回退距离排序。请放置权重或改选 reranker 设置）")
+    elif _is_importable("fastembed") and not _is_reranker_cached():
         global _RERANKER_DOWNLOAD_FAILED_AT
         recent_failure = (
             _RERANKER_DOWNLOAD_FAILED_AT is not None
@@ -825,13 +918,28 @@ def _is_importable(module_name: str) -> bool:
 def _is_reranker_cached() -> bool:
     """Check whether the reranker model is already cached locally.
 
-    与 ``_is_embedding_model_cached`` 同样做纯文件系统探测（不实例化模型，
-    避免依赖检查阶段触发 ~570MB 下载）。当前用 INT8 量化版
+    **Provider 感知**（同 ``_is_embedding_model_cached``）：``reranker_provider=
+    local``（默认）时检查 ``local_reranker_model`` 的本地权重目录；``api`` 模式
+    才检查 fastembed 缓存。
+
+    fastembed 路径：与 ``_is_embedding_model_cached`` 同样做纯文件系统探测
+    （不实例化模型，避免依赖检查阶段触发 ~570MB 下载）。当前用 INT8 量化版
     （``BAAI/bge-reranker-v2-m3-int8``），权重是单文件
     ``onnx/model_int8.onnx``——它是下载的最后一个文件，完整落盘即意味着
     tokenizer 等前置文件也已就绪（中断的下载只会留下前置文件，见
     _model_file_cached 的 .incomplete 处理）。
     """
+    provider, path, backend = _local_provider_state("reranker")
+    if provider == "local" and path:
+        resolved = _resolve_local_model("reranker", path)
+        ok = _local_weights_present(resolved, backend)
+        if ok:
+            logger.debug("RAG deps: 本地 reranker 模型就绪: %s (backend=%s)",
+                         resolved, backend)
+        else:
+            logger.warning("RAG deps: 本地 reranker 模型缺失: %s (backend=%s)",
+                           resolved, backend)
+        return ok
     cache_dir = _get_fastembed_cache_dir()
     for model_dir in _model_cache_dirs(cache_dir, _RERANK_HF_REPO):
         if not os.path.isdir(model_dir):
