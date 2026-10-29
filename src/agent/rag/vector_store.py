@@ -282,6 +282,13 @@ _EF_SINGLETONS_LOCK = threading.Lock()
 _TABLE_CREATE_LOCK = threading.Lock()
 # FTS 建索引的跨实例互斥（见 _ensure_fts_index 内注释）。
 _FTS_CREATE_LOCK = threading.Lock()
+# 向量 ANN 索引的跨实例互斥（与 FTS 同理：写入侧与检索侧不同实例共享同一磁盘
+# 表，并发建/重建索引需互斥，否则报错或索引不一致；建索引是低频操作，全局锁无
+# 吞吐影响）。
+_VECTOR_INDEX_CREATE_LOCK = threading.Lock()
+# 向量 ANN 索引低于该阈值不建：行太少时 IVF 分区无意义、lancedb 可能拒绝建索引，
+# 且行少时 flat 精确检索本身足够快。超过阈值才建，避免小库白烧建索引时间。
+_VECTOR_INDEX_MIN_ROWS = 256
 # embedding 指纹表的读改写互斥（读→比对→采用回写必须原子，否则两个并发
 # search 都看到「无指纹」时会产生交替的 delete/add，可能残留重复行）。
 # 用 RLock：_check_embedding_compat 持锁调用 _write_stored_fingerprint（内部
@@ -934,6 +941,8 @@ class VectorStore:
         self._fts_ready = False  # BM25 全文索引是否已就绪
         self._fts_checked = False  # 是否已尝试创建过 FTS 索引
         self._fts_failed = False  # 建索引曾失败 → 不再重试（见 _ensure_fts_index）
+        self._vec_index_ready = False  # 向量 ANN 索引是否已就绪（仅日志/探测用）
+        self._vec_index_failed = False  # 建索引曾失败 → 不再重试（回退 flat 检索）
         # 当前打开的表是否已通过 embedding 指纹校验（通过后不再重复读 meta 表）。
         # 建表 / 表被 clear 或 close 后复位，下次 add/search 重新校验。
         self._fingerprint_checked = False
@@ -1360,6 +1369,12 @@ class VectorStore:
             self._validate_existing_table(table, records[0]["vector"])
         if created:
             logger.info("LanceDB table '%s' created with %d records", _TABLE_NAME, len(records))
+            # 首次建表：写完即建 BM25 + 向量 ANN 索引（与 add_streaming 的建表分支
+            # 一致）。否则首同步的数据要等到第二次 add 才会被索引，首同步期间检索
+            # 只能走 flat（正确但不加速）。
+            self._fts_ready = False
+            self._ensure_fts_index(self._table)
+            self._ensure_vector_index(self._table)
             return len(records)
 
         # Upsert: 按 source 删除该来源的全部旧记录。
@@ -1397,6 +1412,7 @@ class VectorStore:
         # 数据写入后重建 BM25 全文索引，覆盖新增的行。
         self._fts_ready = False
         self._ensure_fts_index(self._table)
+        self._ensure_vector_index(self._table)
 
         logger.info("VectorStore: added %d chunks", total)
         return total
@@ -1424,6 +1440,11 @@ class VectorStore:
             # 向量删了，但 BM25 倒排索引里的 term 还在——必须失效索引，
             # 否则已删除文档的内容仍会被关键词检索召回并返回给 LLM。
             self._fts_ready = False
+            # 向量 ANN 索引同理：删源后索引里仍残留已删行的分区，必须重建
+            # （向量检索没有像 search_fts 那样的懒重建自愈通道），否则已删
+            # 文档的内容会被 ANN 检索静默召回。低于阈值时 _ensure_vector_index
+            # 会自动 drop 残留旧索引，回退 flat 检索。
+            self._ensure_vector_index(self._table)
             logger.info("VectorStore: deleted records for source '%s'", source)
             if before is None:
                 return 1
@@ -1529,6 +1550,7 @@ class VectorStore:
             # 关键词检索召回（与 delete_by_source 同一理由）。
             self._fts_ready = False
             self._ensure_fts_index(self._table)
+            self._ensure_vector_index(self._table)
             logger.info("VectorStore: 向量去重完成: %d 组重复, 删除 %d 条",
                         dup_groups, removed)
         return {"scanned": scanned, "groups": dup_groups, "removed": removed}
@@ -1613,6 +1635,7 @@ class VectorStore:
                 logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
                 self._fts_ready = False
                 self._ensure_fts_index(self._table)
+                self._ensure_vector_index(self._table)
                 return total
         else:
             # 已有表（或并发竞争后打开）：先按 source 删除旧记录
@@ -1648,6 +1671,7 @@ class VectorStore:
                 # 混合检索会静默退化成纯向量检索（无报错）。
                 self._fts_ready = False
                 self._ensure_fts_index(self._table)
+                self._ensure_vector_index(self._table)
                 return total
 
         # 后续批次
@@ -1731,6 +1755,7 @@ class VectorStore:
         # 必须用 replace=True 重建才能检索到新写入的切片。
         self._fts_ready = False
         self._ensure_fts_index(self._table)
+        self._ensure_vector_index(self._table)
 
         return total
 
@@ -1947,6 +1972,72 @@ class VectorStore:
         self._fts_ready = True
         self._fts_checked = True
         logger.info("  ├─ BM25 全文索引已创建 (原生 FTS simple tokenizer + jieba 预分词)")
+        return True
+
+    def _ensure_vector_index(self, table) -> bool:
+        """为 vector 列建/重建 ANN 索引（IVF_PQ, metric=l2），加速大规模向量检索。
+
+        与 BM25 同理：LanceDB 的 ANN 索引不会在 add() 后自动纳入新行，必须在每次
+        写入后 replace=True 重建，否则新增切片在 ANN 检索下静默不可见。建索引是低频
+        操作（每次同步结束时一次），用模块级锁防并发实例重复重建。
+
+        ⚠️ 必须用 metric="l2"：search() 下游把 _distance 当作「平方 L2」按
+        1 - d²/(2·127²) 还原余弦；若改 cosine 度量，_distance 变成 1-cos 会被错误
+        换算，污染相似度分数与召回排序。
+
+        行数低于 _VECTOR_INDEX_MIN_ROWS 时跳过建索引、并清理可能残留的旧索引
+        （回退 flat 精确检索——行少时更快且 IVF 分区无意义）。建索引失败不致命：
+        置 _vec_index_failed 回退 flat 检索，不影响可用性。
+        """
+        if getattr(self, "_vec_index_failed", False):
+            return False
+        try:
+            row_count = table.count_rows()
+        except Exception:
+            return False
+        dim = _table_vector_dim(table) or 0
+        if dim <= 0:
+            return False
+        if row_count < _VECTOR_INDEX_MIN_ROWS:
+            # 行太少：不建索引；若磁盘上残留旧索引（例如表被删减后变小），清掉它，
+            # 避免 ANN 检索在过期索引上跑（可能漏召回或踩到已删除行）。
+            try:
+                table.drop_index()
+            except Exception:
+                pass
+            self._vec_index_ready = False
+            return False
+        # IVF_PQ 的 PQ 子向量数：必须整除维度。取 dim//16
+        #（256→16, 768→48, 1024→64；nomic/jina 与 Matryoshka 各档均整除）。
+        num_sub_vectors = max(1, dim // 16)
+        while dim % num_sub_vectors != 0 and num_sub_vectors > 1:
+            num_sub_vectors -= 1
+        # 分区数随数据量增长，但封顶 1024；lancedb 在行不足时会自动少训分区，不报错。
+        num_partitions = max(1, min(1024, row_count // 256))
+        with _VECTOR_INDEX_CREATE_LOCK:
+            try:
+                table.create_index(
+                    metric="l2",
+                    vector_column_name="vector",
+                    num_partitions=num_partitions,
+                    num_sub_vectors=num_sub_vectors,
+                )
+            except Exception as e:
+                msg = str(e).lower()
+                # 并发对方刚建好 → 按成功处理（索引在磁盘上已可用）。
+                if "exist" in msg or "already" in msg:
+                    logger.debug("  向量 ANN 索引已由并发方创建: %s", e)
+                else:
+                    logger.warning(
+                        "  ⚠ 向量 ANN 索引创建失败 (回退 flat 精确检索): %s", e)
+                    self._vec_index_failed = True
+                    self._vec_index_ready = False
+                    return False
+        self._vec_index_ready = True
+        logger.info(
+            "  ├─ 向量 ANN 索引已重建 (IVF_PQ, metric=l2, dim=%d, partitions=%d)",
+            dim, num_partitions,
+        )
         return True
 
     @_store_op
@@ -2467,6 +2558,8 @@ class VectorStore:
             self._fts_ready = False
             self._fts_checked = False
             self._fts_failed = False
+            self._vec_index_ready = False
+            self._vec_index_failed = False
             logger.info("VectorStore: cleared %d documents", count)
         # 同步清空文档元数据表。
         if _DOCUMENTS_TABLE_NAME in self._db.table_names():
@@ -2582,8 +2675,9 @@ class VectorStore:
         self._fts_ready = False
         self._fts_checked = False
         # close() 后可以重新 open：失败标记必须一并复位，否则新建的实例会
-        # 永久跳过全文索引。
+        # 永久跳过全文索引 / 向量索引。
         self._fts_failed = False
+        self._vec_index_failed = False
         logger.info("VectorStore: resources released")
 
     def reload(self) -> None:
