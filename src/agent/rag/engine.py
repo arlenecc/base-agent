@@ -2219,6 +2219,31 @@ class RAGEngine:
         store = self._get_store()
         return store.list_documents()
 
+    def get_book_summary(self, doc_name: str) -> str:
+        """返回某本书的后台逐章摘要进度产出的**全书摘要**（无则空串）。
+
+        数据源是 ``{workspace}/rag/chapter_summaries.json``——由
+        ``rag/chapter_summarizer.py`` 的闲时后台调度器增量写入。这里只读，
+        与调度器（单写者）无锁竞争。
+        """
+        try:
+            from .chapter_summarizer import load_summaries_state
+            state = load_summaries_state(self._workspace)
+            books = state.get("books", {})
+            if doc_name in books:
+                return books[doc_name].get("book_summary", "") or ""
+            # 名称模糊匹配（与 get_document_digest 同风格：精确 → basename → 子串）
+            target = (doc_name or "").strip().lower()
+            for name, book in books.items():
+                if (name.lower() == target
+                        or os.path.basename(name).lower() == target
+                        or (target and (target in name.lower()
+                                        or name.lower() in target))):
+                    return book.get("book_summary", "") or ""
+        except Exception:
+            pass
+        return ""
+
     def ensure_digests_for_cached_documents(self, refresh_stale: bool = False) -> int:
         """为已缓存 Markdown 的文档补做/重刷 digest（目录结构）。
 

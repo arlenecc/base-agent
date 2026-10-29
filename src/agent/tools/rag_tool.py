@@ -201,6 +201,16 @@ class RagOutlineTool(Tool):
             digest = doc.get("digest", "")
             if not digest:
                 return ToolResult(success=False, error=f"文档「{doc.get('doc_name', book_name)}」暂无缩略版本")
+            # 附带后台闲时生成的全书摘要（若有）：目录结构 + 全书摘要一起给，
+            # 模型无需逐章 rag_search 即可把握全书脉络。
+            book_summary = ""
+            try:
+                book_summary = self._engine.get_book_summary(
+                    doc.get("doc_name", book_name))
+            except Exception:
+                book_summary = ""
+            if book_summary:
+                digest = (f"{digest}\n\n【全书摘要】\n{book_summary}")
             return ToolResult(success=True, output=digest)
         except Exception as e:
             logger.error("❌ RAG 缩略版本获取失败: %s", e, exc_info=True)

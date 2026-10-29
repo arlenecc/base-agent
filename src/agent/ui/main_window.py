@@ -1153,6 +1153,30 @@ class MainWindow(QMainWindow):
         self._log_poll_timer = QTimer()
         self._log_poll_timer.setInterval(100)  # 100ms
         self._log_poll_timer.timeout.connect(self._poll_sync_logs)
+        # 闲时后台逐章摘要调度器（rag/chapter_summarizer.py）：agent 空闲且
+        # 无同步类 worker 运行时，每 15 分钟（复用已加载辅助引擎）/ 5 分钟
+        # （临时加载）为知识库书籍补一章摘要。无论辅助引擎是否「启用」都会
+        # 执行——未加载时临时加载、用完即卸载。全部依赖经 callable 注入，
+        # 调度器不持有 UI/引擎/辅助引擎强引用。
+        from ..rag.chapter_summarizer import ChapterSummaryScheduler
+        self._summary_scheduler = ChapterSummaryScheduler(
+            get_config=lambda: self.config,
+            get_engine=lambda: (
+                self._agent.tools.get_rag_engine()
+                if (getattr(self, "_agent", None) is not None
+                    and getattr(self._agent, "tools", None) is not None)
+                else None),
+            get_shared_aux=lambda: getattr(self, "_aux_llm", None),
+            is_idle=lambda: (
+                not self._busy
+                and not self._sync_active
+                and not self._is_worker_running(getattr(self, "_sync_worker", None))
+                and not self._is_worker_running(getattr(self, "_deps_worker", None))
+                and not self._is_worker_running(getattr(self, "_dedup_worker", None))
+                and not self._is_worker_running(getattr(self, "_fetch_worker", None))
+            ),
+        )
+        self._summary_scheduler.start()
         # Pending skill suggestion — cached when the agent emits
         # on_skill_suggested during a run, and shown as a dialog AFTER the
         # run finishes. Showing a modal dialog during streaming would block
@@ -4023,6 +4047,15 @@ class MainWindow(QMainWindow):
                 logger.warning("UI: llm close error: %s", e)
         # 辅助模型（投机解码用）同样要关：旧实现只关 _llm，本地辅助权重
         # （~1.6GB）在关窗口时泄漏——进程退出前一直占着。
+        # 先停闲时逐章摘要调度器：它可能在收尾时临时加载/使用辅助引擎，
+        # 必须在 aux close 之前停止，避免竞态（stop 只置位，进行中的一章
+        # 生成最多再跑几十秒即自行退出，不影响后续 close）。
+        sched = getattr(self, "_summary_scheduler", None)
+        if sched is not None:
+            try:
+                sched.stop()
+            except Exception as e:
+                logger.warning("UI: summary scheduler stop error: %s", e)
         if getattr(self, "_aux_llm", None) is not None:
             try:
                 self._aux_llm.close()
