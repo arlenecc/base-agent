@@ -48,11 +48,16 @@ def _chunks(source, texts):
 
 
 def test_fingerprint_recorded_on_create(tmp_path):
-    """建表即写入指纹（模型名 + 维度）。"""
+    """建表即写入指纹（模型名 + 编码版本 + 维度）。"""
     d = tmp_path / "vectors"
     store = _make(d, _FakeEF("model-a", 128))
     store.add(_chunks("/kb/a.pdf", ["内容一", "内容二"]))
-    assert store._read_stored_fingerprint() == ("model-a", 128)
+    # 指纹串为 "{模型名}|{向量编码版本}|m{matryoshka截断维度}"
+    #（假 ef 非 matryoshka 模型 → m0）；维度单独存列。
+    fp = store._read_stored_fingerprint()
+    assert fp[1] == 128
+    assert fp[0].startswith("model-a|")
+    assert "int8q127-f16" in fp[0]
 
 
 def test_reopen_with_same_model_ok(tmp_path):
@@ -86,7 +91,9 @@ def test_legacy_lib_adopts_current_model(tmp_path):
     store2._ensure_initialized()
     store2._db.drop_table("_embedding_meta")           # 模拟旧版本建的库
     assert store2.search("内容", top_k=3)              # 不抛
-    assert store2._read_stored_fingerprint() == ("model-a", 128)
+    fp = store2._read_stored_fingerprint()
+    assert fp[1] == 128
+    assert fp[0].startswith("model-a|")
 
 
 def test_dim_mismatch_caught_after_adoption(tmp_path):

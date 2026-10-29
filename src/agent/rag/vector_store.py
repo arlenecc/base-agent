@@ -21,11 +21,16 @@ import inspect
 import logging
 import math
 import os
+import queue
 import re
+import sqlite3
 import threading
 import time
 import warnings
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -885,6 +890,232 @@ def _table_vector_dim(table: Any) -> Optional[int]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# RRF（Reciprocal Rank Fusion）——混合检索的粗排与兜底融合
+# ---------------------------------------------------------------------------
+
+# RRF 常数：工业界默认 60（rank 越靠前贡献越大，但单一通道的头部不垄断排序）。
+_RRF_K = 60
+# 送入 cross-encoder 精排的候选上限（RRF 粗排后截断）。默认池 = 2 × top_k × 4，
+# top_k=5 时仅 40 条不会触发；top_k 调大或候选倍率调大时防止精排候选爆炸。
+_RERANK_MAX_CANDIDATES = 60
+
+
+def _rrf_fuse(
+    rankings: List[List[Dict[str, Any]]],
+    key_fn: Any,
+    k: int = _RRF_K,
+) -> List[Tuple[Dict[str, Any], float]]:
+    """Reciprocal Rank Fusion：score = Σ 1/(k + rank)。
+
+    ``rankings`` 为多路「已按相关度降序」的候选列表（rank 从 1 计）；
+    同一候选（``key_fn`` 相同）在多路出现时分数累加——这正是 RRF 的价值：
+    两路都靠前的候选显著胜出，单路头部不会垄断。返回 ``[(候选, 融合分)]``
+    按融合分降序。
+    """
+    scores: Dict[Any, float] = {}
+    items: Dict[Any, Dict[str, Any]] = {}
+    for ranking in rankings:
+        for rank, item in enumerate(ranking, start=1):
+            kk = key_fn(item)
+            scores[kk] = scores.get(kk, 0.0) + 1.0 / (k + rank)
+            if kk not in items:
+                items[kk] = item
+    ordered = sorted(scores.keys(), key=lambda kk: scores[kk], reverse=True)
+    return [(items[kk], scores[kk]) for kk in ordered]
+
+
+# ---------------------------------------------------------------------------
+# 查询缓存（TTL + 表版本失效）
+# ---------------------------------------------------------------------------
+
+# 查询缓存 TTL（秒）与容量（条）。主失效机制是 LanceDB 表版本号（任何写入/
+# 删除都会递增，跨进程共享同一磁盘表时也能感知对方写入），TTL 只是兜底；
+# clear() 会 drop 重建表（版本号从 1 重新开始），由 _query_cache_gen 代际号
+# 兜住这种重置。
+_QUERY_CACHE_TTL = 600.0
+_QUERY_CACHE_MAX = 256
+
+
+def _table_state_token(table: Any) -> int:
+    """表的「数据版本」令牌：优先 LanceDB version（任何写操作都递增），
+    退化用 count_rows。用于查询缓存的跨进程失效感知。"""
+    try:
+        return int(table.version)
+    except Exception:
+        pass
+    try:
+        return int(table.count_rows())
+    except Exception:
+        return -1
+
+
+# ---------------------------------------------------------------------------
+# 嵌入缓存：按「模型标识 + 文本内容 hash」复用向量
+# ---------------------------------------------------------------------------
+
+# 磁盘缓存用 sqlite（标准库）而非 LanceDB 表：这是**精确键 KV 查找**（不需要
+# 向量索引），sqlite 的 PRIMARY KEY 点查 O(log n) 且无 schema/维度问题；向量
+# 按 float16 blob 存储（int8 量化下游远比 float16 粗糙，精度无损感知）。
+_EMBED_CACHE_DB = "embedding_cache.sqlite"
+# 内存 LRU 上限（条）。768 维 float16 ≈ 1.5KB/条 → 16k 条 ≈ 25MB。
+_EMBED_CACHE_MEM_MAX = 16384
+# 磁盘行数上限：超过按 created_at 淘汰最旧的一半（内容寻址缓存，淘汰无损
+# 正确性、只损命中率）。
+_EMBED_CACHE_DISK_MAX_ROWS = 500_000
+
+
+class _EmbeddingCache:
+    """嵌入向量缓存（内存 LRU + sqlite 磁盘层），线程安全、失败自动降级。
+
+    收益来源：① 重同步时「已变更文件内未变化的切片」不再重嵌（manifest 只按
+    整文件跳过，文件内改动历来是整文件重算）；② 跨文件的重复内容（样板文字、
+    目录页等）。任何缓存层出错都自动降级为直连嵌入，绝不影响 ingest 正确性。
+    key = sha256(模型标识 + 原始文本)——换 embedding 模型后旧条目天然不命中，
+    且缓存存模型**原始输出**（非 int8 量化结果），Matryoshka 维度配置变更
+    不影响命中率，截断/归一化/量化在命中后照常走 _prepare_stored_vector。
+    """
+
+    def __init__(self, dir_path: str, namespace: str):
+        self._dir = dir_path
+        self._ns = namespace
+        self._mem: "OrderedDict[str, List[float]]" = OrderedDict()
+        self._lock = threading.RLock()
+        self._con: Optional[Any] = None
+        self._failed = False        # 整体不可用（初始化/store 失败）
+        self._disk_ok = True        # 仅磁盘层不可用（内存缓存继续生效）
+
+    def _key(self, text: str) -> str:
+        return hashlib.sha256(f"{self._ns}\x00{text}".encode("utf-8")).hexdigest()
+
+    def _fail(self, why: str, e: Exception) -> None:
+        self._failed = True
+        logger.warning("  ⚠ 嵌入缓存不可用（本次进程内直连嵌入）: %s: %s", why, e)
+
+    def lookup(self, texts: List[str]) -> List[Optional[List[float]]]:
+        """批量查询：返回与 ``texts`` 等长的列表，命中为向量、未命中为 None。"""
+        out: List[Optional[List[float]]] = [None] * len(texts)
+        if self._failed:
+            return out
+        try:
+            with self._lock:
+                misses: List[int] = []
+                keys: List[str] = []
+                for i, t in enumerate(texts):
+                    k = self._key(t)
+                    keys.append(k)
+                    v = self._mem.get(k)
+                    if v is not None:
+                        self._mem.move_to_end(k)
+                        out[i] = v
+                    else:
+                        misses.append(i)
+                if misses and self._disk_ok:
+                    try:
+                        disk = self._disk_lookup([keys[i] for i in misses])
+                        for i in misses:
+                            v = disk.get(keys[i])
+                            if v is not None:
+                                out[i] = v
+                                self._mem_put(keys[i], v)
+                    except Exception as e:
+                        # 磁盘层坏了只降级磁盘（内存缓存继续），不整体报废。
+                        self._disk_ok = False
+                        logger.warning("  ⚠ 嵌入缓存磁盘查询失败（降级内存缓存）: %s", e)
+            return out
+        except Exception as e:
+            self._fail("lookup", e)
+            return [None] * len(texts)
+
+    def store(self, texts: List[str], vectors: List[List[float]]) -> None:
+        if self._failed or not texts or len(texts) != len(vectors):
+            return
+        try:
+            with self._lock:
+                keys = [self._key(t) for t in texts]
+                for k, v in zip(keys, vectors):
+                    self._mem_put(k, list(v))
+                if self._disk_ok:
+                    try:
+                        self._disk_store(keys, vectors)
+                    except Exception as e:
+                        self._disk_ok = False
+                        logger.warning("  ⚠ 嵌入缓存磁盘写入失败（降级内存缓存）: %s", e)
+        except Exception as e:
+            self._fail("store", e)
+
+    def release(self) -> None:
+        """释放内存缓存并关闭磁盘连接（close 时调用；磁盘文件保留，
+        下次打开继续命中）。"""
+        with self._lock:
+            self._mem.clear()
+            if self._con is not None:
+                try:
+                    self._con.close()
+                except Exception:
+                    pass
+                self._con = None
+
+    def _mem_put(self, k: str, v: List[float]) -> None:
+        self._mem[k] = v
+        self._mem.move_to_end(k)
+        while len(self._mem) > _EMBED_CACHE_MEM_MAX:
+            self._mem.popitem(last=False)
+
+    def _open_disk(self) -> None:
+        if self._con is not None:
+            return
+        con = sqlite3.connect(
+            os.path.join(self._dir, _EMBED_CACHE_DB), check_same_thread=False)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS cache ("
+            "key TEXT PRIMARY KEY, dim INTEGER, vec BLOB, created_at REAL)")
+        con.commit()
+        self._con = con
+
+    def _disk_lookup(self, keys: List[str]) -> Dict[str, List[float]]:
+        """按 key 集合点查磁盘缓存。key 为 sha256 hex，参数化查询无注入风险。"""
+        self._open_disk()
+        found: Dict[str, List[float]] = {}
+        for i in range(0, len(keys), 256):
+            batch = keys[i:i + 256]
+            sql = ("SELECT key, vec FROM cache WHERE key IN (%s)"
+                   % ",".join("?" * len(batch)))
+            for k, blob in self._con.execute(sql, batch):
+                # float16 blob → float32 list（float16 精度远粗于 int8 量化
+                # 下游，且 array 模块的 'e' typecode 在部分平台缺失，统一走
+                # numpy——lancedb/pyarrow 链路必带）。
+                found[k] = np.frombuffer(blob, dtype=np.float16).astype(
+                    np.float32).tolist()
+        return found
+
+    def _disk_store(self, keys: List[str], vectors: List[List[float]]) -> None:
+        self._open_disk()
+        rows = []
+        for k, v in zip(keys, vectors):
+            rows.append((k, len(v),
+                         np.asarray(v, dtype=np.float16).tobytes(),
+                         time.time()))
+        self._con.executemany(
+            "INSERT OR REPLACE INTO cache (key, dim, vec, created_at) "
+            "VALUES (?, ?, ?, ?)", rows)
+        self._con.commit()
+        try:
+            n = self._con.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+            if n > _EMBED_CACHE_DISK_MAX_ROWS:
+                # 淘汰最旧的一半：内容寻址缓存，淘汰只损命中率不损正确性。
+                self._con.execute(
+                    "DELETE FROM cache WHERE key IN ("
+                    "SELECT key FROM cache ORDER BY created_at LIMIT ?)",
+                    (n - _EMBED_CACHE_DISK_MAX_ROWS // 2,))
+                self._con.commit()
+                logger.info("  ├─ 嵌入缓存磁盘超上限，已淘汰最旧条目 (%d → %d)",
+                            n, _EMBED_CACHE_DISK_MAX_ROWS // 2)
+        except Exception:
+            pass
+
+
 class VectorStore:
     """Local vector store backed by LanceDB with FastEmbed embeddings.
 
@@ -943,6 +1174,17 @@ class VectorStore:
         self._fts_failed = False  # 建索引曾失败 → 不再重试（见 _ensure_fts_index）
         self._vec_index_ready = False  # 向量 ANN 索引是否已就绪（仅日志/探测用）
         self._vec_index_failed = False  # 建索引曾失败 → 不再重试（回退 flat 检索）
+        # 嵌入缓存（内容 hash → 向量；内存 LRU + 磁盘表），惰性初始化。
+        self._embed_cache: Optional[_EmbeddingCache] = None
+        # 查询缓存：key=(kind, query, top_k, where) → (过期时间, 表版本, 代际, 结果)。
+        # 主失效机制 = LanceDB 表版本（写入即递增，跨进程感知）；gen 兜住 clear()
+        # drop 重建表导致的版本号重置。
+        self._query_cache: "OrderedDict[Any, Tuple[float, int, int, List[Dict[str, Any]]]]" = OrderedDict()
+        self._query_cache_gen = 0
+        self._query_cache_lock = threading.Lock()
+        # rerank 是否走了回退路径（RRF/向量排序）：回退结果不进查询缓存，
+        # 避免「reranker 加载失败期间的降级排序」被缓存 10 分钟。
+        self._last_rerank_used_fallback = False
         # 当前打开的表是否已通过 embedding 指纹校验（通过后不再重复读 meta 表）。
         # 建表 / 表被 clear 或 close 后复位，下次 add/search 重新校验。
         self._fingerprint_checked = False
@@ -1343,7 +1585,27 @@ class VectorStore:
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
             texts = [c["text"] for c in batch_chunks]
-            vectors = self._ef(texts)
+            # 嵌入缓存：命中直接回填，只对未命中条目调模型（与 _embed_chunks
+            # 同一套机制，保证 add / add_streaming 两条写入路径命中率一致）。
+            vectors: List[Optional[List[float]]] = [None] * len(texts)
+            cache = self._get_embed_cache()
+            miss_idx: List[int] = list(range(len(texts)))
+            if cache is not None:
+                hits = cache.lookup(texts)
+                miss_idx = [j for j, v in enumerate(hits) if v is None]
+                for j, v in enumerate(hits):
+                    if v is not None:
+                        vectors[j] = v
+            if miss_idx:
+                miss_vectors = self._ef([texts[j] for j in miss_idx])
+                for j, v in zip(miss_idx, miss_vectors):
+                    vectors[j] = v
+                if cache is not None:
+                    try:
+                        cache.store([texts[j] for j in miss_idx],
+                                    [vectors[j] for j in miss_idx])
+                    except Exception:
+                        pass
             for j, chunk in enumerate(batch_chunks):
                 idx = i + j
                 source = chunk.get("source", "unknown")
@@ -1674,30 +1936,100 @@ class VectorStore:
                 self._ensure_vector_index(self._table)
                 return total
 
-        # 后续批次
+        # 后续批次：**流水线并行**——嵌入移到后台线程预取（embed 第 N+1 批与
+        # 第 N 批的删旧/写库并发），本线程只做删旧 + 写库 + 进度回调。整体
+        # 管线变为 解析(worker) ‖ 嵌入(后台单线程) ‖ 写库(本线程) 三段重叠；
+        # 嵌入仍保持单线程串行（MLX/ONNX 模型不做并发争抢，与 semantic_chunker
+        # 处的约束一致），收益是「嵌入与写库/解析重叠」+ 本线程不再被嵌入
+        # 长任务占死（进度回调、取消响应更及时）。
         chunk_idx = len(first_batch)
-        batch_buf: List[Dict[str, Any]] = []
         batch_num = 1
         deleted_sources: set = sources_seen.copy() if table is not None else set()
-        for chunk in chunk_iter:
-            batch_buf.append(chunk)
-            if len(batch_buf) >= batch_size:
+
+        _PIPE_DONE = object()           # 生产端完成哨兵
+        stop_embed = threading.Event()  # 消费端退出时置位，生产端立即停止拉取/投递
+
+        def _put_pipe(pq: "queue.Queue[Any]", item: Any) -> bool:
+            """带超时的投递循环；消费端已退出（stop_embed 置位）返回 False。"""
+            while not stop_embed.is_set():
+                try:
+                    pq.put(item, timeout=1.0)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _embed_producer(pq: "queue.Queue[Any]") -> None:
+            """后台嵌入线程：从 chunk_iter 拉批 → 嵌入 → 投递 (records, 耗时)。
+
+            嵌入异常必须传回消费端（保持旧行为：add_streaming 向上抛 →
+            engine 记入 errors 并 write_failed），不能静默吞掉。
+            """
+            try:
+                buf: List[Dict[str, Any]] = []
+                local_idx = chunk_idx
+                for chunk in chunk_iter:
+                    if stop_embed.is_set():
+                        return
+                    buf.append(chunk)
+                    if len(buf) >= batch_size:
+                        _t0 = time.monotonic()
+                        recs = self._embed_chunks(buf, local_idx)
+                        _dt = time.monotonic() - _t0
+                        if not _put_pipe(pq, (recs, _dt)):
+                            return
+                        local_idx += len(buf)
+                        buf = []
+                if buf and not stop_embed.is_set():
+                    _t0 = time.monotonic()
+                    recs = self._embed_chunks(buf, local_idx)
+                    _dt = time.monotonic() - _t0
+                    if not _put_pipe(pq, (recs, _dt)):
+                        return
+                if not _put_pipe(pq, _PIPE_DONE):
+                    return
+            except Exception as e:
+                logger.error("  向量化(后台嵌入线程)失败: %s", e)
+                try:
+                    pq.put(("__embed_error__", e), timeout=5.0)
+                except Exception:
+                    pass
+
+        _pq: "queue.Queue[Any]" = queue.Queue(maxsize=2)
+        _producer_t = threading.Thread(
+            target=_embed_producer, args=(_pq,), daemon=True,
+            name="rag-embed-producer")
+        _producer_t.start()
+        try:
+            while True:
+                try:
+                    item = _pq.get(timeout=0.5)
+                except queue.Empty:
+                    if is_cancelled is not None and is_cancelled():
+                        # 已 delete 旧数据/写入部分新数据，BM25 索引却是旧快照：
+                        # 置失效让下次 search_fts 自愈重建，否则新数据在 BM25
+                        # 通道静默不可见。
+                        self._fts_ready = False
+                        return total
+                    continue
+                if item is _PIPE_DONE:
+                    break
+                if isinstance(item, tuple) and item and item[0] == "__embed_error__":
+                    self._fts_ready = False
+                    raise item[1]
+                records, dt_e = item
                 if is_cancelled is not None and is_cancelled():
-                    # 已 delete 旧数据/写入部分新数据，BM25 索引却是旧快照：
-                    # 置失效让下次 search_fts 自愈重建，否则新数据在 BM25 通道静默不可见。
                     self._fts_ready = False
                     return total
                 batch_num += 1
-                logger.info("  ├─ 向量化: 第 %d 批 (%d 切片) 正在嵌入...", batch_num, len(batch_buf))
-                # 先 embed 再 delete+add（与首批同序）：旧实现先 delete 旧数据
-                # 再 embed 再 add——embed 耗时数秒到数分钟，这段时间里该
-                # source 在库里被删空，并发检索会返回空（「文档凭空消失」）。
-                # 调整后，删旧与写新背靠背执行，空窗缩到一次 table.add 的耗时。
-                _t_e = time.monotonic()
-                records = self._embed_chunks(batch_buf, chunk_idx)
-                _dt_e = time.monotonic() - _t_e
+                logger.info(
+                    "  ├─ 向量化: 第 %d 批 (%d 切片) 已由后台线程嵌入",
+                    batch_num, len(records),
+                )
+                # 先 delete 再 add 背靠背（与旧实现同窗口）：嵌入已由后台提前
+                # 完成，该 source 在库里被删空的窗口仍是一次 table.add 耗时。
                 if table is not None:
-                    new_sources = {c["source"] for c in batch_buf} - deleted_sources
+                    new_sources = {r["source"] for r in records} - deleted_sources
                     if new_sources:
                         for source in new_sources:
                             h = _hash_source(source)
@@ -1713,40 +2045,16 @@ class VectorStore:
                     total += len(records)
                     logger.info("  ├─ 向量库写入: 第 %d 批 %d 条 (累计 %d)", batch_num, len(records), total)
                     if on_batch:
-                        _call_on_batch(on_batch, len(records), total, _dt_e, _dt_a)
+                        _call_on_batch(on_batch, len(records), total, dt_e, _dt_a)
                 except Exception as e:
                     logger.error("  向量库写入失败(第 %d 批): %s", batch_num, e)
                     self._fts_ready = False
                     raise
-                chunk_idx += len(batch_buf)
-                batch_buf.clear()
-        # 处理剩余
-        if batch_buf:
-            if is_cancelled is not None and is_cancelled():
-                self._fts_ready = False
-                return total
-            batch_num += 1
-            logger.info("  ├─ 向量化: 最后批次 (%d 切片) 正在嵌入...", len(batch_buf))
-            if table is not None:
-                new_sources = {c["source"] for c in batch_buf} - deleted_sources
-                if new_sources:
-                    for source in new_sources:
-                        h = _hash_source(source)
-                        try:
-                            table.delete(f"id LIKE '{h}_%'")
-                        except Exception:
-                            pass
-            records = self._embed_chunks(batch_buf, chunk_idx)
-            try:
-                table.add(records)
-                total += len(records)
-                logger.info("  ├─ 向量库写入: 最后批次 %d 条 (累计 %d)", len(records), total)
-                if on_batch:
-                    on_batch(len(records), total)
-            except Exception as e:
-                logger.error("  向量库写入失败(最后批次): %s", e)
-                self._fts_ready = False
-                raise
+        finally:
+            # 任何退出路径（取消/异常/正常完成）都停掉生产端并回收线程，
+            # 否则后台线程会继续拉取 chunk_iter 嵌入已经没人要的数据。
+            stop_embed.set()
+            _producer_t.join(timeout=10.0)
 
         logger.info("  └─ 向量化写入完成: 共 %d 个切片 (%d 批次)", total, batch_num)
 
@@ -1759,6 +2067,21 @@ class VectorStore:
 
         return total
 
+
+    def _get_embed_cache(self) -> Optional[_EmbeddingCache]:
+        """惰性创建嵌入缓存。按 embedding 模型标识隔离命名空间（换模型后
+        旧缓存天然不命中）；任何初始化失败返回 None（直连嵌入）。"""
+        if self._embed_cache is not None:
+            return self._embed_cache
+        if self._db is None or self._ef is None:
+            return None
+        try:
+            self._embed_cache = _EmbeddingCache(
+                self._persist_dir, _embedding_model_name(self._ef))
+            return self._embed_cache
+        except Exception as e:
+            logger.warning("  ⚠ 嵌入缓存初始化失败（直连嵌入）: %s", e)
+            return None
 
     def _embed_chunks(
         self, chunks: List[Dict[str, Any]], start_idx: int, ef=None,
@@ -1792,10 +2115,25 @@ class VectorStore:
         texts = [c["text"] for c in chunks]
         # ef：保留参数，单实例模式下恒为 None，统一走 self._ef 单例（进程级共享）。
         efn = ef or self._ef
-        # 长度降序分桶：批内长度相近，padding 浪费最小（降序让最长批最先
-        # 出现，提早把激活水位顶到峰值，后续批更轻）。
-        order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
+        # 嵌入缓存：仅默认单例路径启用（显式传入 ef 的并行路径语义由调用方
+        # 决定，不缓存）。命中的条目直接回填，只对未命中条目走真实子批嵌入。
+        cache = None if ef is not None else self._get_embed_cache()
         vectors_by_idx: List[Optional[List[float]]] = [None] * len(texts)
+        pending = list(range(len(texts)))
+        if cache is not None:
+            hits = cache.lookup(texts)
+            pending = [i for i, v in enumerate(hits) if v is None]
+            for i, v in enumerate(hits):
+                if v is not None:
+                    vectors_by_idx[i] = v
+            if len(pending) < len(texts):
+                logger.info(
+                    "  ├─ 嵌入缓存: %d/%d 条命中, 实际嵌入 %d 条",
+                    len(texts) - len(pending), len(texts), len(pending),
+                )
+        # 长度降序分桶：批内长度相近，padding 浪费最小（降序让最长批最先
+        # 出现，提早把激活水位顶到峰值，后续批更轻）。只对未命中条目分桶。
+        order = sorted(pending, key=lambda i: -len(texts[i]))
         # 并行路径（传入独立 ef）用独立调优器，避免多个并发嵌入线程共享
         # self._subbatch_tuner 造成竞态；串行/默认路径复用实例级调优器。
         tuner = self._subbatch_tuner if ef is None else _SubBatchTuner()
@@ -1846,6 +2184,13 @@ class VectorStore:
             if time.monotonic() - _last_yield >= _YIELD_INTERVAL:
                 time.sleep(0.01)
                 _last_yield = time.monotonic()
+        # 新嵌入的条目写回缓存（含磁盘层），下次同步/同内容切片直接命中。
+        if cache is not None and pending:
+            try:
+                cache.store([texts[i] for i in pending],
+                            [vectors_by_idx[i] for i in pending])
+            except Exception as e:
+                logger.debug("嵌入缓存写回失败（不影响本次结果）: %s", e)
         vectors = vectors_by_idx
         records: List[Dict[str, Any]] = []
         # 一批 chunk 通常来源相同 → 缓存 source→hash 映射，避免每个 chunk
@@ -2041,6 +2386,55 @@ class VectorStore:
         return True
 
     @_store_op
+    # ------------------------------------------------------------------
+    # 查询缓存（TTL + LanceDB 表版本失效 + clear 代际失效）
+    # ------------------------------------------------------------------
+
+    def _query_cache_get(self, kind: str, query: str, top_k: int,
+                         where: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+        table = self._table
+        if table is None:
+            return None
+        key = (kind, query, top_k, where or "")
+        now = time.monotonic()
+        ver = _table_state_token(table)
+        with self._query_cache_lock:
+            entry = self._query_cache.get(key)
+            if entry is None:
+                return None
+            expires, ever, egen, results = entry
+            if now > expires or ever != ver or egen != self._query_cache_gen:
+                self._query_cache.pop(key, None)
+                return None
+            self._query_cache.move_to_end(key)
+            # 逐条浅拷贝，防下游原地修改污染缓存条目。
+            return [dict(c) for c in results]
+
+    def _query_cache_put(self, kind: str, query: str, top_k: int,
+                         where: Optional[str],
+                         results: List[Dict[str, Any]]) -> None:
+        table = self._table
+        if table is None or not isinstance(results, list):
+            return
+        key = (kind, query, top_k, where or "")
+        with self._query_cache_lock:
+            self._query_cache[key] = (
+                time.monotonic() + _QUERY_CACHE_TTL,
+                _table_state_token(table),
+                self._query_cache_gen,
+                list(results),
+            )
+            self._query_cache.move_to_end(key)
+            while len(self._query_cache) > _QUERY_CACHE_MAX:
+                self._query_cache.popitem(last=False)
+
+    def _invalidate_query_cache(self) -> None:
+        """代际失效：clear() drop 重建表后 LanceDB 版本号从 1 重新开始，
+        仅靠版本比对无法感知，需要 gen 兜底。"""
+        with self._query_cache_lock:
+            self._query_cache_gen += 1
+            self._query_cache.clear()
+
     def search_fts(
         self,
         query: str,
@@ -2064,6 +2458,11 @@ class VectorStore:
         table = self._ensure_table()
         if table is None:
             return []
+
+        cached = self._query_cache_get("fts", query, top_k, where)
+        if cached is not None:
+            logger.info("  BM25 检索: 查询缓存命中 (%d 条)", len(cached))
+            return cached
 
         if not self._ensure_fts_index(table):
             return []
@@ -2099,6 +2498,7 @@ class VectorStore:
                 "score": norm,
                 "fts_score": raw,
             })
+        self._query_cache_put("fts", query, top_k, where, output)
         return output
 
     @_store_op
@@ -2126,6 +2526,13 @@ class VectorStore:
         # 的空库不该报错，下一次 add 会用新模型重建指纹）。用当前模型查询
         # 旧模型的库会静默污染结果，必须拦下。
         self._check_embedding_compat(table)
+
+        # 查询缓存：同 (query, top_k, where) + 表版本未变 → 直接复用上次结果，
+        # 省掉查询向量化 + ANN + （hybrid 路径的）BM25 + 重排整条链路。
+        cached = self._query_cache_get("vec", query, top_k, where)
+        if cached is not None:
+            logger.info("  向量检索: 查询缓存命中 (%d 条)", len(cached))
+            return cached
 
         # Embed query (use embed_query for proper prefix handling)
         logger.info("  ├─ 查询向量化: 将查询文本转为向量...")
@@ -2178,6 +2585,7 @@ class VectorStore:
                 "score": similarity,
             })
 
+        self._query_cache_put("vec", query, top_k, where, output)
         return output
 
     # ------------------------------------------------------------------
@@ -2315,6 +2723,9 @@ class VectorStore:
         回退模式下分数是余弦距离的近似（非 reranker 语义分），因此不做
         0.5 阈值过滤——阈值仅对 reranker 的语义分数有意义。
         """
+        # 供 search_with_rerank 感知「本结果是降级排序」——降级结果不进查询
+        # 缓存（reranker 恢复后不应继续命中旧降级结果）。
+        self._last_rerank_used_fallback = True
         logger.info("  ├─ 重排序: Reranker 不可用, 使用向量距离排序 (回退模式)")
         for c in candidates:
             try:
@@ -2330,6 +2741,30 @@ class VectorStore:
         result = candidates[:top_k]
         logger.info("  ├─ 重排序完成(回退): %d → %d 条结果", len(candidates), len(result))
         return result
+
+    def _rrf_fallback(
+        self,
+        vec_candidates: List[Dict[str, Any]],
+        fts_candidates: List[Dict[str, Any]],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """reranker 不可用 / 严格过滤后无结果时的**RRF 融合兜底**。
+
+        旧实现纯按向量余弦排序——BM25 通道的排名贡献完全丢失，混合检索在
+        reranker 故障时静默退化成纯向量检索。RRF 按两路排名融合（两路都
+        靠前的候选显著胜出），无 reranker 时也能得到合理的混合排序。
+
+        分数保留各路原始语义（向量=余弦[0,1]，BM25=s/(1+s)），融合分另存
+        ``rrf_score``；不做 0.5 阈值过滤（阈值仅对 reranker 语义分有意义）。
+        """
+        key_fn = lambda c: (c.get("source", ""), c.get("chunk_index", 0))  # noqa: E731
+        fused = _rrf_fuse([vec_candidates, fts_candidates], key_fn)
+        out: List[Dict[str, Any]] = []
+        for c, rrf in fused[:top_k]:
+            d = dict(c)
+            d["rrf_score"] = rrf
+            out.append(d)
+        return out
 
     @_store_op
     def rerank(
@@ -2480,6 +2915,14 @@ class VectorStore:
         """
         n_candidates = top_k * candidate_multiplier
 
+        # 0. 查询缓存：hybrid 全链路（向量 + BM25 + 重排）结果复用，命中时
+        #    省掉查询向量化 + ANN + FTS + cross-encoder 打分整条链路。
+        cached = self._query_cache_get("hybrid", query, top_k, where)
+        if cached is not None:
+            logger.info(
+                "VectorStore.search_with_rerank: 查询缓存命中 (%d 条)", len(cached))
+            return cached
+
         # 1. Vector similarity search.
         vec_candidates = self.search(query, top_k=n_candidates, where=where)
         logger.info(
@@ -2512,21 +2955,38 @@ class VectorStore:
             len(merged), len(vec_candidates), len(fts_candidates), len(merged),
         )
 
+        # 3.5 RRF 粗排：按「向量排名 + BM25 排名」融合（score = Σ 1/(60+rank)），
+        #    两路都靠前的候选显著胜出，单路头部不垄断；取前 _RERANK_MAX_CANDIDATES
+        #    条送精排——top_k/候选倍率调大时防止 cross-encoder 候选爆炸。
+        key_fn = lambda c: (c.get("source", ""), c.get("chunk_index", 0))  # noqa: E731
+        fused = _rrf_fuse([vec_candidates, fts_candidates], key_fn)
+        rerank_input = [it for it, _s in fused[:_RERANK_MAX_CANDIDATES]]
+
         # 4. BGE rerank + 5. min_similarity filter.
-        results = self.rerank(query, merged, top_k=top_k, min_similarity=min_similarity)
+        self._last_rerank_used_fallback = False
+        results = self.rerank(query, rerank_input, top_k=top_k,
+                              min_similarity=min_similarity)
         logger.info(
             "VectorStore.search_with_rerank: %d 候选 → %d 条 (rerank + 相似度≥%.2f 过滤)",
-            len(merged), len(results), min_similarity,
+            len(rerank_input), len(results), min_similarity,
         )
 
-        # 6. 当 rerank 严格过滤后无结果（例如查询词质量差——拼音、口语化、
-        #    噪声词等导致 rerank 语义分普遍低于阈值）时，回退到向量距离排序，
-        #    至少返回 top_k 条候选，避免 LLM 完全拿不到上下文。
-        if not results and merged:
+        # 6. 兜底：reranker 不可用/打分失败（_rerank_fallback 已触发）或严格
+        #    过滤后无结果（查询词质量差——拼音、口语化、噪声词等）时，用 RRF
+        #    融合两路排名返回 top_k 条候选，避免 LLM 完全拿不到上下文。旧的
+        #    纯向量距离排序会把 BM25 通道的贡献完全丢掉。
+        used_fallback = self._last_rerank_used_fallback
+        if used_fallback or (not results and fused):
             logger.info(
-                "VectorStore.search_with_rerank: rerank 过滤后无结果, 回退到向量距离排序",
+                "VectorStore.search_with_rerank: %s, 使用 RRF 融合排序兜底",
+                "reranker 不可用" if used_fallback else "rerank 过滤后无结果",
             )
-            results = self._rerank_fallback(merged, top_k)
+            results = self._rrf_fallback(vec_candidates, fts_candidates, top_k)
+            used_fallback = True
+        # 只有 reranker 真实参与的排序结果才进查询缓存；降级排序不缓存
+        # （否则 reranker 恢复后仍会命中 10 分钟前的降级结果）。
+        if not used_fallback:
+            self._query_cache_put("hybrid", query, top_k, where, results)
         return results
 
     def _clear_locked(self) -> None:
@@ -2560,6 +3020,10 @@ class VectorStore:
             self._fts_failed = False
             self._vec_index_ready = False
             self._vec_index_failed = False
+            # drop 重建后 LanceDB 表版本号从 1 重新开始，仅靠版本比对无法
+            # 感知清空——必须代际失效查询缓存（嵌入缓存是内容寻址的，不受
+            # 清空影响，保留可让重新 ingest 几乎瞬时完成）。
+            self._invalidate_query_cache()
             logger.info("VectorStore: cleared %d documents", count)
         # 同步清空文档元数据表。
         if _DOCUMENTS_TABLE_NAME in self._db.table_names():
@@ -2678,6 +3142,16 @@ class VectorStore:
         # 永久跳过全文索引 / 向量索引。
         self._fts_failed = False
         self._vec_index_failed = False
+        # 释放缓存占用的内存：嵌入缓存只清内存层（磁盘表保留，下次打开继续
+        # 命中）；查询缓存整表清空。实例置 None 让下次使用时惰性重建。
+        if self._embed_cache is not None:
+            try:
+                self._embed_cache.release()
+            except Exception:
+                pass
+            self._embed_cache = None
+        with self._query_cache_lock:
+            self._query_cache.clear()
         logger.info("VectorStore: resources released")
 
     def reload(self) -> None:
