@@ -303,6 +303,12 @@ class ChapterSummaryScheduler:
         from .document_outline import extract_chapters
         chapters = extract_chapters(markdown)
         if not chapters:
+            # documents 表有目录但原文提取不到章节：markdown 可能损坏/格式异常。
+            # 静默返回会令该书永久「待处理却做不了」且无日志——明确告警一次。
+            if _safe_json_list(info.get("chapters")):
+                logger.warning(
+                    "逐章摘要: 《%s》documents 表有目录但原文提取不到章节"
+                    "（markdown 可能损坏或格式异常），跳过该书", doc_name)
             return None
 
         book = books.setdefault(doc_name, {})
@@ -329,6 +335,17 @@ class ChapterSummaryScheduler:
                     chapters=toc_actual,
                 )
                 book["toc_fixed"] = True
+                # 目录结构变化（章节增删 / 顺序调整）会让「按 idx 记录」的逐章
+                # 摘要错位到错误章节 → 已有摘要作废，全书摘要随之失效需重做。
+                # 仅标题改名（数量与顺序不变）不影响 idx 对齐，可保留摘要。
+                if book.get("chapters") and _toc_structurally_changed(
+                        toc_stored, toc_actual):
+                    logger.info(
+                        "逐章摘要: 《%s》目录结构变化导致章节 idx 错位，"
+                        "重置该书已生成的逐章摘要重做", doc_name)
+                    book["chapters"] = []
+                    book["book_summary"] = ""
+                    book["book_summary_at"] = 0
                 logger.info(
                     "逐章摘要: 《%s》目录结构与原书不符，已按实际标题修正 "
                     "(表内 %d 章 → 实际 %d 章)",
@@ -618,6 +635,21 @@ def _toc_differs(stored: List[Dict[str, Any]],
     for s, a in zip(stored, actual):
         if (s.get("title") or "") != (a.get("title") or ""):
             return True
+        if (s.get("level") or 0) != (a.get("level") or 0):
+            return True
+    return False
+
+
+def _toc_structurally_changed(stored: List[Dict[str, Any]],
+                             actual: List[Dict[str, Any]]) -> bool:
+    """目录「数量或层级顺序」是否变化（决定逐章摘要 idx 是否错位）。
+
+    仅标题改名（数量与层级顺序不变）不影响按位置(idx)记录摘要的对齐，不算；
+    章节增删或层级顺序调整会让 idx→章节 映射错位，必须作废旧摘要重做。
+    """
+    if len(stored) != len(actual):
+        return True
+    for s, a in zip(stored, actual):
         if (s.get("level") or 0) != (a.get("level") or 0):
             return True
     return False
