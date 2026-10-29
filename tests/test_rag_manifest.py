@@ -173,8 +173,11 @@ def _make_engine(tmp_path, fake_store=None):
     engine = RAGEngine(workspace=str(ws), knowledge_base=str(kb))
     if fake_store is not None:
         engine._store = fake_store
-    # Create a .txt file in the KB
-    (kb / "a.txt").write_text("first document content with enough text to chunk")
+    # Create a .txt file in the KB（正文需超过入库最小字数门槛，避免被当作碎片丢弃）
+    (kb / "a.txt").write_text(
+        "first document content with enough text to be chunked and embedded into "
+        "the vector store so that retrieval tests can validate incremental sync "
+        "behavior correctly across multiple ingest passes")
     return engine, kb
 
 
@@ -221,7 +224,9 @@ def test_force_reingest_processes_all_files(tmp_path):
 
     engine.ingest(force=False)  # first, populates manifest
     # Add a second file so there are 2 total
-    (kb / "b.txt").write_text("second document content for chunking purposes here")
+    (kb / "b.txt").write_text(
+        "second document content for chunking purposes here that must be long "
+        "enough to pass the minimum ingest length threshold used by the pipeline")
 
     stats = engine.ingest(force=True)
     assert stats["files_found"] == 2
@@ -238,7 +243,10 @@ def test_modified_file_is_reprocessed(tmp_path):
     # Modify the file
     f = kb / "a.txt"
     time.sleep(0.05)
-    f.write_text("completely different content that should trigger reprocessing")
+    f.write_text(
+        "completely different content that should trigger reprocessing because "
+        "the new text is long enough to exceed the minimum ingest length and "
+        "force the pipeline to re-chunk and re-embed the modified document")
     os.utime(str(f), None)
 
     stats = engine.ingest(force=False)
@@ -253,7 +261,9 @@ def test_new_file_is_processed_on_incremental_sync(tmp_path):
     engine.ingest(force=False)
 
     # Add a new file
-    (kb / "b.txt").write_text("new document added after first sync")
+    (kb / "b.txt").write_text(
+        "new document added after first sync that contains sufficient text to "
+        "exceed the minimum chunk length requirement enforced before ingestion")
 
     stats = engine.ingest(force=False)
     assert stats["files_found"] == 2
@@ -332,6 +342,24 @@ def test_content_change_with_preserved_mtime_is_re_synced(tmp_path):
 
     stats = engine.ingest(force=False)
     assert stats["files_extracted"] >= 1, "内容变了却被判为未修改而跳过"
+
+
+def test_tiny_document_is_discarded_as_junk(tmp_path):
+    """正文 ≤100 字的碎片文档（抽取失败残渣 / 图片附件上的零散信息）不应切片入库。
+
+    与「空文件」不同：它能成功解析出一些文本，但内容过短无检索价值——
+    入库前直接丢弃整个文件（不建 digest、不切片、不写向量），避免垃圾切片
+    污染检索命中。正常长度的文档仍应正常入库。
+    """
+    store = _FakeStore()
+    engine, kb = _make_engine(tmp_path, store)
+    # KB 里再加一个 <100 字的微型文档（碎片垃圾）
+    (kb / "junk.txt").write_text("图片上的零星说明文字。")
+    engine.ingest(force=False)
+
+    sources = {r["source"] for r in store.records}
+    assert any("a.txt" in s for s in sources), "正常文档应入库"
+    assert not any("junk.txt" in s for s in sources), "≤100 字碎片不应切片入库"
 
 
 def test_manifest_survives_corruption(tmp_path):
@@ -434,7 +462,9 @@ def test_rag_engine_search_sees_data_written_by_another_engine(tmp_path, rag_eng
     """
     kb = tmp_path / "kb"
     kb.mkdir()
-    (kb / "note.txt").write_text("LanceDB is a columnar vector database.")
+    (kb / "note.txt").write_text(
+        "LanceDB is a columnar vector database designed for efficient similarity "
+        "search and AI applications at scale with strong performance")
 
     # Agent's engine, created at startup (table doesn't exist yet).
     agent_engine = rag_engine_factory(str(tmp_path), str(kb))
@@ -463,7 +493,9 @@ def test_incremental_sync_visible_to_existing_engine(tmp_path, rag_engine_factor
     """
     kb = tmp_path / "kb"
     kb.mkdir()
-    (kb / "doc1.txt").write_text("First document about Python basics.")
+    (kb / "doc1.txt").write_text(
+        "First document about Python basics covering variables, functions, loops, "
+        "classes, and object-oriented programming concepts in depth")
 
     # Agent 的引擎：首次同步 + 触发一次搜索（让 VectorStore 打开表）
     agent_engine = rag_engine_factory(str(tmp_path), str(kb))
@@ -472,7 +504,9 @@ def test_incremental_sync_visible_to_existing_engine(tmp_path, rag_engine_factor
     assert len(r1) >= 1, "首次同步后应能搜到 doc1"
 
     # 添加新文件
-    (kb / "doc2.txt").write_text("Second document about JavaScript and web development.")
+    (kb / "doc2.txt").write_text(
+        "Second document about JavaScript and web development covering events, the "
+        "DOM, async patterns, closures, and popular frontend frameworks")
 
     # SyncKnowledgeWorker 的引擎：增量同步
     sync_engine = rag_engine_factory(str(tmp_path), str(kb))

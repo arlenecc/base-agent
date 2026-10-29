@@ -408,6 +408,11 @@ _pdf_engine = "docling"
 from .ebook_parser import PANDOC_EXTENSIONS as _PANDOC_FORMAT_EXTENSIONS  # noqa: E402
 from .ebook_parser import EBOOK_EXTENSIONS as _EBOOK_FORMAT_EXTENSIONS  # noqa: E402
 
+# 入库前的「碎片垃圾」门槛：抽取失败遗留的残渣、或本身就是图片/附件上的零散
+# 信息，整篇清洗后正文不超过该字数（汉字计字符）基本无检索价值——直接丢弃
+# 整个文件，不切片、不建 digest、不写向量。覆盖通用解析路径与电子书快速路径。
+_MIN_DOC_CHARS_FOR_INGEST = 100
+
 
 def set_pdf_engine(engine: str) -> None:
     """注入 rag_pdf_engine 配置（同 parsers.set_ocr_config 的模块级注入模式）。
@@ -1243,6 +1248,16 @@ class RAGEngine:
                                     md_name = _safe_filename(rel_path) + ".md"
                                     md_path = os.path.join(self._markdown_dir, md_name)
                                     cleaned = book["full_markdown"]
+                                    # 碎片垃圾：整篇正文不超过门槛（多为抽取失败
+                                    # 残渣或图片/附件上的零散信息）→ 整文件丢弃，
+                                    # 不写缓存/不建 digest/不切片入库。
+                                    if len(cleaned.strip()) <= _MIN_DOC_CHARS_FOR_INGEST:
+                                        logger.warning(
+                                            "    └─ ⚠ 电子书正文仅 %d 字（≤%d），"
+                                            "碎片垃圾，跳过: %s",
+                                            len(cleaned.strip()),
+                                            _MIN_DOC_CHARS_FOR_INGEST, fname)
+                                        continue
                                     try:
                                         with open(md_path, "w", encoding="utf-8") as f:
                                             f.write(cleaned)
@@ -1449,6 +1464,18 @@ class RAGEngine:
 
                             if not cleaned.strip():
                                 logger.warning("    └─ ⚠ 清洗后文本为空: %s", fname)
+                                continue
+
+                            # 碎片垃圾：整篇正文不超过门槛（多数为抽取失败遗留
+                            # 残渣，或图片/附件上的零散信息）→ 整个文件丢弃，不
+                            # 建 digest、不切片、不写向量。缓存已写入，下次同步
+                            # 走缓存快速跳过，不再重复抽取。
+                            if len(cleaned.strip()) <= _MIN_DOC_CHARS_FOR_INGEST:
+                                logger.warning(
+                                    "    └─ ⚠ 正文仅 %d 字（≤%d），碎片垃圾，"
+                                    "跳过切片入库: %s",
+                                    len(cleaned.strip()),
+                                    _MIN_DOC_CHARS_FOR_INGEST, fname)
                                 continue
 
                             # ---- 构建文档缩略版本（目录结构 + 标题）----

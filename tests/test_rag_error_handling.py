@@ -57,34 +57,50 @@ def error_dataset(tmp_path):
     bad_files = []
     skipped_files = []
 
-    # ---- 正常文件 ----
+    # ---- 正常文件（正文需超过入库最小字数门槛，避免被当作碎片丢弃）----
     (kb / "good_text.txt").write_text(
-        "Python is a high-level programming language with dynamic typing."
+        "Python is a high-level programming language with dynamic typing and "
+        "automatic memory management that makes it popular for scripting and "
+        "application development across many domains."
     )
     good_files.append("good_text.txt")
 
     (kb / "good_markdown.md").write_text(
         "# RAG Overview\n\n"
-        "Retrieval-Augmented Generation combines search with LLMs.\n\n"
+        "Retrieval-Augmented Generation combines search with LLMs to improve "
+        "answer accuracy by grounding responses in retrieved documents.\n\n"
         "## Components\n\n"
-        "- Vector store\n"
-        "- Embedding model\n"
-        "- Reranker\n"
+        "- Vector store for similarity search\n"
+        "- Embedding model to encode text\n"
+        "- Reranker to refine candidate passages\n"
+        "- Generator that synthesizes the final answer\n"
     )
     good_files.append("good_markdown.md")
 
-    (kb / "good_csv.csv").write_text("name,value\nalpha,1\nbeta,2\ngamma,3\n")
+    (kb / "good_csv.csv").write_text(
+        "name,value\n"
+        "alpha,1\nbeta,2\ngamma,3\ndelta,4\nepsilon,5\nzeta,6\neta,7\n"
+        "theta,8\niota,9\nkappa,10\nlambda,11\n"
+    )
     good_files.append("good_csv.csv")
 
     (kb / "good_html.html").write_text(
-        "<html><body><h1>Title</h1><p>HTML content here.</p></body></html>"
+        "<html><body><h1>Document Title</h1>"
+        "<p>HTML content here describing the structure of a web page with "
+        "several paragraphs of meaningful text that should be extracted and "
+        "ingested rather than discarded as a tiny fragment.</p>"
+        "<p>Second paragraph provides additional context for retrieval.</p>"
+        "</body></html>"
     )
     good_files.append("good_html.html")
 
     # 子目录中的正常文件
     sub = kb / "subdir"
     sub.mkdir()
-    (sub / "nested.txt").write_text("This file is in a subdirectory.")
+    (sub / "nested.txt").write_text(
+        "This file is in a subdirectory and contains enough descriptive text to "
+        "be ingested as a normal document rather than being discarded as junk."
+    )
     good_files.append("subdir/nested.txt")
 
     # ---- 损坏的 PDF（无效 PDF 头，PyMuPDF 会抛异常）----
@@ -129,14 +145,26 @@ def error_dataset(tmp_path):
         bad_files = [f for f in bad_files if f != "nopermission.txt"]
 
     # ---- Unicode 文件名（边界测试，应正常处理）----
-    (kb / "中文文件.txt").write_text("这是一个包含中文内容的文件。")
+    (kb / "中文文件.txt").write_text(
+        "这是一个包含中文内容的测试文件。它用于验证中文文档在知识库中的解析、"
+        "清洗、分块与向量化入库流程是否正常工作。中文与英文混合的文本也应当被"
+        "正确切分，并在检索时返回相关片段，从而支持基于中文知识库的问答与摘要"
+        "功能，确保多语言内容都能被正确索引和检索。"
+    )
     good_files.append("中文文件.txt")
 
-    (kb / "emoji_🎉.txt").write_text("File with emoji in name and content 🚀")
+    (kb / "emoji_🎉.txt").write_text(
+        "File with emoji in name and content 🚀 that contains enough descriptive "
+        "text to be treated as a normal document during ingestion rather than "
+        "being dropped as a tiny fragment lacking retrieval value."
+    )
     good_files.append("emoji_🎉.txt")
 
     # ---- 不支持的扩展名（应被 SUPPORTED_EXTENSIONS 过滤）----
-    (kb / "readme.rst").write_text("RST format")  # rst 是支持的
+    (kb / "readme.rst").write_text(
+        "RST format document used for testing the reStructuredText parser path "
+        "with sufficient content to pass the minimum ingest length threshold."
+    )  # rst 是支持的
     good_files.append("readme.rst")
     (kb / "image.jpg").write_bytes(b"fake jpg")  # jpg 不支持
     skipped_files.append("image.jpg")
