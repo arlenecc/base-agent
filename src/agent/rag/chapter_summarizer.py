@@ -58,6 +58,12 @@ _SUMMARY_SYS_TOKENS = 200        # 系统提示 + chat 模板固定开销预留
 _CHARS_PER_TOKEN = 1.8
 # map-reduce 分块下限：单块至少这么长才有独立摘要意义（否则直接并入前块）。
 _MIN_BLOCK_CHARS = 400
+# 章节摘要策略：正文超过此阈值（字）强制走 map-reduce，避免单段摘要因篇章过长而
+# 质量下降（保证摘要效果）；不超过则整章直摘。
+_MAP_REDUCE_THRESHOLD = 4000
+# map-reduce 每块目标字数：每 3000 字一个 map；并发 batching 由 aux.batch_chat 的
+# batch_size（默认 5）封顶，同一时刻最多 5 条序列在跑，约束峰值 KV 显存。
+_MAP_BLOCK_CHARS = 3000
 # 全书摘要输入（目录 + 各章摘要）上限：通常远小于章正文，直接整段送。
 _BOOK_INPUT_CHARS = 24_000
 # 章摘要字数约束（同时写进 prompt 与输出校验：超长截断到 ~1.5 倍上限，过短
@@ -424,7 +430,7 @@ class ChapterSummaryScheduler:
         ]
         out: List[str] = []
         for ev in aux.chat_stream(messages, tools=None, temperature=0.2,
-                                  kv_group="aux"):
+                                  kv_group="aux", enable_thinking=False):
             if ev.type == "content":
                 out.append(ev.content)
             elif ev.type == "done":
@@ -459,10 +465,10 @@ class ChapterSummaryScheduler:
     def _generate_chapter_summary(self, aux: Any, chapter: Any) -> str:
         """单章**全文**摘要（不截断章节正文，保证质量）。
 
-        按辅助引擎上下文窗口决定策略：
-          * 章节正文（按 token 折算后）落在可用输入预算内 → 整章直摘；
-          * 超出（上下文窗口较小 / 章节超长）→ **map-reduce**：先按块各自
-            摘要，再把这些块摘要汇总成最终 50-100 字章摘要。
+        策略（保证摘要效果）：
+          * 章节正文 ≤ 4000 字 → 整章直摘（单段摘要，强制关思考）；
+          * 章节正文 > 4000 字 → 强制 **map-reduce**：每 3000 字一个 map 各自
+            摘要，再用 batching（并发上限 5）并行生成，最后汇总成 50-100 字章摘要。
         块摘要与最终摘要都走同一套字数校验（过短判失败、过长截断）。
         """
         text = (getattr(chapter, "text", "") or "").strip()
@@ -472,25 +478,24 @@ class ChapterSummaryScheduler:
         ctx = self._aux_context_tokens(aux)
         budget_tokens = max(256, ctx - _SUMMARY_OUT_TOKENS - _SUMMARY_SYS_TOKENS)
         budget_chars = max(800, int(budget_tokens * _CHARS_PER_TOKEN))
+        # map 块大小：每 3000 字一个 map，且不超过模型单次输入预算（极端小上下文
+        # 模型保底，避免单块超出窗口）。
+        map_block = min(_MAP_BLOCK_CHARS, budget_chars)
 
-        if len(text) <= budget_chars:
-            return self._summarize_block(aux, chapter.title, chapter.level, text)
+        # 正文超过 4000 字（保证摘要效果）或超长超出模型单次预算 → 强制 map-reduce。
+        if len(text) > _MAP_REDUCE_THRESHOLD or len(text) > budget_chars:
+            blocks = self._split_blocks(text, map_block)
+            block_summaries = self._map_summarize_blocks(
+                aux, chapter.title, chapter.level, blocks)
+            if not block_summaries:
+                return ""
+            if len(block_summaries) == 1:
+                return block_summaries[0]
+            return self._summarize_blocks_combined(
+                aux, chapter.title, chapter.level, block_summaries)
 
-        # ---- map-reduce：分块摘要 → 汇总 ----
-        blocks = self._split_blocks(text, budget_chars)
-        block_summaries: List[str] = []
-        for i, blk in enumerate(blocks, 1):
-            s = self._summarize_block(
-                aux, f"{chapter.title}（第{i}/{len(blocks)}段）",
-                chapter.level, blk)
-            if s:
-                block_summaries.append(s)
-        if not block_summaries:
-            return ""
-        if len(block_summaries) == 1:
-            return block_summaries[0]
-        return self._summarize_blocks_combined(
-            aux, chapter.title, chapter.level, block_summaries)
+        # 短章节：整章直摘（单段摘要，强制关思考）。
+        return self._summarize_block(aux, chapter.title, chapter.level, text)
 
     @staticmethod
     def _split_blocks(text: str, budget_chars: int) -> List[str]:
@@ -554,6 +559,57 @@ class ChapterSummaryScheduler:
         if len(summary) > _CHAPTER_SUMMARY_MAX:
             summary = summary[:_CHAPTER_SUMMARY_MAX].rstrip() + "…"
         return summary
+
+    def _map_summarize_blocks(
+        self,
+        aux: Any,
+        title: str,
+        level: int,
+        blocks: List[str],
+    ) -> List[str]:
+        """map 阶段：各文本块摘要。
+
+        优先走辅助模型的 **Batching 模式**（`aux.batch_chat` 连续批处理多分片，
+        单模型共享预填充、并行解码，远快于逐条串行）；辅助客户端不支持批量时
+        退回逐条串行。返回非空摘要列表（保序）。
+        """
+        if not blocks:
+            return []
+        # 与各块对应的 messages（与 _summarize_block 同款 system/user）。
+        messages_list = []
+        for i, blk in enumerate(blocks):
+            user = (f"章节标题：{title}\n标题层级：h{level}\n\n"
+                    f"待概括文本：\n{blk}")
+            messages_list.append([
+                {"role": "system", "content": _CHAPTER_SYSTEM},
+                {"role": "user", "content": user},
+            ])
+
+        if hasattr(aux, "batch_chat"):
+            try:
+                raw = aux.batch_chat(
+                    messages_list, temperature=0.2, max_tokens=200,
+                    enable_thinking=False)
+            except Exception as e:  # 批量失败 → 退回逐条串行，保证健壮
+                logger.warning("逐章摘要: batch_chat 失败，退回串行: %s", e)
+                raw = [self._summarize_block(aux, title, level, b) for b in blocks]
+        else:
+            raw = [self._summarize_block(aux, title, level, b) for b in blocks]
+
+        summaries: List[str] = []
+        for i, s in enumerate(raw):
+            s = _strip_wrappers(s or "").strip()
+            if len(s) < _CHAPTER_SUMMARY_MIN:
+                s = ""
+            elif len(s) > _CHAPTER_SUMMARY_MAX:
+                s = s[:_CHAPTER_SUMMARY_MAX].rstrip() + "…"
+            if s:
+                summaries.append(s)
+            else:
+                logger.warning(
+                    "逐章摘要: 第%d/%d段摘要为空（失败），跳过",
+                    i + 1, len(blocks))
+        return summaries
 
     def _summarize_blocks_combined(
         self,

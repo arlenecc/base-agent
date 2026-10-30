@@ -801,6 +801,10 @@ class LocalLLMClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: float = 0.7,
+        # 调用级思考开关覆盖：默认 None 走客户端构造时的 _enable_thinking；
+        # 显式传 False 可强制单次调用关闭思考（如 RAG 文档摘要等不需要推理的
+        # 轻量子任务），不受 aux 客户端如何构造的影响。
+        enable_thinking: Optional[bool] = None,
         # KV 缓存调用组：主对话用 "main"（持久、跨轮复用，避免每句全量预填充）；
         # 辅助调用（知识图谱抽取 / RAG 重排 / 技能检索 / 工具描述 / 预热）用
         # "aux"（一次性本地缓存，不写实例状态）。两者共享同一模型权重但缓存
@@ -821,11 +825,104 @@ class LocalLLMClient:
         # 串行化同实例的生成（MLX/GGUF 并发不安全）；主/辅实例各自独立互不阻塞。
         with self._gen_lock:
             if self._backend == "mlx":
-                yield from self._stream_mlx(messages, tools, temperature, kv_group)
+                yield from self._stream_mlx(messages, tools, temperature, kv_group, enable_thinking)
             elif self._backend == "gguf":
-                yield from self._stream_gguf(messages, tools, temperature, kv_group)
+                yield from self._stream_gguf(messages, tools, temperature, kv_group, enable_thinking)
             else:
-                yield from self._stream_onnx(messages, tools, temperature, kv_group)
+                yield from self._stream_onnx(messages, tools, temperature, kv_group, enable_thinking)
+
+    # ------------------------------------------------------------------
+    # 批量生成（Batching 模式）：辅助模型高吞吐场景（长文 map-reduce 多分片、
+    # 知识图谱批量抽取等）。单模型连续批处理，共享预填充、并行解码，远快于 N
+    # 次串行 chat_stream，且仅加载一份权重（不需要多实例）。
+    # ------------------------------------------------------------------
+    def batch_chat(
+        self,
+        messages_list: List[List[Dict[str, Any]]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+        enable_thinking: Optional[bool] = None,
+        batch_size: int = 5,
+        kv_group: str = "aux",
+    ) -> List[str]:
+        """一次调用处理多个独立 prompt，返回与各 prompt 顺序一致的文本列表。
+
+        仅 MLX 后端走真正的批量前向（mlx_lm 连续批处理）；其它后端退化为逐条
+        串行 chat_stream，保证可用。模板的 enable_thinking 默认随客户端，可显式
+        覆盖（文档摘要传 False）。``batch_size`` 为并发上限：单次
+        ``batch_generate`` 最多送 ``batch_size`` 片，且内部
+        completion/prefill batch size 亦以此为顶（同一时刻最多 ``batch_size`` 条
+        序列在跑），用于约束峰值 KV 显存、避免占用过多内存。
+        """
+        self._ensure_model()
+        if not messages_list:
+            return []
+        # 同实例串行化：避免与 chat_stream / 其它生成争用同一模型权重。
+        with self._gen_lock:
+            if self._backend != "mlx":
+                return [
+                    self._batch_collect_one(
+                        m, tools, temperature, max_tokens, enable_thinking, kv_group)
+                    for m in messages_list
+                ]
+            import mlx.core as mx  # noqa: F401
+            from mlx_lm.generate import batch_generate
+            from mlx_lm.sample_utils import make_sampler, make_logits_processors
+
+            tok = self._tokenizer
+            eff_think = (self._enable_thinking
+                         if enable_thinking is None else bool(enable_thinking))
+            prompt_ids: List[List[int]] = []
+            for messages in messages_list:
+                if self._backend in ("mlx", "gguf", "onnx"):
+                    messages = _rebuild_raw_messages(messages)
+                try:
+                    prompt = tok.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                        tools=tools if tools else None, enable_thinking=eff_think)
+                except Exception:
+                    prompt = tok.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True)
+                prompt_ids.append(tok.encode(prompt))
+
+            sampler = make_sampler(
+                temperature if temperature > 0 else 0.0,
+                self._top_p, self._min_p, 1, self._top_k)
+            logits_processors = (
+                make_logits_processors(
+                    repetition_penalty=self._repetition_penalty or None,
+                    repetition_context_size=20)
+                if self._repetition_penalty and self._repetition_penalty != 1.0
+                else [])
+
+            out: List[str] = []
+            n = len(prompt_ids)
+            for s in range(0, n, max(1, batch_size)):
+                chunk = prompt_ids[s:s + batch_size]
+                # 并发顶设为 batch_size：同一时刻最多 5 条序列在跑，约束 KV 显存。
+                cbs = min(batch_size, len(chunk))
+                pbs = min(batch_size, len(chunk))
+                resp = batch_generate(
+                    self._model, tok, chunk,
+                    max_tokens=max_tokens, sampler=sampler,
+                    logits_processors=logits_processors,
+                    prefill_batch_size=pbs, completion_batch_size=cbs)
+                out.extend(resp.texts)
+            return out
+
+    def _batch_collect_one(self, messages, tools, temperature, max_tokens,
+                          enable_thinking, kv_group) -> str:
+        """非 MLX 后端：单条串行收集（batch_chat 的兜底路径）。"""
+        out: List[str] = []
+        for ev in self.chat_stream(
+                messages, tools=tools, temperature=temperature,
+                kv_group=kv_group, enable_thinking=enable_thinking):
+            if ev.type == "content":
+                out.append(ev.content)
+            elif ev.type == "done":
+                break
+        return "".join(out).strip()
 
     # ---- 通用：把 think 分段 + 收集全文（用于工具调用解析）----
     def _stream_with_producer(self, deltas: Iterator[str],
@@ -897,7 +994,8 @@ class LocalLLMClient:
         yield StreamEvent("done", tool_calls=calls, usage={}, raw_content=raw)
 
     # ---- MLX ----
-    def _stream_mlx(self, messages, tools, temperature, kv_group: str = "main"):
+    def _stream_mlx(self, messages, tools, temperature, kv_group: str = "main",
+                    enable_thinking: Optional[bool] = None):
         import mlx.core as mx
         from mlx_lm import stream_generate
         from mlx_lm.sample_utils import make_sampler, make_logits_processors
@@ -908,11 +1006,13 @@ class LocalLLMClient:
         # 的逐 token 序列」，跨轮 KV 前缀才对得上。HTTP 后端的历史没有该字段，
         # messages 原样不动（零影响）。
         messages = _rebuild_raw_messages(messages)
+        eff_think = (self._enable_thinking
+                     if enable_thinking is None else bool(enable_thinking))
         try:
             prompt = tok.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
                 tools=tools if tools else None,
-                enable_thinking=self._enable_thinking,
+                enable_thinking=eff_think,
             )
         except Exception:
             prompt = tok.apply_chat_template(
@@ -1188,7 +1288,8 @@ class LocalLLMClient:
             yield ev
 
     # ---- GGUF ----
-    def _stream_gguf(self, messages, tools, temperature, kv_group: str = "main"):
+    def _stream_gguf(self, messages, tools, temperature, kv_group: str = "main",
+                     enable_thinking: Optional[bool] = None):
         """GGUF 生成入口：优先走「前缀复用」路径，否则退回旧路径。
 
         复用只用于主对话（``kv_group == "main"``）且开关打开时。辅助调用
@@ -1441,7 +1542,8 @@ class LocalLLMClient:
         yield StreamEvent("done", tool_calls=calls_acc_list, usage={})
 
     # ---- ONNX ----
-    def _stream_onnx(self, messages, tools, temperature, kv_group: str = "main"):
+    def _stream_onnx(self, messages, tools, temperature, kv_group: str = "main",
+                     enable_thinking: Optional[bool] = None):
         import numpy as np
         # ONNX 走 transformers 的 AutoTokenizer 本身；旧实现照搬 MLX 的
         # ``getattr(tok, "tokenizer", tok)`` 会拿到不可调用的 Rust Tokenizer
