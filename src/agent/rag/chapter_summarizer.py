@@ -174,7 +174,7 @@ class ChapterSummaryScheduler:
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        while not self._stop.wait(self._TICK_SECONDS):
+        while not self._stop.wait(_TICK_SECONDS):
             try:
                 if not self._is_idle():
                     continue
