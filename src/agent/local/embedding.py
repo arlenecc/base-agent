@@ -41,6 +41,9 @@ _FAMILY_TASK_PREFIXES: Dict[str, Dict[str, str]] = {
     # jina 系列：检索 / 聚类 / 分类各有一套前缀
     "jina": {"doc": "passage: ", "query": "query: ",
              "clustering": "clustering: ", "classification": "classification: "},
+    # jina-embeddings-v5（EuroBERT，last-token 池化）：前缀与 v3 不同
+    "jina-v5": {"doc": "Document: ", "query": "Query: ",
+                "clustering": "Document: ", "classification": "Document: "},
     # e5 系列：检索前缀
     "e5": {"doc": "passage: ", "query": "query: "},
 }
@@ -96,10 +99,15 @@ def _model_family(path: str) -> str:
 def _prefix_family(model_ref: str) -> str:
     """从模型目录名 / model_type 推断前缀族（未知 → ""，即全空前缀）。"""
     name = os.path.basename(str(model_ref).rstrip("/\\")).lower()
+    if "jina" in name and "v5" in name:
+        return "jina-v5"      # v5 前缀（Query:/Document:）与 v3 不同，先于通用 jina 判定
     for key in _PREFIX_FAMILY_NAME_KEYWORDS:
         if key in name:
             return key
-    return "nomic" if _model_family(model_ref) == "nomic_bert" else ""
+    family = _model_family(model_ref)
+    if family == "eurobert":
+        return "jina-v5"
+    return "nomic" if family == "nomic_bert" else ""
 
 
 def resolve_task_prefixes(model_ref: str) -> Dict[str, str]:
@@ -116,6 +124,16 @@ def _onnx_file(path: str) -> Optional[str]:
     return None
 
 
+_MLX_WEIGHT_SUFFIXES = (".safetensors", ".npz", ".mlx")
+
+
+def _has_mlx_weights(path: str) -> bool:
+    """目录里是否存在 MLX 权重（safetensors / npz / .mlx）。"""
+    if not os.path.isdir(path):
+        return False
+    return any(f.endswith(_MLX_WEIGHT_SUFFIXES) for f in os.listdir(path))
+
+
 class LocalEmbeddingFunction:
     """本地 embedding 函数（fastembed 的并行可选项）。
 
@@ -125,9 +143,20 @@ class LocalEmbeddingFunction:
 
     def __init__(self, path: str, backend: str = "mlx",
                  doc_prefix: str = "", query_prefix: str = "",
-                 dtype: str = "float32", max_length: Optional[int] = None):
+                 dtype: str = "float32", max_length: Optional[int] = None,
+                 truncate_dim: Optional[int] = None):
         self._path = path
         self._backend = (backend or "mlx").strip().lower()
+        # 按目录内容自动回退 backend：用户选错（如指向 ONNX 目录却留默认 mlx）
+        # 时也能开箱即用，且不覆盖任何「权重确实存在」的有效选择。
+        if (self._backend == "mlx"
+                and not _has_mlx_weights(self._path)
+                and _onnx_file(self._path)):
+            self._backend = "onnx"
+        elif (self._backend == "onnx"
+              and not _onnx_file(self._path)
+              and _has_mlx_weights(self._path)):
+            self._backend = "mlx"
         self._model = None
         self._tokenizer = None
         self._session = None
@@ -136,6 +165,7 @@ class LocalEmbeddingFunction:
         # 前缀：统一按前缀族表取默认值（见 _FAMILY_TASK_PREFIXES）；
         # 显式传 doc_prefix/query_prefix 仅用于覆盖，未传的任务项保持表默认。
         self._family = _model_family(path)            # 架构族：MLX 加载/池化调度用
+        self._prefix_family = _prefix_family(path)    # 前缀族：doc/query 等文本前缀
         self._prefixes = resolve_task_prefixes(path)  # 前缀族 → 任务前缀表
         if doc_prefix:
             self._prefixes["doc"] = doc_prefix
@@ -144,6 +174,10 @@ class LocalEmbeddingFunction:
         self._doc_prefix = self._prefixes.get("doc", "")
         self._query_prefix = self._prefixes.get("query", "")
         self._dtype = dtype
+        # Matryoshka 截维（可选）：非 None 时 MLX jina 系（v3/v5）在模型内
+        # 截取前 N 维并重新 L2 归一化后再返回（v3 的 ONNX 路径不支持，
+        # 仍由 vector_store 的 Matryoshka 流程统一处理）。
+        self._truncate_dim = int(truncate_dim) if truncate_dim else None
         # 最大序列长度：未显式指定时按模型位置编码类型夹紧（见
         # registry.resolve_model_max_length：RoPE→8192，绝对位置→max_position_embeddings），
         # 但无论模型原生支持多长，统一强制截到 _MAX_EMBED_INPUT_TOKENS（1024）：
@@ -195,6 +229,15 @@ class LocalEmbeddingFunction:
             # 本包 vendoring 的 MLX 实现（models/jina-embeddings-v3-mlx-*）：
             # XLM-RoBERTa + RoPE + 任务 LoRA，mlx-embeddings / mlx-lm 都不认这类权重。
             from .mlx_jina import load_model
+            self._model, _cfg = load_model(self._path)
+            from transformers import AutoTokenizer
+            self._tokenizer = AutoTokenizer.from_pretrained(self._path)
+            return
+        if self._family == "eurobert":
+            # jina-embeddings-v5-text-nano（EuroBERT-210M，last-token 池化）。
+            # vendored 实现（mlx_jina_v5）支持 config.json quantization 的
+            # int4/int8 量化权重；fp16 版自动预合并 retrieval LoRA。
+            from .mlx_jina_v5 import load_model
             self._model, _cfg = load_model(self._path)
             from transformers import AutoTokenizer
             self._tokenizer = AutoTokenizer.from_pretrained(self._path)
@@ -297,10 +340,14 @@ class LocalEmbeddingFunction:
         if self._backend == "mlx":
             if self._family == "jina-v3-mlx":
                 return self._encode_mlx_jina(prefixed, jina_task)
+            if self._family == "eurobert":
+                return self._encode_mlx_eurobert(prefixed)
             return self._encode_mlx(prefixed)
         if self._backend == "onnx":
             if self._family == "jina-v3-mlx":
                 return self._encode_onnx_jina(prefixed, jina_task)
+            if self._prefix_family == "jina-v5":
+                return self._encode_onnx_eurobert(prefixed)
             return self._encode_onnx(prefixed)
         return self._encode_gguf(prefixed)
 
@@ -371,8 +418,25 @@ class LocalEmbeddingFunction:
                               max_length=self._max_length, return_tensors="np")
         input_ids = mx.array(enc["input_ids"])
         attention_mask = mx.array(enc["attention_mask"])
-        out = self._model.encode(input_ids, attention_mask, task=jina_task)
+        out = self._model.encode(input_ids, attention_mask,
+                                 truncate_dim=self._truncate_dim, task=jina_task)
         return [list(map(float, row)) for row in np.array(out, dtype=np.float32)]
+
+    def _encode_mlx_eurobert(self, texts: List[str]) -> List[List[float]]:
+        """jina-embeddings-v5-text-nano（MLX/eurobert）编码。
+
+        模型内部 last-token 池化 + L2 归一化（768 维）；``truncate_dim`` 生效时
+        截取前 N 维并重新归一化（MRL）。量化版已预合并 retrieval LoRA，
+        query/passage 仅靠文本前缀（Query:/Document:）区分，无需运行时选任务。
+        """
+        import numpy as np
+        import mlx.core as mx
+        enc = self._tokenizer(texts, padding=True, truncation=True,
+                              max_length=self._max_length, return_tensors="np")
+        out = self._model.encode(mx.array(enc["input_ids"]),
+                                 mx.array(enc["attention_mask"]),
+                                 truncate_dim=self._truncate_dim)
+        return [list(map(float, row)) for row in np.asarray(out, dtype=np.float32)]
 
     def _encode_onnx_jina(self, texts: List[str], jina_task: Optional[str]) -> List[List[float]]:
         """jina-embeddings-v3（ONNX）编码：额外传 task_id 选 LoRA。
@@ -390,6 +454,29 @@ class LocalEmbeddingFunction:
             "task_id": np.array(task_id, dtype=np.int64),
         }
         out = self._session.run(None, feeds)[0]  # (B, 1024) 已归一化
+        return [list(map(float, row)) for row in out]
+
+    def _encode_onnx_eurobert(self, texts: List[str]) -> List[List[float]]:
+        """jina-embeddings-v5-text-nano（ONNX）编码。
+
+        导出图已包含 last-token 池化 + L2 归一化，输出直接是 (B, 768) 归一化向量，
+        不要再二次池化；``truncate_dim`` 生效时截取前 N 维并重新归一化（MRL）。
+        量化版（int4/int8）已预合并 retrieval LoRA，query/doc 仅靠文本前缀
+        （Query:/Document:）区分，无需运行时选任务。
+        """
+        import numpy as np
+        enc = self._tokenizer(texts, padding=True, truncation=True,
+                              max_length=self._max_length, return_tensors="np")
+        feeds = {
+            "input_ids": enc["input_ids"].astype(np.int64),
+            "attention_mask": enc["attention_mask"].astype(np.int64),
+        }
+        out = np.asarray(self._session.run(None, feeds)[0],
+                         dtype=np.float32)  # (B, 768) 已 L2 归一化
+        if self._truncate_dim:
+            out = out[:, :self._truncate_dim]
+            norms = np.linalg.norm(out, axis=1, keepdims=True)
+            out = out / np.clip(norms, 1e-12, None)
         return [list(map(float, row)) for row in out]
 
     # ------------------------------------------------------------------

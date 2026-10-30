@@ -77,12 +77,12 @@ class AgentConfig:
     rag_matryoshka_enabled: bool = True
     # Matryoshka 裁剪维度（仅 rag_matryoshka_enabled 为 True 时生效，且仅作用于
     # 支持 Matryoshka 的模型）。可选 128 / 256 / 512；其它值（含 <=0）视为不裁剪。
-    #   256（默认）：体积与质量均衡；
-    #   128：最小体积/最快，检索质量最低；
+    #   128（默认，配 v5-nano）：最小体积/最快，实测检索无损、STS 反而最高；
+    #   256：体积与质量均衡；
     #   512：质量最高，体积最大。
-    # 设置后自动完成 L2 归一化 + int8 量化，入库与查询同步。改动后向量维度变化，
-    # 旧库需清空重建。
-    rag_embedding_dims: int = 256
+    # 截断后**务必重新 L2 归一化**再量化到 int8（vector_store 统一处理），
+    # 入库与查询同步。改动后向量维度/指纹变化，旧库需清空重建。
+    rag_embedding_dims: int = 128
     # rag_search 默认返回条数（重排后的最终结果数）。
     rag_search_top_k: int = 5
     # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：
@@ -244,13 +244,15 @@ class AgentConfig:
     local_llm_prefill_step_size: int = 4096
 
     embedding_provider: str = "local"
-    # 默认 embedding：jina-embeddings-v3 的 MLX int4 权重（1024 维，XLM-RoBERTa
-    # + RoPE + 任务 LoRA；统一模型，按 retrieval.query/passage 选适配器）。
-    # 路径相对项目根解析（<root>/models/...）。jina 支持 Matryoshka：向量库层
-    # 截取前 256 维、重新归一化后量化到 int8 入库（见 rag/vector_store.py）。
+    # 默认 embedding：jina-embeddings-v5-text-nano 的 MLX int4 权重（EuroBERT-
+    # 210M，last-token 池化；retrieval LoRA 已预合并，query/passage 靠
+    # "Query: " / "Document: " 文本前缀区分，由 local/embedding.py 的 jina-v5
+    # 前缀族自动叠加）。路径相对项目根解析（<root>/models/...）。支持
+    # Matryoshka：向量库层截取前 128 维、重新 L2 归一化后量化到 int8，
+    # 入库与查询同步（见 rag/vector_store.py，维度由 rag_embedding_dims 指定）。
     # 跨平台 / 无 Apple Silicon 时改用 ONNX 版：local_embedding_model 指向
     # models/jina-embeddings-v3-onnx-int4、local_embedding_backend="onnx"。
-    local_embedding_model: str = "models/jina-embeddings-v3-mlx-int4"
+    local_embedding_model: str = "models/jina-embeddings-v5-text-nano-mlx-int4"
     local_embedding_backend: str = "mlx"
     # MLX Metal 缓冲缓存上限（MB）。MLX 默认 cache_limit = 统一内存的 ~75%，空闲
     # Metal buffer 不归还系统、一路涨到上限（16GB 机器上 ~12GB，是 #131 同步内存
@@ -482,15 +484,17 @@ class AgentConfig:
         # 用户若显式选了别的 OvisOCR2 目录名则不受影响。
         if self.rag_ocr_model_name == "OvisOCR2-0.8B-MLX-4bit":
             self.rag_ocr_model_name = "OvisOCR3-MLX-4bit-mixed46"
-        # 本地 embedding 默认模型定为 jina-embeddings-v3（MLX int4 权重，1024 维、
-        # 多语/中文强、支持 Matryoshka）。空路径（旧配置默认走 fastembed 网络模型）
-        # 与历史默认 bge-small-zh-v1.5-mlx 都迁到新默认——bge 只有 512 窗口，与
-        # 新的 800 token 切片不匹配；nomic 用户（非 bge/空）保持原样。用户显式
-        # 指定的其它本地模型目录保持原样。
+        # 本地 embedding 默认模型定为 jina-embeddings-v5-text-nano（MLX int4，
+        # EuroBERT-210M，支持 Matryoshka；中文实测检索/STS 不劣于 v3 且约 4 倍速）。
+        # 空路径（旧配置默认走 fastembed 网络模型）、历史默认 bge-small-zh-v1.5-mlx
+        # 与上一代默认 jina-embeddings-v3-mlx-int4 都迁到新默认；nomic 用户
+        # （非 bge/空）保持原样。用户显式指定的其它本地模型目录保持原样。
+        # 迁移会改变模型指纹/向量维度，旧向量库需清空重建。
         if not self.local_embedding_model or self.local_embedding_model in (
             "bge-small-zh-v1.5-mlx", "models/bge-small-zh-v1.5-mlx",
+            "jina-embeddings-v3-mlx-int4", "models/jina-embeddings-v3-mlx-int4",
         ):
-            self.local_embedding_model = "models/jina-embeddings-v3-mlx-int4"
+            self.local_embedding_model = "models/jina-embeddings-v5-text-nano-mlx-int4"
         if not self.local_reranker_model:
             # 默认 reranker 改为 jina（onnx / CPU-only）。仅在「未显式指定本地
             # 模型」时填充——显式指定了其它模型（如 bge-mxfp8）的用户保持原样。
@@ -499,10 +503,10 @@ class AgentConfig:
             self.local_reranker_model = "jina-reranker-v2-base-multilingual-onnx"
             self.local_reranker_backend = "onnx"
         # Matryoshka 裁剪维度归一：仅在启用且为受支持的 128/256/512 时保留，
-        # 其它值（含 <=0）归一到 256，避免无效维度导致截断逻辑异常。关闭时不裁剪。
+        # 其它值（含 <=0）归一到默认 128，避免无效维度导致截断逻辑异常。关闭时不裁剪。
         if getattr(self, "rag_matryoshka_enabled", True):
             if self.rag_embedding_dims not in (128, 256, 512):
-                self.rag_embedding_dims = 256
+                self.rag_embedding_dims = 128
         else:
             self.rag_embedding_dims = 0
 

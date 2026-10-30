@@ -49,11 +49,11 @@ DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3-int8"
 # jina-embeddings-v3 等）：截断到前 N 维后**重新归一化**仍保留绝大部分语义
 # （官方推荐 64/128/256/512）。入库与查询同步执行「截断 → 重新 L2 归一化 →
 # int8 量化」，详见 _prepare_vector_for_index。
-# 默认 256：体积与质量均衡；128 更省更快、512 质量最高。维度由 config.
-# rag_embedding_dims 经 set_matryoshka_dims() 覆盖；<= 0 表示不截断（保留
-# 模型原始维度）。是否启用由 config.rag_matryoshka_enabled 经
+# 默认 128（配 v5-nano）：最小体积/最快，实测检索无损；256 均衡、512 质量最高。
+# 维度由 config.rag_embedding_dims 经 set_matryoshka_dims() 覆盖；<= 0 表示不截断
+# （保留模型原始维度）。是否启用由 config.rag_matryoshka_enabled 经
 # set_matryoshka_enabled() 控制（关闭则即便模型支持也不裁剪）。
-_DEFAULT_MATRYOSHKA_DIMS = 256
+_DEFAULT_MATRYOSHKA_DIMS = 128
 _MATRYOSHKA_DIMS = _DEFAULT_MATRYOSHKA_DIMS
 _MATRYOSHKA_ENABLED = True
 # int8 量化比例：归一化后分量 ∈ [-1,1]，乘 127 取整映射到 int8 网格
@@ -1437,7 +1437,7 @@ class VectorStore:
         """原始 FP32 向量 → 入库/查询用的 int8 量化向量（两条路径唯一收口）。
 
         截断维度取模块级 ``_MATRYOSHKA_DIMS``（由 config.rag_embedding_dims
-        经 ``set_matryoshka_dims`` 同步，默认 256；<=0 不截断）；是否截断还受
+        经 ``set_matryoshka_dims`` 同步，默认 128；<=0 不截断）；是否截断还受
         全局开关 ``_MATRYOSHKA_ENABLED``（config.rag_matryoshka_enabled）节制。
         """
         return _prepare_vector_for_index(
