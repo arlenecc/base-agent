@@ -238,6 +238,45 @@ def test_two_stage_respects_where(store):
     results = store.search_with_rerank(
         "第1段机器学习内容", top_k=4,
         where="source LIKE '%a.pdf%'")
+    # 内存 source 过滤：结果必须全部落在被过滤的 source 上
+    assert results, "应返回结果"
+    assert all(r["source"] == "/kb/a.pdf" for r in results)
+
+
+def test_two_stage_where_ram_filter_finds_only_matching_source(store):
+    """定向检索（source LIKE）走内存过滤：b.pdf 的独有内容不应被 a.pdf 查询命中。"""
+    _add(store, "/kb/a.pdf", ["阿尔法主题独有内容甲", "阿尔法主题独有内容乙"])
+    _add(store, "/kb/b.pdf", ["贝塔主题独有内容丙", "贝塔主题独有内容丁"])
+    set_binary_prefilter(True, 200)
+    results = store.search_with_rerank(
+        "贝塔主题独有内容", top_k=4, where="source LIKE '%a.pdf%'")
+    # a.pdf 里根本没有『贝塔』内容 → 过滤后无结果（而非跨 source 泄漏召回）
+    assert all(r["source"] == "/kb/a.pdf" for r in results)
+    assert all("阿尔法" in r["text"] for r in results)
+
+
+def test_bin_cache_invalidated_after_add(store):
+    """写入后内存矩阵缓存必须失效重建，否则新增切片会被粗筛遗漏。"""
+    _add(store, "a.pdf", ["机器学习内容甲", "机器学习内容乙"])
+    set_binary_prefilter(True, 200)
+    assert store.search_with_rerank("机器学习内容甲", top_k=2)
+    # 新增一条独有内容的切片
+    _add(store, "a.pdf", ["新增的锌钛合金专题切片"])
+    # 不经过 add 的显式无效化会漏掉该切片；这里验证写后重建命中
+    results = store.search_with_rerank("锌钛合金专题", top_k=2)
+    assert any("锌钛合金" in r["text"] for r in results)
+
+
+def test_two_stage_where_escaped_format_uses_ram_filter(store):
+    """生产环境 where 带 ESCAPE '\\' 后缀，仍应走内存 source 过滤（不回退 LanceDB）。"""
+    _add(store, "/kb/a.pdf", ["阿尔法主题独有内容甲"])
+    _add(store, "/kb/b.pdf", ["贝塔主题独有内容乙"])
+    set_binary_prefilter(True, 200)
+    results = store.search_with_rerank(
+        "阿尔法主题独有内容", top_k=4,
+        where="source LIKE '%a.pdf%' ESCAPE '\\'")
+    assert results
+    assert all(r["source"] == "/kb/a.pdf" for r in results)
 
 
 def test_two_stage_degrades_on_scan_failure(store, monkeypatch):

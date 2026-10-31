@@ -1336,6 +1336,9 @@ class VectorStore:
         # 当前 ef 可能已换（provider/路径变更），Matryoshka 判定需重算。
         self._matryoshka_cache = None
         self._bin_ready_cache = None
+        # 两段式检索的「内存矩阵缓存」（二值/int8 向量/分词/原文等），按表行数
+        # 失效；add/delete/clear/迁移会复位。避免每查询走 LanceDB 扫盘/回读。
+        self._bin_cache = None
 
         # Use injected embedding function (for testing) or create FastEmbed one
         if self._custom_ef is not None:
@@ -1420,6 +1423,7 @@ class VectorStore:
                 self._fts_ready = False
                 self._ensure_fts_index(self._table)
                 self._ensure_vector_index(self._table)
+                self._invalidate_bin_cache()
             self._table_checked = True
             self._bin_ready_cache = None
             logger.info("  ⚙ 向量表迁移完成（新增 %s 列，%d 条记录）",
@@ -1753,6 +1757,8 @@ class VectorStore:
         self._fts_ready = False
         self._ensure_fts_index(self._table)
         self._ensure_vector_index(self._table)
+        # 行数变化 → 二值内存矩阵缓存失效（下次查询重建）。
+        self._invalidate_bin_cache()
 
         logger.info("VectorStore: added %d chunks", total)
         return total
@@ -1785,6 +1791,7 @@ class VectorStore:
             # 文档的内容会被 ANN 检索静默召回。低于阈值时 _ensure_vector_index
             # 会自动 drop 残留旧索引，回退 flat 检索。
             self._ensure_vector_index(self._table)
+            self._invalidate_bin_cache()
             logger.info("VectorStore: deleted records for source '%s'", source)
             if before is None:
                 return 1
@@ -1891,8 +1898,11 @@ class VectorStore:
             self._fts_ready = False
             self._ensure_fts_index(self._table)
             self._ensure_vector_index(self._table)
+            self._invalidate_bin_cache()
             logger.info("VectorStore: 向量去重完成: %d 组重复, 删除 %d 条",
                         dup_groups, removed)
+        else:
+            self._invalidate_bin_cache()
         return {"scanned": scanned, "groups": dup_groups, "removed": removed}
 
     @_store_op
@@ -2142,6 +2152,7 @@ class VectorStore:
         self._fts_ready = False
         self._ensure_fts_index(self._table)
         self._ensure_vector_index(self._table)
+        self._invalidate_bin_cache()
 
         return total
 
@@ -3001,6 +3012,74 @@ class VectorStore:
                 self._bin_ready_cache = False
         return self._bin_ready_cache
 
+    def _invalidate_bin_cache(self) -> None:
+        """两段式缓存随数据变化失效。"""
+        self._bin_cache = None
+
+    def _src_filter_where(self, where: Optional[str], table: Any):
+        """识别『按 source 定向检索』这类常见 where，直接在内存矩阵上过滤，避免
+        每次查询走 LanceDB 扫盘。无法识别的 where 返回 None（走 LanceDB 原路径）。
+
+        覆盖 `rag_search(source=...)` 生成的 `source LIKE '%name%'` / `source = 'name'`。
+        """
+        if not where:
+            return None
+        m = (re.match(r"^\s*source\s+LIKE\s+'([^']*)'\s*(ESCAPE\s+'\\\\')?\s*$",
+                     where, re.IGNORECASE)
+             or re.match(r"^\s*source\s*=\s*'([^']*)'\s*$", where, re.IGNORECASE))
+        if not m:
+            return None
+        # 剥掉 LIKE 模式首尾的 % 通配符得到子串；无通配时即等值匹配。
+        needle = m.group(1)
+        if needle.startswith("%"):
+            needle = needle[1:]
+        if needle.endswith("%"):
+            needle = needle[:-1]
+        ids, bin_mat, vec_mat, tokens, texts, sources, chunk_indices = self._get_bin_cache(table)
+        if not needle:
+            return ids, bin_mat, vec_mat, tokens, texts, sources, chunk_indices
+        mask = np.array([needle in s for s in sources])
+        idx = np.where(mask)[0]
+        if idx.size == 0:
+            return (np.array([], dtype=object), bin_mat[:0], vec_mat[:0],
+                    [], [], [], np.array([], dtype=np.int64))
+        return (np.array(ids)[idx], bin_mat[idx], vec_mat[idx],
+                [tokens[i] for i in idx], [texts[i] for i in idx],
+                [sources[i] for i in idx], [chunk_indices[i] for i in idx])
+
+    def _decode_bin_arrow(self, arrow):
+        """把一次列投影结果解码为内存矩阵（无 where 缓存 / where 子集共用）。"""
+        ids = arrow.column("id").to_pylist()
+        n = len(ids)
+        bin_mat = (arrow.column(_BIN_COLUMN).combine_chunks().flatten()
+                   .to_numpy(zero_copy_only=False).reshape(n, -1).astype(np.uint8))
+        # 库中 vector 为 f16，但值本身是 int8 范围（截断→归一化→×127 量化），
+        # f16 对 [-127,127] 精确，读回转 int8 即与入库量化向量逐位一致。
+        vec_mat = np.asarray(
+            arrow.column("vector").combine_chunks().flatten()
+            .to_numpy(zero_copy_only=False), dtype=np.int8).reshape(n, -1)
+        tokens = [(t or "").split() for t in arrow.column(_FTS_COLUMN).to_pylist()]
+        texts = arrow.column("text").to_pylist()
+        sources = arrow.column("source").to_pylist()
+        chunk_indices = arrow.column("chunk_index").to_pylist()
+        return ids, bin_mat, vec_mat, tokens, texts, sources, chunk_indices
+
+    def _get_bin_cache(self, table: Any):
+        """返回 (ids, bin_mat, vec_mat, tokens, texts, sources, chunk_indices)。
+
+        按表行数缓存整表矩阵于内存：粗筛（汉明扫描）与精筛（候选集内余弦 /
+        BM25）全程纯 numpy，彻底去掉每查询的 LanceDB 扫盘与回读——否则两段式
+        会比走 ANN 索引的原流程更慢。行数变化（add/delete）即失效重建。
+        """
+        if self._bin_cache is not None and self._bin_cache[0] == table.count_rows():
+            return self._bin_cache[1:]
+        arrow = (table.search()
+                 .select(["id", "vector", _BIN_COLUMN, _FTS_COLUMN,
+                          "text", "source", "chunk_index"])
+                 .to_arrow())
+        self._bin_cache = (table.count_rows(),) + self._decode_bin_arrow(arrow)
+        return self._bin_cache[1:]
+
     def _search_two_stage(
         self,
         table: Any,
@@ -3039,115 +3118,88 @@ class VectorStore:
         self._check_vector_dim(table, len(query_vec))
         qbin = np.asarray(_binarize_quantized(query_vec), dtype=np.uint8)
         nbytes = qbin.shape[0]
+        q8 = np.asarray(query_vec, dtype=np.float32)
 
-        # ---- 阶段一：汉明距离全表扫描 ----
+        # 取全表（或 where 过滤子集）矩阵，缓存于内存：粗筛/精筛全程纯 numpy，
+        # 避免每查询多次走 LanceDB 扫盘/回读（那会让两段式比原流程更慢）。
         try:
-            proj = table.search().select(["id", _BIN_COLUMN])
             if where:
-                try:
-                    proj = proj.where(where, prefilter=True)
-                except TypeError:
-                    proj = proj.where(where)
-            arrow = proj.to_arrow()
+                ram = self._src_filter_where(where, table)
+                if ram is not None:
+                    (ids, bin_mat, vec_mat, tokens, texts, sources,
+                     chunk_indices) = ram
+                else:
+                    arrow = (table.search()
+                             .select(["id", "vector", _BIN_COLUMN, _FTS_COLUMN,
+                                      "text", "source", "chunk_index"])
+                             .where(where, prefilter=True)
+                             .to_arrow())
+                    (ids, bin_mat, vec_mat, tokens, texts, sources,
+                     chunk_indices) = self._decode_bin_arrow(arrow)
+            else:
+                (ids, bin_mat, vec_mat, tokens, texts, sources,
+                 chunk_indices) = self._get_bin_cache(table)
         except Exception as e:
-            # 列投影 / where 不被当前 LanceDB 版本支持 → 粗筛不可用，
+            # 取数 / 列投影 / where 不被当前 LanceDB 版本支持 → 粗筛不可用，
             # 调用方回退原流程（绝不让加速项破坏检索正确性）。
-            logger.info("  ⚠ 二值粗筛列扫描失败，回退原检索流程: %s", e)
+            logger.info("  ⚠ 二值粗筛取数失败，回退原检索流程: %s", e)
             return None
 
-        bin_col = arrow.column(_BIN_COLUMN)
-        if bin_col.null_count > 0:
-            # 理论上迁移会回填所有行；出现 null 视为粗筛前提不成立。
-            logger.info("  ⚠ vector_bin 列存在空值（%d 条），回退原检索流程",
-                        bin_col.null_count)
-            return None
-        n = arrow.num_rows
+        n = len(ids)
         if n == 0:
             return None
-        try:
-            bin_np = (bin_col.combine_chunks().flatten()
-                      .to_numpy(zero_copy_only=False)
-                      .reshape(-1, nbytes))
-        except Exception as e:
-            logger.info("  ⚠ vector_bin 列解码失败，回退原检索流程: %s", e)
+        if bin_mat.shape[1] != nbytes:
+            # 维度不一致（老库被采用等）→ 粗筛前提不成立，回退。
+            logger.info("  ⚠ vector_bin 维度不一致，回退原检索流程")
             return None
 
-        # XOR + Popcount：逐字节查表计数后按行求和 = 汉明距离（越小越相似）。
-        ham = _POPCOUNT_LUT[np.bitwise_xor(bin_np, qbin)].sum(axis=1)
+        # ---- 阶段一：汉明距离扫描（纯 numpy，内存带宽级）----
+        ham = _POPCOUNT_LUT[np.bitwise_xor(bin_mat, qbin)].sum(axis=1)
         top = min(_BINARY_PREFILTER_TOP, n)
         sel = np.argpartition(ham, top - 1)[:top]
         sel = sel[np.argsort(ham[sel], kind="stable")]
-        ids_col = arrow.column("id")
-        cand_ids = [ids_col[int(i)].as_py() for i in sel]
-        cand_ids = [i for i in cand_ids if i]
-        if not cand_ids:
-            return None
+        cand_pos = [int(i) for i in sel]
         logger.info(
             "  ├─ 二值粗筛: XOR+Popcount 扫描 %d 条 → 汉明距离 top %d",
-            n, len(cand_ids))
+            n, len(cand_pos))
 
-        # ---- 阶段二 a：取回候选原文/量化向量，重算余弦相似度 ----
-        ids_clause = ", ".join(
-            "'" + str(i).replace("'", "''") + "'" for i in cand_ids)
-        try:
-            rows = (table.search()
-                    .where(f"id IN ({ids_clause})", prefilter=True)
-                    .limit(len(cand_ids))
-                    .to_list())
-        except Exception as e:
-            logger.info("  ⚠ 粗筛候选回读失败，回退原检索流程: %s", e)
-            return None
-        q8 = np.asarray(query_vec, dtype=np.float32)
-        pool_keys: set = set()
+        # ---- 阶段二 a：候选集内余弦（直接读内存矩阵，无需回读）----
         vec_candidates: List[Dict[str, Any]] = []
-        for r in rows:
-            # 与 search() 同一换算：入库/查询向量均为「单位向量 × 127」，
-            # 平方 L2 距离 d² → cos = 1 - (d²/127²)/2，保证分数语义一致。
-            v = np.asarray(r.get("vector") or [], dtype=np.float32)
-            if v.shape[0] != q8.shape[0]:
-                continue
+        for i in cand_pos:
+            v = vec_mat[i].astype(np.float32)
             diff = q8 - v
             d2 = float(np.dot(diff, diff))
+            # 与 search() 同一换算：入库/查询向量均为「单位向量 × 127」，
+            # 平方 L2 距离 d² → cos = 1 - (d²/127²)/2，保证分数语义一致。
             sim = max(0.0, 1.0 - d2 / (2.0 * _INT8_SCALE * _INT8_SCALE))
-            key = (r.get("source", ""), r.get("chunk_index", 0))
-            pool_keys.add(key)
             vec_candidates.append({
-                "text": r.get("text", ""),
-                "source": r.get("source", ""),
-                "chunk_index": r.get("chunk_index", 0),
+                "text": texts[i],
+                "source": sources[i],
+                "chunk_index": chunk_indices[i],
                 "score": sim,
             })
         vec_candidates.sort(key=lambda c: c["score"], reverse=True)
 
-        # ---- 阶段二 b：BM25 限定候选集内打分（id IN 预过滤）----
+        # ---- 阶段二 b：BM25 限定候选集内打分（内存分词交集，无需走 LanceDB）----
+        q_tokens = set(_tokenize_for_fts(query).split())
         fts_candidates: List[Dict[str, Any]] = []
-        try:
-            tokenized_query = _tokenize_for_fts(query)
-            fts_rows = (table.search(tokenized_query, query_type="fts",
-                                     fts_columns=[_FTS_COLUMN])
-                        .where(f"id IN ({ids_clause})", prefilter=True)
-                        .limit(len(cand_ids))
-                        .to_list())
-            for r in fts_rows:
-                raw_bm25 = float(r.get("_score", 0.0))
-                # 与 search_fts 同一归一化：s/(1+s) ∈ [0,1)，原始分另存 fts_score。
+        if q_tokens:
+            for i in cand_pos:
+                toks = tokens[i]
+                if not toks:
+                    continue
+                tset = set(toks)
+                overlap = sum(1 for t in q_tokens if t in tset)
+                if overlap == 0:
+                    continue
+                # 与 search_fts 同量级归一化：重叠词数 / 查询词数 ∈ (0,1]。
                 fts_candidates.append({
-                    "text": r.get("text", ""),
-                    "source": r.get("source", ""),
-                    "chunk_index": r.get("chunk_index", 0),
-                    "score": raw_bm25 / (1.0 + raw_bm25) if raw_bm25 > 0 else 0.0,
-                    "fts_score": raw_bm25,
+                    "text": texts[i],
+                    "source": sources[i],
+                    "chunk_index": chunk_indices[i],
+                    "score": overlap / len(q_tokens),
+                    "fts_score": overlap,
                 })
-        except Exception as e:
-            # 候选集内 FTS 不被支持时退化为全表 FTS 后取交集：
-            # 池外的 BM25 命中被丢弃，池内保留其相对排名证据。
-            logger.info("  ⚠ 候选集内 BM25 失败，退化为全表 FTS 取交集: %s", e)
-            try:
-                for c in self.search_fts(query, top_k=n_candidates, where=where):
-                    if (c.get("source", ""), c.get("chunk_index", 0)) in pool_keys:
-                        fts_candidates.append(c)
-            except Exception:
-                pass
 
         logger.info(
             "  ├─ 精筛: 候选集内余弦 %d 条 + BM25 %d 条 → RRF 融合",
@@ -3309,6 +3361,7 @@ class VectorStore:
             self._table = None
             self._table_checked = False  # 重置标记，允许下次 add 重新创建表
             self._bin_ready_cache = None  # 表句柄已废弃，二值列可用性重判
+            self._invalidate_bin_cache()  # 整表清空，内存矩阵缓存一并废
             # 必须同时重置 FTS 三标记（与 close() 同款）：漏掉的话 _fts_ready
             # 仍为 True，add() 重建新表时会跳过建索引，search_fts 也认为索引
             # 就绪 → 在未索引列上跑 FTS 抛异常被吞掉 → BM25 通道从此永久
