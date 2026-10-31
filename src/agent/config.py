@@ -108,6 +108,15 @@ class AgentConfig:
     # 完全丢弃上下文）。<=0 表示不过滤。
     rag_rerank_min_similarity: float = 0.5
     rag_auto_ingest: bool = True
+    # 两段式检索第一阶段（二值量化粗筛）开关：开启后 search_with_rerank 先用
+    # 查询向量的二进制表示（sign 量化 + 位打包）对全表做 XOR+Popcount 汉明
+    # 距离扫描，极速选出 top 200 候选，再在候选集内重算 int8 余弦相似度 +
+    # BM25 并交给 reranker 精排——大向量库（数十万行+）下显著快于全量 ANN 且
+    # 召回更稳。默认 False（维持原 ANN + 全表 FTS 流程）。旧向量库打开时会
+    # 自动迁移补 vector_bin 列（从已存量化向量派生，无需重嵌）。
+    rag_binary_prefilter_enabled: bool = False
+    # 二值粗筛候选数（第一阶段汉明距离保留的 top N，默认 200）。
+    rag_binary_prefilter_top: int = 200
     # PDF 统一解析引擎切换（仅影响「有文本层的常规 PDF/office 文档」首选谁，
     # 扫描件/图片重 PDF 始终走 parsers 的 RapidOCR 路径）：
     #   - "docling"（默认，现状）：docling 统一解析，不可用回退按格式解析器
@@ -300,6 +309,7 @@ class AgentConfig:
                    "kernel_consolidate_every", "kernel_max_tool_chars",
                    "kernel_max_digest_lines", "rag_ocr_pool_size",
                    "rag_docling_pool_size",
+                   "rag_binary_prefilter_top",
                    "aux_max_tokens", "aux_top_k",
                    "local_llm_num_draft_tokens", "local_llm_prefill_step_size")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
@@ -328,7 +338,7 @@ class AgentConfig:
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
                     "rag_ocr_scale_dynamic", "aux_llm_enabled",
                     "local_llm_enable_thinking", "aux_local_llm_enable_thinking",
-                    "rag_matryoshka_enabled")
+                    "rag_matryoshka_enabled", "rag_binary_prefilter_enabled")
 
     @classmethod
     def _coerce(cls, name: str, value):

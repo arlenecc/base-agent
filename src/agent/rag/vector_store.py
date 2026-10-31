@@ -89,6 +89,17 @@ _META_TABLE_NAME = "_embedding_meta"
 # tokenizer 按空格切分索引，解决中文无空格无法分词的问题）。
 _FTS_COLUMN = "text_fts"
 
+# 二值量化粗筛列（两段式检索第一阶段）：量化向量的 sign 位打包（uint8 定长
+# list，每 8 维压成 1 字节，128 维 → 16 字节）。与 int8 向量同行存储，天然
+# 维护「二进制向量 ↔ 原文 ↔ int8 向量」的关系。粗筛不走 LanceDB ANN（hamming
+# 不是其支持的度量），而是全表列投影 + NumPy 位运算（XOR + Popcount 查表），
+# 百万行 16 字节 ≈ 16MB 数据量级扫描仅几十 ms。
+_BIN_COLUMN = "vector_bin"
+
+# Popcount 查表（0..255 的置位数）：NumPy 无跨版本稳定的 popcount 内建
+# （np.bitwise_count 需要 numpy>=2.0），256 项 uint16 查表对任意版本都快。
+_POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint16)
+
 # jieba 分词器缓存（进程级单例，避免每次调用重复初始化词典）。
 _jieba = None
 _jieba_lock = threading.Lock()
@@ -745,6 +756,27 @@ def set_rerank_min_similarity(value: float) -> None:
     _RERANK_MIN_SIMILARITY = max(0.0, v)
 
 
+# ---- 二值量化粗筛（两段式检索第一阶段，默认关闭）----
+# 开启后 search_with_rerank 走「汉明粗筛 top N → 候选集内余弦+BM25 → rerank」
+# 两段式；关闭则维持原「ANN + 全表 FTS → RRF → rerank」流程。由
+# config.rag_binary_prefilter_enabled / rag_binary_prefilter_top 经
+# local.factory.configure_local_models 同步过来。
+_BINARY_PREFILTER_ENABLED = False
+_DEFAULT_BINARY_PREFILTER_TOP = 200
+_BINARY_PREFILTER_TOP = _DEFAULT_BINARY_PREFILTER_TOP
+
+
+def set_binary_prefilter(enabled: bool, top: int = _DEFAULT_BINARY_PREFILTER_TOP) -> None:
+    """配置二值量化粗筛开关与粗筛候选数（top <= 0 时回退默认 200）。"""
+    global _BINARY_PREFILTER_ENABLED, _BINARY_PREFILTER_TOP
+    _BINARY_PREFILTER_ENABLED = bool(enabled)
+    try:
+        t = int(top)
+    except (TypeError, ValueError):
+        t = _DEFAULT_BINARY_PREFILTER_TOP
+    _BINARY_PREFILTER_TOP = t if t > 0 else _DEFAULT_BINARY_PREFILTER_TOP
+
+
 def reset_local_providers() -> None:
     """把 embedding / reranker provider 复位到默认（``api``）。
 
@@ -755,11 +787,14 @@ def reset_local_providers() -> None:
     「恢复默认配置」路径调用，避免全局开关跨上下文泄漏。
     """
     global _MATRYOSHKA_DIMS, _MATRYOSHKA_ENABLED
+    global _BINARY_PREFILTER_ENABLED, _BINARY_PREFILTER_TOP
     _EMBED_PROVIDER.update(provider="api", path="", backend="mlx")
     _RERANK_PROVIDER.update(provider="api", path="", backend="mlx")
     _MATRYOSHKA_DIMS = _DEFAULT_MATRYOSHKA_DIMS
     _MATRYOSHKA_ENABLED = True
     _RERANK_MIN_SIMILARITY = 0.5
+    _BINARY_PREFILTER_ENABLED = False
+    _BINARY_PREFILTER_TOP = _DEFAULT_BINARY_PREFILTER_TOP
 
 
 def get_or_create_embedding_function(
@@ -1162,6 +1197,9 @@ class VectorStore:
         self._init_lock = threading.RLock()
         # Matryoshka 判定缓存（依赖当前 _ef，初始化/换 provider 时复位）。
         self._matryoshka_cache: Optional[bool] = None
+        # 二值粗筛列可用性（开关开启 + 表含 vector_bin 列），按实例缓存；
+        # _ensure_initialized / 迁移 / clear 后复位。
+        self._bin_ready_cache: Optional[bool] = None
         # 保护 reranker 状态机（避免并发加载两份 ~500MB 模型）。
         self._reranker_lock = threading.RLock()
         # reranker 输出是否为原始 logits（需 sigmoid 归一化）。首次打分时探测
@@ -1297,6 +1335,7 @@ class VectorStore:
         self._fingerprint_checked = False
         # 当前 ef 可能已换（provider/路径变更），Matryoshka 判定需重算。
         self._matryoshka_cache = None
+        self._bin_ready_cache = None
 
         # Use injected embedding function (for testing) or create FastEmbed one
         if self._custom_ef is not None:
@@ -1321,23 +1360,27 @@ class VectorStore:
         logger.info("  向量库初始化完成: 当前存储 %d 条向量记录", count)
 
     def _check_schema_migration(self) -> None:
-        """Migrate an existing table to include the ``text_fts`` column.
+        """Migrate an existing table to include the ``text_fts``/``vector_bin`` columns.
 
-        The BM25 full-text index lives on a pre-tokenized ``text_fts`` column.
-        Tables created before this feature lack the column; since LanceDB
+        The BM25 full-text index lives on a pre-tokenized ``text_fts`` column;
+        the binary prefilter scans the ``vector_bin`` column (二值量化粗筛).
+        Tables created before these features lack the columns; since LanceDB
         schemas are immutable, we rebuild the table (data survives — it is
-        re-read from the old table and re-written with the new column).
+        re-read from the old table and re-written with the new columns).
         """
         if self._table is None:
             return
         try:
             schema = self._table.schema
-            if _FTS_COLUMN in schema.names:
+            names = schema.names
+            missing = [c for c in (_FTS_COLUMN, _BIN_COLUMN) if c not in names]
+            if not missing:
                 return
         except Exception:
             return
 
-        logger.info("  ⚙ 检测到旧版向量表（缺少 %s 列），自动迁移...", _FTS_COLUMN)
+        logger.info("  ⚙ 检测到旧版向量表（缺少 %s 列），自动迁移...",
+                    " / ".join(missing))
         try:
             # Read all existing rows via PyArrow (无 pandas 依赖)。
             arrow_table = self._table.to_arrow()
@@ -1350,7 +1393,17 @@ class VectorStore:
                     "source": row["source"],
                     "chunk_index": row["chunk_index"],
                 }
-                rec[_FTS_COLUMN] = _tokenize_for_fts(rec["text"])
+                if _FTS_COLUMN in missing:
+                    rec[_FTS_COLUMN] = _tokenize_for_fts(rec["text"])
+                elif _FTS_COLUMN in row:
+                    # 旧表已有该列时必须原样带回：重建记录的列集合必须与
+                    # 新 schema 完全一致（缺列会让 create_table 直接抛
+                    # "different number of columns"）。
+                    rec[_FTS_COLUMN] = row[_FTS_COLUMN]
+                if _BIN_COLUMN in missing:
+                    # 二进制向量从已存的量化向量派生（sign 位打包）——与新增行
+                    # 的派生来源一致（见 _binarize_quantized），无需重嵌。
+                    rec[_BIN_COLUMN] = _binarize_quantized(rec["vector"])
                 records.append(rec)
 
             # LanceDB OSS 无 rename_table，只能 drop 后重建。数据已在内存
@@ -1362,8 +1415,15 @@ class VectorStore:
                 _dim = len(records[0]["vector"])
                 self._table = self._db.create_table(
                     _TABLE_NAME, records, schema=_vector_table_schema(_dim))
+                # drop 重建会丢掉 ANN / FTS 索引，立即重建（原实现留待下次
+                # add 时懒建，期间检索/粗筛走无索引路径）。
+                self._fts_ready = False
+                self._ensure_fts_index(self._table)
+                self._ensure_vector_index(self._table)
             self._table_checked = True
-            logger.info("  ⚙ 向量表迁移完成（新增 %s 列，%d 条记录）", _FTS_COLUMN, len(records))
+            self._bin_ready_cache = None
+            logger.info("  ⚙ 向量表迁移完成（新增 %s 列，%d 条记录）",
+                        " / ".join(missing), len(records))
         except Exception as e:
             logger.warning("  ⚠ 向量表迁移失败（BM25 索引将不可用）: %s", e)
             self._table = None
@@ -1627,10 +1687,12 @@ class VectorStore:
                 source = chunk.get("source", "unknown")
                 chunk_idx = chunk.get("chunk_index", idx)
                 chunk_id = f"{_hash_source(source)}_{chunk_idx}"
+                prepared = self._prepare_stored_vector(vectors[j])
                 records.append({
                     "id": chunk_id,
                     "text": chunk["text"],
-                    "vector": self._prepare_stored_vector(vectors[j]),
+                    "vector": prepared,
+                    _BIN_COLUMN: _binarize_quantized(prepared),
                     "source": source,
                     "chunk_index": chunk_idx,
                     _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
@@ -2226,10 +2288,12 @@ class VectorStore:
                 h = _hash_source(source)
                 _hash_cache[source] = h
             chunk_id = f"{h}_{chunk_idx}"
+            prepared = self._prepare_stored_vector(vectors[j])
             records.append({
                 "id": chunk_id,
                 "text": chunk["text"],
-                "vector": self._prepare_stored_vector(vectors[j]),
+                "vector": prepared,
+                _BIN_COLUMN: _binarize_quantized(prepared),
                 "source": source,
                 "chunk_index": chunk_idx,
                 _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
@@ -2918,6 +2982,178 @@ class VectorStore:
         return kept
 
     @_store_op
+    # ------------------------------------------------------------------
+    # 二值量化粗筛（两段式检索第一阶段）
+    # ------------------------------------------------------------------
+
+    def _binary_prefilter_ready(self, table: Any) -> bool:
+        """二值粗筛是否可用：全局开关开启 **且** 表含 ``vector_bin`` 列。
+
+        列可用性按实例缓存（表句柄级别稳定）；迁移/清库会复位缓存。
+        任一条件不满足时调用方应走原检索流程（粗筛是纯加速项，缺失不降正确性）。
+        """
+        if not _BINARY_PREFILTER_ENABLED:
+            return False
+        if self._bin_ready_cache is None:
+            try:
+                self._bin_ready_cache = _BIN_COLUMN in table.schema.names
+            except Exception:
+                self._bin_ready_cache = False
+        return self._bin_ready_cache
+
+    def _search_two_stage(
+        self,
+        table: Any,
+        query: str,
+        n_candidates: int,
+        where: Optional[str],
+    ) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+        """两段式检索：二进制向量极速粗筛 + 候选集内余弦/BM25 精筛。
+
+        阶段一（极速粗筛）：查询向量 sign 二值化 + 位打包后，对全表
+        ``vector_bin`` 列做列投影扫描，XOR + Popcount 计算汉明距离，取
+        ``_BINARY_PREFILTER_TOP``（默认 200）个最近候选。百万行 × 16 字节的
+        位运算是内存带宽级的，远快于逐条 float 比较。
+
+        阶段二（精准筛选）：批量取回候选的 int8 向量重算余弦相似度（与
+        ``search()`` 同一换算公式），并用 ``id IN (...)`` 把 BM25 全文检索
+        限定在候选集内，返回 ``(向量候选, BM25 候选)`` 两路排名——与原流程
+        同构地交给上层 RRF 融合 + reranker 精排。
+
+        Returns:
+            两路候选列表；粗筛不可用（列投影/where 不被支持、无候选行等）
+            返回 ``None``，调用方回退原检索流程。
+        """
+        row_count = table.count_rows()
+        if row_count == 0:
+            return None
+        self._check_embedding_compat(table)
+
+        # 查询向量：与入库完全相同的变换（截断 → 归一化 → int8），再 sign
+        # 二值化 + 位打包成与 vector_bin 同构的字节串。
+        if hasattr(self._ef, 'embed_query'):
+            raw = self._ef.embed_query(query)
+        else:
+            raw = self._ef([query])[0]
+        query_vec = self._prepare_stored_vector(raw)
+        self._check_vector_dim(table, len(query_vec))
+        qbin = np.asarray(_binarize_quantized(query_vec), dtype=np.uint8)
+        nbytes = qbin.shape[0]
+
+        # ---- 阶段一：汉明距离全表扫描 ----
+        try:
+            proj = table.search().select(["id", _BIN_COLUMN])
+            if where:
+                try:
+                    proj = proj.where(where, prefilter=True)
+                except TypeError:
+                    proj = proj.where(where)
+            arrow = proj.to_arrow()
+        except Exception as e:
+            # 列投影 / where 不被当前 LanceDB 版本支持 → 粗筛不可用，
+            # 调用方回退原流程（绝不让加速项破坏检索正确性）。
+            logger.info("  ⚠ 二值粗筛列扫描失败，回退原检索流程: %s", e)
+            return None
+
+        bin_col = arrow.column(_BIN_COLUMN)
+        if bin_col.null_count > 0:
+            # 理论上迁移会回填所有行；出现 null 视为粗筛前提不成立。
+            logger.info("  ⚠ vector_bin 列存在空值（%d 条），回退原检索流程",
+                        bin_col.null_count)
+            return None
+        n = arrow.num_rows
+        if n == 0:
+            return None
+        try:
+            bin_np = (bin_col.combine_chunks().flatten()
+                      .to_numpy(zero_copy_only=False)
+                      .reshape(-1, nbytes))
+        except Exception as e:
+            logger.info("  ⚠ vector_bin 列解码失败，回退原检索流程: %s", e)
+            return None
+
+        # XOR + Popcount：逐字节查表计数后按行求和 = 汉明距离（越小越相似）。
+        ham = _POPCOUNT_LUT[np.bitwise_xor(bin_np, qbin)].sum(axis=1)
+        top = min(_BINARY_PREFILTER_TOP, n)
+        sel = np.argpartition(ham, top - 1)[:top]
+        sel = sel[np.argsort(ham[sel], kind="stable")]
+        ids_col = arrow.column("id")
+        cand_ids = [ids_col[int(i)].as_py() for i in sel]
+        cand_ids = [i for i in cand_ids if i]
+        if not cand_ids:
+            return None
+        logger.info(
+            "  ├─ 二值粗筛: XOR+Popcount 扫描 %d 条 → 汉明距离 top %d",
+            n, len(cand_ids))
+
+        # ---- 阶段二 a：取回候选原文/量化向量，重算余弦相似度 ----
+        ids_clause = ", ".join(
+            "'" + str(i).replace("'", "''") + "'" for i in cand_ids)
+        try:
+            rows = (table.search()
+                    .where(f"id IN ({ids_clause})", prefilter=True)
+                    .limit(len(cand_ids))
+                    .to_list())
+        except Exception as e:
+            logger.info("  ⚠ 粗筛候选回读失败，回退原检索流程: %s", e)
+            return None
+        q8 = np.asarray(query_vec, dtype=np.float32)
+        pool_keys: set = set()
+        vec_candidates: List[Dict[str, Any]] = []
+        for r in rows:
+            # 与 search() 同一换算：入库/查询向量均为「单位向量 × 127」，
+            # 平方 L2 距离 d² → cos = 1 - (d²/127²)/2，保证分数语义一致。
+            v = np.asarray(r.get("vector") or [], dtype=np.float32)
+            if v.shape[0] != q8.shape[0]:
+                continue
+            diff = q8 - v
+            d2 = float(np.dot(diff, diff))
+            sim = max(0.0, 1.0 - d2 / (2.0 * _INT8_SCALE * _INT8_SCALE))
+            key = (r.get("source", ""), r.get("chunk_index", 0))
+            pool_keys.add(key)
+            vec_candidates.append({
+                "text": r.get("text", ""),
+                "source": r.get("source", ""),
+                "chunk_index": r.get("chunk_index", 0),
+                "score": sim,
+            })
+        vec_candidates.sort(key=lambda c: c["score"], reverse=True)
+
+        # ---- 阶段二 b：BM25 限定候选集内打分（id IN 预过滤）----
+        fts_candidates: List[Dict[str, Any]] = []
+        try:
+            tokenized_query = _tokenize_for_fts(query)
+            fts_rows = (table.search(tokenized_query, query_type="fts",
+                                     fts_columns=[_FTS_COLUMN])
+                        .where(f"id IN ({ids_clause})", prefilter=True)
+                        .limit(len(cand_ids))
+                        .to_list())
+            for r in fts_rows:
+                raw_bm25 = float(r.get("_score", 0.0))
+                # 与 search_fts 同一归一化：s/(1+s) ∈ [0,1)，原始分另存 fts_score。
+                fts_candidates.append({
+                    "text": r.get("text", ""),
+                    "source": r.get("source", ""),
+                    "chunk_index": r.get("chunk_index", 0),
+                    "score": raw_bm25 / (1.0 + raw_bm25) if raw_bm25 > 0 else 0.0,
+                    "fts_score": raw_bm25,
+                })
+        except Exception as e:
+            # 候选集内 FTS 不被支持时退化为全表 FTS 后取交集：
+            # 池外的 BM25 命中被丢弃，池内保留其相对排名证据。
+            logger.info("  ⚠ 候选集内 BM25 失败，退化为全表 FTS 取交集: %s", e)
+            try:
+                for c in self.search_fts(query, top_k=n_candidates, where=where):
+                    if (c.get("source", ""), c.get("chunk_index", 0)) in pool_keys:
+                        fts_candidates.append(c)
+            except Exception:
+                pass
+
+        logger.info(
+            "  ├─ 精筛: 候选集内余弦 %d 条 + BM25 %d 条 → RRF 融合",
+            len(vec_candidates), len(fts_candidates))
+        return vec_candidates, fts_candidates
+
     def search_with_rerank(
         self,
         query: str,
@@ -2929,6 +3165,9 @@ class VectorStore:
         """Hybrid retrieval: vector similarity + BM25 keyword, then BGE rerank.
 
         Pipeline:
+          0. （可选，rag_binary_prefilter_enabled）两段式检索：查询向量二值化
+             后 XOR+Popcount 汉明距离全表极速粗筛 top 200 → 候选集内重算
+             int8 余弦相似度 + 候选集内 BM25，两路交给后续同一融合管线。
           1. Vector search: top_k * candidate_multiplier candidates.
           2. BM25 keyword search: top_k * candidate_multiplier candidates.
           3. Merge & dedupe by (source, chunk_index).
@@ -2947,22 +3186,43 @@ class VectorStore:
         """
         n_candidates = top_k * candidate_multiplier
 
+        # 二值粗筛模式判定（决定缓存 kind：两段式与原流程结果可能不同，
+        # 分开缓存避免运行时切换开关后命中另一模式的旧结果）。
+        table = self._ensure_table()
+        bin_mode = (table is not None
+                    and self._binary_prefilter_ready(table))
+        kind = "hybrid_bin" if bin_mode else "hybrid"
+
         # 0. 查询缓存：hybrid 全链路（向量 + BM25 + 重排）结果复用，命中时
         #    省掉查询向量化 + ANN + FTS + cross-encoder 打分整条链路。
-        cached = self._query_cache_get("hybrid", query, top_k, where)
+        cached = self._query_cache_get(kind, query, top_k, where)
         if cached is not None:
             logger.info(
                 "VectorStore.search_with_rerank: 查询缓存命中 (%d 条)", len(cached))
             return cached
 
-        # 1. Vector similarity search.
-        vec_candidates = self.search(query, top_k=n_candidates, where=where)
-        logger.info(
-            "VectorStore.search_with_rerank: 向量检索 %d 条候选", len(vec_candidates),
-        )
+        if bin_mode:
+            two = self._search_two_stage(table, query, n_candidates, where)
+            if two is not None:
+                vec_candidates, fts_candidates = two
+                logger.info(
+                    "VectorStore.search_with_rerank: 两段式检索 "
+                    "(向量 %d + BM25 %d, 粗筛候选集)", len(vec_candidates),
+                    len(fts_candidates))
+            else:
+                # 粗筛不可用（扫描/回读失败等）→ 透明回退原流程。
+                bin_mode = False
+        if not bin_mode:
+            # 1. Vector similarity search.
+            vec_candidates = self.search(query, top_k=n_candidates, where=where)
+            logger.info(
+                "VectorStore.search_with_rerank: 向量检索 %d 条候选",
+                len(vec_candidates),
+            )
 
-        # 2. BM25 keyword search (同样的 where 过滤，保证定向检索一致)。
-        fts_candidates = self.search_fts(query, top_k=n_candidates, where=where)
+            # 2. BM25 keyword search (同样的 where 过滤，保证定向检索一致)。
+            fts_candidates = self.search_fts(
+                query, top_k=n_candidates, where=where)
         logger.info(
             "VectorStore.search_with_rerank: BM25 检索 %d 条候选", len(fts_candidates),
         )
@@ -3023,7 +3283,7 @@ class VectorStore:
         # 只有 reranker 真实参与的排序结果才进查询缓存；降级排序不缓存
         # （否则 reranker 恢复后仍会命中 10 分钟前的降级结果）。
         if not used_fallback:
-            self._query_cache_put("hybrid", query, top_k, where, results)
+            self._query_cache_put(kind, query, top_k, where, results)
         return results
 
     def _clear_locked(self) -> None:
@@ -3048,6 +3308,7 @@ class VectorStore:
             self._db.drop_table(_TABLE_NAME)
             self._table = None
             self._table_checked = False  # 重置标记，允许下次 add 重新创建表
+            self._bin_ready_cache = None  # 表句柄已废弃，二值列可用性重判
             # 必须同时重置 FTS 三标记（与 close() 同款）：漏掉的话 _fts_ready
             # 仍为 True，add() 重建新表时会跳过建索引，search_fts 也认为索引
             # 就绪 → 在未索引列上跑 FTS 抛异常被吞掉 → BM25 通道从此永久
@@ -3626,6 +3887,31 @@ def _quantize_int8(vec: List[float]) -> List[int]:
     return out
 
 
+def _bin_bytes_for_dim(dim: int) -> int:
+    """二进制向量的字节数：每 8 维打包成 1 字节（128 维 → 16 字节）。
+
+    维度非 8 的倍数时向上取整，``np.packbits`` 在尾部补零位——查询侧按同一
+    规则补齐，补零位两侧恒为 0，XOR 后不产生汉明距离贡献。
+    """
+    d = int(dim)
+    return (d + 7) // 8 if d > 0 else 0
+
+
+def _binarize_quantized(vec: Any) -> List[int]:
+    """量化向量 → 二值量化 + 位打包（Binary Quantization + Bit Packing）。
+
+    sign 量化：分量 > 0 → 1，否则 → 0；``np.packbits`` 位打包后每 8 维压成
+    1 字节（uint8）。返回 list[int]（0..255），入库存入 ``vector_bin`` 列。
+
+    为什么从**量化后**向量派生而不是归一化浮点向量：``int8 = round(x·127)``
+    与 x 同号（仅 |x| < 1/255 的近零分量可能取整到 0，边界差异对汉明距离的
+    影响可忽略）。统一从量化向量派生可保证「新增行」与「旧表迁移行」（迁移
+    时只有已存的量化向量可用）的二进制表示**完全一致**，两条写入路径同源。
+    """
+    arr = np.asarray(list(vec), dtype=np.float32)
+    return np.packbits(arr > 0).tolist()
+
+
 def _prepare_vector_for_index(
     vec: List[float], matryoshka: bool, dims: int,
 ) -> List[int]:
@@ -3650,14 +3936,20 @@ def _prepare_vector_for_index(
 
 
 def _vector_table_schema(dim: int):
-    """向量表 schema：vector 列以 float16 精确承载 int8 量化值（可被 LanceDB 检索）。"""
+    """向量表 schema：vector 列以 float16 精确承载 int8 量化值（可被 LanceDB 检索）。
+
+    ``vector_bin`` 为二值量化粗筛列：量化向量 sign 位打包后的 uint8 定长字节
+    （每 8 维 1 字节），与 int8 向量同行存储（同一 id 即维护三者关系）。
+    """
     import pyarrow as pa
 
+    dim = int(dim)
     return pa.schema([
         pa.field("id", pa.string()),
         pa.field("text", pa.string()),
-        pa.field("vector", pa.list_(pa.float16(), int(dim))),
+        pa.field("vector", pa.list_(pa.float16(), dim)),
         pa.field("source", pa.string()),
         pa.field("chunk_index", pa.int64()),
         pa.field(_FTS_COLUMN, pa.string()),
+        pa.field(_BIN_COLUMN, pa.list_(pa.uint8(), _bin_bytes_for_dim(dim))),
     ])

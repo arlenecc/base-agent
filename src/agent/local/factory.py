@@ -149,6 +149,11 @@ def configure_local_models(config) -> None:
     vs.set_rerank_min_similarity(
         float(getattr(config, "rag_rerank_min_similarity", 0.5))
     )
+    # 两段式检索第一阶段（二值量化粗筛）开关与候选数。
+    vs.set_binary_prefilter(
+        bool(getattr(config, "rag_binary_prefilter_enabled", False)),
+        int(getattr(config, "rag_binary_prefilter_top", 200)),
+    )
 
 
 def build_embedding_function(config):

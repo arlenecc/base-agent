@@ -47,7 +47,7 @@
 - **工具调用** — 内置 21 个工具（原子 8 + 能力 12 + 1 个条件注册；另有 2 个原子命名别名，`webexec_js` / `web_execute_js` 仅在配置浏览器端点时注册），支持模型自主决策和工具链式调用
 - **内核控制流** — 三态自动机（THINK / ACT / CONSOLIDATE）+ 五级信息压缩，上下文硬性控制在 30k 以内
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过本地 embedding 模型（默认 `jina-embeddings-v5`）+ LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
-- **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，重排序精准召回
+- **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，重排序精准召回；可选**两段式检索**（二值量化粗筛：查询向量 sign 二值化 + 位打包后 XOR+Popcount 汉明距离全表极速粗筛 top 200 → 候选集内余弦 + BM25 精筛 → reranker 深度打分，大向量库下显著更快）
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、本地 Reranker（`jina-reranker-v2-base-multilingual` ONNX 重排序）等可选增强也会一并检测与自动安装
 - **统一解析引擎三选一** — PDF/office 文档走统一引擎回退链：`docling`（默认）→ `marker` → `ovis`（OvisOCR2 VLM）→ PyMuPDF 纯文本兜底。docling 全量管线：布局/表格模型走 **MPS**（torch Metal，比 CPU 快 ~35%），OCR 走 **Apple Vision（ocrmac，ANE 推理）**；单本图片书实测 ~6-10 分钟（MPS + scale 2.0 调优后，比早期 CPU 配置快约 10 倍）。OvisOCR2（`OvisOCR2-0.8B-MLX-4bit`，mlx-vlm）作为第三配置项：PyMuPDF 取页/裁表 → VLM 转 Markdown（文本页的表格区域自动裁剪回填），配置窗口「OCR模型」行可选模型与路径。三引擎实测（M4，10 页中文扫描书）：docling 18-25s / ovis 50-51s / marker 215s
@@ -169,6 +169,8 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 | `rag_rerank_model` | `provider=api` 时的 FastEmbed cross-encoder 模型名 | `BAAI/bge-reranker-v2-m3-int8` |
 | `rag_rerank_enabled` | 是否启用重排序；关闭后不加载 reranker 权重 | `true` |
 | `rag_rerank_min_similarity` | rerank 结果相似度下限（绝对语义阈值）；`≤0` 关闭过滤；全部候选都低于阈值时仍保留得分最高一条兜底 | `0.5` |
+| `rag_binary_prefilter_enabled` | 两段式检索第一阶段（二值量化粗筛）：汉明距离极速粗筛 top N → 候选集内余弦+BM25 → rerank；关闭则维持原 ANN 流程 | `false` |
+| `rag_binary_prefilter_top` | 二值粗筛保留的候选数（第一阶段汉明距离 top N） | `200` |
 | `rag_pdf_engine` | 统一 PDF/office 解析引擎首选：`docling` / `marker` / `ovis` | `docling` |
 | 🌐 `rag_ocr_engine` | OvisOCR 后端：`mlx-vlm`（已实现）/ `onnx` / `gguf`（预留） | `mlx-vlm` |
 | 🌐 `rag_ocr_model_name` | OvisOCR 模型目录名（自动从 `models/` 加载） | `OvisOCR3-MLX-4bit-mixed46` |
@@ -241,9 +243,12 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 → 统一解析 (docling → Markdown，单实例串行) → 清洗（注释/残留标签剥离 + 密度压缩）
 → Hybrid 智能分片 (结构+语义, 1000 tokens, 5% overlap)
 → 内容去重 / 向量去重 → 向量化 (默认本地 jina-embeddings-v5 / MLX int4)
-→ LanceDB 存储（向量 + 完整原文 + BM25 全文索引）
+→ LanceDB 存储（int8 向量 + 二进制向量 vector_bin + 完整原文 + BM25 全文索引）
 检索时: 向量相似度 top_k×4 + BM25 关键词 top_k×4 → 合并去重 → reranker 精排（默认本地 jina-reranker-v2）
        → 按 rag_rerank_min_similarity（默认 0.5）过滤，全部低于阈值时兜底保留得分最高一条 → 返回最相关 ≤ 3 条
+开启两段式（rag_binary_prefilter_enabled）时改为:
+       查询向量二值化 → XOR+Popcount 汉明距离全表粗筛 top 200
+       → 候选集内重算 int8 余弦相似度 + 候选集内 BM25 → reranker 精排（后续过滤相同）
 ```
 
 ### 同步全链路日志
@@ -316,6 +321,11 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
   - INT8 量化对 cross-encoder 的排序质量损失可忽略（只输出排序分数），体积与常驻内存降到 1/4，且 ONNX int8 在 CPU EP 上更快。
   - reranker 的原始输出是 logits，代码在首次打分时探测一次输出范围并**按模型固定**决定是否做 sigmoid 归一化（不再按「本批候选」自适应），保证 `rag_rerank_min_similarity`（默认 0.5）这个绝对阈值在不同查询间语义一致。
 - **相似度过滤**：rerank 后按 `rag_rerank_min_similarity`（默认 0.5，可由配置调整，`≤0` 关闭过滤）过滤语义相似度低于阈值的结果（不相关的切片不发回模型）；**但全部候选都低于阈值（如中文短查询下 reranker 绝对分普遍偏低）时，仍保留得分最高的一条兜底**，保证始终有可用上下文。最终返回 ≤ 3 条最相关切片（含完整原文与来源信息）。
+- **两段式检索（可选，`rag_binary_prefilter_enabled`）**：针对大向量库的检索加速，默认关闭。
+  - **入库侧**：文本切片计算出量化向量后，同时做一份**二值量化**（sign：分量 > 0 → 1）+ **位打包**（`np.packbits`，每 8 维压成 1 字节，128 维 → 16 字节），存入 `vector_bin` 列——与 int8 向量、原文同行存储，天然维护三者关系。旧向量库打开时自动迁移补列（从已存量化向量派生，**无需重嵌入**）。
+  - **检索阶段一（极速粗筛）**：查询向量做同样的二值化 + 位打包，对全表 `vector_bin` 做列投影扫描，**XOR + Popcount** 计算汉明距离（两个二进制串逐位对比有多少位不同），选出 top 200（`rag_binary_prefilter_top`）个候选。位运算是内存带宽级的：10 万行 × 16 字节扫描 + 取 top 只需 **~3ms**。
+  - **检索阶段二（精准筛选）**：批量取回候选的 INT8 向量重算余弦相似度（与原流程同一换算公式），并用 `id IN (...)` 把 BM25 全文检索**限定在候选集内**打分；两路排名 RRF 融合后交给 reranker 深度打分，最终 top N 返回给大模型。
+  - **降级策略**：粗筛扫描/回读失败（LanceDB 版本不支持列投影等）时**透明回退原 ANN 流程**，绝不因加速项破坏检索正确性；查询缓存按模式分开（`hybrid` / `hybrid_bin`），运行时切换开关不会命中另一模式的旧结果。
 
 ### Meta-context + Targeted RAG（动态按需检索）
 

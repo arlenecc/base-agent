@@ -1824,6 +1824,18 @@ class MainWindow(QMainWindow):
             "关闭则保留模型原始维度（仍做 int8 量化）。")
         r.addWidget(self.matryoshka_chk)
         r.addSpacing(6)
+        self.bin_prefilter_chk = QCheckBox("二值粗筛")
+        self.bin_prefilter_chk.setChecked(
+            bool(getattr(self.config, "rag_binary_prefilter_enabled", False)))
+        self.bin_prefilter_chk.setToolTip(
+            "两段式检索第一阶段（二值量化粗筛）：开启后知识检索先用查询向量的\n"
+            "二进制表示（sign 量化 + 位打包）对全表做 XOR+Popcount 汉明距离\n"
+            "扫描，极速选出 top 200 候选，再在候选集内重算余弦相似度 + BM25，\n"
+            "交给 reranker 精排。大向量库（数十万行+）下显著更快。\n"
+            "关闭则维持原 ANN + 全表 BM25 流程。旧向量库首次检索前会自动\n"
+            "迁移补二进制列（从已存向量派生，无需重嵌入）。")
+        r.addWidget(self.bin_prefilter_chk)
+        r.addSpacing(6)
         r.addWidget(QLabel("裁剪维度"))
         self.embedding_dims_combo = _combo(["128", "256", "512"])
         _dims_init = str(getattr(self.config, "rag_embedding_dims", 256))
@@ -2469,6 +2481,8 @@ class MainWindow(QMainWindow):
         self.chunk_overlap_edit.setText(str(getattr(self.config, "rag_chunk_overlap", 50)))
         self.matryoshka_chk.setChecked(
             bool(getattr(self.config, "rag_matryoshka_enabled", True)))
+        self.bin_prefilter_chk.setChecked(
+            bool(getattr(self.config, "rag_binary_prefilter_enabled", False)))
         _dims_load = str(getattr(self.config, "rag_embedding_dims", 256))
         if _dims_load not in ("128", "256", "512"):
             _dims_load = "256"
@@ -2613,6 +2627,7 @@ class MainWindow(QMainWindow):
         _num(self.chunk_size_edit, "rag_chunk_size", 800, int, "切片大小")
         _num(self.chunk_overlap_edit, "rag_chunk_overlap", 50, int, "重叠")
         self.config.rag_matryoshka_enabled = self.matryoshka_chk.isChecked()
+        self.config.rag_binary_prefilter_enabled = self.bin_prefilter_chk.isChecked()
         _dims_save = self.embedding_dims_combo.currentText().strip()
         self.config.rag_embedding_dims = (
             int(_dims_save) if _dims_save in ("128", "256", "512") else 256)
