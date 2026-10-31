@@ -175,6 +175,67 @@ class TestRagFullFlowJinaV5:
             logging.disable(prev_log_level)
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_rerank_min_similarity_configurable_keeps_top1(self):
+        """rerank 相似度下限可配置，且全部低于阈值时兜底保留得分最高一条。
+
+        - 把阈值调到 0.99（远高于 reranker 实际得分）→ 正常路径过滤后本应全空，
+          但 ``_filter_by_similarity`` 兜底保留 top1，故 ``search_with_rerank`` 仍返回
+          ≥1 条；且 reranker 实际参与了（``_last_rerank_used_fallback`` 应为 False，
+          不是 RRF 旁路）。
+        - 阈值 <=0 表示不过滤，恢复多结果返回。
+        注意：为避免命中查询缓存，三个分支用不同的 top_k 形成不同缓存键。
+        """
+        from agent.rag import vector_store as vs
+        from agent.rag.engine import RAGEngine
+
+        saved_dims = vs._MATRYOSHKA_DIMS
+        saved_enabled = vs._MATRYOSHKA_ENABLED
+        saved_min = vs._RERANK_MIN_SIMILARITY
+        vs.set_matryoshka_enabled(True)
+        vs.set_matryoshka_dims(128)
+        vs.set_embedding_provider("local", path=JINA_V5_MLX, backend="mlx")
+        vs.set_reranker_provider(
+            "local", path="jina-reranker-v2-base-multilingual-onnx", backend="onnx")
+
+        prev = logging.root.manager.disable
+        logging.disable(logging.CRITICAL)
+        tmp = tempfile.mkdtemp(prefix="rag_min_sim_")
+        try:
+            kb = self._build_workspace(tmp)
+            engine = RAGEngine(
+                tmp, knowledge_base=kb, embedding_model=JINA_V5_MLX,
+                clamp_model=JINA_V5_MLX, rerank_enabled=True)
+            stat = engine.ingest()
+            assert stat.get("error") is None, f"入库报错: {stat.get('error')}"
+            store = engine._get_store()
+
+            q0 = "苹果手机有什么特点"
+            # 默认阈值 0.5：应返回多条，且 reranker 正常介入
+            hyb_default = store.search_with_rerank(q0, top_k=5)
+            assert hyb_default, "默认阈值下应返回结果"
+            assert store._last_rerank_used_fallback is False
+
+            # 调到 0.99：全部低于阈值 → 兜底保留 top1，仍返回 ≥1 条；
+            # 且不是 RRF 旁路（reranker 参与了，只是分数被过滤）
+            vs.set_rerank_min_similarity(0.99)
+            hyb_hi = store.search_with_rerank(q0, top_k=2)
+            assert hyb_hi, "高阈值下仍应至少保留 top1"
+            assert len(hyb_hi) >= 1
+            assert store._last_rerank_used_fallback is False, (
+                "高阈值过滤后不应走 RRF 旁路（应保留 rerank top1）")
+            assert os.path.basename(hyb_hi[0]["source"]) == "苹果手机.md"
+
+            # <=0 表示不过滤：恢复多结果
+            vs.set_rerank_min_similarity(0.0)
+            hyb_all = store.search_with_rerank(q0, top_k=1)
+            assert hyb_all, "不过滤时应返回结果"
+        finally:
+            vs.set_rerank_min_similarity(saved_min)
+            vs.set_matryoshka_dims(saved_dims)
+            vs.set_matryoshka_enabled(saved_enabled)
+            logging.disable(prev)
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_chapter_summary_scheduler_thread_starts(self):
         """章节摘要调度器线程应能正常启动循环（验证 _TICK_SECONDS 笔误修复）。
 
@@ -201,3 +262,35 @@ class TestRagFullFlowJinaV5:
         sched.stop()
         time.sleep(0.2)
         assert alive is True, "章节摘要线程启动后未存活（_TICK_SECONDS 修复可能失效）"
+
+
+def test_rerank_min_similarity_config_default():
+    """rag_rerank_min_similarity 配置项存在、默认 0.5、且能被强制为 float。
+
+    不依赖任何模型权重（纯配置单测），随 pytest 始终运行。
+    """
+    from agent.config import AgentConfig
+
+    cfg = AgentConfig()
+    assert cfg.rag_rerank_min_similarity == 0.5
+    assert "rag_rerank_min_similarity" in AgentConfig._FLOAT_FIELDS
+    # config.json 里手写成字符串也要能转回 float（类型强制）
+    assert AgentConfig._coerce("rag_rerank_min_similarity", "0.3") == 0.3
+    assert AgentConfig._coerce("rag_rerank_min_similarity", "0") == 0.0
+
+
+def test_set_rerank_min_similarity_clamps():
+    """set_rerank_min_similarity 接受 float/字符串，并将负数归一为 0（不过滤）。
+
+    纯模块级单测，不依赖模型权重。
+    """
+    from agent.rag import vector_store as vs
+
+    vs.set_rerank_min_similarity(0.3)
+    assert vs._RERANK_MIN_SIMILARITY == 0.3
+    vs.set_rerank_min_similarity("0.7")  # 字符串也接受
+    assert vs._RERANK_MIN_SIMILARITY == 0.7
+    vs.set_rerank_min_similarity(-0.2)   # 负数 → 0（不过滤）
+    assert vs._RERANK_MIN_SIMILARITY == 0.0
+    vs.set_rerank_min_similarity("not-a-number")  # 非法值忽略，保持原值
+    assert vs._RERANK_MIN_SIMILARITY == 0.0

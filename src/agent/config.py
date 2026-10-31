@@ -101,6 +101,12 @@ class AgentConfig:
     # fp32 名迁到 int8。
     rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"
     rag_rerank_enabled: bool = True
+    # 重排序结果相似度下限（绝对语义阈值）：rerank 分数低于该值的分片视为不相关、
+    # 不送入 LLM。默认 0.5。jina-reranker-v2 对中文短查询的绝对分校准偏低（常落在
+    # 0.3~0.55），若整体打分偏低导致正确结果被过滤，可调低本值；且 search_with_rerank
+    # 内置「至少保留得分最高一条」兜底，保证始终有可用结果返回（不会因阈值过严而
+    # 完全丢弃上下文）。<=0 表示不过滤。
+    rag_rerank_min_similarity: float = 0.5
     rag_auto_ingest: bool = True
     # PDF 统一解析引擎切换（仅影响「有文本层的常规 PDF/office 文档」首选谁，
     # 扫描件/图片重 PDF 始终走 parsers 的 RapidOCR 路径）：
@@ -298,6 +304,7 @@ class AgentConfig:
                    "local_llm_num_draft_tokens", "local_llm_prefill_step_size")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
+                     "rag_rerank_min_similarity",
                      "rag_chunk_overlap_percent",
                      "aux_temperature", "aux_top_p", "aux_min_p",
                      "aux_repetition_penalty", "aux_request_timeout",

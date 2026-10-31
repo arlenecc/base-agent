@@ -730,6 +730,21 @@ def set_reranker_provider(provider: str, path: str = "", backend: str = "mlx") -
     _RERANK_PROVIDER.update(new)
 
 
+# rerank 结果相似度下限（绝对语义阈值），由 config.rag_rerank_min_similarity 经
+# set_rerank_min_similarity() 覆盖。<= 0 表示不过滤。
+_RERANK_MIN_SIMILARITY = 0.5
+
+
+def set_rerank_min_similarity(value: float) -> None:
+    """配置 rerank 结果相似度下限（绝对语义阈值）。``<= 0`` 表示不过滤。"""
+    global _RERANK_MIN_SIMILARITY
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return
+    _RERANK_MIN_SIMILARITY = max(0.0, v)
+
+
 def reset_local_providers() -> None:
     """把 embedding / reranker provider 复位到默认（``api``）。
 
@@ -744,6 +759,7 @@ def reset_local_providers() -> None:
     _RERANK_PROVIDER.update(provider="api", path="", backend="mlx")
     _MATRYOSHKA_DIMS = _DEFAULT_MATRYOSHKA_DIMS
     _MATRYOSHKA_ENABLED = True
+    _RERANK_MIN_SIMILARITY = 0.5
 
 
 def get_or_create_embedding_function(
@@ -2772,7 +2788,7 @@ class VectorStore:
         query: str,
         candidates: List[Dict[str, Any]],
         top_k: int = 5,
-        min_similarity: float = 0.5,
+        min_similarity: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Re-rank candidates using FastEmbed reranker for precise scoring.
 
@@ -2782,8 +2798,12 @@ class VectorStore:
 
         Results whose final score is below ``min_similarity`` are dropped
         (they are not semantically relevant enough to send to the LLM), so
-        the returned list may be shorter than ``top_k``.
+        the returned list may be shorter than ``top_k``. ``None`` (默认) 取
+        模块级 ``_RERANK_MIN_SIMILARITY``（由 config.rag_rerank_min_similarity
+        经 ``set_rerank_min_similarity`` 配置）。
         """
+        if min_similarity is None:
+            min_similarity = _RERANK_MIN_SIMILARITY
         if not candidates:
             return []
 
@@ -2875,10 +2895,20 @@ class VectorStore:
         A rerank score (BGE sigmoid, or cosine-similarity fallback) below the
         threshold means the chunk is not semantically close enough to the
         query to be worth sending to the LLM.
+
+        兜底：若全部候选都低于阈值（如中文短查询下 reranker 绝对分普遍偏低），
+        仍保留得分最高的一条（``results`` 已按分数降序），保证下游始终有可用
+        上下文，不会因阈值过严而把结果全部丢弃。
         """
         if not results or min_similarity <= 0:
             return results
         kept = [r for r in results if r.get("score", 0.0) >= min_similarity]
+        if not kept:
+            logger.info(
+                "  ├─ 相似度过滤: 全部 %d 条均 < %.2f，兜底保留得分最高 1 条",
+                len(results), min_similarity,
+            )
+            return [results[0]]
         if len(kept) < len(results):
             dropped = len(results) - len(kept)
             logger.info(
@@ -2894,7 +2924,7 @@ class VectorStore:
         top_k: int = 5,
         candidate_multiplier: int = 4,
         where: Optional[str] = None,
-        min_similarity: float = 0.5,
+        min_similarity: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid retrieval: vector similarity + BM25 keyword, then BGE rerank.
 
@@ -2903,7 +2933,8 @@ class VectorStore:
           2. BM25 keyword search: top_k * candidate_multiplier candidates.
           3. Merge & dedupe by (source, chunk_index).
           4. BGE rerank the merged candidate set.
-          5. Drop any result whose rerank score < min_similarity (0.5).
+          5. Drop任何 rerank 分数 < min_similarity 的结果；**全部低于阈值时也
+             保留得分最高的一条**兜底，保证始终有可用上下文返回。
           6. Return up to top_k results.
 
         Args:
@@ -2911,7 +2942,8 @@ class VectorStore:
             top_k: Final number of results to return.
             candidate_multiplier: Candidates per retrieval channel = top_k × N.
             where: Optional SQL filter (applied to vector search only).
-            min_similarity: Reject rerank results below this score.
+            min_similarity: Reject rerank results below this score. ``None``
+                (默认) 取模块级 ``_RERANK_MIN_SIMILARITY``（config.rag_rerank_min_similarity）。
         """
         n_candidates = top_k * candidate_multiplier
 
@@ -2963,6 +2995,8 @@ class VectorStore:
         rerank_input = [it for it, _s in fused[:_RERANK_MAX_CANDIDATES]]
 
         # 4. BGE rerank + 5. min_similarity filter.
+        if min_similarity is None:
+            min_similarity = _RERANK_MIN_SIMILARITY
         self._last_rerank_used_fallback = False
         results = self.rerank(query, rerank_input, top_k=top_k,
                               min_similarity=min_similarity)
@@ -2983,6 +3017,9 @@ class VectorStore:
             )
             results = self._rrf_fallback(vec_candidates, fts_candidates, top_k)
             used_fallback = True
+            # 标记本次为降级排序（含「过滤后无结果」的 RRF 兜底分支），否则外部
+            # 无法察觉 reranker 实际已被旁路。
+            self._last_rerank_used_fallback = True
         # 只有 reranker 真实参与的排序结果才进查询缓存；降级排序不缓存
         # （否则 reranker 恢复后仍会命中 10 分钟前的降级结果）。
         if not used_fallback:

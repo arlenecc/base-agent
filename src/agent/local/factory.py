@@ -145,6 +145,10 @@ def configure_local_models(config) -> None:
         path=getattr(config, "local_reranker_model", ""),
         backend=_backend(getattr(config, "local_reranker_backend", "mlx"), "mlx"),
     )
+    # rerank 相似度下限（绝对语义阈值），由 config.rag_rerank_min_similarity 驱动。
+    vs.set_rerank_min_similarity(
+        float(getattr(config, "rag_rerank_min_similarity", 0.5))
+    )
 
 
 def build_embedding_function(config):
