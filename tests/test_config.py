@@ -154,6 +154,45 @@ def test_default_max_tokens_is_32768():
     assert cfg.max_context_tokens == 32768
 
 
+def test_default_aux_model_params_tuned():
+    """Aux model defaults tuned for speed/faithfulness (2026-10-31): smaller
+    output cap, low temp, mild repetition penalty; thinking stays off."""
+    cfg = AgentConfig()
+    assert cfg.aux_max_tokens == 8192
+    assert cfg.aux_temperature == 0.3
+    assert cfg.aux_repetition_penalty == 1.1
+    assert cfg.aux_local_llm_enable_thinking is False
+
+
+def test_migrate_aux_defaults_to_tuned(tmp_path):
+    """Older configs at the legacy aux defaults (32768 / 0.7 / 1.0) must be
+    migrated to the tuned defaults (8192 / 0.3 / 1.1)."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({
+        "aux_max_tokens": 32768,
+        "aux_temperature": 0.7,
+        "aux_repetition_penalty": 1.0,
+    }))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.aux_max_tokens == 8192, f"expected 8192, got {cfg.aux_max_tokens}"
+    assert cfg.aux_temperature == 0.3, f"expected 0.3, got {cfg.aux_temperature}"
+    assert cfg.aux_repetition_penalty == 1.1, f"expected 1.1, got {cfg.aux_repetition_penalty}"
+
+
+def test_migrate_preserves_explicit_aux_params(tmp_path):
+    """Explicitly chosen aux params must survive migration."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({
+        "aux_max_tokens": 16384,
+        "aux_temperature": 0.9,
+        "aux_repetition_penalty": 1.2,
+    }))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.aux_max_tokens == 16384
+    assert cfg.aux_temperature == 0.9
+    assert cfg.aux_repetition_penalty == 1.2
+
+
 def test_ensure_workspace_creates_dir(tmp_path):
     cfg = AgentConfig(workspace=str(tmp_path / "ws"))
     cfg.ensure_workspace()

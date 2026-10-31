@@ -1584,12 +1584,12 @@ class MainWindow(QMainWindow):
                 self.aux_second_w, self.aux_type_combo, self.aux_second_label,
                 self.aux_mmproj_edit, self.aux_mmproj_pick,
                 self.aux_tokenizer_edit, self.aux_tokenizer_pick))
-        self.aux_max_tokens_edit = _num("32768", 80)
-        self.aux_temp_edit = _num("0.7")
+        self.aux_max_tokens_edit = _num("8192", 80)
+        self.aux_temp_edit = _num("0.3")
         self.aux_top_p_edit = _num("0.95")
         self.aux_min_p_edit = _num("0.05")
         self.aux_top_k_edit = _num("20")
-        self.aux_repeat_penalty_edit = _num("1.0")
+        self.aux_repeat_penalty_edit = _num("1.1")
         self.aux_thinking_check = QCheckBox("思考模式")
         self.aux_thinking_check.setToolTip(self.thinking_check.toolTip())
         # 辅助模型同样暴露 KV 复用 / KV INT8 量化开关（与主模型同款）。

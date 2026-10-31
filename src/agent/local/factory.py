@@ -90,12 +90,12 @@ def build_aux_llm_client(config) -> Any:
     logger.info("辅助 LLM 引擎：%s（backend=%s）", path, backend)
     return LocalLLMClient(
         path=path, backend=backend,
-        max_tokens=getattr(config, "aux_max_tokens", 32768),
-        temperature=getattr(config, "aux_temperature", 0.7),
+        max_tokens=getattr(config, "aux_max_tokens", 8192),
+        temperature=getattr(config, "aux_temperature", 0.3),
         top_p=getattr(config, "aux_top_p", 0.95),
         min_p=getattr(config, "aux_min_p", 0.05),
         top_k=getattr(config, "aux_top_k", 20),
-        repetition_penalty=getattr(config, "aux_repetition_penalty", 1.0),
+        repetition_penalty=getattr(config, "aux_repetition_penalty", 1.1),
         # 兜底值必须与 AgentConfig 的字段默认值一致（辅助模型默认关闭思考）。
         enable_thinking=bool(getattr(config, "aux_local_llm_enable_thinking", False)),
         # 辅助模型 KV 复用：默认关闭（辅助 prompt 每轮都变，复用通常无意义），

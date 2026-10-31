@@ -219,12 +219,12 @@ class AgentConfig:
     aux_llm_provider: str = "local"
     aux_local_llm_model: str = ""
     aux_local_llm_backend: str = "mlx"
-    aux_temperature: float = 0.7
-    aux_max_tokens: int = 32768
+    aux_temperature: float = 0.3
+    aux_max_tokens: int = 8192
     aux_top_p: float = 0.95
     aux_min_p: float = 0.05
     aux_top_k: int = 20
-    aux_repetition_penalty: float = 1.0
+    aux_repetition_penalty: float = 1.1
     aux_request_timeout: float = 120.0
     # 辅助模型 KV 缓存相关（2026-10-24 需求：主/辅助都可配）。
     #   aux_local_llm_kv_reuse    跨轮 KV 复用（默认 False：辅助 prompt 每轮都变，
@@ -485,6 +485,15 @@ class AgentConfig:
         # so the shrink threshold follows the model's actual window.
         if self.max_context_tokens < 8192:
             self.max_context_tokens = self.max_tokens
+        # 辅助模型默认参数调优（2026-10-31 需求：辅助模型仅做事实抽取等轻量子
+        # 任务，降低输出上限 + 低温 + 轻微重复惩罚 → 加快响应、忠于原文、避免
+        # 无效重复）。仅当仍是旧默认值时迁移，用户显式设置的值保持不变。
+        if self.aux_max_tokens == 32768:
+            self.aux_max_tokens = 8192
+        if self.aux_temperature == 0.7:
+            self.aux_temperature = 0.3
+        if self.aux_repetition_penalty == 1.0:
+            self.aux_repetition_penalty = 1.1
         # OvisOCR 默认模型升级：OvisOCR2-0.8B-MLX-4bit → OvisOCR3-MLX-4bit-mixed46。
         # 旧配置持久化的旧默认名必须迁走，否则用户继续加载 OvisOCR2（磁盘上已
         # 替换为 OvisOCR3 时）导致 OCR 模型加载失败。只精确匹配旧默认字符串——
