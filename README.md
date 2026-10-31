@@ -165,6 +165,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 | `rag_embedding_model` | 嵌入模型（FastEmbed 模型名） | `nomic-ai/nomic-embed-text-v1.5-Q` |
 | `rag_rerank_model` | 重排序模型（FastEmbed cross-encoder） | `BAAI/bge-reranker-v2-m3-int8` |
 | `rag_rerank_enabled` | 是否启用重排序；关闭后不加载 reranker 权重 | `true` |
+| `rag_rerank_min_similarity` | rerank 结果相似度下限（绝对语义阈值）；`≤0` 关闭过滤；全部候选都低于阈值时仍保留得分最高一条兜底 | `0.5` |
 | `rag_pdf_engine` | 统一 PDF/office 解析引擎首选：`docling` / `marker` / `ovis` | `docling` |
 | 🌐 `rag_ocr_engine` | OvisOCR 后端：`mlx-vlm`（已实现）/ `onnx` / `gguf`（预留） | `mlx-vlm` |
 | 🌐 `rag_ocr_model_name` | OvisOCR 模型目录名（自动从 `models/` 加载） | `OvisOCR3-MLX-4bit-mixed46` |
@@ -239,7 +240,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 → 内容去重 / 向量去重 → 向量化 (nomic-embed-text-v1.5 / FastEmbed ONNX)
 → LanceDB 存储（向量 + 完整原文 + BM25 全文索引）
 检索时: 向量相似度 top_k×4 + BM25 关键词 top_k×4 → 合并去重 → FastEmbed Reranker 精排
-       → 过滤相似度 < 0.7 → 返回最相关 ≤ 3 条
+       → 按 rag_rerank_min_similarity（默认 0.5）过滤，全部低于阈值时兜底保留得分最高一条 → 返回最相关 ≤ 3 条
 ```
 
 ### 同步全链路日志
@@ -310,8 +311,8 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 - **重排序**：FastEmbed Reranker (`BAAI/bge-reranker-v2-m3-int8`，INT8 量化版 ~570MB，fp32 全量 2.27GB)，对混合候选精排，提升召回精度。无重排序依赖时自动回退到距离排序。**CPU-only 显式强制**（`providers=["CPUExecutionProvider"]`），不依赖 FastEmbed 的默认回退。
   - 可在配置里关掉重排序（`rag_rerank_enabled=false`）或换成别的模型（`rag_rerank_model`）；关闭后检索直接走混合排序，**不会**加载 reranker 权重。
   - INT8 量化对 cross-encoder 的排序质量损失可忽略（只输出排序分数），体积与常驻内存降到 1/4，且 ONNX int8 在 CPU EP 上更快。
-  - reranker 的原始输出是 logits，代码在首次打分时探测一次输出范围并**按模型固定**决定是否做 sigmoid 归一化（不再按「本批候选」自适应），保证 `min_similarity=0.7` 这个绝对阈值在不同查询间语义一致。
-- **相似度过滤**：rerank 后过滤语义相似度 < 0.7 的结果（不相关的切片不发回模型），最终返回 ≤ 3 条最相关切片（含完整原文与来源信息）。
+  - reranker 的原始输出是 logits，代码在首次打分时探测一次输出范围并**按模型固定**决定是否做 sigmoid 归一化（不再按「本批候选」自适应），保证 `rag_rerank_min_similarity`（默认 0.5）这个绝对阈值在不同查询间语义一致。
+- **相似度过滤**：rerank 后按 `rag_rerank_min_similarity`（默认 0.5，可由配置调整，`≤0` 关闭过滤）过滤语义相似度低于阈值的结果（不相关的切片不发回模型）；**但全部候选都低于阈值（如中文短查询下 reranker 绝对分普遍偏低）时，仍保留得分最高的一条兜底**，保证始终有可用上下文。最终返回 ≤ 3 条最相关切片（含完整原文与来源信息）。
 
 ### Meta-context + Targeted RAG（动态按需检索）
 
