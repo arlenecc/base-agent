@@ -1452,3 +1452,9 @@ def test_system_prompt_book_content_outline_then_search():
     assert 'source="书名"' in SYSTEM_PROMPT
     assert "先总后分" in SYSTEM_PROMPT
     assert "不要跳过 outline 直接 search" in SYSTEM_PROMPT
+    # 2026-11-03 用户反馈：问《神之所欲》时 agent 反复「接下来检索 X」不收敛——
+    # 协议必须带收敛硬约束（轮数上限 / 不重复主题 / 禁止把计划当回复）
+    assert "rag_search` 至多 3 次" in SYSTEM_PROMPT
+    assert "不重复已检索过的主题" in SYSTEM_PROMPT
+    assert "禁止把「接下来再检索 X」写进回复" in SYSTEM_PROMPT
+    assert "读摘要即可作答" in SYSTEM_PROMPT
