@@ -122,6 +122,48 @@ pip install -e ".[all]"
 
 RAG 子系统依赖也可在首次同步知识库时通过界面自动检测并安装。
 
+### 首次启动 · 默认模型自动下载
+
+默认使用本地模型（`embedding_provider=local` / `reranker_provider=local`）时，若
+`models/` 目录缺少对应权重，软件首次启动会先弹出**处置方式确认**，由用户选择：
+
+- **自动下载补全**：进入模态下载对话框（下载完成前无法使用），流程如下；
+- **自行下载并指定**：不启动自动下载，用户手动下载模型放到 `models/` 目录
+  （或在配置窗口为各阶段指定要用的模型），之后正常使用。
+
+缺失检测验证的是**用户实际配置的模型路径**（与 `registry.resolve_model_path`
+同序：绝对路径 → CWD 相对 → `models/<value>` → `<root>/<value>` → `~/models/<value>`）：
+用户指定了自定义目录（如绝对路径 `/data/models/my-emb`）时只检查该目录——
+模型就绪即不再提示；选择自动下载时直接**原位补全用户指定的目录**，下载后立即可用，
+不会下载到用不到的默认位置。
+
+**默认下载位置**：用户未指定路径时，模型下载到**配置文件所在目录的 `models/`
+子目录**（默认 `~/.base-agent/models/<模型名>/`，冻结版 .app 里项目根只读，
+这里才是可写且升级不丢的位置）；`registry.resolve_model_path` 的搜索顺序已
+包含该位置，下载完成后应用直接可加载。用户在配置里指定了模型路径（绝对路径）
+时则原位补全该目录。
+
+选择自动下载后：
+
+- **镜像源**：`https://hf-mirror.com`，仓库为 `arlenecc/<模型名>`（默认 embedding
+  `arlenecc/jina-embeddings-v5-text-nano-mlx-int4`、默认 reranker
+  `arlenecc/jina-reranker-v2-base-multilingual-onnx`）。
+- **只拉需要的文件**：先调 HF REST 树接口（`/api/models/{repo}/tree/main`）取文件
+  清单，按白名单 + 后端类型过滤——embedding（MLX）拉 safetensors/配置/分词器/
+  自定义代码（.py，trust_remote_code 需要）；reranker（ONNX）只拉**一个** onnx
+  变体（量化优先，`model_quantized.onnx` 279MB 而非全仓 1.97GB）+ 配置与分词器；
+  排除 PyTorch 冗余权重（.bin/.pt/.pth/.h5）、README/LICENSE 与 `__pycache__`。
+  加载器（`_onnx_file`）已兼容 HF 常见的 `onnx/` 子目录布局。
+- **断点续传**：`.part` 半成品 + `Range: bytes=N-`；中断后重试自动续传；服务端
+  不支持 Range（返回 200）时自动整文件重下；完成后按字节数校验，`.part` 原子改名。
+- **进度显示**：总体字节进度条 + 当前文件 + 实时速度；失败可重试（已下载部分
+  不重头），或取消退出；下载完成前软件不可用。
+
+相关配置（config.json）：`hf_mirror_base_url`（默认 `https://hf-mirror.com`）、
+`hf_model_namespace`（默认 `arlenecc`）、`model_auto_download`（默认 `true`，
+置 `false` 跳过自动下载）。实现见 `src/agent/local/model_downloader.py`，
+测试见 `tests/test_model_downloader.py`（含 Range 续传/白名单过滤/端到端）。
+
 ### 环境要求（macOS Intel）
 
 RAG 依赖（`fastembed` / `docling` / `chonkie` 等）按需安装即可；reranker 已随 fastembed 提供，无需额外安装 torch。

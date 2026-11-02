@@ -9,13 +9,31 @@
 ``resolve_model_path(kind, value)`` 的解析规则：
     value 为空        → 使用上述默认目录
     value 是已存在路径 → 原样返回
-    value 是目录名     → 视为 ``models/<value>``
+    value 是目录名     → 依次查 配置目录 models/ → 项目根 models/ → ~/models/
     其它              → 原样返回（交给后端报错，信息更明确）
 """
 from __future__ import annotations
 
 import os
 from typing import Dict, Optional
+
+# 测试隔离用：置位后 config_dir() 返回它（而不是真实 ~/.base-agent）。
+CONFIG_DIR_OVERRIDE: Optional[str] = None
+
+
+def config_dir() -> str:
+    """配置文件所在目录（默认 ``~/.base-agent``，单一定义见 config.py）。
+
+    模型自动下载的默认落点是它下面的 ``models/`` 子目录——PyInstaller 冻结
+    环境里项目根（.app 包内）只读，配置目录才是用户可写的稳定位置。
+    """
+    from ..config import DEFAULT_CONFIG_PATH
+    return CONFIG_DIR_OVERRIDE or os.path.dirname(DEFAULT_CONFIG_PATH)
+
+
+def config_models_dir() -> str:
+    """配置目录下的 models 子目录（模型自动下载默认落点）。"""
+    return os.path.join(config_dir(), "models")
 
 # 应用内自带权重的默认相对路径（相对项目根）
 _DEFAULTS: Dict[str, str] = {
@@ -54,9 +72,11 @@ def resolve_model_path(kind: str, value: str = "", project_root: Optional[str] =
 
     搜索顺序（价值的是「用户把权重放在哪」）：
       1. value 本身是已存在路径（绝对/相对）→ 原样返回；
-      2. ``<project_root>/models/<value>``（仓库自带权重的位置）；
-      3. ``<project_root>/<value>``；
-      4. ``~/models/<value>``（用户级模型目录——权重搬出项目后最常放的地方）。
+      2. ``<config_dir>/models/<value>``（模型自动下载的默认落点，~/.base-agent/models）；
+      3. ``<config_dir>/<value>``；
+      4. ``<project_root>/models/<value>``（仓库自带权重的位置）；
+      5. ``<project_root>/<value>``；
+      6. ``~/models/<value>``（用户级模型目录——权重搬出项目后最常放的地方）。
     都找不到 → 原样返回 value，让后端报「目录不存在」（信息更明确）。
     """
     root = project_root or _project_root()
@@ -67,6 +87,14 @@ def resolve_model_path(kind: str, value: str = "", project_root: Optional[str] =
     if value:
         if _exists(value):
             return value
+        # 配置目录（~/.base-agent）下的 models：模型自动下载的默认落点，
+        # 必须在项目根之前解析——冻结环境里项目根只读，下载只能落配置目录。
+        cfg_models = os.path.join(config_models_dir(), value)
+        if _exists(cfg_models):
+            return cfg_models
+        cfg_direct = os.path.join(config_dir(), value)
+        if _exists(cfg_direct):
+            return cfg_direct
         under = os.path.join(root, "models", value)
         if _exists(under):
             return under

@@ -29,6 +29,11 @@ def _onnx_file(path: str) -> Optional[str]:
         p = os.path.join(path, name)
         if os.path.exists(p):
             return p
+    # HF 仓库常见布局：权重放在 onnx/ 子目录（自动下载保持镜像原始路径）。
+    for name in ("model.onnx", "model_quantized.onnx"):
+        p = os.path.join(path, "onnx", name)
+        if os.path.exists(p):
+            return p
     return None
 
 

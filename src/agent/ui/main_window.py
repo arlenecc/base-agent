@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..agent import Agent, AgentCallbacks
-from ..config import AgentConfig
+from ..config import AgentConfig, DEFAULT_CONFIG_PATH
 from ..llm_client import LLMClient, LLMError
 from ..skills import Skill
 from ..tools import ToolRegistry
@@ -45,7 +45,7 @@ from .ocr_test_dialog import OcrTestDialog
 from .convert_tool_dialog import ConvertToolDialog
 
 
-CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
+CONFIG_PATH = DEFAULT_CONFIG_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -1069,6 +1069,174 @@ class SendEditor(QPlainTextEdit):
 
 
 # ===========================================================================
+# 首次启动 · 默认模型自动下载（hf-mirror.com，断点续传 + 进度）
+# ===========================================================================
+
+
+class _ModelDownloadWorker(QThread):
+    """后台下载缺失的默认本地模型（不阻塞 UI 线程，进度经信号投递）。"""
+
+    # done_bytes / total_bytes / 当前文件描述
+    progress = pyqtSignal(int, int, str)
+    finished_ok = pyqtSignal(list)   # 每个模型的下载统计
+    failed = pyqtSignal(str)         # 错误信息（"__cancelled__" 表示用户取消）
+
+    def __init__(self, config: AgentConfig, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._config = config
+        self.cancel = threading.Event()
+
+    def run(self) -> None:
+        from ..local import model_downloader as _md
+        try:
+            # 每次尝试都重查缺失：重试时已完成的模型（目录完整）自动跳过。
+            missing = _md.check_missing_models(self._config)
+            if not missing:
+                self.finished_ok.emit([])
+                return
+            results = _md.download_missing_models(
+                self._config,
+                progress_cb=lambda d, t, s: self.progress.emit(d, t, s),
+                cancel_event=self.cancel)
+            self.finished_ok.emit(results)
+        except _md.ModelDownloadCancelled:
+            self.failed.emit("__cancelled__")
+        except Exception as e:  # 网络/HTTP/校验等一切失败
+            logger.error("默认模型下载失败: %s", e)
+            self.failed.emit(str(e))
+
+
+class ModelDownloadDialog(QDialog):
+    """首次启动的模态下载对话框：下载完成前软件不可用。
+
+    显示总体字节进度、当前文件与实时速度；失败时可重试（已下载部分经
+    ``.part`` + Range 断点续传，不会重头来）；「取消并退出」终止整个应用。
+    """
+
+    def __init__(self, config: AgentConfig,
+                 missing: list, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        from ..local import model_downloader as _md
+        self._md = _md
+        self._config = config
+        self._missing = missing
+        self._worker: Optional[_ModelDownloadWorker] = None
+        self._last_tick = 0.0
+        self._last_bytes = 0
+        self._speed = 0.0
+
+        self.setWindowTitle("首次使用 · 需要联网下载模型")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+
+        lay = QVBoxLayout(self)
+        names = "\n".join(
+            f"  • {t.display_name}：{t.repo_name}" for t in missing)
+        base = getattr(config, "hf_mirror_base_url", "") or _md.DEFAULT_BASE_URL
+        ns = getattr(config, "hf_model_namespace", "") or _md.DEFAULT_NAMESPACE
+        info = QLabel(
+            "检测到默认本地模型尚未就绪：\n"
+            f"{names}\n\n"
+            f"将从 {base}（{ns}/<模型名>）下载运行所需的文件到 models/ 目录。\n"
+            "下载完成前软件无法使用，请保持网络连接；中断后重试会自动断点续传。")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        lay.addWidget(self._bar)
+
+        self._status = QLabel("正在获取文件清单…")
+        self._status.setWordWrap(True)
+        lay.addWidget(self._status)
+
+        self._err = QLabel("")
+        self._err.setWordWrap(True)
+        self._err.setStyleSheet("color: #c0392b;")
+        self._err.hide()
+        lay.addWidget(self._err)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self._retry_btn = QPushButton("重试")
+        self._retry_btn.hide()
+        self._retry_btn.clicked.connect(self._start)
+        self._quit_btn = QPushButton("取消并退出")
+        self._quit_btn.clicked.connect(self._on_cancel)
+        btn_row.addWidget(self._retry_btn)
+        btn_row.addWidget(self._quit_btn)
+        lay.addLayout(btn_row)
+
+        self._start()
+
+    # -- 下载控制 ----------------------------------------------------------
+
+    def _start(self) -> None:
+        self._err.hide()
+        self._retry_btn.hide()
+        self._quit_btn.setText("取消并退出")
+        self._bar.setValue(0)
+        self._status.setText("正在获取文件清单…")
+        self._worker = _ModelDownloadWorker(self._config, parent=self)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished_ok.connect(self._on_done)
+        self._worker.failed.connect(self._on_failed)
+        self._last_tick = time.monotonic()
+        self._last_bytes = 0
+        self._worker.start()
+
+    def _on_cancel(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel.set()
+            self._quit_btn.setEnabled(False)
+            self._quit_btn.setText("正在取消…")
+            return
+        QApplication.quit()
+
+    def _on_progress(self, done: int, total: int, current: str) -> None:
+        if total > 0:
+            self._bar.setRange(0, 100)
+            self._bar.setValue(min(100, int(done * 100 / total)))
+        now = time.monotonic()
+        dt = now - self._last_tick
+        if dt >= 0.5:
+            inst = (done - self._last_bytes) / dt if dt > 0 else 0.0
+            # 指数平滑，避免速度数字跳动
+            self._speed = inst if self._speed <= 0 else self._speed * 0.6 + inst * 0.4
+            self._last_tick = now
+            self._last_bytes = done
+        speed = (f"{self._speed / 1e6:.1f} MB/s"
+                 if self._speed >= 1e6 else f"{self._speed / 1e3:.0f} KB/s")
+        self._status.setText(
+            f"{current}\n"
+            f"{done / 1e9:.2f} / {total / 1e9:.2f} GB    {speed}")
+
+    def _on_done(self, results: list) -> None:
+        self._worker = None
+        self.accept()
+
+    def _on_failed(self, msg: str) -> None:
+        self._worker = None
+        if msg == "__cancelled__":
+            # 用户取消 → 退出应用（下载完成前不可使用）
+            QApplication.quit()
+            return
+        self._err.setText(f"下载失败：{msg}\n"
+                          "可重试（已下载部分自动续传），或取消并退出软件。")
+        self._err.show()
+        self._retry_btn.show()
+        self._quit_btn.setText("退出软件")
+
+    def closeEvent(self, e) -> None:  # noqa: N802 (Qt 命名)
+        # 模态期间不允许点右上角 × 绕过「下载完成才能使用」；只能走按钮。
+        if self._worker is not None and self._worker.isRunning():
+            e.ignore()
+            return
+        super().closeEvent(e)
+
+
+# ===========================================================================
 # Main window
 # ===========================================================================
 
@@ -1188,9 +1356,74 @@ class MainWindow(QMainWindow):
         self._wire_signals()
         self._setup_log_bridge()
         self._apply_config_to_widgets()
+        # 首次启动：默认本地模型缺失 → 模态联网下载（hf-mirror.com），完成后才继续
+        # 初始化（_rebuild_agent 会加载 embedding/reranker，缺权重必然报错）。
+        self._ensure_default_models()
         self._rebuild_agent()
         # 启动主动加载：本地模式自动加载主模型；辅助模型仅在勾选「启用」时加载。
         self._auto_load_startup()
+
+    # ------------------------------------------------------------------
+    # 首次启动：默认本地模型自动下载（先确认处置方式，模态，完成前不可用）
+    # ------------------------------------------------------------------
+    def _ensure_default_models(self) -> None:
+        """默认本地模型（embedding/reranker，provider=local）缺失时先确认再下载。
+
+        检查本身只读文件系统（毫秒级），在 UI 线程执行；确有缺失先弹**处置方式
+        确认**：自动下载补全（模态进度对话框，下载在 QThread 里跑）或用户自行
+        下载并指定模型（不启动自动下载，继续启动流程）。选择自动下载后，下载
+        完成前对话框不可关闭——用户要么等下载完成，要么「取消并退出」。检查器
+        自身异常不拦截启动：让后续模型加载给出明确报错（避免下载器 bug 变成
+        无法启动的软锁）。
+        """
+        if not getattr(self.config, "model_auto_download", True):
+            return
+        from ..local import model_downloader as _md
+        try:
+            missing = _md.check_missing_models(self.config)
+        except Exception as e:
+            logger.warning("默认模型完整性检查失败（跳过自动下载）: %s", e)
+            return
+        if not missing:
+            return
+        logger.info("检测到缺失的默认本地模型: %s",
+                    [t.repo_name for t in missing])
+        if not self._confirm_model_download(missing):
+            # 用户选择「自行下载并指定」：不启动自动下载，继续初始化——
+            # 用户手动把模型放到 models/（或在配置窗口指定各阶段模型）后可用。
+            logger.info("用户选择自行下载并指定模型，跳过自动下载")
+            return
+        dlg = ModelDownloadDialog(self.config, missing, parent=self)
+        dlg.exec()
+
+    def _confirm_model_download(self, missing: list) -> bool:
+        """缺失模型处置方式确认：True=自动下载补全；False=用户自行下载并指定。
+
+        确认框给出两种方式的具体含义（镜像源 / 断点续传 / 手动放置位置），
+        由用户显式选择，杜绝未经同意的联网下载。
+        """
+        names = "\n".join(f"  • {t.display_name}：{t.repo_name}"
+                          for t in missing)
+        base = (getattr(self.config, "hf_mirror_base_url", "")
+                or "https://hf-mirror.com")
+        ns = (getattr(self.config, "hf_model_namespace", "") or "arlenecc")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("缺少默认本地模型")
+        box.setText(
+            "检测到以下默认本地模型尚未就绪：\n"
+            f"{names}\n\n"
+            "请选择处理方式：\n"
+            f"  • 自动下载补全 —— 从 {base}（{ns}/<模型名>）拉取运行所需文件，\n"
+            "    支持断点续传，下载完成前软件不可用；\n"
+            "  • 自行下载并指定 —— 不自动下载；你手动下载模型放到 models/ 目录\n"
+            "    （或在配置窗口为各阶段指定要用的模型），之后正常使用。")
+        auto_btn = box.addButton("自动下载补全",
+                                 QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("自行下载并指定", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(auto_btn)
+        box.exec()
+        return box.clickedButton() is auto_btn
 
     # ------------------------------------------------------------------
     # UI construction

@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+# 配置文件路径（单一来源）：main_window 与模型目录解析（local/registry）共用。
+# 模型自动下载的默认落点即该目录下的 models/ 子目录（~/.base-agent/models）。
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
+
 
 @dataclass
 class AgentConfig:
@@ -279,6 +283,15 @@ class AgentConfig:
     reranker_provider: str = "local"
     local_reranker_model: str = "jina-reranker-v2-base-multilingual-onnx"
     local_reranker_backend: str = "onnx"
+
+    # --- 默认模型自动下载（首次启动） ---
+    # 默认本地模型（provider=local 的 embedding / reranker）在 models/ 缺失时，
+    # 从 HF 镜像站按 <namespace>/<模型名> 仓库拉取**必需文件**（REST 树接口取
+    # 清单 → 白名单过滤 → Range 断点续传），落盘 models/<模型名>/。见
+    # local/model_downloader.py。下载完成前 UI 阻塞（模态进度对话框）。
+    hf_mirror_base_url: str = "https://hf-mirror.com"
+    hf_model_namespace: str = "arlenecc"
+    model_auto_download: bool = True
 
     vlm_provider: str = "api"
     local_vlm_model: str = ""
