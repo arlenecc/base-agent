@@ -173,7 +173,7 @@ app = BUNDLE(
     bundle_identifier='com.baseagent.app',
     info_plist={
         'CFBundleDisplayName': 'BaseAgent',
-        'CFBundleShortVersionString': '0.1.0',
+        'CFBundleShortVersionString': '1.2.8',
         'CFBundleVersion': '1',
         'NSHighResolutionCapable': True,
         'NSMicrophoneUsageDescription': 'BaseAgent may need microphone access for voice input.',
