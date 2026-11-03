@@ -167,6 +167,97 @@ def test_kernel_greeting_blocks_ask_user_popup(cfg):
     assert asks == [], "寒暄不得弹出 ask_user 框"
 
 
+def test_kernel_caps_rag_search_per_run(cfg):
+    """rag_search 轮内硬上限：第 4 次起不执行，以纠正反馈逼模型作答。
+
+    2026-11-03 用户反馈：outline 后连发大量无效 search——提示词约束对本地
+    小模型不可靠，必须在派发层强制。
+    """
+    from agent.tools.base import ToolResult
+
+    scripts = []
+    for i in range(5):
+        tc = [{"id": f"c{i}",
+               "function": {"name": "rag_search",
+                            "arguments": json.dumps({"query": f"主题{i}"})}}]
+        scripts.append([_evt("done", tool_calls=tc, usage={"total_tokens": 1})])
+    scripts.append([_evt("content", "全书主要思想是……"),
+                    _evt("done", usage={"total_tokens": 1})])
+    mock = MockLLM(scripts)
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+
+    dispatched = []
+
+    class _StubDispatcher:
+        def dispatch(self, calls):
+            dispatched.extend(tc.name for tc in calls)
+            return [ToolResult(True, output="检索结果") for _ in calls]
+
+    agent.kernel.dispatcher = _StubDispatcher()
+    result = agent.kernel.run("主要思想是什么")
+
+    assert result.reason is ExitReason.DONE
+    assert dispatched.count("rag_search") == 3, "第 4 次起必须被拦截"
+    # 拦截反馈回灌进历史，模型据此收尾作答
+    capped = [m for m in mock.calls[-1]["messages"]
+              if m.get("role") == "tool" and "硬上限" in m.get("content", "")]
+    assert capped, "上限反馈必须回灌给模型"
+
+
+def test_kernel_same_tool_varied_fail_fuse(cfg):
+    """同一工具连败（参数各异）达阈值 → 熔断收尾。
+
+    2026-11-03 用户实测（1.2.8 版本）：rag_search 空参连发 14 次失败——
+    参数每次微变即可绕过「签名一致」熔断 _FAIL_REPEAT_LIMIT；而
+    _same_tool_fail_streak 只记账从不收尾。此测试锁住补上的缺口。
+    """
+    from agent.tools.base import ToolResult
+
+    scripts = []
+    for i in range(8):
+        tc = [{"id": f"w{i}",
+               "function": {"name": "work_memory",
+                            "arguments": json.dumps({"key_info": f"尝试{i}"})}}]
+        scripts.append([_evt("done", tool_calls=tc, usage={"total_tokens": 1})])
+    scripts.append([_evt("content", "好的，收尾。"),
+                    _evt("done", usage={"total_tokens": 1})])
+    mock = MockLLM(scripts)
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+
+    dispatched = []
+
+    class _StubDispatcher:
+        def dispatch(self, calls):
+            dispatched.extend(tc.name for tc in calls)
+            return [ToolResult(False, error="缺少必需参数") for _ in calls]
+
+    agent.kernel.dispatcher = _StubDispatcher()
+    result = agent.kernel.run("帮我记录一下当前任务的关键信息")
+
+    assert result.reason is ExitReason.DONE
+    # 第 6 次失败后熔断：之后不再派发（脚本备了 8 轮也只用到 6）
+    assert dispatched.count("work_memory") == 6
+    # 收尾文字非空，不静默
+    assert result.text.strip()
+
+
+def test_kernel_summary_flood_treated_as_empty(cfg):
+    """<summary> 千次级退化复读按空回复重试，恢复后正常作答。
+
+    2026-11-03 用户实测：单轮输出 <summary>×1000——退化输出烧满轮次。
+    """
+    flood = "<summary>" * 30
+    mock = MockLLM([
+        [_evt("content", flood), _evt("done", usage={"total_tokens": 1})],
+        [_evt("content", "正常回答"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    result = agent.kernel.run("hi")
+
+    assert result.reason is ExitReason.DONE
+    assert result.text == "正常回答"
+
+
 def test_kernel_retries_empty_response_then_gives_up(cfg):
     """空回复重试最多 3 次，之后必须终止而不是无限循环。"""
     scripts = [[_evt("content", "   "), _evt("done", usage={})] for _ in range(6)]

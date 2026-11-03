@@ -477,6 +477,73 @@ def test_rag_tools_registered_with_knowledge_base(config, tmp_path):
     reg.shutdown()
 
 
+def test_rag_outline_no_args_guides_next_step():
+    """无参 rag_outline 列出文档后必须自带下一步指引。
+
+    2026-11-03 用户反馈：问「主要思想是什么」（没点名书），模型卡在
+    「不知道对哪本 outline」反复复述意图——工具结果要直接给出决策规则。
+    """
+    from agent.tools.rag_tool import RagOutlineTool
+
+    class _Eng:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def list_documents(self):
+            return list(self._docs)
+
+    single = RagOutlineTool(_Eng(["神之所欲.epub"])).run()
+    assert single.success
+    assert "只有这一篇" in single.output
+    assert "先总后分" in single.output
+
+    multi = RagOutlineTool(_Eng(["a.epub", "b.pdf"])).run()
+    assert multi.success
+    assert "挑文档名/主题与问题最相关的一篇" in multi.output
+    assert "ask_user" in multi.output
+
+
+def test_rag_search_empty_query_error_discourages_retry():
+    """空参 rag_search 的错误信息必须自带反循环指引。
+
+    2026-11-03 用户实测（1.2.8 版本）：模型空参连发 14 次全失败——
+    「请提供搜索查询词」不含任何跳出循环的信息，模型只会原样重试。
+    错误信息要指明：停止重复、可用已有结果作答、正确用法示例。
+    """
+    from agent.tools.rag_tool import RagSearchTool
+
+    res = RagSearchTool(engine=None).run(query="")
+    assert not res.success
+    # 指出缺什么
+    assert "query" in res.error
+    # 反循环：停止重复检索
+    assert "不要重复调用" in res.error
+    # 出路：已有摘要可直接作答 / 给出正确示例
+    assert "全书摘要" in res.error
+    assert "如" in res.error and "主要思想" in res.error
+
+
+def test_rag_outline_with_summary_discourages_extra_search():
+    """outline 附全书摘要时必须明示：问整体内容直接作答，无需再 search。"""
+    from agent.tools.rag_tool import RagOutlineTool
+
+    class _Eng:
+        def list_documents(self):
+            return ["神之所欲.epub"]
+
+        def get_document_outline(self, name):
+            return {"doc_name": name, "digest": "第一章 神……"}
+
+        def get_book_summary(self, name):
+            return "本书主张……"
+
+    res = RagOutlineTool(_Eng()).run("神之所欲")
+    assert res.success
+    assert "【全书摘要】" in res.output
+    assert "无需再 rag_search" in res.output
+    assert "至多 3 次" in res.output
+
+
 # ---------------------------------------------------------------------------
 # shell_run: timeout must not leave orphaned processes behind
 # ---------------------------------------------------------------------------

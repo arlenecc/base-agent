@@ -683,6 +683,44 @@ def test_summary_stripper_char_by_char():
 
 
 # ---------------------------------------------------------------------------
+# 流式正文大片空白收缩（模型连吐换行 / 思考段裁剪残留）2026-11-03
+# ---------------------------------------------------------------------------
+
+def _shrink(chunks):
+    from agent.ui.main_window import _BlankShrinker
+    s = _BlankShrinker()
+    out = ""
+    for c in chunks:
+        out += s.feed(c)
+    return out + s.flush()
+
+
+def test_blank_shrinker_collapses_newline_flood():
+    from agent.ui.main_window import _BlankShrinker
+    # 消息开头空行丢弃（feed-only，无 flush）
+    s = _BlankShrinker()
+    assert s.feed("\n\n\n正文") == "正文"
+    # >2 连续换行压成 2（段落分隔保留）
+    s2 = _BlankShrinker()
+    assert s2.feed("段落一\n\n\n\n\n段落二") == "段落一\n\n段落二"
+
+
+def test_blank_shrinker_holds_trailing_newlines_across_chunks():
+    # 尾部换行暂扣，等下一块决定保留几个
+    assert _shrink(["段落三\n\n\n", "段落四"]) == "段落三\n\n段落四"
+    # 回合结束：暂扣的按上限吐出
+    from agent.ui.main_window import _BlankShrinker
+    s = _BlankShrinker()
+    s.feed("文字\n\n\n\n\n")
+    assert s.flush() == "\n\n"
+
+
+def test_blank_shrinker_preserves_content_and_indentation():
+    out = _shrink(["标题\n\n正文  保持缩进", "，两行\n结尾"])
+    assert out == "标题\n\n正文  保持缩进，两行\n结尾"
+
+
+# ---------------------------------------------------------------------------
 # 模型路径选择按钮：按「模型类型」分流文件/目录（2026-10-23）
 # ---------------------------------------------------------------------------
 

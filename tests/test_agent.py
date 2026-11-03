@@ -1458,7 +1458,13 @@ def test_system_prompt_book_content_outline_then_search():
     assert "不要跳过 outline 直接 search" in SYSTEM_PROMPT
     # 2026-11-03 用户反馈：问《神之所欲》时 agent 反复「接下来检索 X」不收敛——
     # 协议必须带收敛硬约束（轮数上限 / 不重复主题 / 禁止把计划当回复）
-    assert "rag_search` 至多 3 次" in SYSTEM_PROMPT
+    assert "超过 3 次会被直接拦截" in SYSTEM_PROMPT
     assert "不重复已检索过的主题" in SYSTEM_PROMPT
     assert "禁止把「接下来再检索 X」写进回复" in SYSTEM_PROMPT
-    assert "读摘要即可作答" in SYSTEM_PROMPT
+    assert "读摘要直接作答" in SYSTEM_PROMPT
+    assert "前言/导论" in SYSTEM_PROMPT
+    # 2026-11-03 用户反馈（第二次）：问「主要思想是什么」没点名书，知识库有
+    # 4 篇文档，模型卡在「不知道对哪本 outline」反复复述意图。协议必须覆盖
+    # 无书名分支：无参列出 → 单篇直接做 / 多篇挑最相关的做并注明依据。
+    assert "问句没点名文档" in SYSTEM_PROMPT
+    assert "挑文档名/主题与问题最相关的一篇" in SYSTEM_PROMPT

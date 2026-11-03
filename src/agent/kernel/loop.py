@@ -41,6 +41,14 @@ _TRUNCATION_MARKS = ("[!!! 流异常中断", "!!!Error:", "max_tokens !!!]")
 _CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_]*\n[\s\S]{50,}?```")
 _TAG_STRIP_RE = re.compile(r"<(thinking|think|summary)>[\s\S]*?</\1>", re.I)
 
+# rag_search 轮内硬上限（先总后分检索收敛）：提示词层面的「至多 3 次」对本地
+# 小模型不可靠——2026-11-03 实测问「主要思想是什么」时 outline 后连发大量
+# 无效 search 甚至退化复读。在派发层面强制：超过上限的 rag_search 不执行。
+_RAG_SEARCH_MAX_PER_RUN = 3
+# 退化复读判定：协议片段在单轮输出里重复超过该次数（如 <summary>×1000）
+# 即视为退化输出，按空回复重试。
+_DEGENERATE_REPEAT_LIMIT = 5
+
 # ---- 规划门 / 反思门（防止「跑丢」与「半路停」）---------------------------
 # 规划门：任务开始后、还没干过实际活、且还没有计划时，每轮提醒先规划；一旦
 # 开始干实际活就停止（一句话任务如「读 a.txt」不被强制规划）。多步任务真正
@@ -108,6 +116,13 @@ _REPEAT_CALL_LIMIT = 4     # 第 5 次 → 收尾，不再烧轮次
 # 设为 3：允许「失败→失败→改而回复」的正常模式完整跑完（第三轮才收尾），
 # 而对「持续相同失败」的问候场景在第 4 轮熔断（远优于烧满 max_iterations）。
 _FAIL_REPEAT_LIMIT = 3      # 连续 3 次相同失败签名（第 4 次出现）→ 收尾
+
+# 「同一工具连续失败（不论参数是否一致）」熔断：_FAIL_REPEAT_LIMIT 只兜签名
+# 完全一致的纯重试；本地弱模型退化时同一工具会只换/漏参数连发（2026-11-03
+# 实测 rag_search({}) 空参连发 14 次，参数每次微变即可绕过签名熔断）。连续
+# N 次同工具失败 → 收尾。中途穿插任何成功调用会清零计数，「失败→换参数
+# 再试→成功」的正常排查不受影响；阈值给足探索空间。
+_SAME_TOOL_FAIL_LIMIT = 6   # 同一工具连败 6 次 → 收尾
 
 # 「模型在向用户追问必要信息」的信号。只在任务未起步时作为放行依据，
 # 因此刻意收得比反思门的禁止清单更窄：只认真正索取信息的句式，不认
@@ -320,6 +335,8 @@ class KernelLoop:
         self._plan_finish_nudge = 0
         # 重复调用检测（成功调用同样空转，见 ACT 态的重复调用检测注释）
         self._repeat_streak = 0
+        # rag_search 轮内计数（硬上限见 _RAG_SEARCH_MAX_PER_RUN）
+        self._rag_search_calls = 0
         self._last_call_sigs: List[str] = []
         self._fail_repeat_streak = 0
         self._same_tool_fail_streak = 0
@@ -679,6 +696,26 @@ class KernelLoop:
                     for tc in tool_calls if tc.name == "ask_user"
                 }
                 exec_calls = [tc for tc in tool_calls if tc.name != "ask_user"]
+
+            # ---- rag_search 轮内硬上限（先总后分检索收敛）----
+            # 提示词层面的「至多 3 次」对本地小模型不可靠（实测仍会连发无效
+            # search），在派发层面强制：超过上限的 rag_search 不执行，以纠正
+            # 反馈占位，逼模型基于已有目录/【全书摘要】/已检索内容直接作答。
+            _capped: List[ToolCall] = []
+            for tc in exec_calls:
+                if tc.name == "rag_search":
+                    if self._rag_search_calls >= _RAG_SEARCH_MAX_PER_RUN:
+                        blocked_asks[tc.id] = (
+                            f"[System] 本轮 rag_search 已达硬上限"
+                            f"（{_RAG_SEARCH_MAX_PER_RUN} 次）。停止检索——"
+                            "基于已获取的目录/【全书摘要】/已检索内容直接输出"
+                            "最终回答；个别细节缺失就如实说明，不要继续检索。")
+                        self.log("[kernel] rag_search 达到轮内上限 %d，拦截"
+                                 % _RAG_SEARCH_MAX_PER_RUN)
+                        continue
+                    self._rag_search_calls += 1
+                _capped.append(tc)
+            exec_calls = _capped
             try:
                 _exec_results = (self.dispatcher.dispatch(exec_calls)
                                  if exec_calls else [])
@@ -795,6 +832,16 @@ class KernelLoop:
             if fr >= _FAIL_REPEAT_LIMIT:
                 self.log("[kernel] 连续 %d 次相同失败调用，结束本轮（避免空转）"
                          % (fr + 1))
+                if not final_text:
+                    final_text = (resp.content
+                                  or "（工具调用持续失败，已停止当前回合）")
+                exit_reason = ExitReason.DONE
+                break
+            elif ft >= _SAME_TOOL_FAIL_LIMIT:
+                # 「同一工具连续失败（不论参数）」熔断：签名每次微变即可绕过
+                # 上面的 fr 熔断，此处兜底（中途穿插成功会清零计数）。
+                self.log("[kernel] %s 连续 %d 次失败（参数各异），结束本轮"
+                         "（避免空转）" % (self._same_tool_fail_name, ft))
                 if not final_text:
                     final_text = (resp.content
                                   or "（工具调用持续失败，已停止当前回合）")
@@ -1353,6 +1400,15 @@ class KernelLoop:
     def _no_tool_event(self, resp: LLMResponse) -> str:
         content = (resp.content or "").strip()
         if not content and not (resp.reasoning or "").strip():
+            self._empty_retry += 1
+            return "retry" if self._empty_retry <= _MAX_EMPTY_RETRY else "done"
+        # 退化复读（本地小模型偶发）：协议片段在单轮输出里成百上千次重复
+        # （如 <summary>×1000）。视为退化输出走空回复重试——通常一次重试即
+        # 恢复；连续多次则收尾，避免把整轮烧在这种垃圾上。
+        if (content.count("<summary>") >= _DEGENERATE_REPEAT_LIMIT
+                or (resp.reasoning or "").count("<summary>")
+                >= _DEGENERATE_REPEAT_LIMIT):
+            self.log("[kernel] 检测到 <summary> 退化复读，按空回复处理重试")
             self._empty_retry += 1
             return "retry" if self._empty_retry <= _MAX_EMPTY_RETRY else "done"
         tail = content[-120:]

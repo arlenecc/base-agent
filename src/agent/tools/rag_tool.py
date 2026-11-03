@@ -78,7 +78,16 @@ class RagSearchTool(Tool):
         # 归一化成空串再判断。
         query = (query or "").strip()
         if not query:
-            return ToolResult(success=False, error="请提供搜索查询词")
+            # 本地小模型退化时可能不带参数连发：错误信息必须自带反循环指引，
+            # 否则模型只会原样重试空参。
+            return ToolResult(
+                success=False,
+                error=(
+                    "rag_search 缺少必需参数 query（搜索查询词）。"
+                    "不要重复调用空参的 rag_search——先停下来：若 rag_outline 已返回【全书摘要】或目录里已有章节摘要，直接据此作答；"
+                    "确需细节，用一句中文查询词（如 \"薄伽梵歌 主要思想\"）再调用一次；仍拿不到就如实说明。"
+                ),
+            )
 
         # 默认 top_k 从配置读取（rag_search_top_k，默认 5）；模型未传/传 null
         # 时走配置默认，传了非法值也回退到配置默认。_config 由 bind() 注入，
@@ -188,6 +197,17 @@ class RagOutlineTool(Tool):
             lines.extend(f"  - {d}" for d in docs[:_MAX_DOCS])
             if len(docs) > _MAX_DOCS:
                 lines.append(f"  … （其余 {len(docs) - _MAX_DOCS} 个省略）")
+            # 决策指引放在工具结果里（比系统提示更靠近决策点）：用户问句没点名
+            # 文档时，模型常卡在「不知道对哪本书 outline」而反复复述意图。
+            if len(docs) == 1:
+                lines.append(
+                    "\n只有这一篇：直接对它执行先总后分"
+                    "（rag_outline(book_name=…) 拿目录/摘要 → 按需 rag_search）。")
+            else:
+                lines.append(
+                    "\n用户问题没点名文档时：挑文档名/主题与问题最相关的一篇"
+                    "直接执行先总后分，并在回答开头注明「基于《XX》」；确实"
+                    "无法判断才用 ask_user 请用户选择。")
             return ToolResult(success=True, output=_cap_output("\n".join(lines)))
 
         logger.info("📖 RAG 工具调用: rag_outline(book_name=%r)", book_name[:80])
@@ -210,7 +230,10 @@ class RagOutlineTool(Tool):
             except Exception:
                 book_summary = ""
             if book_summary:
-                digest = (f"{digest}\n\n【全书摘要】\n{book_summary}")
+                digest = (f"{digest}\n\n【全书摘要】\n{book_summary}"
+                          "\n\n（问整体内容（主要思想/讲了什么）直接据此作答，"
+                          "无需再 rag_search；确需细节只检索目标章节——"
+                          "本轮 rag_search 至多 3 次，超过会被内核拦截。）")
             return ToolResult(success=True, output=digest)
         except Exception as e:
             logger.error("❌ RAG 缩略版本获取失败: %s", e, exc_info=True)

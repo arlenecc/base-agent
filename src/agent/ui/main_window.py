@@ -318,6 +318,53 @@ def _plan_progress_text(plan: Any) -> str:
 # ===========================================================================
 
 
+class _BlankShrinker:
+    """收缩流式正文里的大片空白：>2 的连续换行压成 2，消息开头空行丢弃。
+
+    本地小模型常退化成连吐换行（或思考段裁剪后残留成片空行），原样
+    ``insertText`` 会在对话框里留下几百行空白。跨 chunk 状态化：尾部连续
+    换行先暂扣（最多展示 max 个），等下一块非换行内容到达再决定保留几个；
+    回合结束 ``flush`` 时把暂扣的按上限吐出。只动 ``\\n`` 的连续数量，
+    行首缩进空格等正文内容不碰。
+    """
+
+    def __init__(self, max_blank: int = 2) -> None:
+        self._max = max_blank
+        self._held = 0         # 尾部暂扣的连续换行数
+        self._started = False  # 是否已输出过非换行内容
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        out: List[str] = []
+        for ch in text:
+            if ch == "\n":
+                self._held += 1
+                continue
+            if not self._started:
+                # 消息开头（尚无任何正文）的空行整段丢弃
+                self._started = True
+                self._held = 0
+            else:
+                self._started = True
+                if self._held > self._max:
+                    self._held = self._max
+                out.append("\n" * self._held)
+                self._held = 0
+            out.append(ch)
+        # 尾部暂扣的换行不吐：等下一块（可能是回合结束 flush）
+        return "".join(out)
+
+    def flush(self) -> str:
+        n = min(self._held, self._max if self._started else 0)
+        self._held = 0
+        return "\n" * n
+
+    def reset(self) -> None:
+        self._held = 0
+        self._started = False
+
+
 class _SummaryStripper:
     """把协议标签 ``<summary>…</summary>`` 从流式文本里剔掉。
 
@@ -1315,6 +1362,8 @@ class MainWindow(QMainWindow):
         self._stream_timer: Optional[QTimer] = None
         # 协议标签剥离器（每个 assistant 回合重建）
         self._summary_stripper = _SummaryStripper()
+        # 流式正文大片空白收缩器（与 stripper 同生命周期）
+        self._blank_shrinker = _BlankShrinker()
         # 日志轮询定时器：每 100ms 检查 sync_worker._log_buffer，
         # 把新日志追加到 log_view。绕过 Qt queued signal 机制，
         # 避免在 GIL 竞争下信号无法被主线程处理的问题。
@@ -3609,6 +3658,7 @@ class MainWindow(QMainWindow):
         # 空回复。比只在 _force_stop_agent 里复位更稳（它是兜底而非唯一入口）。
         self._streaming_assistant = False
         self._summary_stripper = _SummaryStripper()
+        self._blank_shrinker = _BlankShrinker()
         self._set_controls_busy(True)
         self.think_view.clear()
         # 上一回合（尤其被强杀的）可能残留未落盘的缓冲
@@ -3679,6 +3729,7 @@ class MainWindow(QMainWindow):
         self._flush_stream(final=True)
         self._streaming_assistant = False
         self._summary_stripper = _SummaryStripper()
+        self._blank_shrinker = _BlankShrinker()
         # 本轮只生成了一半：缓存末尾对应「被截断的输出」，历史里却是已落盘的
         # 部分文本——两者不再是前缀关系，必须丢弃缓存，否则下一轮会错位续算。
         try:
@@ -3789,6 +3840,8 @@ class MainWindow(QMainWindow):
             return
         # 协议标签 <summary>…</summary> 是给内核的机器标记，不显示给用户
         text = self._summary_stripper.feed(text)
+        # 大片空白收缩（模型连吐换行 / 思考段裁剪残留）
+        text = self._blank_shrinker.feed(text)
         if not text:
             return
         if not self._streaming_assistant:
@@ -3824,6 +3877,9 @@ class MainWindow(QMainWindow):
             residue = self._summary_stripper.flush()
             if residue:
                 self._pending_content.append(residue)
+            blank = self._blank_shrinker.flush()
+            if blank:
+                self._pending_content.append(blank)
         timer = getattr(self, "_stream_timer", None)
         if timer is not None:
             timer.stop()
