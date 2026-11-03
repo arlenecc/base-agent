@@ -146,6 +146,27 @@ def test_kernel_ask_user_answer_flows_back_to_model(cfg):
                for m in second_messages)
 
 
+def test_kernel_greeting_blocks_ask_user_popup(cfg):
+    """寒暄输入下 ask_user 必须被硬拦截：不弹框、直接文字收尾。
+
+    用户反馈：问候一句「你好」，模型却弹 ask_user 框追问「要做什么任务」——
+    弹框打断体验极差。问候不需要任何信息，内核在派发前直接拦截。
+    """
+    tc = [{"id": "c1", "function": {"name": "ask_user",
+                                    "arguments": json.dumps({"prompt": "你想做什么任务？"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 1})],
+    ])
+    cb = Noop()
+    asks = []
+    cb.ask_user = lambda p: (asks.append(p) or "ok")  # type: ignore[method-assign]
+    agent = Agent(llm=mock, config=cfg, callbacks=cb)
+    result = agent.kernel.run("你好")
+
+    assert result.reason is ExitReason.DONE
+    assert asks == [], "寒暄不得弹出 ask_user 框"
+
+
 def test_kernel_retries_empty_response_then_gives_up(cfg):
     """空回复重试最多 3 次，之后必须终止而不是无限循环。"""
     scripts = [[_evt("content", "   "), _evt("done", usage={})] for _ in range(6)]

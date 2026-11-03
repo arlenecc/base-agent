@@ -1436,6 +1436,10 @@ def test_system_prompt_splits_greeting_from_simple_qa():
     assert "你没有给出具体任务" in SYSTEM_PROMPT   # 明确禁语
     assert "禁止复读" in SYSTEM_PROMPT             # 同一句话不许输出第二遍
     assert "ask_user" in SYSTEM_PROMPT             # 只缺参数时问那一个参数
+    # 2026-11-03 用户反馈：寒暄也弹 ask_user 框追问「要做什么任务」——
+    # 弹框打断体验差，协议必须限定 ask_user 只用于任务中的关键缺口。
+    assert "ask_user` 是弹框打断" in SYSTEM_PROMPT
+    assert "寒暄/问候/闲聊绝不调用" in SYSTEM_PROMPT
 
 
 def test_system_prompt_book_content_outline_then_search():

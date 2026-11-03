@@ -8,8 +8,14 @@ from .base import Tool, ToolRegistry, ToolResult
 class AskUserTool(Tool):
     name = "ask_user"
     description = (
-        "Ask the user a clarifying question or request confirmation/info. "
-        "Use when information is missing or a non-destructive decision is needed."
+        "Ask the user ONE specific blocking question via a popup dialog — a "
+        "real interruption for the user, so use it sparingly. Only while a "
+        "task is actually in progress and a piece of information you cannot "
+        "obtain yourself is missing (a path/param, a choice, or a "
+        "confirmation). NEVER for greetings or small talk (just reply "
+        "naturally), never to ask what the user wants to do, never for "
+        "anything inferable from context or prior tool results, and never to "
+        "request permission to continue."
     )
     parameters = {
         "type": "object",

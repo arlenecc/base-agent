@@ -663,11 +663,31 @@ class KernelLoop:
                     self.log("[kernel] 规划前置门：拦截首次执行，要求先 update_plan(create)")
                     continue
 
+            # ---- 寒暄硬门禁：问候输入下拦截 ask_user 弹框 ----
+            # 问候不需要任何信息；弹框追问「要做什么任务」是纯打扰（用户还得
+            # 在弹出框里填空）。命中就把 ask_user 从实际派发中剔除、以纠正反馈
+            # 占位（问候无文字答复时，下方问候熔断会直接文字收尾）。用严格判定
+            # _is_greeting，「读文件」等短任务不受影响。
+            blocked_asks: Dict[str, Any] = {}
+            exec_calls = tool_calls
+            if self._is_greeting(user_input) and any(
+                    tc.name == "ask_user" for tc in tool_calls):
+                self.log("[kernel] 问候场景拦截 ask_user 弹框（直接文字回应即可）")
+                blocked_asks = {
+                    tc.id: "[System] 寒暄/问候不需要向用户提问，更不该弹框追问"
+                           "「要做什么任务」——直接用一两句自然的话回应即可。"
+                    for tc in tool_calls if tc.name == "ask_user"
+                }
+                exec_calls = [tc for tc in tool_calls if tc.name != "ask_user"]
             try:
-                raw_results = self.dispatcher.dispatch(tool_calls)
+                _exec_results = (self.dispatcher.dispatch(exec_calls)
+                                 if exec_calls else [])
             except Exception as e:
                 self.log(f"[kernel] dispatcher error: {e}")
-                raw_results = [None] * len(tool_calls)
+                _exec_results = [None] * len(exec_calls)
+            _exec_iter = iter(_exec_results)
+            raw_results = [blocked_asks[tc.id] if tc.id in blocked_asks
+                           else next(_exec_iter) for tc in tool_calls]
 
             # 失败记账必须在拼装 pending 之前：步骤内失败数要在 update_plan
             # 把它重置之前，被「未充分尝试就 blocked」的守卫读走。
