@@ -150,16 +150,87 @@ def test_agent_run_persists_turn(cfg):
 # ---------------------------------------------------------------------------
 
 def test_system_prompt_injects_l0_and_l1(cfg, layout):
+    from agent.memory_sop_texts import (
+        MEMORY_MANAGEMENT_SOP, MEMORY_MANAGEMENT_SOP_FULL,
+    )
+    from agent.kernel.budget import estimate_tokens
+
     agent = Agent(llm=_MockLLM([]), config=cfg, callbacks=_Noop())
     prompt = agent._system_prompt()
+    # 提炼版常驻：核心公理 4 条与最高优先级口号一条不少
     assert "核心公理" in prompt and "No Execution, No Memory" in prompt
+    assert "神圣不可删改性" in prompt and "禁止存储易变状态" in prompt
+    assert "最小充分指针" in prompt and "决策树速记" in prompt
     assert "# [Global Memory Insight]" in prompt
     assert prompt.index("核心公理") < prompt.index("# [Global Memory Insight]")
+    # 提炼必须真的省 token（全文不再逐轮常驻）
+    assert estimate_tokens(MEMORY_MANAGEMENT_SOP) < estimate_tokens(
+        MEMORY_MANAGEMENT_SOP_FULL) * 0.45
+    # 指针指向的全文文件真实存在且完整
+    assert "memory/memory_management_sop.md" in prompt
+    assert os.path.isfile(layout.l0_path)
+    full = open(layout.l0_path, encoding="utf-8").read()
+    assert "L1 ↔ L2/L3 同步规则" in full and "信息分类快速决策树" in full
     # L1 文件真实落盘且可维护
     assert os.path.isfile(layout.l1_path)
     assert "[RULES]" in open(layout.l1_path, encoding="utf-8").read()
     # L0 恒定、L1 是独立的一段（两次构建一致 → KV 前缀稳定）
     assert agent._system_prompt() == prompt
+
+
+def test_l0_full_materialized_but_never_overwritten(layout):
+    """全文只在缺失时写，用户手改后不被系统覆盖（神圣不可删改）。"""
+    from agent.memory_v2 import ensure_l0
+
+    first = ensure_l0(layout)
+    assert "各层职责与原则" in first and "信息分类快速决策树" in first
+    with open(layout.l0_path, "w", encoding="utf-8") as f:
+        f.write("USER_EDITED_MARK")
+    ensure_l0(layout)
+    assert open(layout.l0_path, encoding="utf-8").read() == "USER_EDITED_MARK"
+
+
+def test_l0_pointer_upgrades_legacy_l1(layout):
+    """旧版 L1 里无后缀的 L0 指针要补丁成明确路径，其余内容不动。"""
+    from agent.memory_v2 import ensure_l0
+
+    with open(layout.l1_path, "w", encoding="utf-8") as f:
+        f.write("# [Global Memory Insight]\n"
+                "META-SOP(L0):memory_management_sop\n"
+                "L0(META-SOP): memory_management_sop\n"
+                "[RULES]\n1. 手写红线不可丢\n")
+    ensure_l0(layout)
+    text = open(layout.l1_path, encoding="utf-8").read()
+    assert "memory/memory_management_sop.md" in text
+    assert "1. 手写红线不可丢" in text
+    assert "memory_management_sop\n" not in text
+
+
+def test_l0_pointer_readable_by_real_file_read_tool(cfg, layout):
+    """模型按 L0 指针发 file_read 必须真的读到全文（workspace 边界内）。"""
+    from agent.tools import ToolRegistry
+    from agent.memory_v2 import ensure_l0
+
+    ensure_l0(layout)
+    reg = ToolRegistry(config=cfg, callbacks=_Noop())
+    res = reg.execute("file_read", {"path": "memory/memory_management_sop.md"})
+    assert res.success
+    assert "各层职责与原则" in res.output
+    assert "信息分类快速决策树" in res.output
+    reg.shutdown()
+
+
+def test_l0_full_read_triggers_key_info_and_not_l3_index(layout):
+    """读 L0 全文走改进 5 的提炼联动，但不混进 L3 索引行。"""
+    from agent.memory_v2 import ensure_l0, sync_l1
+
+    ensure_l0(layout)
+    assert is_l3_sop_read(_call("file_read", path="memory/memory_management_sop.md"))
+    assert not is_l23_write(_call("file_append", path="memory/memory_management_sop.md"))
+    sync_l1(layout)
+    l1 = open(layout.l1_path, encoding="utf-8").read()
+    line = next(l for l in l1.splitlines() if l.startswith("L3:"))
+    assert "memory_management_sop.md" not in line
 
 
 def test_memory_system_block_reads_updated_l1(layout):

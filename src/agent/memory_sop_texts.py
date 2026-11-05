@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# L0：META-SOP —— 恒定注入 system prompt（改进 3）
+# L0：META-SOP 全文（物化到 memory/memory_management_sop.md，按场景按需读取）
 # ---------------------------------------------------------------------------
-MEMORY_MANAGEMENT_SOP = """## 0. 核心公理 (Core Axioms - 最高优先级)
+MEMORY_MANAGEMENT_SOP_FULL = """## 0. 核心公理 (Core Axioms - 最高优先级)
 1.  **行动验证原则 (Action-Verified Only)**
     *   **定义**：任何写入 L1/L2/L3 的信息，必须源自**成功的工具调用结果**（如 `shell` 执行成功、`file_read` 确认内容存在、代码运行通过）。
     *   **禁止**：严禁将模型的“固有知识”、“推理猜测”、“未执行的计划”或“未验证的假设”作为事实写入。
@@ -100,6 +100,34 @@ L4: 工作目录下的memory目录下raw_sessions子目录(历史会话层 - sch
             │
             └─ NO → 判定为『通用常识』或『冗余信息』: 严禁存储，直接丢弃
 ```"""
+
+# ---------------------------------------------------------------------------
+# L0 提炼版：常驻 system prompt（2026-11-05）
+#
+# 全文见 MEMORY_MANAGEMENT_SOP_FULL，运行时由 MemoryLayout.ensure_l0() 物化到
+# memory/memory_management_sop.md，模型写 L1/L2/L3 前 file_read 按需读取。
+# 保留的是「每轮都必须知道」的最高优先级内容：4 条核心公理、层级、
+# 决策树速记、L1 硬约束、读全文指针。下沉的是展开说明、反例、同步表格、
+# 各层细则、L2 瘦身与 L3 审计流程 —— 按 L0 自身「存在性编码」原则，
+# 这些只在写记忆/整理记忆时才需要，常驻等于每轮白付 token。
+# ---------------------------------------------------------------------------
+MEMORY_MANAGEMENT_SOP = """## 0. 核心公理 (Core Axioms - 最高优先级)
+1. **行动验证原则 (Action-Verified Only)**：写入 L1/L2/L3 的信息必须源自成功的工具调用结果；严禁固有知识、推理猜测、未执行的计划、未验证假设。**No Execution, No Memory. (无行动，不记忆)**
+2. **神圣不可删改性 (Sanctity of Verified Data)**：经行动验证的有效配置、避坑指南、关键路径，重构/GC 时严禁丢弃；可压缩文字、可迁移层级，但绝不丢失准确性与可追溯性。记忆修改极度小心：只能少量 patch，禁 overwrite / code_run，改不动宁愿不改。
+3. **禁止存储易变状态 (No Volatile State)**：时间戳、临时 Session ID、PID、具体绝对路径、设备信息等高频变化数据一律不存。
+4. **最小充分指针 (Minimum Sufficient Pointer)**：上层只留能定位下层的最短标识，多一词即冗余。
+
+## 记忆层级
+L1 memory/global_mem_insight.txt（极简索引，≤30 行）→ L2 memory/global_mem.txt（事实库，`## [SECTION]`）→ L3 memory/*.md|*.py（任务级 SOP / 脚本）→ L4 memory/raw_sessions/（历史会话）。上层只做导航，细节在下层。
+
+## 写记忆前必读
+**写任何 L1/L2/L3 前，先 `file_read("memory/memory_management_sop.md")` 读 META-SOP 全文**（各层职责与禁止项、L1↔L2/L3 同步规则、信息分类快速决策树与反例）。读完按「只读一次 SOP」原则把要点提炼进 key_info，之后不再重复读。
+
+## 决策树速记
+环境特异性事实（IP / 非标路径 / 凭证 / ID）→ L2，并同步 L1 导航行；全局通用避坑规律 → L1 [RULES] 一句；特定任务技术（艰难尝试才成功、未来复用）→ L3 专项 SOP；通用常识 / 易变状态 / 可几步重建的细节 → 判定冗余，直接丢弃。
+
+## 红线
+L1 只写关键词或名称：≤30 行、禁搬细节 / How-to / 密码与 API Key / 日志，括号内只放反直觉触发词；L2/L3 变更后同步 L1（只 patch 索引行）；所有验证过的事实不可删改，memory 下文件只能追加或少量 patch（除非新建）。"""
 
 # ---------------------------------------------------------------------------
 # 改进 6：L2/L3 提纯 prompt（由 start_long_term_update 回执给模型）
@@ -243,10 +271,10 @@ SOP 越写越让人不敢动手时，优先删这几类：
 # 改进 4：默认 L1 索引（首次运行自动创建）
 # ---------------------------------------------------------------------------
 DEFAULT_L1_TEMPLATE = """# [Global Memory Insight]
-Facts(L2): memory/global_mem.txt || SOPs(L3): memory/*.md or *.py | META-SOP(L0):memory_management_sop
+Facts(L2): memory/global_mem.txt || SOPs(L3): memory/*.md or *.py | META-SOP(L0):memory/memory_management_sop.md
 L1 Insight是极简索引，L2/L3变更时同步L1，索引必须极简。写记忆前先读META-SOP(L0)。
 需要时read L2 或 ls 工作目录下memory子目录查L3
-L0(META-SOP): memory_management_sop
+L0(META-SOP): memory/memory_management_sop.md
 L2: 现空
 L3: memory_cleanup_sop(记忆整理)
 L4: raw_sessions/ 历史会话

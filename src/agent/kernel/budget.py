@@ -60,9 +60,10 @@ class ContextBudget:
 
     # 比例（合计 1.0）
     # 2026-11-05：system 由 0.13（30k 下 3900）提到 1/6（30k 下 5000）。
-    # L0 META-SOP + L1 全局索引常驻 system prompt 后实测约 4553 token，旧配额
-    # 会把它判成超支，由 overspent() 从 RAW 扣回 653 token，工具结果与近期
-    # 原文被无谓裁剪。多出的份额从 RESERVE（模型输出 + 估算误差缓冲）扣，
+    # 起因：L0 META-SOP + L1 全局索引常驻 system prompt，压缩前实测 4553 token
+    # 会被旧配额判成超支，由 overspent() 从 RAW 扣回 653 token。同日又对
+    # SYSTEM_PROMPT 做了提炼（-1354 token，现合计约 3.2K）；5000 配额保留，
+    # 给 L1 索引与后续 SOP 增长留余量。多出的份额从 RESERVE 扣，
     # RAW / TOOLS / EARLIER 保持原值：不加剧折叠、不压近期原文预算。
     _SYSTEM_RATIO = 1 / 6
     _RATIO = {

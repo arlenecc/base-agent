@@ -1,7 +1,8 @@
 """L0~L4 分层记忆：会话落盘、索引注入、归档压缩、辅助引擎维护。
 
 层级（工作目录 workspace 下）：
-    L0  META-SOP            —— 恒定文本 ``memory_sop_texts.MEMORY_MANAGEMENT_SOP``
+    L0  META-SOP            —— 提炼版常驻 system prompt；全文物化到
+                               memory/memory_management_sop.md 按需读取
     L1  memory/global_mem_insight.txt  —— ≤30 行极简索引，紧跟 L0 进 system prompt
     L2  memory/global_mem.txt          —— 事实库
     L3  memory/*.md / *.py             —— 任务级 SOP / 脚本
@@ -29,6 +30,7 @@ from .memory_sop_texts import (
     HISTORY_MINING_SOP,
     MEMORY_CLEANUP_SOP,
     MEMORY_MANAGEMENT_SOP,
+    MEMORY_MANAGEMENT_SOP_FULL,
     MEMORY_PURIFY_PROMPT,
 )
 
@@ -41,6 +43,9 @@ _L1_MAX_LINES = 30
 _L1_MAX_L3_ITEMS = 12
 # 改进 5/6 内核检测时排除的「系统维护产物」，它们不是 L3 SOP
 _SYSTEM_FILES = {"history_insight.md", "cleanup_report.md", "global_mem_insight.txt"}
+# L0 全文文件：不是 L3 任务 SOP，不进 L3 索引行；但 file_read 命中它时仍应
+# 触发「提炼进 key_info」联动（与读普通 L3 SOP 同机制）。
+_L0_FILE = "memory_management_sop.md"
 
 _IO_LOCK = threading.RLock()
 
@@ -69,6 +74,7 @@ class MemoryLayout:
         # 改进 1/2/7 用户文字里 raw_session / raw_sessions 混用，统一用复数
         # （改进 7 与历史挖掘 SOP 均以 raw_sessions 为准）。
         self.raw_dir = os.path.join(self.memory_dir, "raw_sessions")
+        self.l0_path = os.path.join(self.memory_dir, "memory_management_sop.md")
         self.l1_path = os.path.join(self.memory_dir, "global_mem_insight.txt")
         self.l2_path = os.path.join(self.memory_dir, "global_mem.txt")
         self.all_histories_path = os.path.join(self.raw_dir, "all_histories.txt")
@@ -208,6 +214,37 @@ def record_turn(layout: MemoryLayout, rec: Any,
 # ---------------------------------------------------------------------------
 # 改进 3 + 4：L0 恒定 + L1 实时索引注入 system prompt
 # ---------------------------------------------------------------------------
+def ensure_l0(layout: MemoryLayout) -> str:
+    """把 L0 META-SOP 全文物化到 memory/memory_management_sop.md。
+
+    提炼版只常驻核心公理与指针，模型按指针 ``file_read`` 时必须有真文件可读，
+    否则「写记忆前先读全文」会变成死链。只在文件缺失/为空时写，绝不覆盖用户
+    手改；顺带把旧版 L1 里无后缀的 L0 指针 patch 成明确路径（只动这两处）。
+    """
+    if not layout.workspace:
+        return ""
+    layout.ensure()
+    if not os.path.isfile(layout.l0_path) or not _read(layout.l0_path).strip():
+        try:
+            _write(layout.l0_path, MEMORY_MANAGEMENT_SOP_FULL)
+        except OSError as e:
+            logger.warning("[memory] ensure_l0 write failed: %s", e)
+    l1 = _read(layout.l1_path)
+    if l1 and "memory/memory_management_sop.md" not in l1:
+        patched = (
+            l1.replace("META-SOP(L0):memory_management_sop",
+                       "META-SOP(L0):memory/memory_management_sop.md")
+              .replace("L0(META-SOP): memory_management_sop",
+                       "L0(META-SOP): memory/memory_management_sop.md")
+        )
+        if patched != l1:
+            try:
+                _write(layout.l1_path, patched)
+            except OSError:
+                pass
+    return _read(layout.l0_path)
+
+
 def read_l1(layout: MemoryLayout) -> str:
     """读 L1；不存在则以默认模板初始化（改进 4：文件真实存在且可维护）。"""
     text = _read(layout.l1_path)
@@ -221,9 +258,11 @@ def read_l1(layout: MemoryLayout) -> str:
 
 
 def memory_system_block(layout: MemoryLayout) -> str:
-    """system prompt 中紧跟基础提示之后注入的恒定 L0 + 实时 L1。"""
+    """system prompt 中紧跟基础提示之后注入的恒定 L0 提炼版 + 实时 L1。"""
     if not layout.workspace:
         return MEMORY_MANAGEMENT_SOP
+    # 构建提示词时顺手保证全文文件存在：L0 指针必须可读。
+    ensure_l0(layout)
     return MEMORY_MANAGEMENT_SOP + "\n\n---\n" + read_l1(layout).strip()
 
 
@@ -237,7 +276,7 @@ def _l3_names(layout: MemoryLayout) -> List[str]:
         names = sorted(
             n for n in os.listdir(layout.memory_dir)
             if n.endswith((".md", ".py")) and n not in _SYSTEM_FILES
-            and not n.startswith(".")
+            and n != _L0_FILE and not n.startswith(".")
         )
     except OSError:
         return []
@@ -328,6 +367,8 @@ def is_l23_write(call: Any) -> bool:
     if not p.startswith("memory/"):
         return False
     name = os.path.basename(p)
+    if name == _L0_FILE:
+        return False  # L0 全文是系统维护文件，不是 L2/L3 写入目标
     if name == "global_mem.txt" or name == "global_mem_insight.txt":
         return True
     return name.endswith((".md", ".py")) and name not in _SYSTEM_FILES
@@ -341,9 +382,10 @@ def long_term_update_payload(transcript: str, focus: str, layout: MemoryLayout) 
         "prompt": MEMORY_PURIFY_PROMPT,
         "transcript": (transcript or "")[-4000:],
         "decision_tree": (
-            "按 L0 决策树归类：环境特异性事实 → file_append 到 memory/global_mem.txt 的 "
-            "## [SECTION]；特定任务技术 → 新建或追加 memory/xxx_sop.md；"
-            "通用规律 → L1 [RULES] 一句；通用常识/易变状态 → 丢弃"
+            "写前先 file_read('memory/memory_management_sop.md') 读 META-SOP 全文与决策树，"
+            "读完提炼进 key_info。速记：环境特异性事实 → file_append 到 "
+            "memory/global_mem.txt 的 ## [SECTION]；特定任务技术 → 新建或追加 "
+            "memory/xxx_sop.md；通用规律 → L1 [RULES] 一句；通用常识/易变状态 → 丢弃"
         ),
         "write_rules": [
             "只写经工具验证成功的信息；No Execution, No Memory",
