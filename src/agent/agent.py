@@ -22,6 +22,11 @@ from .kernel import (
 from .kernel.compressor import DISTILL_PROMPT, DISTILL_SYSTEM
 from .tools.checkpoint import restore_checkpoint
 from .atomic_io import atomic_write_text
+from .memory_sop_texts import SOP_KEY_INFO_HINT
+from .memory_v2 import (
+    MemoryLayout, archive_past_sessions, is_l23_write, is_l3_sop_read,
+    memory_system_block, record_turn, run_memory_maintenance, sync_l1,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +76,8 @@ class AgentCallbacks:
 SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the user's task by reasoning, planning, and calling tools.
 
 ## 交互协议（每轮必须遵守）
-- 正文先输出一个 <summary>…</summary>（≤30 字的物理快照）：上一步结果带来的新信息 + 本次意图。它会被压缩进长期工作记忆，必须含真实信息、禁止空话。
-- 若用户需求未完成，必须调用工具推进，不要只用文字描述下一步。**例外——查资料类问答**（先总后分检索、memory/file 查证）：已有信息足以回答时，**直接给出最终回答本身就是「推进」**，不要为调工具而调工具，更不要把「接下来再查 X」当作文字推进。
+- 正文先输出一个 <summary>…</summary>（≤30 词的快照）：上一步结果带来的新信息 + 本次意图，必须真实、禁止空话。
+- 若用户需求未完成，调用工具推进，不要只用文字描述下一步。**例外——查资料类问答**（先总后分检索、memory/file 查证）：已有信息足以回答时，**直接给出最终回答本身就是「推进」**，不要为调工具而调工具，更不要把「接下来再查 X」当作文字推进。
 - **`ask_user` 是弹框打断，非必要不用**：仅当任务执行中缺**自己无法获取**的关键信息（路径/选项/二选一确认）才问，一次只问一个具体问题。寒暄/问候/闲聊绝不调用——直接自然回应即可；禁止用它问「你想做什么任务」（用户没给任务就回应或等待）、禁止问能从上下文或工具结果推断的内容、禁止用它请求继续或许可。
 
 ## 任务推进：先规划，再步步为营
@@ -93,6 +98,12 @@ SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the us
   - `memory_search` / `memory_graph`：长期经验检索与知识图谱（长期事实由系统自动抽取，无需主动调用）。
 - `update_plan`：任务级「目标 + 路径」规划与进度更新（每轮自动回注）。
 - `start_long_term_update`：任务完成/检查点时触发经验蒸馏。
+
+## 全局记忆 L0~L4（规则全文见本提示末尾注入的 memory_management_sop）
+- L1（global_mem_insight.txt，紧跟 L0 注入）是极简索引：决策前先看它；需要细节才 `file_read` L2（`memory/global_mem.txt`）或 `memory/` 下的 L3 SOP / 脚本。禁止把 L2/L3 全文塞进上下文。
+- 通过 L1 定位到某个 L3 SOP 时，用 `file_read` 读一次（工具结果按上下文上限截断即可）；**读完后立刻**用 `update_working_checkpoint(key_info=...)` 把「关键前置 + 典型坑 + 指针」压缩进工作记忆，之后每轮随 key_info 自动回注，不要重复读同一份 SOP。
+- L2/L3 的**唯一正式写入入口**是 `start_long_term_update`（当前轮数 <5 会被直接拒绝）：拿到【记忆提纯】prompt 后按 L0 决策树归类，用 `file_append` **追加**到 `memory/global_mem.txt` 或 `memory/xxx_sop.md`；严禁 `file_write`/`code_run` 覆盖、严禁写未验证/易变信息。写完后内核会自动同步 L1 并重新注入。
+- 历史会话全文与摘要由系统自动落到 `memory/raw_sessions/`，无需手动记录；往日日志会被自动归档压缩。
 
 ## 何时调用工具 / 记忆
 - **纯寒暄 / 打招呼**（「hi」「你好」「在吗」这类没有信息需求的输入）：一句话文字回复即可，不调用工具、不建计划、不写记忆；即使误调工具看到报错，也不要重试或换参数，直接文字回复。
@@ -293,6 +304,25 @@ class _AgentKernelHooks(KernelHooks):
             return bool(self.agent._shrink_session(reason))
         return False
 
+    def failed(self, session: Session, err: str) -> None:
+        self.agent.callbacks.on_error(err)
+
+    # 改进 5/6：内核只按标签插入提示/触发同步，路径分类留在这里（Agent 层）。
+    def classify_tool_call(self, call: Any) -> str:
+        if is_l3_sop_read(call):
+            return "sop_read"
+        if is_l23_write(call):
+            return "l23_write"
+        return ""
+
+    def sop_hint(self) -> str:
+        return SOP_KEY_INFO_HINT
+
+    def memory_written(self) -> None:
+        # L2/L3 变更 → 同步 L1 索引并让 system prompt 缓存失效（下一轮立即生效）
+        _ = sync_l1(self.agent._memory_layout)
+        self.agent._invalidate_prompt_cache()
+
     def finished(self, session: Session, text: str) -> None:
         agent = self.agent
         # 既有能力：异步抽取事实写知识图谱（不阻塞回复）
@@ -300,6 +330,11 @@ class _AgentKernelHooks(KernelHooks):
             agent._maybe_extract_facts_async(text)
         except Exception as e:
             agent._log(f"[kernel] fact extraction error: {e}")
+        # 改进 7/8：任务终止边主引擎空闲 → 后台归档 + 辅助引擎挖掘/整理
+        try:
+            agent._run_memory_maintenance_async()
+        except Exception as e:
+            agent._log(f"[kernel] memory maintenance error: {e}")
         # 新增能力：L4 经验蒸馏（模型显式调用 start_long_term_update，或长任务）
         #
         # 阈值用 ``session.current_turn``（真实轮数 = start_turn 次数，不含
@@ -309,9 +344,6 @@ class _AgentKernelHooks(KernelHooks):
         # 可接受的（蒸馏本身有 _fact_extract_lock 串行 + 跳过上次未完成的）。
         if agent.kernel.distill_requested or session.current_turn >= agent._distill_min_turns:
             agent._distill_experience_async(session)
-
-    def failed(self, session: Session, err: str) -> None:
-        self.agent.callbacks.on_error(err)
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +435,25 @@ class Agent:
         # __init__ 里创建——懒初始化是 check-then-act 竞态，两个抽取线程可能
         # 各自建一把锁并各自成功 acquire，防堆叠形同虚设。
         self._fact_extract_lock = threading.RLock()
+        # 后台记忆维护自己的防堆叠锁：与事实抽取锁分开，避免多个维护线程
+        # 同时排队等锁（每个用户轮次都会在终止边触发一次）。
+        self._memory_maint_lock = threading.Lock()
+
+        # ---- 改进 1~4：L0~L4 记忆体系 ----
+        self._memory_layout = MemoryLayout(config.workspace)
+        # 全文/摘要落盘挂在 Session.finish_turn 的统一回调：所有收尾分支都覆盖。
+        # 传方法本身（callable），只有当天首轮才会真正取 system prompt。
+        self.session.on_turn_finished = lambda rec: record_turn(
+            self._memory_layout, rec, self._system_prompt)
+        # 应用启动时先把「今天之前」的会话归档掉（纯文件 IO，不碰任何 LLM，
+        # 避免 UI 构造 Agent 时隐式加载辅助模型权重）。
+        try:
+            threading.Thread(
+                target=lambda: archive_past_sessions(self._memory_layout),
+                daemon=True, name="memory-archive-boot",
+            ).start()
+        except Exception as e:  # pragma: no cover - defensive
+            self._log(f"[memory] boot archive error: {e}")
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -1147,8 +1198,29 @@ class Agent:
             "要求：只输出要点列表，不要前言或解释；不要复述对话；不要编造。\n\n"
             f"对话历史:\n{transcript}"
         )
+        # 改进 8：压缩摘要改由辅助引擎承担，绝不占主引擎推理流。
+        #  * UI 已加载辅助模型 → 直接用它（它就是「辅助引擎」）；
+        #  * 未加载 → 用独立抽取客户端（自己的 httpx 连接池/推理实例）；
+        #  * 拿到的仍是本地主引擎本身 → 干脆不调 LLM，直接用已有 L2 摘要行
+        #    折叠，宁可摘要粗一点也不让用户在压缩轮卡十几秒。
+        # L1/L2/L3 的系统化整理由后台维护线程按「记忆整理 SOP」在辅助模型
+        # 空闲时执行（见 _run_memory_maintenance_async）。
+        # 注意：这里不 import .local.llm（会拉起 MLX 依赖），用类名判定本地
+        # 客户端即可；否则缺依赖的环境会把整段压缩吞成空摘要。
         try:
-            summary = self._summarize_via_llm(summary_prompt)
+            aux = getattr(self, "aux_llm", None)
+            if aux is not None:
+                summary = self._summarize_via_llm(summary_prompt, llm=aux)
+            else:
+                try:
+                    client = self._get_extract_llm()
+                except Exception:
+                    client = self.llm
+                if (client is self.llm
+                        and type(self.llm).__name__ == "LocalLLMClient"):
+                    summary = ""
+                else:
+                    summary = self._summarize_via_llm(summary_prompt, llm=client)
         except Exception as e:
             self._log(f"[context] summarize LLM call failed: {e}")
             summary = ""
@@ -1225,6 +1297,65 @@ class Agent:
                 self._fact_extract_lock.release()
 
         threading.Thread(target=_target, daemon=True, name="l4-distill").start()
+
+    # ------------------------------------------------------------------
+    # 改进 7/8：后台记忆维护（归档 → 历史挖掘 → 记忆整理）
+    # ------------------------------------------------------------------
+    def _run_memory_maintenance_async(self) -> None:
+        """任务终止边触发：主引擎已空闲，后台线程做归档与辅助引擎提炼。
+
+        * 归档是纯文件 IO，永远执行（今天之前的全文 → 骨架汇总 + zip + 删原文件）；
+        * 语义提炼 / 记忆整理只在「辅助模型已加载且未被事实抽取占用」时跑，
+          不隐式加载模型权重，也不与蒸馏抢同一把锁；
+        * 整流程每天至多跑一次完整版（见 memory_v2.run_memory_maintenance）。
+        """
+        layout = self._memory_layout
+
+        def _target() -> None:
+            if not self._memory_maint_lock.acquire(blocking=False):
+                return  # 已有维护线程在跑，本次直接让位
+            try:
+                # 关键：不能与事实抽取抢 _fact_extract_lock。
+                # 两个线程都是「拿不到锁就跳过」，若维护先抢到，先启动的
+                # _maybe_extract_facts_async 会静默 return —— 那是既有的长期
+                # 事实抽取能力，绝不能被新增的后台维护挤掉。
+                # 因此：先让出 0.2s 让事实抽取先入场，再用带超时的 acquire
+                # 等它跑完（后台 daemon 线程，完全不阻塞用户看到回复）。
+                time.sleep(0.2)
+                acquired = self._fact_extract_lock.acquire(timeout=10)
+                if not acquired:
+                    # 辅助引擎长时间被占用：只做纯 IO 归档，挖掘/整理留给下次。
+                    try:
+                        archive_past_sessions(layout)
+                    except Exception as e:
+                        self._log(f"[memory] archive error: {e}")
+                    return
+                try:
+                    aux = getattr(self, "aux_llm", None)
+                    if aux is None:
+                        # 辅助模型未加载：只归档，绝不隐式加载权重。
+                        run_memory_maintenance(layout, None)
+                        return
+
+                    def _call(system: str, prompt: str) -> str:
+                        return self._summarize_via_llm(prompt, system=system, llm=aux)
+
+                    result = run_memory_maintenance(layout, _call)
+                    if result.get("cleaned") or result.get("mined"):
+                        self._invalidate_prompt_cache()
+                        self._log(
+                            f"[memory] 维护完成: archived={result.get('archived')} "
+                            f"mined={result.get('mined') or '-'} "
+                            f"cleaned={result.get('cleaned')}")
+                finally:
+                    self._fact_extract_lock.release()
+            except Exception as e:
+                self._log(f"[memory] maintenance error: {e}")
+            finally:
+                self._memory_maint_lock.release()
+
+        threading.Thread(target=_target, daemon=True,
+                         name="memory-maintenance").start()
 
     # ------------------------------------------------------------------
     # Tool execution helpers
@@ -1322,7 +1453,11 @@ class Agent:
                 and hasattr(self, "_cached_prompt")):
             return self._cached_prompt
 
-        base = SYSTEM_PROMPT
+        # 改进 3/4：L0 META-SOP 恒定 + L1 全局索引实时加载，紧跟基础系统提示。
+        # L0 是静态文本；L1 只在 L2/L3 变更时由 memory_written() 同步重写，
+        # 两次变更之间整段 system prompt 逐字不变 —— 与「KV 缓存只认完整前缀」
+        # 不冲突（变更后的那一轮重算一次前缀，之后继续稳定命中）。
+        base = SYSTEM_PROMPT + "\n\n" + memory_system_block(self._memory_layout)
 
         # 注意：工作记忆 / 当天事实 / 匹配技能 / 知识库状态等「每轮易变」内容一律
         # 不进系统提示，改由 volatile_context() 注入用户消息（见 kernel/loop.py）。
@@ -1334,6 +1469,11 @@ class Agent:
         self._cached_prompt_turn = self._turn_idx
         self._cached_prompt = base
         return base
+
+    def _invalidate_prompt_cache(self) -> None:
+        """L1 索引被同步更新后，下一轮必须重新拼 system prompt。"""
+        self._cached_prompt_turn = -1
+        self._cached_prompt = ""
 
     # ------------------------------------------------------------------
     def volatile_context(self) -> str:

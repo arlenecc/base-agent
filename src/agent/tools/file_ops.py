@@ -191,6 +191,52 @@ class FileWriteTool(_FileTool):
         return ToolResult(True, output=f"Wrote {len(content)} chars to {path}")
 
 
+class FileAppendTool(_FileTool):
+    """追加写入（L0 红线：memory 下已验证数据只能追加/少量 patch，禁 overwrite）。
+
+    改进 6：L2/L3 的唯一正式写入通道。``file_write`` 会整文件覆盖，模型一旦
+    把旧事实库当成新内容重写就会造成「神圣不可删改性」的持久伤害；追加工具
+    从工具层消除这类误操作。
+    """
+
+    name = "file_append"
+    description = (
+        "Append text to a workspace file, creating it and parent dirs if absent. "
+        "Use this (never file_write/code_run) to add verified facts to memory/ "
+        "L2 (global_mem.txt) or L3 (*_sop.md). Does not overwrite existing data."
+    )
+    destructive = False
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        },
+        "required": ["path", "content"],
+    }
+
+    def run(self, path: str, content: str) -> ToolResult:
+        try:
+            full = self._resolve(path)
+        except PermissionError as e:
+            return ToolResult(False, error=str(e))
+        if not isinstance(content, str):
+            content = str(content)
+        if len(content) > _MAX_WRITE_CHARS:
+            return ToolResult(
+                False,
+                error=(f"content too large ({len(content)} chars > {_MAX_WRITE_CHARS} cap). "
+                       "Split into several file_append calls."),
+            )
+        try:
+            os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+            with open(full, "a", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            return ToolResult(False, error=f"Append failed: {e}")
+        return ToolResult(True, output=f"Appended {len(content)} chars to {path}")
+
+
 class FileModifyTool(_FileTool):
     name = "file_modify"
     description = "Replace the first occurrence of `old` with `new` in a workspace file."

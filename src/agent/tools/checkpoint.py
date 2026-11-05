@@ -14,6 +14,9 @@ from typing import Any, Optional
 
 from ..config import AgentConfig
 from ..kernel.compressor import compact_json
+from ..memory_v2 import (
+    LONG_TERM_MIN_TURNS, MemoryLayout, long_term_update_payload,
+)
 from .base import Tool, ToolRegistry, ToolResult
 from .memory import _work_memory
 
@@ -89,20 +92,23 @@ class UpdateWorkingCheckpointTool(Tool):
 
 
 class StartLongTermUpdateTool(Tool):
-    """Trigger L4 distillation of this task's experience into long-term memory.
+    """L2/L3 长期记忆的唯一正式写入触发点（改进 6）。
 
-    对应 GenericAgent 的 ``start_long_term_update``。它不直接改记忆文件 ——
-    只把「本会话摘要 + 待提纯材料」交给模型，并给内核打上 distill 标记；
-    内核在终止边调用 Agent 的 hook 真正写入知识图谱 / 技能库。
+    它自己不写任何记忆文件：只做门控，并把【记忆提纯】prompt + 会话摘要 +
+    L0 决策树回执给模型；模型再按决策树用 ``file_append`` 追加到 L2/L3。
+    内核检测到该工具（未被门控拒绝时）仍会打上 distill 标记，终止边由
+    Agent hook 做既有的知识图谱异步蒸馏。
     """
 
     name = "start_long_term_update"
     description = (
-        "After finishing a task or reaching a checkpoint, distill durable experience "
-        "into long-term memory. Only for verified facts, user preferences and lessons "
-        "that are expensive to rediscover. Then (optionally) call memory_graph to add "
-        "the distilled entities, or skill_save to freeze a reusable procedure. "
-        "Skip if nothing durable was learned."
+        "ONLY entry point for writing L2/L3 long-term memory. Call after finishing "
+        "a task or reaching an important checkpoint; rejected if the session has "
+        f"fewer than {LONG_TERM_MIN_TURNS} turns (short tasks must not touch "
+        "long-term memory). Returns the 【记忆提纯】prompt; then classify verified "
+        "facts by the L0 decision tree and append them with file_append to "
+        "memory/global_mem.txt (L2) or memory/xxx_sop.md (L3). "
+        "Never overwrite, never store unverified/volatile data."
     )
     parameters = {
         "type": "object",
@@ -124,6 +130,16 @@ class StartLongTermUpdateTool(Tool):
 
     def run(self, focus: str = "") -> ToolResult:
         sess = _session(self.registry)
+        turns = int(getattr(sess, "current_turn", 0) or 0)
+        # 改进 6 门控：短任务不许碰长期记忆。用「成功 + REJECTED」而不是失败
+        # 返回：内核会把失败计入熔断记账，且本地小模型常对失败原样重试。
+        if turns < LONG_TERM_MIN_TURNS:
+            return ToolResult(True, output=compact_json({
+                "status": "REJECTED",
+                "reason": (f"当前仅 {turns} 轮（需 ≥{LONG_TERM_MIN_TURNS} 轮）："
+                           "短任务不许碰长期记忆。本次请求已直接拒绝。"),
+                "next": "不要重试本工具；直接完成当前任务即可。",
+            }, 600))
         transcript = ""
         if sess is not None:
             transcript = "\n".join(sess.all_digest_lines()[-25:])
@@ -133,22 +149,9 @@ class StartLongTermUpdateTool(Tool):
         if not transcript:
             transcript = "(当前会话尚无有效记录)"
 
-        payload = {
-            "status": "DISTILL_REQUESTED",
-            "focus": focus or "",
-            "transcript": transcript[-3000:],
-            "next": [
-                "memory_graph(op=create_entity/add_observations) 写入验证过的事实与偏好",
-                "skill_save(...) 若该流程可复用，固化为 SKILL.md",
-                "rag_ingest() 若有外部语料需要灌入本地知识库",
-            ],
-            "rules": [
-                "只写经工具验证成功的信息；禁止写入推测、临时状态、通用常识",
-                "合并重复、压缩冗述，不堆叠流水账",
-                "无提纯价值则跳过，不要为了调用而调用",
-            ],
-        }
-        return ToolResult(True, output=compact_json(payload, 2600))
+        layout = MemoryLayout(getattr(self.config, "workspace", "") or "")
+        payload = long_term_update_payload(transcript, focus or "", layout)
+        return ToolResult(True, output=compact_json(payload, 4000))
 
 
 # ---------------------------------------------------------------------------

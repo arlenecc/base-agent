@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .budget import ContextBudget, estimate_tokens
 from .compressor import compact_json, l3_fold
@@ -133,6 +133,12 @@ class Session:
         self.turn_index = 0
         self.folded_count = 0                 # 已被折叠的轮数（统计用）
         self._last_fold_at = 0.0
+        # 每轮落地后的旁路记录（改进 1/2：全文与摘要落盘）。由 Agent 注入，
+        # Session 不关心实现；回调内部必须自行吞掉异常，绝不影响主流程。
+        # 放在 finish_turn 而不是 loop 的各个收尾分支：文字收尾 / 工具轮 /
+        # 反思门放行都经过 finish_turn，不会漏轮；被 rollback 的轮不会走到
+        # 这里，天然不计入有效对话。
+        self.on_turn_finished: Optional[Callable[[TurnRecord], None]] = None
 
     # ------------------------------------------------------------------
     # 轮次生命周期
@@ -169,6 +175,13 @@ class Session:
         # 被 rollback 的轮不会走到这里，提示会继续保留给下一轮（见 anchor_prompt）。
         self.working.pop("__truncated__", None)
         self.working.pop("__plan_boundary__", None)
+
+        if self.on_turn_finished is not None:
+            try:
+                self.on_turn_finished(rec)
+            except Exception:
+                # 落盘是旁路能力：磁盘满/权限问题都不该让 agent 循环挂掉。
+                pass
 
     # ------------------------------------------------------------------
     # 工作记忆（L4 的落地位置）

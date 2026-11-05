@@ -169,6 +169,20 @@ class KernelHooks:
     def finished(self, session: Session, text: str) -> None: ...
     def failed(self, session: Session, err: str) -> None: ...
 
+    # 记忆层工具分类（改进 5/6）。内核只做控制流，不认识 memory/ 路径：
+    # 由上层 hooks 判定，内核只按返回的标签插入提示或触发同步。
+    def classify_tool_call(self, call: ToolCall) -> str:
+        """返回 "" / "sop_read"（读了 L3 SOP）/ "l23_write"（写了 L2/L3）。"""
+        return ""
+
+    def sop_hint(self) -> str:
+        """读到 L3 SOP 后要回灌的「提炼进 key_info」提示；空串表示不提醒。"""
+        return ""
+
+    def memory_written(self) -> None:
+        """L2/L3 写入成功后的同步（L1 索引刷新等）。"""
+        ...
+
 
 class KernelResult:
     """一次 run() 的产物。"""
@@ -790,6 +804,23 @@ class KernelLoop:
             # 改成直接问「模型有没有真的按协议写 <summary>」。
             has_summary = has_summary_tag(resp.content)
 
+            # 改进 5/6：记忆层工具由 hooks 分类，内核只按标签强制动作。
+            # 必须放在下面两个「提前 break」之前：模型在最后一轮写完 L2/L3
+            # 就直接收尾，若把同步放在 parts 段，索引会永远不刷新。
+            # 提示词约束对本地小模型不可靠（本项目多次验证），因此「读了 SOP
+            # 就要把要点提炼进 key_info」「写完 L2/L3 要同步 L1」都在内核层强制。
+            memory_sop_hint = ""
+            try:
+                kinds = [self.hooks.classify_tool_call(tc) for tc in tool_calls]
+                ok = [(k, bool(getattr(r, "success", False)))
+                      for k, r in zip(kinds, raw_results)]
+                if any(k == "l23_write" and good for k, good in ok):
+                    self.hooks.memory_written()
+                if any(k == "sop_read" and good for k, good in ok):
+                    memory_sop_hint = self.hooks.sop_hint()
+            except Exception as e:
+                self.log(f"[kernel] memory hooks error: {e}")
+
             if any(o.should_exit for o in outcomes):
                 final_text = resp.content
                 exit_reason = ExitReason.INTERRUPT
@@ -802,6 +833,8 @@ class KernelLoop:
                 break
 
             parts = list(next_prompts)
+            if memory_sop_hint:
+                parts.append(memory_sop_hint)
             if not has_summary:
                 parts.append("[TIPS] 回复正文必须包含 <summary>…</summary>（≤30 字物理快照）。")
             # 失败恢复提示：计划步骤出错时不许停下等用户说「继续」——依据失败
@@ -1094,7 +1127,10 @@ class KernelLoop:
             # 模型带着答案继续任务。之前把它特判成 INTERRUPT 会让整轮终止、
             # 用户答案被直接丢弃（回答进不了任何后续 LLM 调用）。
             if tc.name == "start_long_term_update":
-                self.distill_requested = True
+                # 改进 6 门控：短任务被 REJECTED 时不触发终止边的 L4 蒸馏
+                # （"短任务不许碰长期记忆"），否则绕过门控照样写知识图谱。
+                if "REJECTED" not in self._result_text(res):
+                    self.distill_requested = True
             # L0：先兜住病态长度（工具本身没上限时保护进程内存），
             # L1：再按 RAW 区余额裁到真正要注入的长度。
             out.append(StepOutcome(

@@ -120,7 +120,7 @@ class ToolRegistry:
 
     # ------------------------------------------------------------------
     def _register_defaults(self) -> None:
-        from .file_ops import FileReadTool, FileWriteTool, FileModifyTool
+        from .file_ops import FileReadTool, FileWriteTool, FileModifyTool, FileAppendTool
         from .code_run import CodeRunTool
         from .shell_run import ShellRunTool
         from .web import WebScanTool, WebExecJsTool
@@ -131,7 +131,7 @@ class ToolRegistry:
         from .plan import UpdatePlanTool
 
         tools_to_register = [
-            FileReadTool(), FileWriteTool(), FileModifyTool(),
+            FileReadTool(), FileWriteTool(), FileModifyTool(), FileAppendTool(),
             CodeRunTool(),
             ShellRunTool(),
             WebScanTool(),

@@ -59,24 +59,36 @@ class ContextBudget:
     """
 
     # 比例（合计 1.0）
+    # 2026-11-05：system 由 0.13（30k 下 3900）提到 1/6（30k 下 5000）。
+    # L0 META-SOP + L1 全局索引常驻 system prompt 后实测约 4553 token，旧配额
+    # 会把它判成超支，由 overspent() 从 RAW 扣回 653 token，工具结果与近期
+    # 原文被无谓裁剪。多出的份额从 RESERVE（模型输出 + 估算误差缓冲）扣，
+    # RAW / TOOLS / EARLIER 保持原值：不加剧折叠、不压近期原文预算。
+    _SYSTEM_RATIO = 1 / 6
     _RATIO = {
-        "system": 0.13,
+        "system": _SYSTEM_RATIO,
         "earlier": 0.09,
         "raw": 0.40,
         "tools": 0.17,
-        "reserve": 0.21,
+        "reserve": 0.21 - (_SYSTEM_RATIO - 0.13),
     }
 
     def __init__(self, total: int = 30_000):
         self.total = max(4_000, int(total))
         r = self._RATIO
         self.quota = Quota(
-            system=int(self.total * r["system"]),
+            # round 而非 int：1/6 的浮点表示乘 30000 会是 4999.999999999999，
+            # 直接 int() 会静默少 1 token（用户要的是恰好 5000）。
+            system=round(self.total * r["system"]),
             earlier=int(self.total * r["earlier"]),
             raw=int(self.total * r["raw"]),
             tools=int(self.total * r["tools"]),
             reserve=int(self.total * r["reserve"]),
         )
+        # 取整尾差（最多 1 token）统一补给 reserve，保证各区配额之和精确
+        # 等于 total —— Quota 的契约是「加起来 = total」。
+        q = self.quota
+        q.reserve += self.total - (q.system + q.earlier + q.raw + q.tools + q.reserve)
         # 实测值（每轮刷新），用于判定是否越界
         self._used = {"system": 0, "earlier": 0, "raw": 0, "tools": 0}
 

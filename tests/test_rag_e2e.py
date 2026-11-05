@@ -718,7 +718,10 @@ class TestRAGTools:
         tool = RagSearchTool(engine)
         result = tool.run(query="")
         assert result.success is False
-        assert "请提供" in result.error
+        # 空参错误必须自带反循环指引（2026-11-03：模型曾空参连发 14 次）
+        assert "query" in result.error
+        assert "不要重复调用" in result.error
+        assert "全书摘要" in result.error
 
     def test_rag_search_tool_no_results(self, engine):
         from src.agent.tools.rag_tool import RagSearchTool

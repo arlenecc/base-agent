@@ -487,7 +487,9 @@ def test_prompt_stays_within_30k_over_long_run(cfg):
 def test_budget_quotas_sum_to_total():
     b = ContextBudget(30_000)
     q = b.quota
-    assert q.system + q.earlier + q.raw + q.tools + q.reserve <= 30_001
+    assert q.system + q.earlier + q.raw + q.tools + q.reserve == 30_000
+    # L0 META-SOP + L1 常驻 system prompt 后配额提升到 5000（2026-11-05）
+    assert q.system == 5_000
     assert q.raw == 12_000
     b.set_used("raw", 20_000)
     assert b.raw_over
@@ -551,7 +553,8 @@ def test_update_working_checkpoint_writes_session(cfg):
     reg.shutdown()
 
 
-def test_start_long_term_update_marks_distill_and_returns_transcript(cfg):
+def test_start_long_term_update_gates_short_tasks(cfg):
+    """改进 6：当前轮数 <5 直接拒绝，短任务不许碰长期记忆。"""
     from agent.tools import ToolRegistry
 
     reg = ToolRegistry(config=cfg, callbacks=Noop())
@@ -561,9 +564,32 @@ def test_start_long_term_update_marks_distill_and_returns_transcript(cfg):
     reg.session = s
 
     res = reg.execute("start_long_term_update", {"focus": "部署流程"})
+    assert res.success  # 成功回执（避免失败记账/原样重试），但状态是拒绝
+    assert "REJECTED" in res.output
+    assert "不要重试" in res.output
+    assert "记忆提纯" not in res.output
+    reg.shutdown()
+
+
+def test_start_long_term_update_returns_purify_prompt(cfg):
+    """改进 6：≥5 轮才受理，回执【记忆提纯】prompt 与会话摘要。"""
+    from agent.tools import ToolRegistry
+
+    reg = ToolRegistry(config=cfg, callbacks=Noop())
+    s = Session(budget=ContextBudget(30_000))
+    for i in range(5):
+        rec = s.start_turn(f"步骤{i}")
+        s.finish_turn(rec, "完成", [], [], f"第{i}步完成")
+    rec = s.start_turn("部署到 staging")
+    s.finish_turn(rec, "已部署", [], [], "部署完成")
+    reg.session = s
+
+    res = reg.execute("start_long_term_update", {"focus": "部署流程"})
     assert res.success
-    assert "DISTILL_REQUESTED" in res.output
+    assert "MEMORY_PURIFY_REQUESTED" in res.output
+    assert "记忆提纯" in res.output
     assert "部署完成" in res.output
+    assert "global_mem.txt" in res.output
     reg.shutdown()
 
 

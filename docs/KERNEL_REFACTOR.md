@@ -105,11 +105,11 @@ base-agent 现状是 O(轮次 × 8K)，每轮重发全部 —— 这是最本质
 **预算分配（总计 30 000 tokens）**
 
 ```
-SYS     4 000  系统提示 + 记忆索引 + 工作记忆 checkpoint
+SYS     5 000  系统提示 + 记忆索引 + 工作记忆 checkpoint
 EARLIER 2 500  L3 折叠摘要区
 RAW    12 000  L1 裁剪后的最近 K 轮原文（含当前轮工具输出）
 TOOLS   5 000  工具 schema
-RESERVE 6 500  模型输出 + 估算误差
+RESERVE 5 500  模型输出 + 估算误差
 ```
 
 `ContextBudget` 按上述配额核算；`Session.build_messages()` 在超配额时**强制折叠**最老的原文轮，
