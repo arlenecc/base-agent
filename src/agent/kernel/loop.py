@@ -382,6 +382,12 @@ class KernelLoop:
                 seed.get("same_tool_fail_streak", 0) or 0)
             self._same_tool_fail_name = seed.get("same_tool_fail_name")
             self._did_work = bool(seed.get("did_work", False))
+            # 续跑段继承本用户轮次已用的检索次数，硬上限才是真正的 3 次。
+            self._rag_search_calls = int(seed.get("rag_search_calls", 0) or 0)
+            self._repeat_streak = int(seed.get("repeat_streak", 0) or 0)
+            self._last_call_sigs = list(seed.get("last_call_sigs") or [])
+            self._step_fails = int(seed.get("step_fails", 0) or 0)
+            self._shrink_guard = int(seed.get("shrink_guard", 0) or 0)
         # max_turns 是「本次 run() 的轮次上限」，不是「整个会话的累计轮次」。
         # Session.turn_index 跨 run() 单调递增（它就是历史编号），拿它当循环
         # 上界会让 Agent 在累计 N 轮之后彻底不再调用 LLM。
@@ -735,10 +741,19 @@ class KernelLoop:
                                  if exec_calls else [])
             except Exception as e:
                 self.log(f"[kernel] dispatcher error: {e}")
-                _exec_results = [None] * len(exec_calls)
+                # 按 tool_calls（而非 exec_calls）补齐：本批若含被门禁拦截的
+                # ask_user / 超限 rag_search，旧实现结果数不足会让下面的
+                # next() 抛 StopIteration，整个用户轮次直接异常中断。
+                _exec_results = [None] * len(tool_calls)
             _exec_iter = iter(_exec_results)
-            raw_results = [blocked_asks[tc.id] if tc.id in blocked_asks
-                           else next(_exec_iter) for tc in tool_calls]
+            raw_results = []
+            for tc in tool_calls:
+                if tc.id in blocked_asks:
+                    raw_results.append(blocked_asks[tc.id])
+                else:
+                    # 结果不足时补 None（_result_ok 明确判为失败），不再抛
+                    # StopIteration，也不让 zip 静默截断后面的结果。
+                    raw_results.append(next(_exec_iter, None))
 
             # 失败记账必须在拼装 pending 之前：步骤内失败数要在 update_plan
             # 把它重置之前，被「未充分尝试就 blocked」的守卫读走。
@@ -768,6 +783,13 @@ class KernelLoop:
                 if self._repeat_streak >= _REPEAT_CALL_LIMIT:
                     # 提醒已经给过，仍在原地打转 → 收尾，别再烧轮次。
                     self.log("[kernel] 重复调用达到上限，结束本轮")
+                    # 必须给可见文本：空 final_text 会被 Agent.run 的兜底
+                    # 解释成「模型连续多次返回空响应」，用户被误导，且计划
+                    # 有 open 步时还会触发无意义续跑。
+                    if not (final_text or "").strip():
+                        final_text = (resp.content or "").strip() or (
+                            "（检测到连续重复的工具调用，已停止本轮以避免空转。"
+                            "请换一种做法或换个说法再问一次。）")
                     exit_reason = ExitReason.DONE
                     break
                 # 只收集、不直接赋值 pending：pending 会在下面被
@@ -822,13 +844,13 @@ class KernelLoop:
                 self.log(f"[kernel] memory hooks error: {e}")
 
             if any(o.should_exit for o in outcomes):
-                final_text = resp.content
+                final_text = (resp.content or "").strip() or "（工具要求中断本轮。）"
                 exit_reason = ExitReason.INTERRUPT
                 break
 
             next_prompts = sorted({o.next_prompt for o in outcomes if o.next_prompt})
             if not next_prompts:
-                final_text = resp.content
+                final_text = (resp.content or "").strip() or "（本轮已结束。）"
                 exit_reason = ExitReason.DONE
                 break
 
@@ -1082,12 +1104,26 @@ class KernelLoop:
         resp = LLMResponse(
             content=text,
             reasoning=reasoning_text,
-            tool_calls=[self._to_tool_call(c) for c in calls],
+            tool_calls=self._unique_call_ids(
+                [self._to_tool_call(c) for c in calls]),
             usage=usage,
             raw_content=raw_buf,
         )
         resp.summary = l2_summary(text, [tc.name for tc in resp.tool_calls]) if text else ""
         return resp
+
+    @staticmethod
+    def _unique_call_ids(calls: List[ToolCall]) -> List[ToolCall]:
+        """批内 id 唯一化：模型偶尔给两条调用发同一个 id，而 blocked_asks
+        以 id 为 key，同 id 会共享拦截占位并让结果错位。"""
+        seen: set = set()
+        n = 0
+        for tc in calls:
+            while tc.id in seen:
+                n += 1
+                tc.id = f"{tc.id}_dup{n}"
+            seen.add(tc.id)
+        return calls
 
     def _to_tool_call(self, raw: Dict[str, Any]) -> ToolCall:
         fn = (raw.get("function") or {}) if isinstance(raw, dict) else {}
@@ -1099,7 +1135,12 @@ class KernelLoop:
             args = {"__parse_error__": f"Invalid JSON in tool arguments: {e}",
                     "__raw__": args_raw}
         if not isinstance(args, dict):
-            args = {}
+            # 模型偶尔把 arguments 写成 JSON 数组/null/数字；静默当 {} 会让
+            # registry 报「缺少必填参数」，模型随后原样重试形成循环。明确
+            # 报回原文片段，让它知道该改的是 arguments 形状。
+            args = {"__parse_error__": (
+                "tool arguments 必须是 JSON 对象；实际为 "
+                f"{type(args).__name__}: {str(args)[:200]}")}
         tid = str(raw.get("id") or "")
         if not tid:
             # 部分本地模型不发 id；没有 id 就无法把 tool 结果关联回去。
@@ -1205,6 +1246,17 @@ class KernelLoop:
             # 反思门文案会变成「你还一次工具都没调用」（对已经干过活的段是错的，
             # 会误导模型），失败感知预算也会从 6 掉回 2。
             "did_work": self._did_work,
+            # rag_search 硬上限按「用户轮次」而非「内核段」计：自动续跑最多
+            # 4 段，若每段各自清零，单次用户输入最坏可检索 4×3=12 次，
+            # 与「outliner 后 search 不超过 3 次」的约束直接相悖。
+            "rag_search_calls": self._rag_search_calls,
+            # 这四个若不在段间传递，每段都会重新获得「5 次重复调用空转 /
+            # 3 次上下文收缩重试」的额度，且 _premature_block 丢失步骤内
+            # 失败次数；叠加最多 5 段续跑会放大成 75 轮 LLM。
+            "repeat_streak": self._repeat_streak,
+            "last_call_sigs": list(self._last_call_sigs),
+            "step_fails": self._step_fails,
+            "shrink_guard": self._shrink_guard,
         }
 
     def seed_failures(self, snapshot: Optional[Dict[str, Any]]) -> None:
@@ -1413,7 +1465,9 @@ class KernelLoop:
         """
         t = (user_input or "").strip().lower()
         if not t:
-            return True
+            # 空输入不是寒暄：否则会命中 ask_user 硬门禁与「无文字直接收尾」，
+            # 把一个空/异常请求误判成问候。
+            return False
         t = t.rstrip("。！？!?，,.、；; \t\n")
         return t in KernelLoop._GREETING_SET
 

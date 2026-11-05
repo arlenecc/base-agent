@@ -68,7 +68,18 @@ class UpdateWorkingCheckpointTool(Tool):
         self.registry = registry
 
     def run(self, key_info: str, persist: bool = False) -> ToolResult:
-        text = (key_info or "").strip()[:_MAX_KEY_INFO]
+        # 严格布尔解析：与 rag_ingest(force=...) 对齐。模型/JSON 序列化把
+        # persist 传成字符串 "false" 时，非空字符串都是真值 → 会意外把临时
+        # checkpoint 写进跨会话的 work_memory.json。
+        if isinstance(persist, str):
+            persist = persist.strip().lower() in ("1", "true", "yes", "on")
+        elif persist is None:
+            persist = False
+        else:
+            persist = bool(persist)
+        # 非字符串 key_info 也不能让 .strip() 抛异常（registry 会误报成
+        # 「工具内部错误」，本地小模型随后原样重试形成循环）。
+        text = str(key_info or "").strip()[:_MAX_KEY_INFO]
         sess = _session(self.registry)
         if sess is None:
             # 旧实现这里静默返回成功，模型以为 checkpoint 已写入，实际什么都没存
@@ -130,7 +141,10 @@ class StartLongTermUpdateTool(Tool):
 
     def run(self, focus: str = "") -> ToolResult:
         sess = _session(self.registry)
-        turns = int(getattr(sess, "current_turn", 0) or 0)
+        try:
+            turns = int(getattr(sess, "current_turn", 0) or 0)
+        except (TypeError, ValueError):
+            turns = 0
         # 改进 6 门控：短任务不许碰长期记忆。用「成功 + REJECTED」而不是失败
         # 返回：内核会把失败计入熔断记账，且本地小模型常对失败原样重试。
         if turns < LONG_TERM_MIN_TURNS:

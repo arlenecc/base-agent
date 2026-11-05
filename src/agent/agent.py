@@ -191,8 +191,11 @@ class _ToolDispatcher:
         if self._cache is None:
             try:
                 self._cache = self.agent.tools.schemas()
-            except Exception:
-                self._cache = []
+            except Exception as e:
+                # 旧实现把一次失败缓存成 []，之后整个会话模型都看不到任何
+                # 工具，且内核的 schema 告警分支因异常已被吞永远不会触发。
+                logger.warning("[kernel] 工具 schema 获取失败（本轮不缓存，下轮重试）: %s", e)
+                return []
         return self._cache
 
     def dispatch(self, tool_calls: List["Any"]) -> List[ToolResult]:
@@ -392,6 +395,9 @@ class Agent:
         )
         # 工具通过 registry.session 读写工作记忆（update_working_checkpoint 等）
         self.tools.session = self.session
+        # rag_ingest 工具由模型自行触发同步时，通知这里失效知识库状态缓存，
+        # 避免随后 volatile_context 继续注入 30s 前的旧 chunks 数。
+        self.tools.on_rag_data_changed = self.invalidate_rag_status
         self._last_user_text = ""
         self._distill_min_turns = 6
         # 自动续跑开关（MAX_TURNS 截断 / 提前收尾但计划未完成时自动续跑，
@@ -453,6 +459,17 @@ class Agent:
         self.session.reset()
         self.kernel._total_tokens = 0
         self.kernel._last_consolidated_turn = -1
+        # 清空对话必须连预算记账与跨段 seed 一起归零：否则新一轮的
+        # CONSOLIDATE 会在重算前读到旧账，残留 seed 还会污染下一轮输入。
+        for _sec in ("system", "earlier", "raw", "tools"):
+            self._budget.set_used(_sec, 0)
+        self.kernel._seed_failures = None
+        self.kernel._rag_search_calls = 0
+        self.kernel._repeat_streak = 0
+        self.kernel._last_call_sigs = []
+        self.kernel._step_fails = 0
+        self.kernel._shrink_guard = 0
+        self._last_user_text = ""
         # Invalidate cached prompt
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
@@ -1127,16 +1144,29 @@ class Agent:
                 self._log("[agent] 空回复：已向用户返回可见提示")
             elif result is None:
                 text = "（本轮异常中断，请查看上方错误信息后重试。）"
-            self._fire_finished_hook(text)
+            # 取消 / 异常 / 空回复轮次不做经验沉淀：否则「（已取消本次对话。）」
+            # 会被拿去抽取事实、写知识图谱，甚至固化成 SKILL.md。UI 的 _busy
+            # 复位由下面无条件执行的 callbacks.on_finished() 负责，不受影响。
+            self._fire_finished_hook(
+                text,
+                allow_memory=(result is not None
+                              and result.reason in (ExitReason.DONE, ExitReason.MAX_TURNS)
+                              and bool((text or "").strip())),
+            )
             self.callbacks.on_finished()
         return text
 
-    def _fire_finished_hook(self, text: str) -> None:
+    def _fire_finished_hook(self, text: str, allow_memory: bool = True) -> None:
         """整个用户轮次（含全部自动续跑段）结束后，触发一次 finished 钩子。
 
         事实抽取与 L4 蒸馏都在这个钩子里，是「一次用户输入一次」的语义；
         直接由内核每段触发会把它们放大成最多 4 次。
+        ``allow_memory=False`` 用于取消/异常/空回复轮次：只跳过经验沉淀，
+        UI 复位仍由调用方的 ``callbacks.on_finished()`` 完成。
         """
+        if not allow_memory:
+            self._log("[agent] 取消/异常/空回复轮次跳过经验沉淀")
+            return
         hooks = getattr(self.kernel, "hooks", None)
         finished = getattr(hooks, "finished", None)
         if not callable(finished):

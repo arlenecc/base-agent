@@ -14,6 +14,26 @@ from ..config import AgentConfig
 
 logger = logging.getLogger(__name__)
 
+# 工具参数由模型提供，可能携带密钥/token/MCP env；日志与异常回执里不能
+# 原样落盘（UI 的 kernel debug log 也走同一条 logger）。
+_SENSITIVE_KEY = ("key", "token", "secret", "password", "auth",
+                  "credential", "env", "cookie", "_raw_arguments")
+
+
+def _redact_args(args: Any) -> Dict[str, Any]:
+    """给日志用的参数摘要：敏感键打码、其余截断，避免整份参数落日志。"""
+    if not isinstance(args, dict):
+        return {"_": f"<{type(args).__name__}>"}
+    out: Dict[str, Any] = {}
+    for k, v in args.items():
+        key = str(k)
+        if any(s in key.lower() for s in _SENSITIVE_KEY):
+            out[key] = f"<redacted:{type(v).__name__}>"
+        else:
+            s = str(v)
+            out[key] = s[:120] + ("…" if len(s) > 120 else "")
+    return out
+
 
 @dataclass
 class ToolResult:
@@ -196,7 +216,9 @@ class ToolRegistry:
             name = server_cfg.get("name", "")
             command = server_cfg.get("command", "")
             if not name or not command:
-                logger.warning("MCP server config missing name or command: %s", server_cfg)
+                # server_cfg 可能含 mcp_servers[].env（整份 API key/token）
+                logger.warning("MCP server config missing name or command (keys=%s)",
+                               list(server_cfg.keys()))
                 continue
 
             try:
@@ -339,6 +361,10 @@ class ToolRegistry:
                 # 窗口夹紧用实际生效的本地模型（local 模式取 local_embedding_model），
                 # 避免 rag_embedding_model 的遗留值把 800 夹成 bge 的 510。
                 clamp_model=effective_embedding_model(self.config),
+                # 阈值此前只经 UI 的 configure_local_models 注入模块级全局，
+                # 脚本/嵌入式/直接构造 Agent 的路径永远拿到硬编码 0.5。
+                # 由引擎自己持有并显式下传（非法值在引擎构造里安全回退）。
+                min_similarity=getattr(self.config, "rag_rerank_min_similarity", 0.5),
             )
             self._rag_engine = engine
 
@@ -475,6 +501,13 @@ class ToolRegistry:
             except Exception as e:
                 logger.warning("⚠ RAG 引擎资源释放异常: %s", e)
             self._rag_engine = None
+            # 工具对象仍持有刚 close 的引擎；若不摘掉，shutdown 后一次
+            # execute() 会经 _get_store() 静默重建 LanceDB 连接并重新加载
+            # embedding 权重（~600MB C++ 堆），且拿到半死引擎的状态。
+            for _rag_name in ("rag_search", "rag_outline", "rag_status", "rag_ingest"):
+                _rag_tool = self._tools.get(_rag_name)
+                if _rag_tool is not None and hasattr(_rag_tool, "_engine"):
+                    _rag_tool._engine = None
         # Release the singleton LongTermMemory's GraphMemoryStore (LanceDB +
         # FastEmbed ONNX model ~137MB).  Without this, each _rebuild_agent()
         # call leaks the model loaded for the knowledge graph.
@@ -561,7 +594,8 @@ class ToolRegistry:
             result = tool.run(**args)
         except TypeError as e:
             # 签名已通过 → 这里的 TypeError 是工具内部缺陷，如实报告。
-            logger.exception("tool %s raised TypeError internally (args=%r)", name, args)
+            logger.exception("tool %s raised TypeError internally (args=%s)",
+                             name, _redact_args(args))
             return ToolResult(
                 success=False,
                 error=f"{name} failed internally (not an argument problem): "

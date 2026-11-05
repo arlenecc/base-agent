@@ -172,7 +172,9 @@ class WorkMemoryTool(Tool):
             if not key:
                 return ToolResult(False, error="op 'get' requires 'key'")
             v = wm.get(key)
-            return ToolResult(True, output=v if v is not None else "")
+            # work_memory 存的是任意 JSON 值；非字符串 output 会让上层的
+            # len(res.output) 抛 TypeError，整批 dispatch 崩掉。
+            return ToolResult(True, output=str(v) if v is not None else "")
         if op == "list":
             return ToolResult(True, output=json.dumps(wm.list(), ensure_ascii=False))
         if op == "clear":

@@ -1009,6 +1009,8 @@ def _table_state_token(table: Any) -> int:
 # 向量索引），sqlite 的 PRIMARY KEY 点查 O(log n) 且无 schema/维度问题；向量
 # 按 float16 blob 存储（int8 量化下游远比 float16 粗糙，精度无损感知）。
 _EMBED_CACHE_DB = "embedding_cache.sqlite"
+# 保护 _get_embed_cache 的惰性初始化（多实例并发首次调用）
+_EMBED_CACHE_INIT_LOCK = threading.Lock()
 # 内存 LRU 上限（条）。768 维 float16 ≈ 1.5KB/条 → 16k 条 ≈ 25MB。
 _EMBED_CACHE_MEM_MAX = 16384
 # 磁盘行数上限：超过按 created_at 淘汰最旧的一半（内容寻址缓存，淘汰无损
@@ -1119,9 +1121,17 @@ class _EmbeddingCache:
         con = sqlite3.connect(
             os.path.join(self._dir, _EMBED_CACHE_DB), check_same_thread=False)
         con.execute("PRAGMA journal_mode=WAL")
+        # agent 引擎与 UI 同步 worker 会各开一个连接到同一份缓存 DB：
+        # 没有 busy_timeout 时一次写锁竞争即抛 "database is locked"，该实例
+        # 的磁盘缓存会被永久关闭。
+        con.execute("PRAGMA busy_timeout=5000")
         con.execute(
             "CREATE TABLE IF NOT EXISTS cache ("
             "key TEXT PRIMARY KEY, dim INTEGER, vec BLOB, created_at REAL)")
+        # 淘汰路径按 created_at 排序；50 万行时无索引的全表排序会造成
+        # 明显的同步期 I/O 抖动。
+        con.execute("CREATE INDEX IF NOT EXISTS idx_cache_created_at "
+                    "ON cache(created_at)")
         con.commit()
         self._con = con
 
@@ -1239,6 +1249,10 @@ class VectorStore:
         # rerank 是否走了回退路径（RRF/向量排序）：回退结果不进查询缓存，
         # 避免「reranker 加载失败期间的降级排序」被缓存 10 分钟。
         self._last_rerank_used_fallback = False
+        # 降级标记必须是「每次调用」的局部状态：rag_search 在内核的并行白名单
+        # 里，多个检索并发共享同一 VectorStore，实例属性会互相串味（A 读到 B
+        # 的降级结果，甚至把降级排序写进 10 分钟查询缓存）。
+        self._rerank_tls = threading.local()
         # 当前打开的表是否已通过 embedding 指纹校验（通过后不再重复读 meta 表）。
         # 建表 / 表被 clear 或 close 后复位，下次 add/search 重新校验。
         self._fingerprint_checked = False
@@ -2164,13 +2178,18 @@ class VectorStore:
             return self._embed_cache
         if self._db is None or self._ef is None:
             return None
-        try:
-            self._embed_cache = _EmbeddingCache(
-                self._persist_dir, _embedding_model_name(self._ef))
-            return self._embed_cache
-        except Exception as e:
-            logger.warning("  ⚠ 嵌入缓存初始化失败（直连嵌入）: %s", e)
-            return None
+        # 双检锁：两个实例并发首次调用时，无锁版本会各建一个 sqlite 连接，
+        # 其中一个成为泄漏的孤儿连接。初始化本身极便宜，串行无性能损失。
+        with _EMBED_CACHE_INIT_LOCK:
+            if self._embed_cache is not None:
+                return self._embed_cache
+            try:
+                self._embed_cache = _EmbeddingCache(
+                    self._persist_dir, _embedding_model_name(self._ef))
+                return self._embed_cache
+            except Exception as e:
+                logger.warning("  ⚠ 嵌入缓存初始化失败（直连嵌入）: %s", e)
+                return None
 
     def _embed_chunks(
         self, chunks: List[Dict[str, Any]], start_idx: int, ef=None,
@@ -2816,7 +2835,9 @@ class VectorStore:
         """
         # 供 search_with_rerank 感知「本结果是降级排序」——降级结果不进查询
         # 缓存（reranker 恢复后不应继续命中旧降级结果）。
+        # 实例属性保留供外部观测/既有测试读取；内部判定改用线程局部值。
         self._last_rerank_used_fallback = True
+        self._rerank_tls.used_fallback = True
         logger.info("  ├─ 重排序: Reranker 不可用, 使用向量距离排序 (回退模式)")
         for c in candidates:
             try:
@@ -3213,8 +3234,12 @@ class VectorStore:
         candidate_multiplier: int = 4,
         where: Optional[str] = None,
         min_similarity: Optional[float] = None,
+        use_reranker: bool = True,
     ) -> List[Dict[str, Any]]:
         """Hybrid retrieval: vector similarity + BM25 keyword, then BGE rerank.
+
+        ``use_reranker=False`` 时跳过精排，但仍保留向量 + BM25 两路 RRF 融合
+        （而不是退化成纯向量检索）。
 
         Pipeline:
           0. （可选，rag_binary_prefilter_enabled）两段式检索：查询向量二值化
@@ -3236,6 +3261,10 @@ class VectorStore:
             min_similarity: Reject rerank results below this score. ``None``
                 (默认) 取模块级 ``_RERANK_MIN_SIMILARITY``（config.rag_rerank_min_similarity）。
         """
+        # 阈值必须在算缓存 key 之前解析：旧实现到第 4 步才取全局值，缓存
+        # key 不含它，改 rag_rerank_min_similarity 后最长 600s 仍命中旧结果。
+        if min_similarity is None:
+            min_similarity = _RERANK_MIN_SIMILARITY
         n_candidates = top_k * candidate_multiplier
 
         # 二值粗筛模式判定（决定缓存 kind：两段式与原流程结果可能不同，
@@ -3244,6 +3273,9 @@ class VectorStore:
         bin_mode = (table is not None
                     and self._binary_prefilter_ready(table))
         kind = "hybrid_bin" if bin_mode else "hybrid"
+        # 阈值 + 是否精排一起进 key：否则「改阈值」「关闭 rerank」都会命中
+        # 之前那套排序，配置看起来完全不生效。
+        kind = f"{kind}|s{float(min_similarity):.3f}|r{int(bool(use_reranker))}"
 
         # 0. 查询缓存：hybrid 全链路（向量 + BM25 + 重排）结果复用，命中时
         #    省掉查询向量化 + ANN + FTS + cross-encoder 打分整条链路。
@@ -3307,30 +3339,38 @@ class VectorStore:
         rerank_input = [it for it, _s in fused[:_RERANK_MAX_CANDIDATES]]
 
         # 4. BGE rerank + 5. min_similarity filter.
-        if min_similarity is None:
-            min_similarity = _RERANK_MIN_SIMILARITY
-        self._last_rerank_used_fallback = False
-        results = self.rerank(query, rerank_input, top_k=top_k,
-                              min_similarity=min_similarity)
-        logger.info(
-            "VectorStore.search_with_rerank: %d 候选 → %d 条 (rerank + 相似度≥%.2f 过滤)",
-            len(rerank_input), len(results), min_similarity,
-        )
-
-        # 6. 兜底：reranker 不可用/打分失败（_rerank_fallback 已触发）或严格
-        #    过滤后无结果（查询词质量差——拼音、口语化、噪声词等）时，用 RRF
-        #    融合两路排名返回 top_k 条候选，避免 LLM 完全拿不到上下文。旧的
-        #    纯向量距离排序会把 BM25 通道的贡献完全丢掉。
-        used_fallback = self._last_rerank_used_fallback
-        if used_fallback or (not results and fused):
+        self._last_rerank_used_fallback = False  # 保留供外部观测/既有测试读取
+        self._rerank_tls.used_fallback = False   # 本次调用的线程局部真值
+        results: List[Dict[str, Any]] = []
+        all_below = False
+        if use_reranker:
+            results = self.rerank(query, rerank_input, top_k=top_k,
+                                  min_similarity=min_similarity)
             logger.info(
-                "VectorStore.search_with_rerank: %s, 使用 RRF 融合排序兜底",
-                "reranker 不可用" if used_fallback else "rerank 过滤后无结果",
+                "VectorStore.search_with_rerank: %d 候选 → %d 条 (rerank + 相似度≥%.2f 过滤)",
+                len(rerank_input), len(results), min_similarity,
             )
+            # _filter_by_similarity 在全部候选低于阈值时会「至少保留 1 条」，
+            # 使原先的 `not results` 兜底分支成为死代码。识别这种情形，让
+            # BM25 高分但 reranker 语义分低的候选也能经 RRF 融合进来。
+            try:
+                top_score = float(results[0].get("score") or 0) if results else 0.0
+            except (TypeError, ValueError):
+                top_score = 0.0
+            all_below = len(results) == 1 and top_score < min_similarity
+        used_fallback = bool(getattr(self._rerank_tls, "used_fallback", False))
+
+        # 6. 兜底：reranker 不可用 / 全部低于阈值 / 配置关闭重排 / 过滤后无结果
+        #    时，用 RRF 融合两路排名返回 top_k 条。旧的纯向量距离排序会把
+        #    BM25 通道的贡献完全丢掉；关闭 rerank 时也不该退化成纯向量。
+        if used_fallback or all_below or not use_reranker or (not results and fused):
+            reason = ("reranker 不可用" if used_fallback else
+                      "全部候选低于阈值" if all_below else
+                      "重排已在配置中关闭" if not use_reranker else
+                      "rerank 过滤后无结果")
+            logger.info("VectorStore.search_with_rerank: %s, 使用 RRF 融合排序", reason)
             results = self._rrf_fallback(vec_candidates, fts_candidates, top_k)
             used_fallback = True
-            # 标记本次为降级排序（含「过滤后无结果」的 RRF 兜底分支），否则外部
-            # 无法察觉 reranker 实际已被旁路。
             self._last_rerank_used_fallback = True
         # 只有 reranker 真实参与的排序结果才进查询缓存；降级排序不缓存
         # （否则 reranker 恢复后仍会命中 10 分钟前的降级结果）。

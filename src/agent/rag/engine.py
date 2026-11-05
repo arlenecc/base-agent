@@ -661,6 +661,7 @@ class RAGEngine:
         rerank_enabled: bool = True,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
         clamp_model: str = "",
+        min_similarity: Optional[float] = None,
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -694,6 +695,14 @@ class RAGEngine:
         # 关掉重排序或换模型都完全无效（README / 设计文档却宣称可用）。这里接线：
         # 关闭时 search 直接走向量+BM25 混合排序，不加载 ~2.3GB 的 reranker。
         self._rerank_enabled = bool(rerank_enabled)
+        # 相似度阈值由 config 显式注入（不依赖 configure_local_models 的模块级
+        # 全局；脚本/嵌入式/直接构造 Agent 的路径从没走过那个 UI 初始化）。
+        # None 时由 VectorStore 退回自身的默认 0.5。
+        try:
+            self._min_similarity = (float(min_similarity)
+                                    if min_similarity is not None else None)
+        except (TypeError, ValueError):
+            self._min_similarity = None
         self._parallel_workers = max(1, int(parallel_workers))
         self._store: Optional[VectorStore] = None
         self._store_lock = threading.Lock()  # 保护 _store 懒初始化的线程安全
@@ -2100,12 +2109,17 @@ class RAGEngine:
             query[:80], top_k, store_count,
         )
         logger.info("  ├─ 混合初检: 向量相似度 + BM25 关键词, 各取 top %d 候选", top_k * 4)
-        if self._rerank_enabled:
-            results = store.search_with_rerank(query, top_k=top_k, where=where)
-        else:
+        # 两条路径都走 search_with_rerank：关闭精排时仍保留向量 + BM25 的
+        # RRF 融合。旧实现退回 store.search() 是**纯向量**，中文关键词/专名/
+        # 书名等 BM25 强项整条通道消失，日志却仍宣称「混合检索」。
+        results = store.search_with_rerank(
+            query, top_k=top_k, where=where,
+            min_similarity=self._min_similarity,
+            use_reranker=self._rerank_enabled,
+        )
+        if not self._rerank_enabled:
             logger.info("  ├─ 重排序已在配置中关闭 (rag_rerank_enabled=false)，"
-                        "直接使用混合检索排序")
-            results = store.search(query, top_k=top_k, where=where)
+                        "跳过 reranker，保留向量 + BM25 的 RRF 融合排序")
         t_total = time.monotonic() - t0
         if results:
             logger.info("  └─ ✅ 检索完成: 返回 %d 条结果 (耗时 %.2fs)", len(results), t_total)
@@ -2145,8 +2159,9 @@ class RAGEngine:
                 "列出全部文档；若是检索词太偏，可换用资料中可能出现的措辞重试。）"
             )
 
-        lines = [f"从知识库检索到 {len(results)} 条相关内容（已重排序）：\n"]
-        total = 0
+        head = f"从知识库检索到 {len(results)} 条相关内容（已重排序）：\n"
+        lines = [head]
+        total = len(head) + 1
         for i, r in enumerate(results, 1):
             # 回退结果（向量排序）可能缺键，直接下标会 KeyError 打断整个工具
             # 调用；用 .get() 兜底。
@@ -2155,15 +2170,16 @@ class RAGEngine:
             text = r.get("text") or ""
             if len(text) > max_chars_per_result:
                 text = text[:max_chars_per_result] + "…"
-            lines.append(header)
-            total += len(header) + 1
-            lines.append(text)
-            total += len(text)
-            lines.append("")
-            total += 1
-            if total >= max_total_chars:
+            # 追加前预估：旧实现在 append 之后才判断，单条最长 1500 字会把
+            # 8000 上限撑到 ~9500 字，工具层 200k 兜底对此毫不起作用。
+            block = len(header) + 1 + len(text) + 1 + 1
+            if total + block > max_total_chars:
                 lines.append("…（结果过长，已截断）")
                 break
+            lines.append(header)
+            lines.append(text)
+            lines.append("")
+            total += block
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -2259,16 +2275,24 @@ class RAGEngine:
             books = state.get("books", {})
             if doc_name in books:
                 return books[doc_name].get("book_summary", "") or ""
-            # 名称模糊匹配（与 get_document_digest 同风格：精确 → basename → 子串）
+            # 精确 → basename → 单向子串（且查询词至少 4 字，多候选命中返回空）。
+            # 旧实现的双向子串会让「导论」「第一卷」这类短词命中错误书籍的
+            # 全书摘要，作为【全书摘要】注入后直接误导回答。
             target = (doc_name or "").strip().lower()
+            fuzzy_hits = []
             for name, book in books.items():
-                if (name.lower() == target
-                        or os.path.basename(name).lower() == target
-                        or (target and (target in name.lower()
-                                        or name.lower() in target))):
+                low = name.lower()
+                if low == target or os.path.basename(name).lower() == target:
                     return book.get("book_summary", "") or ""
-        except Exception:
-            pass
+                if len(target) >= 4 and target in low:
+                    fuzzy_hits.append(book)
+            if len(fuzzy_hits) == 1:
+                return fuzzy_hits[0].get("book_summary", "") or ""
+            if len(fuzzy_hits) > 1:
+                logger.info("RAG: 书名 %r 模糊匹配到 %d 本，跳过全书摘要以免串书",
+                            doc_name, len(fuzzy_hits))
+        except Exception as e:
+            logger.warning("RAG: 读取全书摘要失败: %s", e)
         return ""
 
     def ensure_digests_for_cached_documents(self, refresh_stale: bool = False) -> int:
@@ -2432,12 +2456,20 @@ class RAGEngine:
         # 后 ingest 仍会返回，调用方（SyncKnowledgeWorker）紧接着就 close()。
         # 不先撤 worker 的话，它们随后会对着已关闭的 LanceDB/ONNX 会话报错，
         # 并把大文档的切片内存继续占着（线程是 daemon，不会阻止进程退出）。
-        if self._ingest_lock.acquire(blocking=False):
-            try:
-                self._cancelled.set()
-            finally:
-                self._ingest_lock.release()
         self._cancelled.set()
+        # 等待在途 ingest 退出：worker 的取消是协作式的（文件/批次边界生效），
+        # 若此刻直接 close store，它们在途的 add_streaming 会对着已关闭的
+        # LanceDB 报错，整轮已解析数据全废，OCR/docling 单例也会被提前摘掉。
+        # 先无阻塞探测（绝大多数路径没有在途 ingest，零延迟）；探测失败才
+        # 带超时等待，避免关窗被一个数分钟的大文件解析无限期卡住。
+        if self._ingest_lock.acquire(blocking=False):
+            self._ingest_lock.release()
+        elif self._ingest_lock.acquire(timeout=5.0):
+            self._ingest_lock.release()
+        else:
+            logger.warning(
+                "RAG: close() 等待在途 ingest 退出超时 5s，仍继续释放资源；"
+                "本次同步可能丢弃尚未写入的切片")
         if self._store is not None:
             with self._store_lock:
                 if self._store is not None:

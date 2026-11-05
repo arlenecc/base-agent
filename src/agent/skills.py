@@ -187,8 +187,11 @@ class SkillManager:
         keywords = list(keywords or [])
         tags = list(tags or [])
 
-        # Sanitize name → directory name
-        dir_name = re.sub(r"[^\w\-.]", "-", name.lower().strip()).strip("-")
+        # Sanitize name → directory name。
+        # 不能放行 "."：name=".." 会变成 dir_name=".."，os.path.join 后逃出
+        # skills 目录，skill.json 被写到 .agent/ 下（工具层 skill_save 已有
+        # realpath 防护，这里是独立的公开 API 残留入口）。
+        dir_name = re.sub(r"[^\w\-]", "-", name.lower().strip()).strip("-")
         if not dir_name:
             dir_name = "unnamed-skill"
         # Ensure uniqueness.

@@ -123,7 +123,7 @@ class UpdatePlanTool(Tool):
         sess = _session(self.registry)
         if sess is None:
             return ToolResult(False, error="plan unavailable (no kernel session)")
-        op = (op or "").strip().lower()
+        op = str(op or "").strip().lower()
 
         if op == "clear":
             sess.clear_plan()
@@ -212,7 +212,7 @@ class UpdatePlanTool(Tool):
             cur = sess.get_plan()
             if cur is None:
                 return ToolResult(False, error="no plan to patch — call op='create' first")
-            new_status = (status or "").strip().lower()
+            new_status = str(status or "").strip().lower()
             if new_status and new_status not in ("pending", "doing", "done",
                                                  "blocked", "skipped"):
                 return ToolResult(False, error=f"invalid status: {status!r}")

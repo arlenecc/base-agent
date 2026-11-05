@@ -253,10 +253,19 @@ def l4_extract_json(text: str) -> Dict[str, Any]:
 
 def l4_normalize(data: Dict[str, Any]) -> Dict[str, Any]:
     """归一化提纯结果，所有字段都有确定类型，避免下游 KeyError/TypeError。"""
+    def _clean(s: str) -> str:
+        # 蒸馏内容来自工具输出/用户输入，会经知识图谱与 SKILL.md 再次回注
+        # 到 prompt（间接 prompt 注入闭环）。去掉控制字符、伪造的协议标签，
+        # 并限制单条长度，避免超长注入文本常驻上下文。
+        s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", s)
+        s = re.sub(r"</?(?:summary|thinking|think|system|user|assistant)\s*>",
+                   " ", s, flags=re.IGNORECASE)
+        return s.strip()[:160]
+
     def _strlist(v: Any, limit: int, cap: int) -> List[str]:
         if not isinstance(v, list):
             return []
-        out = [str(x).strip() for x in v if isinstance(x, (str, int, float))]
+        out = [_clean(str(x)) for x in v if isinstance(x, (str, int, float))]
         return [x for x in out if x][:limit][:cap]
 
     skill = data.get("skill")

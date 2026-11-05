@@ -254,6 +254,18 @@ class FileModifyTool(_FileTool):
     }
 
     def run(self, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
+        # 与 rag_ingest(force) / checkpoint(persist) 一致：字符串 "false" 是
+        # 真值，旧实现会把它当 True 全量替换整份文件。
+        if isinstance(replace_all, str):
+            replace_all = replace_all.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            replace_all = bool(replace_all)
+        old = "" if old is None else str(old)
+        new = "" if new is None else str(new)
+        # 空 old 会让 str.replace("", new) 在每个字符之间插入内容，瞬间毁掉
+        # 整个文件；必须在碰盘前拦下。
+        if not old:
+            return ToolResult(False, error="'old' 不能为空字符串（会破坏整份文件）")
         try:
             full = self._resolve(path)
         except PermissionError as e:

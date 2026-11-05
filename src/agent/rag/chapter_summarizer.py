@@ -241,10 +241,14 @@ class ChapterSummaryScheduler:
                 # 指纹用 list（与 JSON 往返后的存储类型一致，tuple 会永不匹配）。
                 try:
                     st = os.stat(md_path)
-                    fingerprint = [int(st.st_mtime), st.st_size]
+                    fingerprint = [int(st.st_mtime_ns), st.st_size]
+                    # 兼容旧状态文件里的秒级指纹：否则升级后所有书都会被误判
+                    # 为「内容已更新」，触发一次全量章节摘要重做。
+                    legacy_fingerprint = [int(st.st_mtime), st.st_size]
                 except OSError:
                     continue
-                if book.get("md_fingerprint") not in (None, fingerprint):
+                if book.get("md_fingerprint") not in (
+                        None, fingerprint, legacy_fingerprint):
                     logger.info("逐章摘要: 检测到《%s》内容已更新，重置该书进度", doc_name)
                     books.pop(doc_name, None)
                     interval = self._process_book(engine, cfg, doc_name, md_path,
@@ -322,7 +326,7 @@ class ChapterSummaryScheduler:
             st = os.stat(md_path)
             # 用 list 而非 tuple：状态会经 JSON 落盘（tuple → list），两侧
             # 类型一致才能正确比对（否则每次都误判「内容已更新」而重置进度）。
-            book["md_fingerprint"] = [int(st.st_mtime), st.st_size]
+            book["md_fingerprint"] = [int(st.st_mtime_ns), st.st_size]
         except OSError:
             pass
         book.setdefault("content_hash",
