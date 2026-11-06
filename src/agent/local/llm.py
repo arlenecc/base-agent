@@ -78,6 +78,24 @@ def _new_tool_call_id(n: int) -> str:
     return f"local_call_{n}"
 
 
+def _registered_tool_names(tools: Any) -> List[str]:
+    """从 OpenAI 风格 tools schema 取出工具名。
+
+    供「标签名即工具名」的文本调用识别使用；传 None/畸形数据时返回空列表，
+    不抛异常（工具 schema 来自内核，可能含非标准条目）。
+    """
+    names: List[str] = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function")
+        if isinstance(fn, dict) and fn.get("name"):
+            names.append(str(fn["name"]))
+        elif t.get("name"):
+            names.append(str(t["name"]))
+    return names
+
+
 # ---------------------------------------------------------------------------
 # 双视图历史：raw_content → 忠实于生成的 prompt 序列
 # ---------------------------------------------------------------------------
@@ -134,13 +152,18 @@ def _rebuild_raw_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return out if changed else messages
 
 
-def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
+def parse_tool_calls(text: str,
+                     known_tool_names: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """从模型输出里抽取工具调用，返回 OpenAI 风格的 tool_calls 列表。
 
-    支持三种常见格式：
+    支持四种常见格式：
       1. Qwen XML   ``<tool_call><function=name><parameter=k>v</parameter></function></tool_call>``
       2. Hermes JSON ``<tool_call>{"name":...,"arguments":{...}}</tool_call>``
       3. 裸 JSON     ``{"name":...,"arguments":{...}}`` 或 ``[{...}]``
+      4. 「标签名即工具名」 ``<update_plan>{"op":"create",...}</update_plan>``
+         —— 仅当调用方显式传入 ``known_tool_names``（已注册工具名）时启用，
+         且只在上述三种都没解析出结果时才尝试。默认 None 时行为与旧版完全
+         一致，对其它模型/后端零影响。
     """
     calls: List[Dict[str, Any]] = []
     seen_xml = False
@@ -178,6 +201,31 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
                 continue
             if isinstance(obj, dict) and "name" in obj:
                 calls.append(_dict_to_tool_call(obj, len(calls)))
+
+    # 4) 「标签名即工具名」文本块。本地小模型没走标准 function-call 协议时，
+    #    常把调用写成 <update_plan>{...}</update_plan>（无 <tool_call> 包裹、
+    #    JSON 里也没有 "name"）——上面三种都抓不到，工具不会执行，计划面板
+    #    因此永远不刷新。这里按**已注册工具名**白名单精确匹配，避免把任意
+    #    XML 文本误判成工具调用；标签名必须匹配才解析，且 JSON 必须是对象。
+    if not calls and known_tool_names:
+        for name in known_tool_names:
+            if not name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                continue
+            block_re = re.compile(
+                r"<\s*" + re.escape(name) + r"\s*>(.*?)<\s*/\s*"
+                + re.escape(name) + r"\s*>",
+                re.DOTALL | re.IGNORECASE)
+            for m in block_re.finditer(text):
+                body = m.group(1).strip()
+                if not body.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(body)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if isinstance(obj, dict):
+                    calls.append(_dict_to_tool_call(
+                        {"name": name, "arguments": obj}, len(calls)))
 
     return calls
 
@@ -487,6 +535,9 @@ class LocalLLMClient:
         # "partial kv removal not supported" 并退回全量重算）。因此这里只能做
         # 「严格扩展则复用、分叉/回退则 reset 全量」的 append-only 复用。
         self._gguf_ids: List[int] = []
+        # 思考类模板边界修正：(bot_token, hist_tail, gen_tail)，见
+        # _gguf_detect_boundary_fix；None 表示无需修正（如 ChatML）。
+        self._gguf_boundary_fix = None
         # 与 llama.cpp 内部同款构造的 chat formatter（取 prompt 原文用）。
         self._gguf_fmt = None
         # 创建该缓存的线程 ID。MLX 的 GPU stream 是**线程局部**的：cache 里的
@@ -668,6 +719,112 @@ class LocalLLMClient:
     # GGUF：与 llama.cpp 同款的 chat formatter（取 prompt 原文以支持前缀复用）
     # ------------------------------------------------------------------
 
+    class _PlainTextChatFormatter:
+        """无内嵌 chat_template 时的兜底：确定性纯文本对话格式。
+
+        仅用于 ``tokenizer.chat_template`` 缺失的 GGUF（i1/q4 等量化常把模板
+        丢掉）。行为等价于此前 ``create_chat_completion`` 的“无模板裸拼”——该模型
+        本就以裸文本方式应答——但它产出**确定性**的 token 序列，使 ``_gguf_render``
+        能正常渲染、``_stream_gguf_reuse`` 能启用跨轮 KV 复用（否则 formatter 为
+        None → 每轮全量重算，见 ``_stream_gguf`` 调度）。
+        """
+
+        def __init__(self, add_generation_prompt: bool = True):
+            self.add_generation_prompt = add_generation_prompt
+
+        def __call__(self, *, messages, tools=None, **kwargs):
+            chunks: List[str] = []
+            for m in messages or []:
+                role = (m.get("role") or "").lower()
+                content = m.get("content") or ""
+                if role == "system":
+                    chunks.append(content)
+                elif role == "user":
+                    chunks.append(f"User: {content}")
+                elif role == "assistant":
+                    chunks.append(f"Assistant: {content}")
+                else:
+                    chunks.append(f"{role}: {content}")
+            prompt = "\n\n".join(c for c in chunks if c != "")
+            if self.add_generation_prompt:
+                prompt = f"{prompt}\n\nAssistant: "
+            return {"prompt": prompt}
+
+    @staticmethod
+    def _gguf_detect_boundary_fix(fmt, model):
+        """检测思考类模板「生成提示尾 token」与「历史 assistant 渲染前缀尾 token」。
+
+        仅当边界错位属于「思考开/闭标签」这种**已知且安全**的情形时才返回修正参数；
+        否则返回 ``None``（不做任何改动），确保 ChatML 等**正常模板完全不受影响**。
+
+        背景：Qwen3 系自定义模板把生成提示写成 ``<|Bot|><think>``、历史渲染写成
+        ``<|Bot|></think>``——两者只差一个 token，导致每遇到一个 assistant 消息前缀就
+        分叉、KV 复用整段失效。把历史前缀的 ``</think>`` 修正成 ``<think>`` 后跨轮前缀
+        严格扩展（思考行为不变，生成仍走 ``<think>`` 提示）。
+
+        安全护栏（防止误伤其它正常模型，分两层）：
+          1. 若生成提示尾与历史前缀尾是同一个 token（如 ChatML 的
+             ``<|im_start|>assistant`` 之后接同一继续 token），直接 None，零改动；
+          2. 即便二者不同，也仅在二者的**解码文本构成「思考开/闭标签对」**
+             （生成侧是 ``<think>`` 开标签、历史侧是 ``</think>`` 闭标签）时才修正。
+             其它任何模板的边界错位都不触碰——既不会把正常模型的历史前缀改坏，
+             也不会因为误判而破坏非思考类模型的生成。
+        """
+        u, a = "ZZUSERZZ", "ZZASSTZZ"
+        try:
+            r1 = fmt(messages=[{"role": "system", "content": "S"},
+                               {"role": "user", "content": u}],
+                     tools=None).prompt
+            r2 = fmt(messages=[{"role": "system", "content": "S"},
+                               {"role": "user", "content": u},
+                               {"role": "assistant", "content": a}],
+                     tools=None).prompt
+        except Exception:
+            return None
+        gp = r1.split(u)[-1]                  # 生成提示（user 标记之后）
+        ap = r2.split(a)[0].split(u)[-1]      # 历史 assistant 渲染前缀
+        try:
+            gp_ids = model.tokenize(gp.encode(), add_bos=False, special=True)
+            ap_ids = model.tokenize(ap.encode(), add_bos=False, special=True)
+        except Exception:
+            return None
+        n = 0
+        while n < len(gp_ids) and n < len(ap_ids) and gp_ids[n] == ap_ids[n]:
+            n += 1
+        if n == 0 or n >= len(gp_ids) or n >= len(ap_ids):
+            return None
+        bot, gen_tail, hist_tail = gp_ids[n - 1], gp_ids[n], ap_ids[n]
+        if gen_tail == hist_tail:
+            return None
+        # 护栏②：边界 token 解码后必须构成「思考开/闭标签对」才修正。
+        # 生成侧必须是开标签（模型从 <think> 继续推理），历史侧必须是闭标签，
+        # 方向不能反——否则会把历史前缀改成错误形态。非 think 类模板一律 None。
+        try:
+            gen_txt = model.detokenize([gen_tail]).decode("utf-8", "ignore")
+            hist_txt = model.detokenize([hist_tail]).decode("utf-8", "ignore")
+        except Exception:
+            return None
+        gen_open = "<think" in gen_txt.lower()
+        hist_close = "</think" in hist_txt.lower()
+        if not (gen_open and hist_close):
+            return None
+        return (bot, hist_tail, gen_tail)
+
+    @staticmethod
+    def _gguf_patch_boundary(ids, bot, hist, gen):
+        """把渲染 token 流里所有的 ``[bot, hist]``（历史 assistant 前缀）改成
+        ``[bot, gen]``，使其与生成时实际喂入的 token 一致，跨轮前缀得以严格扩展。
+        ``[bot, hist]`` 仅出现在历史边界（生成提示本身是 ``[bot, gen]``），故不会误伤
+        模型内容里自带的 ``</think>``。
+        """
+        if not ids or hist == gen:
+            return ids
+        out = list(ids)
+        for i in range(len(out) - 1):
+            if out[i] == bot and out[i + 1] == hist:
+                out[i + 1] = gen
+        return out
+
     def _build_gguf_chat_formatter(self, add_generation_prompt: bool = True):
         """构造与 llama-cpp-python 内部**同款**的 chat formatter。
 
@@ -686,22 +843,41 @@ class LocalLLMClient:
             meta = getattr(self._model, "metadata", {}) or {}
             tmpl = meta.get("tokenizer.chat_template")
             if not tmpl:
-                return None
+                # 模型内嵌对话模板缺失：GGUF 量化常丢 chat_template。退回确定性
+                # 纯文本格式——行为与此前 create_chat_completion 的“无模板裸拼”一致
+                # （该模型本就以裸文本方式应答），但能启用跨轮 KV 复用。
+                logger.warning(
+                    "GGUF 模型缺少内嵌 chat_template，改用纯文本兜底格式"
+                    "（跨轮 KV 复用仍可用；建议换用带 chat_template 的 GGUF 以获得最佳效果）")
+                return LocalLLMClient._PlainTextChatFormatter(
+                    add_generation_prompt=add_generation_prompt)
             eos = meta.get("tokenizer.ggml.eos_token") or "</s>"
             bos = meta.get("tokenizer.ggml.bos_token") or "<s>"
             try:
                 eos_id = self._model.token_eos()
             except Exception:
                 eos_id = None
-            return Jinja2ChatFormatter(
-                template=tmpl,
-                eos_token=eos,
-                bos_token=bos,
-                stop_token_ids=[eos_id] if eos_id is not None else None,
-                add_generation_prompt=add_generation_prompt,
-            )
+            stop_ids = [eos_id] if eos_id is not None else None
+            # 探测模板「生成提示尾 token」与「历史 assistant 渲染前缀尾 token」是否一致。
+            # 思考类模板（Qwen3 系自定义）常把二者写成 <think> / </think>，差一个 token
+            # → 每轮 assistant 处前缀分叉、KV 复用整段失效。修正方案：渲染后把历史前缀
+            # 的尾 token 改回生成提示用的尾 token（思考行为不变），使跨轮前缀严格扩展。
+            base = Jinja2ChatFormatter(template=tmpl, eos_token=eos,
+                                      bos_token=bos, stop_token_ids=stop_ids,
+                                      add_generation_prompt=add_generation_prompt)
+            if self._gguf_boundary_fix is None:
+                probe = Jinja2ChatFormatter(template=tmpl, eos_token=eos,
+                                           bos_token=bos, stop_token_ids=stop_ids,
+                                           add_generation_prompt=True)
+                fix = self._gguf_detect_boundary_fix(probe, self._model)
+                if fix is not None:
+                    logger.warning(
+                        "GGUF 模板生成提示与历史渲染边界不一致（思考类模板），"
+                        "已启用边界 token 修正以启用跨轮 KV 复用（思考行为不变）")
+                self._gguf_boundary_fix = fix
+            return base
         except Exception as e:
-            logger.debug("GGUF chat formatter 不可用（降级为无前缀复用）: %s", e)
+            logger.warning("GGUF chat formatter 不可用（降级为无前缀复用）: %s", e)
             return None
 
     def _preload_gguf_system(self, system_prompt: str, tools=None) -> None:
@@ -725,6 +901,13 @@ class LocalLLMClient:
                     add_generation_prompt=False)
                 if not ids:
                     return
+                # 先清空上下文：warm_up 走 aux 旧路径（create_chat_completion(reset=True)）
+                # 可能在同实例上留下不一致状态，直接 eval 会触发 llama_decode -3。预填本
+                # 就应从干净上下文重建系统前缀，reset 无害且保证健壮。
+                try:
+                    self._model.reset()
+                except Exception:
+                    pass
                 self._model.eval(ids)
                 self._gguf_ids = list(ids)
                 logger.info("LLM: GGUF 系统提示已预填（%d token）", len(ids))
@@ -756,6 +939,12 @@ class LocalLLMClient:
                 return None, None
             ids = list(self._model.tokenize(prompt.encode("utf-8"),
                                             add_bos=False, special=True))
+            # 思考类模板边界修正：把历史 assistant 前缀尾 token 改回生成提示用的尾
+            # token，使跨轮前缀严格扩展（详见 _gguf_detect_boundary_fix）。
+            fix = self._gguf_boundary_fix
+            if fix is not None:
+                ids = LocalLLMClient._gguf_patch_boundary(
+                    ids, fix[0], fix[1], fix[2])
             return prompt, ids
         except Exception as e:
             logger.debug("GGUF prompt 渲染失败（降级为无前缀复用）: %s", e)
@@ -810,6 +999,9 @@ class LocalLLMClient:
         # "aux"（一次性本地缓存，不写实例状态）。两者共享同一模型权重但缓存
         # 隔离，aux 调用再也不会冲掉主对话的 KV 缓存。
         kv_group: str = "main",
+        # 调用级生成长度覆盖：默认 None 走客户端构造时的 max_tokens；预热等轻量
+        # 场景可传很小的值（只触发首轮前向/编译，不产出整段回答）。
+        max_tokens: Optional[int] = None,
     ) -> Iterator[StreamEvent]:
         self._ensure_model()
         # 双视图历史的第二视图只有本地复用型后端读得懂（MLX 的 KV 前缀、
@@ -825,11 +1017,11 @@ class LocalLLMClient:
         # 串行化同实例的生成（MLX/GGUF 并发不安全）；主/辅实例各自独立互不阻塞。
         with self._gen_lock:
             if self._backend == "mlx":
-                yield from self._stream_mlx(messages, tools, temperature, kv_group, enable_thinking)
+                yield from self._stream_mlx(messages, tools, temperature, kv_group, enable_thinking, max_tokens)
             elif self._backend == "gguf":
-                yield from self._stream_gguf(messages, tools, temperature, kv_group, enable_thinking)
+                yield from self._stream_gguf(messages, tools, temperature, kv_group, enable_thinking, max_tokens)
             else:
-                yield from self._stream_onnx(messages, tools, temperature, kv_group, enable_thinking)
+                yield from self._stream_onnx(messages, tools, temperature, kv_group, enable_thinking, max_tokens)
 
     # ------------------------------------------------------------------
     # 批量生成（Batching 模式）：辅助模型高吞吐场景（长文 map-reduce 多分片、
@@ -927,7 +1119,8 @@ class LocalLLMClient:
     # ---- 通用：把 think 分段 + 收集全文（用于工具调用解析）----
     def _stream_with_producer(self, deltas: Iterator[str],
                               start_in_think: bool = False,
-                              raw_getter: Optional[Callable[[], str]] = None):
+                              raw_getter: Optional[Callable[[], str]] = None,
+                              known_tool_names: Optional[List[str]] = None):
         """消费 (text_delta) 迭代器，发出 content/reasoning，最后解析工具调用。
 
         分流规则（本地模型把思考/工具调用/摘要都以文本写在正文里）：
@@ -984,7 +1177,7 @@ class LocalLLMClient:
             if kind == "summary" and piece:
                 yield StreamEvent("reasoning", content=piece)
         text = "".join(full)
-        calls = parse_tool_calls(text)
+        calls = parse_tool_calls(text, known_tool_names)
         raw = ""
         if raw_getter is not None:
             try:
@@ -995,7 +1188,7 @@ class LocalLLMClient:
 
     # ---- MLX ----
     def _stream_mlx(self, messages, tools, temperature, kv_group: str = "main",
-                    enable_thinking: Optional[bool] = None):
+                    enable_thinking: Optional[bool] = None, max_tokens: Optional[int] = None):
         import mlx.core as mx
         from mlx_lm import stream_generate
         from mlx_lm.sample_utils import make_sampler, make_logits_processors
@@ -1006,6 +1199,7 @@ class LocalLLMClient:
         # 的逐 token 序列」，跨轮 KV 前缀才对得上。HTTP 后端的历史没有该字段，
         # messages 原样不动（零影响）。
         messages = _rebuild_raw_messages(messages)
+        mt = self._max_tokens if max_tokens is None else int(max_tokens)
         eff_think = (self._enable_thinking
                      if enable_thinking is None else bool(enable_thinking))
         try:
@@ -1209,7 +1403,7 @@ class LocalLLMClient:
                     prompt_cache = cache + draft_cache
                 for resp in stream_generate(
                     self._model, tok, prompt=suffix_ids,
-                    max_tokens=self._max_tokens, sampler=sampler,
+                    max_tokens=mt, sampler=sampler,
                     logits_processors=logits_processors,
                     prompt_cache=prompt_cache, **_sg_kwargs,
                 ):
@@ -1277,7 +1471,8 @@ class LocalLLMClient:
         # prompt_tokens 用整段 prompt 的 token 数（含 KV 复用部分，语义是
         # 「本轮的输入规模」），completion_tokens 用实际生成数。
         for ev in self._stream_with_producer(
-                _produce(), start_in_think=start_in_think, raw_getter=_raw_getter):
+                _produce(), start_in_think=start_in_think, raw_getter=_raw_getter,
+                known_tool_names=_registered_tool_names(tools)):
             if ev.type == "done":
                 n_gen = len(gen_ref[0]) if gen_ref else 0
                 ev.usage = {
@@ -1289,13 +1484,14 @@ class LocalLLMClient:
 
     # ---- GGUF ----
     def _stream_gguf(self, messages, tools, temperature, kv_group: str = "main",
-                     enable_thinking: Optional[bool] = None):
+                     enable_thinking: Optional[bool] = None, max_tokens: Optional[int] = None):
         """GGUF 生成入口：优先走「前缀复用」路径，否则退回旧路径。
 
         复用只用于主对话（``kv_group == "main"``）且开关打开时。辅助调用
         （知识图谱抽取 / RAG 精简 / 技能检索）的 prompt 每轮都变，与 MLX 的
         aux 一次性缓存同款处理：整体 reset 后生成，不参与跨轮复用。
         """
+        mt = self._max_tokens if max_tokens is None else int(max_tokens)
         persist = (kv_group == "main")
         if self._kv_reuse and persist and self._gguf_fmt is not None:
             try:
@@ -1310,7 +1506,7 @@ class LocalLLMClient:
                 except Exception:
                     pass
                 self._gguf_ids = []
-        yield from self._stream_gguf_legacy(messages, tools, temperature)
+        yield from self._stream_gguf_legacy(messages, tools, temperature, max_tokens)
 
     def _stream_gguf_reuse(self, messages, tools, temperature):
         """GGUF 跨轮前缀复用：只把**新增**的 token eval 进 llama.cpp 上下文。
@@ -1332,6 +1528,22 @@ class LocalLLMClient:
             raise RuntimeError("GGUF prompt 为空（渲染失败）")
 
         cached = self._gguf_ids
+        # 状态一致性校验：``_gguf_ids`` 记录的是「底层 llama.cpp 上下文里应当
+        # 有的 token 数」，而 ``Llama.n_tokens`` 是实际值。后台 aux 调用走
+        # create_chat_completion(reset=True)（事实抽取/技能选择/预热复用同一
+        # 实例时会发生）、或上一轮被中断/异常，都可能让两者失配而**没有**同步
+        # 清空 _gguf_ids。此时若继续按「严格扩展」只 eval 增量，llama.cpp 会
+        # 因 pos 与残留 KV（尤其 SWA memory）冲突返回 llama_decode -3，整轮
+        # 失败。发现失配就强制退化为全量重建。
+        try:
+            actual_n = getattr(self._model, "n_tokens", None)
+        except Exception:
+            actual_n = None
+        if cached and isinstance(actual_n, int) and actual_n != len(cached):
+            logger.warning(
+                "GGUF KV 状态失配（n_tokens=%d, cached=%d），整体重建",
+                actual_n, len(cached))
+            cached = []
         # 长会话护栏：缓存随会话线性增长（每层每 token 都要留 KV）。超过
         # _KV_MAX_TOKENS 直接丢弃旧 KV、整体重建——与 MLX 的同款护栏一致，
         # 避免 C++ context 的 KV 无上限膨胀（n_ctx 容量保护只在接近上限时才
@@ -1367,7 +1579,20 @@ class LocalLLMClient:
             suffix = ids
             reuse_n = 0
 
-        self._model.eval(suffix)
+        try:
+            self._model.eval(suffix)
+        except Exception as e:
+            # 兜底：即使状态校验通过，llama.cpp 仍可能因 SWA memory 残留等
+            # 内部状态不一致在 decode 时返回 -3。彻底 reset 后全量重建，保证
+            # 本轮仍能正常产出；否则异常冒到 kernel，会在「首个 chunk 之前」
+            # 触发重试 N 次仍失败，用户看到的就是「报错、无法运行」。
+            logger.warning("GGUF eval 失败(%s)，reset 后全量重建", e)
+            try:
+                self._model.reset()
+            except Exception:
+                pass
+            self._model.eval(ids)
+            reuse_n = 0
         self._gguf_ids = list(ids)
 
         start_in_think = bool(prompt and prompt.rstrip().endswith(_THINK_OPEN))
@@ -1430,7 +1655,8 @@ class LocalLLMClient:
 
         for ev in self._stream_with_producer(
                 _produce(), start_in_think=start_in_think,
-                raw_getter=_raw_getter):
+                raw_getter=_raw_getter,
+                known_tool_names=_registered_tool_names(tools)):
             if ev.type == "done":
                 ev.usage = {
                     "prompt_tokens": len(ids),
@@ -1487,18 +1713,26 @@ class LocalLLMClient:
         except Exception:
             return False
 
-    def _stream_gguf_legacy(self, messages, tools, temperature):
+    def _stream_gguf_legacy(self, messages, tools, temperature, max_tokens: Optional[int] = None):
         """旧路径：整轮走 ``create_chat_completion``（无跨轮复用）。"""
         # 旧路径每轮 reset（create_chat_completion → generate(reset=True)），
         # 预填/复用状态不再有效 → 清空，避免下轮拿过期序列做前缀判断。
+        # aux 调用（事实抽取/技能选择/预热）与主对话复用**同一 Llama 实例**时，
+        # 这里显式 reset 一次，把手动 eval 留下的 KV（尤其 SWA memory）清干净，
+        # 否则 create_chat_completion 自己可能在 decode 时报 llama_decode -3。
         self._gguf_ids = []
+        try:
+            self._model.reset()
+        except Exception:
+            pass
+        mt = self._max_tokens if max_tokens is None else int(max_tokens)
         create = getattr(self._model, "create_chat_completion", None)
         if create is None:
             raise RuntimeError("llama-cpp-python 版本过旧，缺少 create_chat_completion")
         kwargs: Dict[str, Any] = {
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": self._max_tokens,
+            "max_tokens": mt,
             "stream": True,
         }
         if self._top_p:
@@ -1542,14 +1776,22 @@ class LocalLLMClient:
                 yield StreamEvent(kind, content=seg)
         if not calls_acc:
             text = "".join(full)
-            calls_acc_list = parse_tool_calls(text)
+            calls_acc_list = parse_tool_calls(
+                text, _registered_tool_names(tools))
         else:
             calls_acc_list = [calls_acc[k] for k in sorted(calls_acc)]
+        # 收尾再归位：create_chat_completion 结束后 Llama.n_tokens 停在 aux
+        # prompt+生成的长度，与 _gguf_ids=[] 不一致。复位后下轮主对话（无论走
+        # 复用还是 preload）都从干净上下文开始，不会因状态错位触发 -3。
+        try:
+            self._model.reset()
+        except Exception:
+            pass
         yield StreamEvent("done", tool_calls=calls_acc_list, usage={})
 
     # ---- ONNX ----
     def _stream_onnx(self, messages, tools, temperature, kv_group: str = "main",
-                     enable_thinking: Optional[bool] = None):
+                     enable_thinking: Optional[bool] = None, max_tokens: Optional[int] = None):
         import numpy as np
         # ONNX 走 transformers 的 AutoTokenizer 本身；旧实现照搬 MLX 的
         # ``getattr(tok, "tokenizer", tok)`` 会拿到不可调用的 Rust Tokenizer
@@ -1558,6 +1800,7 @@ class LocalLLMClient:
         # 双视图历史：与 MLX/GGUF 同款，把 assistant 消息还原成生成时的逐 token
         # 序列，跨轮 KV（past）续算的前缀才对得上。
         messages = _rebuild_raw_messages(messages)
+        mt = self._max_tokens if max_tokens is None else int(max_tokens)
         tok = self._tokenizer
         hf = _hf_tok(tok)
         prompt = hf.apply_chat_template(
@@ -1610,7 +1853,7 @@ class LocalLLMClient:
             kv_len = 0
             feed_ids = ids_list
             input_ids = np.array([feed_ids], dtype=np.int64)
-        for _ in range(self._max_tokens):
+        for _ in range(mt):
             feeds = {"input_ids": input_ids}
             # 按需补 attention_mask / position_ids：导出格式差异大，只喂会话
             # 真正声明的输入（旧实现只喂 input_ids+past，带 attention_mask 的
@@ -1677,7 +1920,8 @@ class LocalLLMClient:
             raw = hf.decode(generated) if generated else ""
         except Exception:
             raw = ""
-        yield StreamEvent("done", tool_calls=parse_tool_calls("".join(full)),
+        yield StreamEvent("done", tool_calls=parse_tool_calls(
+                          "".join(full), _registered_tool_names(tools)),
                           raw_content=raw,
                           usage={"prompt_tokens": n_prompt,
                                  "completion_tokens": len(generated),

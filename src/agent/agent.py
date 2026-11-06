@@ -920,8 +920,11 @@ class Agent:
                 {"role": "system", "content": self._system_prompt()},
                 {"role": "user", "content": "hi"},
             ]
-            # 消费完整流（含思考/重试），触发首次编译/图优化。
-            for _ in client.chat_stream(messages, kv_group="aux"):
+            # 消费完整流（含思考/重试），触发首次编译/图优化。max_tokens 限极小
+            # 值：预热只需「加载权重 + 跑一次真实形状的前向（prefill+少量 decode）」，
+            # 不必产出整段回答——尤其 GGUF 在 CPU 上，少解码几百个 token 能省数秒到
+            # 十几秒；MLX 的图编译与输出长度无关，限短同样能触发。
+            for _ in client.chat_stream(messages, kv_group="aux", max_tokens=4):
                 pass
             # 注意：此处**不再** invalidate 主缓存。aux 预热走独立缓存、不写实例级
             # self._mlx_cache，原 invalidate 本就是 no-op；而真正的系统提示预热改由

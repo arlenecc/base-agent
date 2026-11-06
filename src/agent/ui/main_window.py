@@ -665,14 +665,11 @@ class AgentWorker(QThread):
                 "已有消息在排队，跳过空闲期预热（首句将自行完成编译）")
             logger.info("AgentWorker: 队列已有待处理消息，跳过空闲期预热")
         else:
-            try:
-                self._callbacks.bridge.status.emit(
-                    "系统提示预热中（预填上下文，请稍候）")
-                self._agent.preload_kv()
-                self._callbacks.bridge.status.emit("系统提示已预热，可开始对话")
-            except Exception:
-                self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
-            # warm_up（首次推理编译）：与预填串行、同在 worker 线程，不另起并发抢权重。
+            # warm_up（首次推理编译/冷启动）必须先跑：它在**主模型**上做一次真实
+            # 推理（kv_group="aux" 走旧路径 → create_chat_completion(reset=True)），
+            # 会 reset 共享的 llama.cpp 上下文、并清空主缓存计数器 _gguf_ids。若排在
+            # preload_kv 之后，会把刚预填好的系统提示 KV 整个冲掉，首句退回全量预填充
+            # （慢）。排在前面，它的 reset 无害；随后的 preload_kv 再重新预填。
             try:
                 self._callbacks.bridge.status.emit(
                     "主模型预热中（首次推理编译，约 20-30s，请稍候）")
@@ -682,6 +679,16 @@ class AgentWorker(QThread):
                 logger.warning("主模型预热失败(忽略): %s", e)
                 self._callbacks.bridge.status.emit(
                     "预热失败，但仍可对话（首句会偏慢）")
+            # preload_kv（系统提示 KV 预填）必须**最后**跑：在 warm_up 的 reset 之后
+            # 把系统提示 eval 进上下文，使首句 prompt 是其严格扩展 → 直接命中缓存，
+            # 跳过系统提示的全量预填充（首句只付用户消息那段）。
+            try:
+                self._callbacks.bridge.status.emit(
+                    "系统提示预热中（预填上下文，请稍候）")
+                self._agent.preload_kv()
+                self._callbacks.bridge.status.emit("系统提示已预热，可开始对话")
+            except Exception:
+                self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
         while True:
             text = self._queue.get()
             if text is None:
