@@ -2206,7 +2206,7 @@ class MainWindow(QMainWindow):
         self.rag_mcp_stop_btn.setFixedWidth(56)
         self.rag_mcp_stop_btn.clicked.connect(self._on_rag_mcp_stop)
         mcp_row.addWidget(self.rag_mcp_stop_btn)
-        adv_lay.addWidget(mcp_row)
+        adv_lay.addLayout(mcp_row)
 
         # stdio 接入命令（供其它大模型应用以子进程方式接入，无需端口）
         stdio_row = QHBoxLayout(); stdio_row.setSpacing(8)
@@ -2219,7 +2219,7 @@ class MainWindow(QMainWindow):
         self.rag_mcp_stdio_copy_btn.setFixedWidth(56)
         self.rag_mcp_stdio_copy_btn.clicked.connect(self._on_copy_rag_mcp_stdio)
         stdio_row.addWidget(self.rag_mcp_stdio_copy_btn)
-        adv_lay.addWidget(stdio_row)
+        adv_lay.addLayout(stdio_row)
 
         lay.addWidget(adv_box)
         lay.addStretch(1)
