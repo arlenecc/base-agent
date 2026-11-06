@@ -2257,6 +2257,46 @@ class RAGEngine:
         store = self._get_store()
         return store.get_document_digest(doc_name)
 
+    def delete_document(self, name: str) -> bool:
+        """删除指定文档（按名/子串匹配）：元数据 + 向量 chunks + markdown 缓存。
+
+        供 MCP 工具 ``delete_document`` / ``forget_context`` 复用，实现「知识遗忘」：
+        彻底移除文档在向量库、倒排索引与磁盘缓存中的全部痕迹，使后续检索不再
+        召回该文档内容。返回是否确有记录被删除。
+        """
+        store = self._get_store()
+        info = store.get_document_digest(name)
+        md_path = info.get("md_path") if info else None
+        store.delete_document(name)      # 元数据（documents 表）
+        store.delete_by_source(name)     # 向量 chunks + 失效 FTS/ANN 索引
+        if md_path and os.path.isfile(md_path):
+            try:
+                os.remove(md_path)
+            except OSError as e:
+                logger.warning("删除文档 markdown 缓存失败: %s", e)
+        logger.info("🗑 已删除文档（知识遗忘）: %s", name)
+        return info is not None
+
+    def get_document(self, doc_name: str) -> Optional[str]:
+        """返回指定文档经解析/提取/清洗后的完整 markdown 正文（磁盘透传）。
+
+        供 MCP 工具 ``get_document`` 复用：文档的原始 ``.md`` 缓存位于
+        ``markdown_dir``，由 ``get_document_outline`` 给出的 ``md_path`` 定位，
+        这里直接读盘回传全文。
+        """
+        info = self.get_document_outline(doc_name)
+        if not info:
+            return None
+        md_path = info.get("md_path")
+        if not md_path or not os.path.isfile(md_path):
+            return None
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError as e:
+            logger.warning("读取文档 markdown 失败: %s", e)
+            return None
+
     def list_documents(self) -> List[str]:
         """Return stored document names that have a digest."""
         store = self._get_store()

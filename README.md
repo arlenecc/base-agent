@@ -1126,6 +1126,55 @@ rapidocr 模块上验证 CoreML providers 真的排到最前、CPU 保留作回�
 
 详细部署文档见 [docs/deploy.md](docs/deploy.md)。
 
+## RAG MCP 服务（对外暴露 RAG 能力）
+
+将 base-agent 已有的 RAG（检索增强生成）能力以 **MCP 工具**形式对外暴露，供其它大模型应用（如 Claude Desktop、其它支持 MCP 的客户端）直接对接；复用桌面端同一份知识库索引与模型，无需重复加载（~600MB 向量/模型内存）。
+
+### 安装
+
+fastmcp 为可选依赖，需先安装；同时需启用 RAG 能力（否则 MCP 工具返回「RAG 引擎未就绪」）：
+
+```bash
+pip install "base-agent[mcp]"   # 或单独：pip install fastmcp>=4.0
+pip install "base-agent[rag]"   # RAG 能力（向量库 / 嵌入 / 重排 / 解析）
+```
+
+### 两种接入方式
+
+| 方式 | 适用场景 | 如何启用 |
+|------|----------|----------|
+| **HTTP（streamable-HTTP）** | 局域网/本机其它应用以 URL 对接 | 桌面端：配置面板 → 高级配置 → RAG MCP 服务，选「监听范围」（仅限本机 / 局域网可用）+ 端口（默认 8080），点「启动」。服务根路径为 `http://<host>:<port>/mcp/` |
+| **stdio（标准输入/输出）** | Claude Desktop 等以子进程方式接入，无需端口 | 直接运行 `python -m agent.tools.rag_mcp_server --transport stdio`；或在 MCP 客户端配置该命令由其拉起子进程 |
+
+独立命令行启动（不依赖桌面 GUI）：
+
+```bash
+# stdio 接入（默认）
+python -m agent.tools.rag_mcp_server --transport stdio
+
+# HTTP 接入（可指定端口与监听范围）
+python -m agent.tools.rag_mcp_server --transport http --port 8080 --scope lan
+```
+
+> 注意：stdio 传输会占用进程的标准输入/输出，**只能用于独立命令行进程**，不能运行在桌面应用主进程内（GUI 需保留 stdout 给日志/框架）。
+
+### 暴露的工具
+
+| 工具名 | 能力 |
+|--------|------|
+| `parse_and_ingest_document` | 复杂文档解析入库（PDF / Office / Markdown 等） |
+| `delete_document` / `forget_context` | 知识遗忘 / 删除文档（向量 + 元数据 + 原文缓存） |
+| `list_document` | 已入库文件列表 |
+| `extract_metadata` | 智能元数据提取（章节目录 + 摘要） |
+| `hybrid_search_with_rerank` | 混合检索与重排序（向量 + BM25 + rerank） |
+| `get_document` | 原始文件透传（解析后的完整 markdown） |
+
+所有工具均为薄封装，直接复用应用内已加载的 `RAGEngine`，返回统一 JSON 结构 `{"status":"ok"|"error","data"|"message"}`。
+
+### 配置持久化（HTTP 模式）
+
+HTTP 服务的「监听范围 / 端口 / 是否启用」写入 `~/.base-agent/config.json`（`rag_mcp_enabled` / `rag_mcp_scope` / `rag_mcp_port`）。启用后应用启动时自动拉起服务。
+
 ## License
 
 MIT

@@ -39,6 +39,7 @@ from ..config import AgentConfig, DEFAULT_CONFIG_PATH
 from ..llm_client import LLMClient, LLMError
 from ..skills import Skill
 from ..tools import ToolRegistry
+from ..tools.rag_mcp_service import RagMcpService
 from ..rag.engine import RAGEngine, effective_embedding_model
 from ..rag.vector_store import DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL
 from .ocr_test_dialog import OcrTestDialog
@@ -1503,6 +1504,16 @@ class MainWindow(QMainWindow):
         host_lay.setContentsMargins(0, 0, 0, 0)
         self._config_panel = self._build_config_panel()
         host_lay.addWidget(self._config_panel)
+        # RAG MCP 服务生命周期（2025 streamable-HTTP）：默认关闭；若配置启用则随应用自启。
+        self._rag_mcp_service = RagMcpService()
+        if getattr(self.config, "rag_mcp_enabled", False):
+            try:
+                self._rag_mcp_service.start(
+                    scope=getattr(self.config, "rag_mcp_scope", "localhost"),
+                    port=getattr(self.config, "rag_mcp_port", 8080))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("RAG MCP 服务自启失败: %s", e)
+            self._refresh_rag_mcp_status()
         # 宿主仅是面板在「对话框 ↔ 主窗口」间 reparent 的中间容器，本身不进任何布局，
         # 必须隐藏——否则会作为浮动控件出现在主窗口 (0,0) 左上角（盖住对话区）。
         self._config_host.hide()
@@ -2161,6 +2172,56 @@ class MainWindow(QMainWindow):
         klay.addLayout(r)
 
         lay.addWidget(kb_box)
+
+        # ==================================================================
+        # 区三：高级配置（RAG MCP 服务对外暴露，2025 streamable-HTTP）
+        # ==================================================================
+        adv_box = QGroupBox("高级配置")
+        adv_lay = QVBoxLayout(adv_box)
+        adv_lay.setContentsMargins(10, 8, 10, 8)
+        adv_lay.setSpacing(8)
+
+        # 将 RAG 能力以 MCP 工具形式对外暴露，供其它大模型应用对接使用。
+        mcp_row = QHBoxLayout(); mcp_row.setSpacing(8)
+        mcp_row.addWidget(QLabel("RAG MCP 服务"))
+        mcp_row.addSpacing(8)
+        mcp_row.addWidget(QLabel("监听范围:"))
+        self.rag_mcp_scope_combo = _combo(["仅限本机", "局域网可用"])
+        self.rag_mcp_scope_combo.setCurrentText(
+            "局域网可用" if getattr(self.config, "rag_mcp_scope", "localhost") == "lan"
+            else "仅限本机")
+        mcp_row.addWidget(self.rag_mcp_scope_combo)
+        mcp_row.addWidget(QLabel("端口:"))
+        self.rag_mcp_port_edit = _num(str(getattr(self.config, "rag_mcp_port", 8080)), width=64)
+        mcp_row.addWidget(self.rag_mcp_port_edit)
+        mcp_row.addWidget(QLabel("状态:"))
+        self.rag_mcp_status_label = QLabel("未启动")
+        mcp_row.addWidget(self.rag_mcp_status_label)
+        mcp_row.addStretch(1)
+        self.rag_mcp_start_btn = QPushButton("启动")
+        self.rag_mcp_start_btn.setFixedWidth(56)
+        self.rag_mcp_start_btn.clicked.connect(self._on_rag_mcp_start)
+        mcp_row.addWidget(self.rag_mcp_start_btn)
+        self.rag_mcp_stop_btn = QPushButton("停止")
+        self.rag_mcp_stop_btn.setFixedWidth(56)
+        self.rag_mcp_stop_btn.clicked.connect(self._on_rag_mcp_stop)
+        mcp_row.addWidget(self.rag_mcp_stop_btn)
+        adv_lay.addWidget(mcp_row)
+
+        # stdio 接入命令（供其它大模型应用以子进程方式接入，无需端口）
+        stdio_row = QHBoxLayout(); stdio_row.setSpacing(8)
+        stdio_row.addWidget(QLabel("stdio 接入:"))
+        self.rag_mcp_stdio_cmd_edit = QLineEdit(
+            "python -m agent.tools.rag_mcp_server --transport stdio")
+        self.rag_mcp_stdio_cmd_edit.setReadOnly(True)
+        stdio_row.addWidget(self.rag_mcp_stdio_cmd_edit, 1)
+        self.rag_mcp_stdio_copy_btn = QPushButton("复制")
+        self.rag_mcp_stdio_copy_btn.setFixedWidth(56)
+        self.rag_mcp_stdio_copy_btn.clicked.connect(self._on_copy_rag_mcp_stdio)
+        stdio_row.addWidget(self.rag_mcp_stdio_copy_btn)
+        adv_lay.addWidget(stdio_row)
+
+        lay.addWidget(adv_box)
         lay.addStretch(1)
 
         # 主模型模式切换 & 加载/卸载按钮
@@ -2171,6 +2232,50 @@ class MainWindow(QMainWindow):
         self.unload_aux_btn.clicked.connect(self._on_unload_aux_model)
 
         return box
+
+    # ---- RAG MCP 服务（2025 streamable-HTTP）启停 ----
+    def _on_rag_mcp_start(self) -> None:
+        scope = "lan" if self.rag_mcp_scope_combo.currentText() == "局域网可用" else "localhost"
+        try:
+            port = int(self.rag_mcp_port_edit.text() or "8080")
+        except ValueError:
+            QMessageBox.warning(self, "RAG MCP 服务", "端口必须是数字。")
+            return
+        if self._rag_mcp_service.is_running:
+            QMessageBox.information(self, "RAG MCP 服务", "服务已在运行。")
+            return
+        try:
+            self._rag_mcp_service.start(scope=scope, port=port)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "RAG MCP 服务", f"启动失败：{e}")
+            return
+        self.config.rag_mcp_scope = scope
+        self.config.rag_mcp_port = port
+        self.config.rag_mcp_enabled = True
+        self.config.save(CONFIG_PATH)
+        self._refresh_rag_mcp_status()
+        host = "0.0.0.0" if scope == "lan" else "127.0.0.1"
+        QMessageBox.information(self, "RAG MCP 服务", f"已启动：http://{host}:{port}/mcp/")
+
+    def _on_rag_mcp_stop(self) -> None:
+        self._rag_mcp_service.stop()
+        self.config.rag_mcp_enabled = False
+        self.config.save(CONFIG_PATH)
+        self._refresh_rag_mcp_status()
+
+    def _refresh_rag_mcp_status(self) -> None:
+        running = self._rag_mcp_service.is_running
+        if getattr(self, "rag_mcp_status_label", None) is not None:
+            self.rag_mcp_status_label.setText("运行中" if running else "未启动")
+        if getattr(self, "rag_mcp_start_btn", None) is not None:
+            self.rag_mcp_start_btn.setEnabled(not running)
+        if getattr(self, "rag_mcp_stop_btn", None) is not None:
+            self.rag_mcp_stop_btn.setEnabled(running)
+
+    def _on_copy_rag_mcp_stdio(self) -> None:
+        text = self.rag_mcp_stdio_cmd_edit.text()
+        QApplication.clipboard().setText(text)
+        self.status_label.setText("已复制 RAG MCP stdio 接入命令")
 
     # ------------------------------------------------------------------
     # 配置窗口：模型路径选择 / 主模型模式切换 / 主·辅助模型加载·卸载
@@ -2780,6 +2885,12 @@ class MainWindow(QMainWindow):
                                self.reranker_path_edit)
         # 同步主模型模式切换的可见性
         self._on_main_mode_changed(self.main_mode_combo.currentText())
+        # RAG MCP 服务控件同步（范围 / 端口 / 状态）
+        self.rag_mcp_scope_combo.setCurrentText(
+            "局域网可用" if getattr(self.config, "rag_mcp_scope", "localhost") == "lan"
+            else "仅限本机")
+        self.rag_mcp_port_edit.setText(str(getattr(self.config, "rag_mcp_port", 8080)))
+        self._refresh_rag_mcp_status()
 
     def _sync_impl_fields(self, combo, name_edit, path_edit) -> None:
         """按实现下拉显隐「模型名 / 本地路径」：fastembed 显示模型名、隐藏路径；

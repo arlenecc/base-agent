@@ -51,8 +51,13 @@ rag = [
 # rapidocr 3.x 起为统一包名（兼容层 rapidocr-onnxruntime 仅供旧环境回退，
 # 见 parsers._get_ocr_engine）；模型目录与 docling 共享，且支持 CoreML EP。
 ocr = ["rapidocr>=3.10"]
+# MCP server (2025 streamable-HTTP): 将 RAG 能力以 MCP 工具形式对外暴露，
+# 供其它大模型应用对接使用（需启用 RAG 可选依赖）。
+# 代码使用 fastmcp 4.x API（http_app() / run(transport="stdio") /
+# fastmcp.client.transports.StdioTransport），故锁定 >=4.0。
+mcp = ["fastmcp>=4.0"]
 # All optional features
-#all = ["base-agent[test,rag,ocr]"]
+#all = ["base-agent[test,rag,ocr,mcp]"]
 
 [project.scripts]
 base-agent = "agent.ui.main_window:run"

@@ -316,6 +316,13 @@ class AgentConfig:
     #   [{"name": "filesystem", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}]
     mcp_servers: list = field(default_factory=list)
 
+    # ---- RAG MCP 服务（2025 streamable-HTTP）----
+    # 将 RAG 能力以 MCP 工具形式对外暴露，供其它大模型应用对接使用。默认关闭。
+    rag_mcp_enabled: bool = False
+    # 监听范围：'localhost'（仅本机，监听 127.0.0.1）/ 'lan'（局域网，监听 0.0.0.0）
+    rag_mcp_scope: str = "localhost"
+    rag_mcp_port: int = 8080
+
     # 数值字段的类型，用于把 config.json 里的字符串/浮点值强制转换回正确类型。
     # 手工编辑过的 config.json 常出现 "32768"（字符串）或 32768.0（浮点），
     # 直接喂给 dataclass 会让后续算术/比较在运行时炸掉。
@@ -330,7 +337,8 @@ class AgentConfig:
                    "rag_docling_pool_size",
                    "rag_binary_prefilter_top",
                    "aux_max_tokens", "aux_top_k",
-                   "local_llm_num_draft_tokens", "local_llm_prefill_step_size")
+                   "local_llm_num_draft_tokens", "local_llm_prefill_step_size",
+                   "rag_mcp_port")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
                      "rag_rerank_min_similarity",
@@ -352,13 +360,14 @@ class AgentConfig:
                    "aux_llm_provider", "aux_local_llm_model", "aux_local_llm_backend",
                    "local_llm_mmproj_path", "local_llm_tokenizer_path",
                    "aux_local_llm_mmproj_path", "aux_local_llm_tokenizer_path",
-                   "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path")
+                   "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path",
+                   "rag_mcp_scope")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
                     "rag_ocr_scale_dynamic", "aux_llm_enabled",
                     "local_llm_enable_thinking", "aux_local_llm_enable_thinking",
                     "rag_matryoshka_enabled", "rag_binary_prefilter_enabled",
-                    "web_allow_private_hosts")
+                    "web_allow_private_hosts", "rag_mcp_enabled")
 
     @classmethod
     def _coerce(cls, name: str, value):
