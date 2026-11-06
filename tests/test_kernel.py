@@ -329,14 +329,14 @@ def test_session_folds_and_never_dangles(cfg):
             f"摘要{i}",
         )
     rec = s.start_turn("prompt 8")
+    # 模拟「预算溢出触发的主动收缩」：force_fold 把旧轮摘要摘入 extra_digest 回注
+    s.force_fold(2)
     msgs = s.build_messages("SYS", "prompt 8")
 
-    # 原文窗口恒定：只保留最近 raw_turns 个已完成轮
-    assistants = [m for m in msgs if m.get("role") == "assistant"]
-    assert len(assistants) == 2
-    # 折叠区存在
+    # 预算溢出折叠：旧轮摘要回注入 <earlier_context>
     assert any("<earlier_context>" in str(m.get("content")) for m in msgs)
-    # 无悬挂 tool 消息
+    assert s.extra_digest
+    # 折叠以「整轮」为单位，不变量：任何 tool 消息都紧跟带 tool_calls 的 assistant
     for i, m in enumerate(msgs):
         if m.get("role") == "tool":
             assert msgs[i - 1].get("role") == "assistant" and msgs[i - 1].get("tool_calls")
@@ -353,6 +353,23 @@ def test_session_force_fold_moves_turns_to_digest(cfg):
     assert s.force_fold(2) == 2
     assert len(s.turns) == 2
     assert len(s.extra_digest) == 2
+
+
+def test_force_fold_injects_digest_on_budget_overflow(cfg):
+    """预算溢出触发的主动收缩（force_fold）必须把旧轮摘要回注到上下文。
+
+    这是与「窗口到达静默丢弃」互补的另一半语义：只有预算溢出路径才保留
+    历史脉络（<earlier_context>），窗口到达路径不回注。
+    """
+    s = Session(budget=ContextBudget(30_000), raw_turns=2, max_digest_lines=20)
+    for i in range(1, 6):
+        rec = s.start_turn(f"prompt {i}")
+        s.finish_turn(rec, f"reply {i}", [], [], f"摘要{i}")
+    # 模拟「预算溢出触发的主动收缩」
+    s.force_fold(2)
+    assert len(s.extra_digest) == 2
+    msgs = s.build_messages("SYS", "prompt 6")
+    assert any("<earlier_context>" in str(m.get("content")) for m in msgs)
 
 
 def test_session_anchor_injects_key_info_and_truncation(cfg):
@@ -439,25 +456,6 @@ def test_reask_keeps_the_final_turn(cfg):
     # 第一次 reask 被回滚（不占历史），最终这一轮必须留下并可被 L4 追溯
     assert len(agent.session.turns) == 1
     assert agent.session.all_digest_lines()
-
-
-def test_periodic_consolidate_really_folds(cfg):
-    """每 N 轮的周期性沉淀必须真的折叠，不能是空操作。"""
-    with open(os.path.join(cfg.workspace, "a.txt"), "w") as f:
-        f.write("A" * 50)
-    tc = [{"id": "c1", "function": {"name": "file_read",
-                                    "arguments": json.dumps({"path": "a.txt"})}}]
-    scripts = [[_evt("done", tool_calls=tc, usage={"total_tokens": 1})] for _ in range(6)]
-    scripts.append([_evt("content", "done"), _evt("done", usage={"total_tokens": 1})])
-    mock = MockLLM(scripts)
-    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
-    agent.max_iterations = 10
-    agent._distill_min_turns = 999
-    agent.run("loop")
-
-    # 7 轮里应该发生过折叠：turns 被折走、摘要行留下
-    assert agent.session.extra_digest, "周期性 CONSOLIDATE 没有折叠任何轮"
-    assert len(agent.session.turns) < 7
 
 
 def test_prompt_stays_within_30k_over_long_run(cfg):

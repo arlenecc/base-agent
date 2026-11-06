@@ -15,6 +15,7 @@ from .config import AgentConfig
 from .llm_client import LLMClient, StreamEvent
 from .skills import SkillManager
 from .tools import ToolRegistry, ToolResult, parse_args
+from .tools import risk as _risk
 from .kernel import (
     ContextBudget, ExitReason, KernelHooks, KernelLoop, KernelResult, Session,
     l4_extract_json, l4_normalize,
@@ -1424,6 +1425,10 @@ class Agent:
         """
         from .tools import ToolResult
 
+        # 并行段由 _run_parallel_tools 启动；若主线程在等待期间被取消，
+        # 后台 daemon 线程在此处尽早退出，减少写入已 reset 会话的副作用。
+        if self.callbacks.is_cancelled():
+            return ToolResult(False, error="已取消")
         try:
             return self.tools.execute(name, args)
         except Exception as e:  # pragma: no cover - defensive
@@ -1436,27 +1441,60 @@ class Agent:
     ) -> None:
         """并发执行一组互相独立的只读工具，结果按索引回填。
 
-        UI 回调（on_tool_start / on_tool_end）全部在主线程发出，只有工具本身
-        在线程池里跑，因此界面上的工具顺序不受并发影响。
+        UI 回调（on_tool_start / on_tool_end）由主线程发出；工具自身在 daemon
+        线程里跑。取消 / 总时限到达时立即返回，未完成的填「未完成」错误，后台
+        daemon 线程继续跑完自行退出——主线程（UI）不再被最长任务（web_scan /
+        rag_search）拖住，进程退出也不被非 daemon worker 阻塞。
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         from .tools import ToolResult
 
-        workers = min(_MAX_PARALLEL_TOOLS, len(jobs))
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tool-par") as ex:
-            futures = {}
-            for idx, name, args in jobs:
-                self.callbacks.on_tool_start(name, args)
-                futures[ex.submit(self._exec_tool_blocking, name, args)] = (idx, name)
-            for fut in as_completed(futures):
-                idx, name = futures[fut]
-                try:
-                    res = fut.result()
-                except Exception as e:  # pragma: no cover - defensive
-                    res = ToolResult(False, error=f"{type(e).__name__}: {e}")
-                self._log_tool_result(name, res)
-                self.callbacks.on_tool_end(name, res)
-                results[idx] = res
+        n = len(jobs)
+        if n == 0:
+            return
+        # 终止对话场景下的总等待上限：常规并行检索几秒完成，最坏情况（web_scan
+        # 多跳 180s+）也最多等这么多秒，避免 UI 卡死。
+        allow = max(30.0, 10.0 * n)
+        deadline = time.monotonic() + allow
+        out: List[Any] = [None] * n
+        lock = threading.Lock()
+
+        def _run(idx: int, name: str, args: Dict[str, Any]) -> None:
+            res = self._exec_tool_blocking(name, args)
+            with lock:
+                out[idx] = res
+
+        threads = []
+        for idx, name, args in jobs:
+            self.callbacks.on_tool_start(name, args)
+            t = threading.Thread(target=_run, args=(idx, name, args),
+                                name=f"tool-par-{name}-{idx}", daemon=True)
+            t.start()
+            threads.append(t)
+
+        done_ev = threading.Event()
+
+        def _waiter() -> None:
+            for t in threads:
+                t.join()
+            done_ev.set()
+
+        threading.Thread(target=_waiter, name="tool-par-waiter",
+                        daemon=True).start()
+        while not done_ev.wait(0.1):
+            if time.monotonic() >= deadline or self.callbacks.is_cancelled():
+                break
+
+        with lock:
+            for idx in range(n):
+                if out[idx] is None:
+                    out[idx] = ToolResult(
+                        False,
+                        error="工具在限定时间内未完成（可能因用户取消或超时）")
+        for idx, name, args in jobs:
+            res = out[idx]
+            self._log_tool_result(name, res)
+            self.callbacks.on_tool_end(name, res)
+            results[idx] = res
 
     # ------------------------------------------------------------------
     def _system_prompt(self) -> str:
@@ -1775,37 +1813,63 @@ class Agent:
         }
 
     def _confirm_message(self, name: str, args: Dict[str, Any]) -> str:
-        """Build a concise confirmation message (purpose description, no code).
+        """Build a confirmation message.
 
-        ``code_run`` / ``shell_run`` carry full code/commands — dumping them
-        into the dialog makes it unreadably long and pushes the Yes/No buttons
-        off-screen.  We show a short *purpose* description instead.
+        ``code_run`` / ``shell_run`` 必须让用户看到**真实**代码/命令预览与
+        风险命中原因——只给启发式「用途」会被恶意/诱导性注释蒙蔽（确认弹窗
+        失去核对意义）。其他工具展示脱敏后的参数摘要（避免密钥进弹窗）。
         """
         if name == "code_run":
             code = str(args.get("code", "")).strip()
             timeout = args.get("timeout")
             purpose = self._describe_code_purpose(code)
-            msg = f"即将执行代码：{purpose}"
+            reason = _risk.risky_reason_code(code, self.config.workspace)
+            preview = self._code_preview(code)
+            msg = f"【用途】{purpose}\n\n【实际代码】\n{preview}"
+            if reason:
+                msg += f"\n\n【风险提示】{reason}"
             if timeout is not None:
-                msg += f"\n超时：{timeout}s"
+                msg += f"\n\n超时：{timeout}s"
             return msg + "\n\n是否继续？"
         if name == "shell_run":
             cmd = str(args.get("command", "")).strip()
             timeout = args.get("timeout")
             purpose = self._describe_code_purpose(cmd)
-            msg = f"即将执行命令：{purpose}"
+            reason = _risk.risky_reason_command(cmd, self.config.workspace)
+            preview = self._code_preview(cmd)
+            msg = f"【用途】{purpose}\n\n【实际命令】\n{preview}"
+            if reason:
+                msg += f"\n\n【风险提示】{reason}"
             if timeout is not None:
                 msg += f"\n超时：{timeout}s"
             return msg + "\n\n是否继续？"
 
-        # Other tools: show a compact argument summary (truncated).
+        # 其他工具：展示脱敏后的参数摘要（密钥/环境变量不进弹窗）。
         try:
-            pretty = json.dumps(args, ensure_ascii=False)
+            arg_sum = {str(k): (f"<redacted:{type(v).__name__}>"
+                                if any(s in str(k).lower() for s in
+                                       ("key", "token", "secret", "password",
+                                        "auth", "credential", "env", "cookie"))
+                                else str(v)[:120])
+                       for k, v in (args or {}).items()}
+            pretty = json.dumps(arg_sum, ensure_ascii=False)
         except Exception:
-            pretty = str(args)
+            pretty = "<args>"
         if len(pretty) > 500:
             pretty = pretty[:500] + "…"
         return f"即将调用工具 `{name}`：\n{pretty}\n\n是否继续？"
+
+    @staticmethod
+    def _code_preview(src: str) -> str:
+        """真实代码/命令的前若干行预览，避免弹窗无限拉长。"""
+        lines = src.splitlines()
+        head = lines[:12]
+        preview = "\n".join(head)
+        if len(lines) > 12:
+            preview += "\n…"
+        if len(preview) > 1200:
+            preview = preview[:1200] + "\n…"
+        return preview or "（空）"
 
     def _log(self, line: str) -> None:
         self.callbacks.on_log(line)

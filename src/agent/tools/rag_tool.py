@@ -354,7 +354,8 @@ class RagIngestTool(Tool):
         },
         "required": [],
     }
-    destructive = False
+    # 重建知识库会清除并重新索引全部文档，是破坏性操作，需人工确认。
+    destructive = True
 
     def __init__(self, engine: "RAGEngine", registry: "ToolRegistry" = None):
         self._engine = engine

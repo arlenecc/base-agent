@@ -305,6 +305,12 @@ class AgentConfig:
     # True = 恢复旧的逐次确认行为。
     always_confirm_code: bool = False
 
+    # web_scan / webexec_js 的初始 URL 私网/内网访问开关（SSRF 防护）。
+    # 默认 False：拦截私网/loopback/链路本地/保留地址（如云元数据
+    # 169.254.169.254），防止模型通过本工具读取内网凭证。本地调试需扫
+    # localhost 时在配置中开启。重定向目标始终受 _is_blocked_host 约束。
+    web_allow_private_hosts: bool = False
+
     # MCP servers – list of {name, command, args?, env?} dicts.
     # Example:
     #   [{"name": "filesystem", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}]
@@ -351,7 +357,8 @@ class AgentConfig:
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
                     "rag_ocr_scale_dynamic", "aux_llm_enabled",
                     "local_llm_enable_thinking", "aux_local_llm_enable_thinking",
-                    "rag_matryoshka_enabled", "rag_binary_prefilter_enabled")
+                    "rag_matryoshka_enabled", "rag_binary_prefilter_enabled",
+                    "web_allow_private_hosts")
 
     @classmethod
     def _coerce(cls, name: str, value):

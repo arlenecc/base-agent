@@ -124,6 +124,13 @@ _FAIL_REPEAT_LIMIT = 3      # 连续 3 次相同失败签名（第 4 次出现�
 # 再试→成功」的正常排查不受影响；阈值给足探索空间。
 _SAME_TOOL_FAIL_LIMIT = 6   # 同一工具连败 6 次 → 收尾
 
+# 「失败总数硬上限」熔断：前两类熔断都依赖「连续/同工具」语义，失败-成功-
+# 失败-成功交替时计数被穿插的成功清零（见 _track_failures 的 `not failed`
+# 清零分支），无法收敛而烧满 max_iterations。这里用整个 run 的失败总数作为
+# 绝对兜底，不依赖连续性，覆盖极端抖动场景。阈值给足探索空间（正常多步任务
+# 难达此数，卡死才会）。
+_FAILED_TOTAL_HARD_CAP = 40   # 单 run 失败工具调用累计达此数 → 收尾
+
 # 「模型在向用户追问必要信息」的信号。只在任务未起步时作为放行依据，
 # 因此刻意收得比反思门的禁止清单更窄：只认真正索取信息的句式，不认
 # 「请问需要我继续吗」这类停车话术（后者由反思门继续拦）。
@@ -228,7 +235,7 @@ class KernelLoop:
             budget=ContextBudget(
                 int(getattr(config, "kernel_max_context_tokens", 30_000) or 30_000)
             ),
-            raw_turns=int(getattr(config, "kernel_raw_turns", 20) or 20),
+            raw_turns=int(getattr(config, "kernel_raw_turns", 8) or 8),
             max_digest_lines=int(getattr(config, "kernel_max_digest_lines", 40) or 40),
         )
         # 必须与 Session 共用同一个预算对象，否则内核记的账和 Session 折叠时
@@ -410,6 +417,10 @@ class KernelLoop:
                 break
 
             # ---- CONSOLIDATE ----
+            # 仅预算溢出触发折叠：历史保持「追加式」（不删头部），KV 缓存才能
+            # 稳定命中（form ①）。每轮删头部会让 system 之后整体分叉、ArraysCache
+            # 不可裁剪 → 每轮全量重建，响应变慢。预算溢出由 force_fold 成块折叠
+            # 兜底（稀疏触发，fold 后恢复追加式）。
             if self._needs_consolidate():
                 self.state = KernelState.CONSOLIDATE
                 self._last_consolidated_turn = session.current_turn
@@ -897,6 +908,16 @@ class KernelLoop:
                 # 上面的 fr 熔断，此处兜底（中途穿插成功会清零计数）。
                 self.log("[kernel] %s 连续 %d 次失败（参数各异），结束本轮"
                          "（避免空转）" % (self._same_tool_fail_name, ft))
+                if not final_text:
+                    final_text = (resp.content
+                                  or "（工具调用持续失败，已停止当前回合）")
+                exit_reason = ExitReason.DONE
+                break
+            elif self._failed_total >= _FAILED_TOTAL_HARD_CAP:
+                # 绝对兜底：失败-成功交替抖动时前两类熔断被穿插成功清零，
+                # 单 run 失败总数仍持续累积，到此硬上限强制收尾，避免空转。
+                self.log("[kernel] 单轮失败累计达 %d 次，结束本轮（避免空转）"
+                         % self._failed_total)
                 if not final_text:
                     final_text = (resp.content
                                   or "（工具调用持续失败，已停止当前回合）")

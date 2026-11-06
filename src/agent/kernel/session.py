@@ -120,7 +120,7 @@ class Session:
     def __init__(
         self,
         budget: ContextBudget,
-        raw_turns: int = 2,
+        raw_turns: int = 8,
         max_digest_lines: int = 40,
     ):
         self.budget = budget
@@ -361,6 +361,7 @@ class Session:
         """
         return "".join(
             (t.prompt or "") + (t.assistant_text or "")
+            + (t.raw_content or "")  # 第二视图：本地 MLX 后端会随消息发送，必须入预算
             + "".join(
                 json.dumps(tc.args, ensure_ascii=False) if isinstance(tc.args, dict)
                 else str(tc.args)
@@ -416,8 +417,10 @@ class Session:
         old, raw = self._windows()
         self.folded_count = len(self.extra_digest) + len(old)
 
+        # 只有「预算溢出主动收缩」摘入 extra_digest 的摘要才回注；超出 raw 窗口
+        # 的 old 区轮（窗口到达静默丢弃的那些）不再回注摘要，避免历史凭空膨胀。
         digest = l3_fold(
-            list(self.extra_digest) + [t.digest_line() for t in old],
+            list(self.extra_digest),
             max_lines=self.max_digest_lines,
         )
 

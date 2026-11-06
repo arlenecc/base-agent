@@ -121,35 +121,56 @@ def mentions_outside_path(text: str, workspace: str) -> bool:
     return False
 
 
-def is_risky_command(command: str, workspace: str) -> bool:
-    """shell_run 的风险判定。"""
+def _command_risks(command: str, workspace: str) -> List[str]:
+    """返回命令命中的风险原因列表（用于确认弹窗的「风险提示」）。"""
     cmd = command or ""
     low = cmd.lower()
+    risks: List[str] = []
     if _SHELL_CTRL_RE.search(low):
-        return True
+        risks.append("含系统/电源/进程控制命令（sudo/kill/shutdown 等）")
     if _PIPE_EXEC_RE.search(low):
-        return True
+        risks.append("远程下载脚本直接执行（curl|wget … | sh/python）")
     if _GIT_FORCE_RE.search(low):
-        return True
+        risks.append("git push --force 改写远端历史")
     # 破坏性动词（或向绝对路径重定向）+ 工作区之外的路径 → 风险
     if (_SHELL_VERB_RE.search(low) or _SHELL_REDIRECT_RE.search(low)) \
             and mentions_outside_path(cmd, workspace):
-        return True
-    return False
+        risks.append("向工作区之外的路径写入")
+    return risks
+
+
+def is_risky_command(command: str, workspace: str) -> bool:
+    """shell_run 的风险判定。"""
+    return bool(_command_risks(command, workspace))
+
+
+def risky_reason_command(command: str, workspace: str) -> Optional[str]:
+    """命令命中的风险原因串（无则 None），供确认弹窗展示。"""
+    rs = _command_risks(command, workspace)
+    return "；".join(rs) if rs else None
+
+
+def _code_risks(code: str, workspace: str) -> List[str]:
+    """返回代码命中的风险原因列表。"""
+    src = code or ""
+    risks: List[str] = []
+    if re.search(r"\bsudo\b", src):
+        risks.append("含 sudo 提权")
+    if _PIPE_EXEC_RE.search(src):
+        risks.append("远程下载脚本直接执行")
+    if _GIT_FORCE_RE.search(src):
+        risks.append("git push --force")
+    if _PY_CALL_RE.search(src) and mentions_outside_path(src, workspace):
+        risks.append("向工作区之外的路径写入")
+    return risks
 
 
 def is_risky_code(code: str, workspace: str) -> bool:
     """code_run 的风险判定。"""
-    src = code or ""
-    if re.search(r"\bsudo\b", src):
-        return True
-    if _PIPE_EXEC_RE.search(src):
-        return True
-    if _GIT_FORCE_RE.search(src):
-        return True
-    # 破坏性调用 + 工作区之外的路径字面量同现才判风险：
-    # shutil.rmtree("build") 在工作区内是安全的；
-    # subprocess.run(["pip", "install", "x"]) 无外部路径也安全。
-    if _PY_CALL_RE.search(src) and mentions_outside_path(src, workspace):
-        return True
-    return False
+    return bool(_code_risks(code, workspace))
+
+
+def risky_reason_code(code: str, workspace: str) -> Optional[str]:
+    """代码命中的风险原因串（无则 None），供确认弹窗展示。"""
+    rs = _code_risks(code, workspace)
+    return "；".join(rs) if rs else None

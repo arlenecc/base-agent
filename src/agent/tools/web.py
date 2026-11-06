@@ -62,20 +62,43 @@ _STATIC_ASSET_RE = re.compile(
 )
 
 
-def _is_blocked_host(host: str) -> bool:
-    """重定向目标主机是否落在应拦截的网段（SSRF 防护）。
+def _check_initial_url(url: str, allow_private: bool):
+    """初始 URL 的私网/内网校验（SSRF 防护）。
+
+    旧实现只校验 scheme，让 ``http://169.254.169.254/...`` 这类云元数据/
+    内网地址可直接被模型读取。重定向目标始终由 ``_is_blocked_host`` 约束；
+    这里把同样的约束补到**初始** URL，但保留 ``allow_private`` 开关以兼容
+    本地调试扫 localhost 的合法需求。
+    """
+    if allow_private:
+        return None
+    host = urlparse(url).hostname or ""
+    if _is_blocked_host(host, unresolvable_is_blocked=False):
+        return ToolResult(
+            False,
+            error=(f"禁止访问私网/内网地址 {host or url[:80]}（SSRF 防护）。"
+                   "如需访问本地或内网服务，请在配置中开启 web_allow_private_hosts。"),
+        )
+    return None
+
+
+def _is_blocked_host(host: str, unresolvable_is_blocked: bool = True) -> bool:
+    """主机是否落在应拦截的网段（SSRF 防护）。
 
     follow_redirects=True 只约束协议不跨（http→file），管不了跨网络边界：
     公网 URL 可被 302 引到云元数据（169.254.169.254）、loopback、内网段。
-    这里对**重定向目标**做主机解析 + 网段判定；初始 URL 是用户/模型显式
-    给的，仍只校验 scheme（本地调试扫 localhost 是合法需求）。
+
+    ``unresolvable_is_blocked``：解析失败时是否视为拦截。重定向目标默认
+    拦截（不当跳转目标）；**初始 URL** 调用时传 False——离线/无 DNS 环境下
+    把 ``example.com`` 这类公网域名误杀成私网反而破坏正常访问，解析失败应
+    交由网络层（连接错误）处理，只对「明确解析到私网/回环 IP」拦截。
     """
     if not host:
         return True
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
-        return True  # 解析不了的主机不当跳转目标
+        return unresolvable_is_blocked  # 解析不了：初始 URL 放行，重定向目标拦截
     for info in infos:
         ip_str = info[4][0]
         try:
@@ -439,6 +462,9 @@ class WebScanTool(Tool):
         # 可被用来读取本地文件或探测内网。
         if not url.lower().startswith(("http://", "https://")):
             return ToolResult(False, error=f"Only http/https URLs are supported: {url[:80]}")
+        blocked = _check_initial_url(url, getattr(self.config, "web_allow_private_hosts", False))
+        if blocked is not None:
+            return blocked
         http = getattr(self, "_http", None)
         if http is None:
             return ToolResult(False, error="web_scan 未绑定（registry.bind 未执行）")
@@ -707,6 +733,10 @@ class WebExecJsTool(Tool):
             ))
         payload = {"url": url, "script": script, "action": action,
                    "selector": selector, "value": value}
+        if url:
+            blocked = _check_initial_url(url, getattr(self.config, "web_allow_private_hosts", False))
+            if blocked is not None:
+                return blocked
         try:
             resp = self._http.post(endpoint.rstrip("/") + "/exec", json=payload)
         except Exception as e:

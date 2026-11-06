@@ -16,6 +16,15 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# 只向 MCP 子进程传递「运行所必需」的最小环境，避免父进程的全部环境变量
+# （含各种 API_KEY/TOKEN）被泄露给第三方 MCP server。需要的额外变量由
+# server 配置里的 env 显式提供（用户已信任该 server）。
+_MCP_SAFE_ENV = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL",
+    "LANG", "LC_ALL", "TERM", "TMPDIR", "TEMP", "TMP",
+    "SYSTEMROOT", "SYSTEMDRIVE", "PATHEXT", "COMSPEC", "XDG_CACHE_HOME",
+)
+
 # tools/call 的下限超时（秒）。握手/枚举用实例的 timeout（默认 30s）足够，
 # 但工具调用本身可能是构建、批量处理、爬取等长任务——共用 30s 会让长任务
 # 必然超时，且服务端还在跑，结果被当迟到响应丢弃。
@@ -106,6 +115,21 @@ class MCPClient:
         self._server_info: Dict[str, Any] = {}
         self._tools: List[Dict[str, Any]] = []
 
+    def _build_env(self) -> Optional[Dict[str, str]]:
+        """构造传给 MCP 子进程的环境变量。
+
+        只传运行所必需的最小环境（``_MCP_SAFE_ENV``），避免父进程的全部环境
+        变量（含各类 API_KEY/TOKEN）泄露给第三方 MCP server。需要的额外变量
+        由 ``self.env``（server 配置里的 env）显式提供（用户已信任该 server）。
+        """
+        if self.env or _MCP_SAFE_ENV:
+            import os
+            env = {k: os.environ[k] for k in _MCP_SAFE_ENV if k in os.environ}
+            if self.env:
+                env.update(self.env)
+            return env
+        return None
+
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
@@ -132,11 +156,7 @@ class MCPClient:
             self._pending.clear()
             self._results.clear()
 
-        env = None
-        if self.env:
-            import os
-            env = os.environ.copy()
-            env.update(self.env)
+        env = self._build_env()
 
         try:
             self._process = subprocess.Popen(

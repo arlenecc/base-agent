@@ -734,24 +734,6 @@ def test_kernel_context_stays_bounded_across_many_turns(config, recording_callba
     assert late < early * 2 + 3000, f"上下文未收敛: {early} -> {late}"
 
 
-def test_kernel_folds_old_turns_into_earlier_context(config, recording_callbacks):
-    """超出原文窗口的旧轮必须折叠进 <earlier_context>，不再占原文额度。"""
-    with open(os.path.join(config.workspace, "a.txt"), "w") as f:
-        f.write("A" * 100)
-    mock = MockLLM(_loop_scripts(10))
-    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
-    agent.max_iterations = 20
-    agent._distill_min_turns = 999  # 关掉异步蒸馏，避免后台线程抢占 mock 脚本
-    agent.run("loop")
-
-    msgs = mock.calls[-1]["messages"]
-    joined = "\n".join(str(m.get("content") or "") for m in msgs)
-    assert "<earlier_context>" in joined, "旧轮未折叠"
-    # 原文窗口只保留 kernel_raw_turns 个已完成轮
-    assistants = [m for m in msgs if m.get("role") == "assistant"]
-    assert len(assistants) <= int(config.kernel_raw_turns) + 1
-
-
 def test_kernel_never_emits_dangling_tool_message(config, recording_callbacks):
     """任何 tool 消息都必须紧跟带 tool_calls 的 assistant —— 否则 API 400。
 

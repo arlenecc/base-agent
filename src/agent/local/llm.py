@@ -1332,6 +1332,12 @@ class LocalLLMClient:
             raise RuntimeError("GGUF prompt 为空（渲染失败）")
 
         cached = self._gguf_ids
+        # 长会话护栏：缓存随会话线性增长（每层每 token 都要留 KV）。超过
+        # _KV_MAX_TOKENS 直接丢弃旧 KV、整体重建——与 MLX 的同款护栏一致，
+        # 避免 C++ context 的 KV 无上限膨胀（n_ctx 容量保护只在接近上限时才
+        # 触发，这里提前一道硬上限，超长会话也只付一次全量预填充）。
+        if cached and len(cached) > _KV_MAX_TOKENS:
+            cached = []
         common = 0
         if cached:
             lim = min(len(cached), len(ids))

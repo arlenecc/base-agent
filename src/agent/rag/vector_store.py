@@ -2685,9 +2685,13 @@ class VectorStore:
                 )
             else:
                 # _distance 字段缺失（罕见：表 schema 不兼容或旧表迁移）。
-                # 使用中等分数避免将无效结果排到最前或最后。
-                logger.debug("VectorStore.search: _distance field missing for result, using default score 0.5")
-                similarity = 0.5
+                # 这些结果没有可信相似度，按「最低优先级」处理（0.0）而非伪造
+                # 中等分 0.5，避免把无法验证的命中排到有效结果中间；升级为
+                # warning 以便发现 schema 兼容问题。
+                logger.warning(
+                    "VectorStore.search: _distance field missing for result, "
+                    "scoring as 0.0 (schema/compat issue)")
+                similarity = 0.0
             output.append({
                 "text": r.get("text", ""),
                 "source": r.get("source", ""),
