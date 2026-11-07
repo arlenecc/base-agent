@@ -462,10 +462,10 @@ def test_plan_resets_when_previous_task_finished(cfg):
     ])
     agent = Agent(llm=mock, config=cfg, callbacks=Noop())
     agent.kernel.run("任务A")
-    assert agent.session.get_plan() is not None
+    assert agent.session.get_plan() is None, "任务完成后执行计划应自动关闭（不再保留待重置）"
 
     agent.kernel.run("任务B")          # 直接调内核不走门面
-    assert agent.session.get_plan() is not None, "内核不管任务边界"
+    assert agent.session.get_plan() is None, "新请求未建计划则保持关闭，不遗留过期计划"
 
     # 走门面（真实入口）：第二个 run 开始时应清掉已完成的计划
     mock2 = MockLLM([[_evt("content", "ok"), _evt("done", usage={"total_tokens": 1})]])
@@ -505,9 +505,7 @@ def test_plan_survives_when_previous_task_unfinished(cfg):
     ])
     agent.llm = mock2
     agent.run("继续")
-    assert agent.session.get_plan() is not None
-    assert agent.session.get_plan()["goal"] == "任务A"
-    assert agent.session.plan_open_steps() == []
+    assert agent.session.get_plan() is None, "「继续」把剩余步骤完成后，计划自动关闭"
     anchor = next(
         (str(m.get("content") or "") for m in reversed(mock2.calls[0]["messages"])
          if m.get("role") == "user"), "")

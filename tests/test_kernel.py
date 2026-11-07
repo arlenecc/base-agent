@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent.agent import Agent                      # noqa: E402
 from agent.config import AgentConfig               # noqa: E402
 from agent.kernel import (                         # noqa: E402
-    ContextBudget, KernelState, Session, estimate_tokens,
+    ContextBudget, KernelLoop, KernelState, Session, estimate_tokens,
     l0_capture, l1_trim, l2_summary, l3_fold,
 )
 from agent.kernel.outcome import ExitReason, StepOutcome, next_state  # noqa: E402
@@ -33,7 +33,7 @@ class MockLLM:
         self._scripts = list(scripts)
         self.calls = []
 
-    def chat_stream(self, messages, tools=None, temperature=0.7):
+    def chat_stream(self, messages, tools=None, temperature=0.7, **kwargs):
         self.calls.append({"messages": messages, "tools": tools})
         if not self._scripts:
             raise AssertionError("MockLLM ran out of scripted responses")
@@ -75,6 +75,39 @@ class Noop:
 
     def ask_user(self, p):
         return "ok"
+
+
+def test_recover_answer_from_reasoning():
+    """关思考兜底作答：把思考转写成最终答复；辅助生成失败则退回原始思考。"""
+    class FakeClient:
+        def __init__(self, out):
+            self._out = out
+
+        def chat_stream(self, messages, **kwargs):
+            assert kwargs.get("enable_thinking") is False, "应关闭思考"
+            assert kwargs.get("kv_group") == "aux", "应用 aux 缓存隔离"
+            return iter([_evt("content", self._out), _evt("done")])
+
+    class Stub:
+        def __init__(self, client):
+            self._client = client
+            self.log = lambda *a, **k: None
+
+        def _llm(self):
+            return self._client
+
+    stub = Stub(FakeClient("你好！有什么可以帮你的吗？"))
+    got = KernelLoop._recover_answer_from_reasoning(
+        stub, "用户问hi，根据协议直接友好回应", None)
+    assert got == "你好！有什么可以帮你的吗？", got
+
+    class Boom:
+        def chat_stream(self, messages, **kwargs):
+            raise RuntimeError("boom")
+
+    stub2 = Stub(Boom())
+    got2 = KernelLoop._recover_answer_from_reasoning(stub2, "原始思考内容", None)
+    assert got2 == "原始思考内容", got2
 
 
 @pytest.fixture()

@@ -678,8 +678,14 @@ class KernelLoop:
                     exit_reason = ExitReason.DONE
                     break
                 final_text = resp.content
-                session.finish_turn(rec, resp.content, [], [],
-                                    l2_summary(resp.content),
+                if not (final_text or "").strip() and (resp.reasoning or "").strip():
+                    # 模型只产出思考、未产出独立最终答复（漏闭合 </think:6124c78e> / 答案
+                    # 写进思考块）：用一次「关思考」的辅助生成把思考转写成真正的
+                    # 最终答复，避免空回复或把内心独白当答案。失败退回原始思考。
+                    self.log("[kernel] 模型未产出独立正文，触发关思考兜底作答")
+                    final_text = self._recover_answer_from_reasoning(resp.reasoning, session)
+                session.finish_turn(rec, final_text, [], [],
+                                    l2_summary(final_text),
                                     raw_content=resp.raw_content)
                 exit_reason = ExitReason.DONE
                 break
@@ -971,6 +977,20 @@ class KernelLoop:
                 self.hooks.finished(session, final_text)
             except Exception as e:
                 self.log(f"[kernel] finished hook error: {e}")
+
+        # 任务正常完成且计划步骤已全部收尾时，自动清空执行计划（关闭计划面板），
+        # 避免「计划 N/N 完成却一直挂在面板上关不掉」。仅在确实存在计划、且无未
+        # 完成步骤时才清——中途放弃 / 达上限的未完成计划保持原样，便于续跑或复盘。
+        if (exit_reason == ExitReason.DONE
+                and session.get_plan() is not None
+                and not session.plan_open_steps()):
+            session.clear_plan()
+            cb = getattr(self.callbacks, "on_plan_updated", None)
+            if callable(cb):
+                try:
+                    cb(None)
+                except Exception:
+                    pass
 
         return KernelResult(final_text, exit_reason, self._turns_used,
                             self.distill_requested)
@@ -1514,6 +1534,44 @@ class KernelLoop:
         if "？" in tail or "?" in tail:
             return True
         return bool(_ASK_USER_RE.search(tail))
+
+    def _recover_answer_from_reasoning(self, reasoning: str, session) -> str:
+        """模型只产出思考、未产出独立最终答复时的兜底作答。
+
+        本地推理模型（Qwen3 + enable_thinking）对寒暄 / 自我认知等简单问题常只吐
+        思考、不闭合 </think:6124c78e>、也不给独立答复，导致 ``content`` 为空、用户收到空
+        回复。这里用一次「关闭思考」的辅助生成（``kv_group="aux"``，不污染主对话
+        KV 缓存）把思考过程转写成应当呈现给用户的最终答复正文。任何异常或仍为空都
+        退回原始思考——保证绝不对用户返回空回复。
+        """
+        reasoning = (reasoning or "").strip()
+        if not reasoning:
+            return ""
+        try:
+            client = self._llm()
+            if client is None:
+                return reasoning
+            messages = [
+                {"role": "system", "content":
+                    "你是一个对话助手。下面是一段【内部思考过程】。请忽略其格式与"
+                    "任何「根据协议」之类的内部措辞，只输出应当呈现给用户的【最终"
+                    "答复】正文，不要包含任何思考过程或元说明。"},
+                {"role": "user", "content": reasoning},
+            ]
+            parts: List[str] = []
+            for ev in client.chat_stream(
+                messages, enable_thinking=False, kv_group="aux", max_tokens=512
+            ):
+                if ev.type == "content":
+                    parts.append(ev.content)
+                elif ev.type == "done":
+                    break
+            text = "".join(parts).strip()
+            if text:
+                return text
+        except Exception as e:  # 兜底生成失败也不应让整轮变空
+            self.log(f"[kernel] 关思考兜底作答失败，退回原始思考: {e}")
+        return reasoning
 
     def _no_tool_event(self, resp: LLMResponse) -> str:
         content = (resp.content or "").strip()

@@ -332,8 +332,8 @@ def test_block_allowed_after_enough_failures(cfg):
     guard = _last_user_prompt(mock, len(script) - 1)
     assert "尝试不够" not in guard, "充分尝试后标记 blocked 不应被拦"
     assert out.text == "此路不通"
-    plan = agent.session.get_plan()
-    assert plan["steps"][0]["status"] == "blocked"
+    # 阻塞决策已放行（守卫未拦）；任务完成后执行计划自动关闭，不再持久化
+    assert agent.session.get_plan() is None
 
 
 def test_block_nudge_is_bounded(cfg):

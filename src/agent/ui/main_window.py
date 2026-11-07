@@ -662,19 +662,24 @@ class AgentWorker(QThread):
         # 纯浪费，实测表现为「发了消息 18s 没动静」）。空队列时才值得预热。
         if not self._queue.empty():
             self._callbacks.bridge.status.emit(
-                "已有消息在排队，跳过空闲期预热（首句将自行完成编译）")
+                "已有消息在排队，跳过空闲期预热（首句将自行完成编译与预填）")
             logger.info("AgentWorker: 队列已有待处理消息，跳过空闲期预热")
         else:
-            # warm_up（首次推理编译/冷启动）必须先跑：它在**主模型**上做一次真实
-            # 推理（kv_group="aux" 走旧路径 → create_chat_completion(reset=True)），
-            # 会 reset 共享的 llama.cpp 上下文、并清空主缓存计数器 _gguf_ids。若排在
-            # preload_kv 之后，会把刚预填好的系统提示 KV 整个冲掉，首句退回全量预填充
-            # （慢）。排在前面，它的 reset 无害；随后的 preload_kv 再重新预填。
+            # warm_up 必须先跑：MLX 走 kv_group="aux" 做一次「真实形状」推理
+            # （占位提问做到接近典型首句长度）以触发图编译——首句长度与之接近时
+            # 直接复用已编译图，编译成本锁在启动期而非落在第一句；GGUF 走
+            # create_chat_completion(reset=True) 会 reset 共享 llama.cpp 上下文、
+            # 清空主缓存计数器 _gguf_ids，若排在 preload_kv 之后会把刚预填好的
+            # 系统提示 KV 整个冲掉，首句退回全量预填充。排在前面，reset 无害；
+            # 随后的 preload_kv 再重新预填。
             try:
                 self._callbacks.bridge.status.emit(
-                    "主模型预热中（首次推理初始化，请稍候）")
+                    "主模型预热中（编译计算图 + 首次推理，约 20-30s）")
                 self._agent.warm_up()
-                self._callbacks.bridge.status.emit("主模型预热完成，可开始对话")
+                # 编译阶段结束、进入系统提示预填前，用过渡文案衔接，避免直接
+                # 弹「可开始对话」后又被下方「预填中」覆盖造成「完成↔预热」反复。
+                self._callbacks.bridge.status.emit(
+                    "主模型编译完成，正在预填系统提示…")
             except Exception as e:
                 logger.warning("主模型预热失败(忽略): %s", e)
                 self._callbacks.bridge.status.emit(
@@ -684,7 +689,7 @@ class AgentWorker(QThread):
             # 跳过系统提示的全量预填充（首句只付用户消息那段）。
             try:
                 self._callbacks.bridge.status.emit(
-                    "系统提示预热中（预填上下文，请稍候）")
+                    "系统提示预填中（预填上下文 KV，请稍候）")
                 self._agent.preload_kv()
                 # 预热只是内部优化，用户只关心「能不能对话」：最终态统一回
                 # 「主模型已就绪，可对话」（与 model_loaded 后的文案一致），

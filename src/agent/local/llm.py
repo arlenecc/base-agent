@@ -359,6 +359,10 @@ class _ThinkSplitter:
                 buf = buf[:lt]
                 if not buf or not buf.strip():
                     return []
+        # 注：流结束仍在 think 内（模型漏输 </think:6124c78e> 闭合标签）时，整段已作为
+        # reasoning 在 feed 中逐段发出，此处缓冲仅余末段残片；是否把漏闭合的内容
+        # 当正文回收交给内核 no-tool 路径的兜底处理（见 loop.py），避免这里只回
+        # 收残片、反而让 content 非空、掩盖真正的兜底。
         return [("reasoning" if self._in_think else "content", buf)]
 
 

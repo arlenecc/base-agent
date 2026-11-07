@@ -84,7 +84,7 @@ SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the us
 - 禁止复读：同一句话/同一问题不输出第二遍。
 
 ## 任务推进
-- 非平凡任务先 `update_plan(op="create", ...)` 拆 2~7 个可验证步骤，**规划完立即开工**；一句话任务不必规划。
+- 只有明显多步、需要跟踪进度的任务才先 `update_plan(op="create", ...)` 拆 2~7 个可验证步骤，**规划完立即开工**；**≤3 步可完成的小任务（单次读文件 / 单次问答 / 单次命令 / 单次搜索）不要建执行计划，直接执行即可**。
 - 工具结果回来先在 <summary> 写清证实/推翻了什么；每步完成用 `update_plan(op="patch", status=..., note=...)` 更新；计划有未完成步骤不许只给文字总结收尾。
 - 工具报错是信号：读报错分类 → 换没试过的方法重试 → 至少 3 种方法都失败才标 blocked 并继续其余步骤。绝不重复同样的失败调用、不把报错甩给用户、不停下问要不要继续。
 
@@ -963,12 +963,11 @@ class Agent:
     def warm_up(self, client=None) -> None:
         """模型加载完成后预热一次：触发首次推理的编译/初始化，让首句不等冷启动。
 
-        **仅 MLX 需要**：``mlx_lm`` 首次 generate 要编译计算图（常 20-30s）。
-        GGUF(llama.cpp)/ONNX 没有图编译，首次 decode 的 kernel 初始化由紧接着
-        的 ``preload_kv()`` 系统段 prefill 承担。这里再跑一次 "hi" 推理，会走
-        ``create_chat_completion(reset=True)`` 冲掉上下文、白付一次完整 prefill
-        （实测真实 system prompt 下约 1.8s），随后 preload 仍需 reset 从头再算
-        5263 token——纯浪费。故直接跳过。
+        **仅 MLX 需要**：``mlx_lm`` 首次 generate 要编译计算图（常 20-30s），且按
+        输入序列长度惰性编译并缓存——warm_up 用的占位提问若与首句长度差太多，首句会
+        按新长度重新编译（20-30s 全落第一句）。故占位提问做到接近典型首句长度，让典型
+        首句直接复用已编译图。走 ``kv_group="aux"`` 独立缓存，不污染主对话缓存。
+        GGUF(llama.cpp)/ONNX 没有图编译，跳过；系统段 prefill 由 ``preload_kv()`` 承担。
 
         网络后端 / 未标注 backend 的 mock 保持原行为。失败不影响主流程。
         """
@@ -978,14 +977,21 @@ class Agent:
         if getattr(client, "_backend", None) in ("gguf", "onnx"):
             return
         try:
+            # 占位用户消息要做到「接近典型首句长度」：MLX 计算图按输入序列长度惰性
+            # 编译并缓存，warm_up 与首句序列长度相差越大，首句越可能按新长度重新编译
+            # （20-30s 全落在第一句上，而非启动预热期）。之前用 "hi" 太短，几乎必然与
+            # 真实首句长度不符 → 首句重编译、预热白做。这里用一句真实长度的提问占位，
+            # 让典型首句直接复用已编译图（首句若更长/更短会再编译一次，属罕见情况）。
             messages = [
                 {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": "hi"},
+                {"role": "user", "content": (
+                    "你好，请介绍一下你自己，并说明你作为一个本地自主智能体"
+                    "都能帮我完成哪些任务？"
+                )},
             ]
-            # 消费完整流（含思考/重试），触发首次编译/图优化。max_tokens 限极小
-            # 值：预热只需「加载权重 + 跑一次真实形状的前向（prefill+少量 decode）」，
-            # 不必产出整段回答——尤其 GGUF 在 CPU 上，少解码几百个 token 能省数秒到
-            # 十几秒；MLX 的图编译与输出长度无关，限短同样能触发。
+            # 消费完整流（含思考/重试），触发首次编译/图优化。max_tokens 限极小值：
+            # 预热只需「加载权重 + 跑一次真实形状的前向（prefill+少量 decode）」，
+            # 不必产出整段回答——MLX 的图编译与输出长度无关，限短同样能触发。
             for _ in client.chat_stream(messages, kv_group="aux", max_tokens=4):
                 pass
             # 注意：此处**不再** invalidate 主缓存。aux 预热走独立缓存、不写实例级
