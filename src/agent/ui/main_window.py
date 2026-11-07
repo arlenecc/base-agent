@@ -672,7 +672,7 @@ class AgentWorker(QThread):
             # （慢）。排在前面，它的 reset 无害；随后的 preload_kv 再重新预填。
             try:
                 self._callbacks.bridge.status.emit(
-                    "主模型预热中（首次推理编译，约 20-30s，请稍候）")
+                    "主模型预热中（首次推理初始化，请稍候）")
                 self._agent.warm_up()
                 self._callbacks.bridge.status.emit("主模型预热完成，可开始对话")
             except Exception as e:

@@ -1,24 +1,47 @@
-"""MCP (Model Context Protocol) JSON-RPC client over stdio.
+"""MCP (Model Context Protocol) client built on ``fastmcp`` 4.x.
 
-Manages a subprocess that runs an MCP server, communicates via JSON-RPC 2.0
-over stdin/stdout, and exposes tools/list and tools/call.
+协议实现统一交给 fastmcp：握手/协议版本协商、tools/list、tools/call、
+resources/list、resources/read、prompts/list、prompts/get、以及 stdio /
+streamable-HTTP / SSE 三种传输都由 ``fastmcp.Client`` 负责，本模块只提供：
+
+  * **同步门面** —— 内核与 ``ToolRegistry`` 是同步的 worker 线程，fastmcp 的
+    ``Client`` 全异步。这里用一个常驻后台 event loop + 单一 session task 持有
+    ``Client`` 上下文，同步侧经 ``concurrent.futures.Future`` 等待结果。
+    ``Client.__aenter__`` 用 ``asyncio.current_task()`` 记录连接持有者，因此
+    enter / exit / 所有 RPC 必须在**同一个 task** 内完成；把请求排进队列由
+    session task 顺序执行正好满足这一点，也避免每次调用重连 stdio 子进程。
+
+  * **兼容契约** —— ``MCPClient`` 的同步方法、``MCPError``、``_cap_output``、
+    ``_build_env`` 的安全白名单、超时分层、重连冷却、永久停牌语义保持与旧版
+    一致，``MCPTool`` / ``ToolRegistry`` 无需感知底层换成了 fastmcp。
+
+  * **配置** —— 旧的 ``{name, command, args?, env?}``（stdio）继续可用；新增
+    ``{name, url, headers?, transport?: 'http'|'sse'}``（远程 MCP server）。
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import logging
-import queue
-import subprocess
+import os
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class MCPError(Exception):
+    """Raised when MCP communication fails."""
+    pass
+
 
 # 只向 MCP 子进程传递「运行所必需」的最小环境，避免父进程的全部环境变量
 # （含各种 API_KEY/TOKEN）被泄露给第三方 MCP server。需要的额外变量由
 # server 配置里的 env 显式提供（用户已信任该 server）。
+# 注意：fastmcp 的 StdioTransport 不会自动继承 os.environ（与旧实现一致），
+# 必须显式传 env；这里仍然只给白名单内容。
 _MCP_SAFE_ENV = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL",
     "LANG", "LC_ALL", "TERM", "TMPDIR", "TEMP", "TMP",
@@ -27,561 +50,46 @@ _MCP_SAFE_ENV = (
 
 # tools/call 的下限超时（秒）。握手/枚举用实例的 timeout（默认 30s）足够，
 # 但工具调用本身可能是构建、批量处理、爬取等长任务——共用 30s 会让长任务
-# 必然超时，且服务端还在跑，结果被当迟到响应丢弃。
+# 必然超时。fastmcp 的 Client 有全局 timeout，这里显式按调用覆盖。
 _TOOL_CALL_TIMEOUT = 300.0
 
-# 连接断开后自动重连的冷却（秒）。瞬时故障（server 崩溃、写失败、reader
-# 退出）不应让该 server 的工具在本次 Agent 生命周期内全部不可用；但持续
-# 崩溃的 server 也不能每个工具调用都拉起一次进程。冷却期内 ensure_connected
-# 直接返回 False，调用方以 "not running" 失败（错误信息里带上了原因）。
+# 关闭上下文的超时（秒）。挂起的 stdio server 不应让 stop() 无限期阻塞。
+_CLOSE_TIMEOUT = 5.0
+
+# 连接断开后自动重连的冷却（秒）。瞬时故障不应让该 server 的工具在本次
+# Agent 生命周期内全部不可用；但持续崩溃的 server 也不能每个调用都重连。
 _RESTART_COOLDOWN_SECS = 30.0
 
 # 单次 MCP 工具返回保留的最大字符数。MCP 工具是外部代码，输出体积不受我们
-# 控制（例如让它 dump 一个大文件/数据库表），而这段文本会原样进入模型上下文
-# ——不设上限一次调用就能把窗口撑爆。与 file_read / shell_run 的 200K 策略
-# 保持一致，保留头部并明确标注截断。
+# 控制，而这段文本会原样进入模型上下文——不设上限一次调用就能把窗口撑爆。
+# 与 file_read / shell_run 的 200K 策略保持一致，保留头部并明确标注截断。
 _MAX_TOOL_OUTPUT_CHARS = 200_000
 
-# 写入队列容量与入队超时。MCP server 若停止读取 stdin，管道缓冲区（64KB）
-# 写满后阻塞写会**无限期挂起** agent 线程（旧实现持 _write_lock 原地 write，
-# 卡死后所有后续 _call 全部排队等死）。改用专用写线程 + 有界队列后，最坏
-# 情况是入队超时后抛 MCPError，agent 线程永远不再被管道堵死。
+# 兼容常量：旧实现的 stdin 写队列上限 / 入队超时。新实现不再有写线程，
+# 但请求队列仍按同一上限做背压，避免工具调用堆积把后台 loop 拖垮。
 _WRITE_QUEUE_MAX = 64
 _WRITE_ENQUEUE_TIMEOUT = 10.0
 
-# ------------------------------------------------------------------
-# MCP JSON-RPC wire types
-# ------------------------------------------------------------------
-
-
-@dataclass
-class JSONRPCRequest:
-    jsonrpc: str = "2.0"
-    id: int = 0
-    method: str = ""
-    params: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class JSONRPCResponse:
-    jsonrpc: str = "2.0"
-    id: int = 0
-    result: Any = None
-    error: Optional[Dict[str, Any]] = None
+# fastmcp 是核心依赖（见 pyproject），但导入期仍做防御：即使某个精简安装
+# 缺了它，主程序也能启动，只有实际连接 MCP server 时给出明确提示。
+try:
+    from fastmcp import Client as _FastMCPClient
+    from fastmcp.client.transports import (
+        SSETransport as _SSETransport,
+        StdioTransport as _StdioTransport,
+        StreamableHttpTransport as _StreamableHttpTransport,
+    )
+    _HAS_FASTMCP = True
+    _FASTMCP_IMPORT_ERROR: Optional[str] = None
+except Exception as _e:  # pragma: no cover - 取决于安装
+    _FastMCPClient = None  # type: ignore[assignment]
+    _SSETransport = _StdioTransport = _StreamableHttpTransport = None  # type: ignore[assignment]
+    _HAS_FASTMCP = False
+    _FASTMCP_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 
 # ------------------------------------------------------------------
-# MCP Client
-# ------------------------------------------------------------------
-
-
-class MCPClient:
-    """Manages one MCP server subprocess and JSON-RPC communication."""
-
-    def __init__(
-        self,
-        name: str,
-        command: str,
-        args: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = None,
-        timeout: float = 30.0,
-    ):
-        self.name = name
-        self.command = command
-        self.args = args or []
-        self.env = env
-        self.timeout = timeout
-        self._process: Optional[subprocess.Popen] = None
-        self._request_id = 0
-        self._lock = threading.Lock()
-        # stdin 写入走专用线程 + 有界队列（见 _WRITE_QUEUE_MAX 注释）：持锁原地
-        # write 会被不读 stdin 的 server 堵死。单消费者线程天然保证消息不会
-        # 交错，因此不再需要写锁。
-        self._write_queue: "queue.Queue[Optional[str]]" = queue.Queue(
-            maxsize=_WRITE_QUEUE_MAX
-        )
-        self._writer_thread: Optional[threading.Thread] = None
-        self._pending: Dict[int, threading.Event] = {}
-        self._results: Dict[int, JSONRPCResponse] = {}
-        self._reader_thread: Optional[threading.Thread] = None
-        self._stderr_thread: Optional[threading.Thread] = None
-        self._running = False
-        # 主动停止标志（stop()）：与「连接自己断」区分开——后者下次使用前
-        # 自动重连（见 ensure_connected），前者是用户/registry 的拆除意图，
-        # 永不重启。
-        self._stopped = False
-        # 自动重连冷却截止（monotonic）：持续崩溃的 server 不会被反复拉起。
-        self._restart_after = 0.0
-        self._server_info: Dict[str, Any] = {}
-        self._tools: List[Dict[str, Any]] = []
-
-    def _build_env(self) -> Optional[Dict[str, str]]:
-        """构造传给 MCP 子进程的环境变量。
-
-        只传运行所必需的最小环境（``_MCP_SAFE_ENV``），避免父进程的全部环境
-        变量（含各类 API_KEY/TOKEN）泄露给第三方 MCP server。需要的额外变量
-        由 ``self.env``（server 配置里的 env）显式提供（用户已信任该 server）。
-        """
-        if self.env or _MCP_SAFE_ENV:
-            import os
-            env = {k: os.environ[k] for k in _MCP_SAFE_ENV if k in os.environ}
-            if self.env:
-                env.update(self.env)
-            return env
-        return None
-
-    # ------------------------------------------------------------------
-    # lifecycle
-    # ------------------------------------------------------------------
-
-    def start(self) -> None:
-        """Launch the MCP server subprocess and perform the initialize handshake."""
-        if self._running:
-            return
-        # 显式 start = 用户意图：清掉「已主动停止」，允许重新拉起。
-        self._stopped = False
-
-        # 上一次连接的残留状态必须先清掉：
-        # * _fail_pending / stop() 可能已在 _write_queue 里留下 None 哨兵，
-        #   新写线程会立刻消费它并退出 → 之后所有 _call() 干等 30~300s 超时；
-        # * _pending/_results 里可能躺着上一次连接的迟到条目，污染新会话。
-        # 不清的话「瞬时写失败 → _fail_pending 置 _running=False → 重启」
-        # 这条路永远修不好一个只是打了磕绊的连接。
-        while True:
-            try:
-                self._write_queue.get_nowait()
-            except queue.Empty:
-                break
-        with self._lock:
-            self._pending.clear()
-            self._results.clear()
-
-        env = self._build_env()
-
-        try:
-            self._process = subprocess.Popen(
-                [self.command] + self.args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                text=True,
-                bufsize=1,
-                # 独立进程组：很多 MCP server 由 `npx` 启动，npx 会再 fork 出
-                # 真正的 node server。不建新会话的话 terminate() 只杀掉 npx，
-                # 真正的 server 会变成孤儿进程一直存活到关机。有了独立进程组，
-                # stop() 可以 killpg 一次性回收整棵树。
-                start_new_session=True,
-            )
-        except FileNotFoundError:
-            raise MCPError(f"MCP server '{self.name}': command not found: {self.command}")
-        except Exception as e:
-            raise MCPError(f"MCP server '{self.name}': failed to start: {e}")
-
-        self._running = True
-        # Drain stderr in a background thread so the pipe buffer never fills up
-        # and blocks the subprocess.
-        self._stderr_thread = threading.Thread(
-            target=self._drain_stderr, daemon=True
-        )
-        self._stderr_thread.start()
-        self._writer_thread = threading.Thread(
-            target=self._write_loop, daemon=True, name=f"mcp-write-{self.name}"
-        )
-        self._writer_thread.start()
-        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader_thread.start()
-
-        # Initialize handshake
-        try:
-            init_resp = self._call("initialize", {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "base-agent", "version": "1.0"},
-            })
-            self._server_info = init_resp.result or {}
-            # Send initialized notification
-            self._send_notification("notifications/initialized", {})
-            # Fetch tools
-            tools_resp = self._call("tools/list", {})
-            self._tools = tools_resp.result.get("tools", []) if tools_resp.result else []
-            logger.info(
-                "MCP server '%s' initialized: %d tools available",
-                self.name, len(self._tools),
-            )
-        except Exception:
-            # 握手失败只做**局部清理**（不停牌 _stopped）：这次失败可能是瞬时
-            # 的（模型下载中断、端口竞争），之后的 ensure_connected 还应能
-            # 自动重试。stop() 是「永久拆除」语义，不能用于这里。
-            self._teardown()
-            raise
-
-    def stop(self) -> None:
-        """永久停止（用户 / registry 拆除意图）：之后不会自动重连。"""
-        self._stopped = True
-        self._teardown()
-
-    def _teardown(self) -> None:
-        """Terminate the MCP server subprocess and wait for threads.
-
-        Cleanup is driven by ``self._process``, NOT by ``self._running``.
-        The reader thread sets ``_running = False`` in its ``finally`` block
-        whenever the server dies on its own (crash, stdout closed).  If we
-        bailed out on ``not self._running``, that path would skip
-        terminate()/wait() entirely and leave a zombie child forever — and a
-        still-alive server (only its stdout closed) would become an orphan.
-        """
-        # Signal the reader thread to stop first. We set _running=False under
-        # the lock so the reader sees it on its next loop iteration.
-        with self._lock:
-            self._running = False
-            process = self._process
-            self._process = None
-        # Terminate / wait happen OUTSIDE the lock so the reader thread (which
-        # may be in its finally block trying to acquire the lock) doesn't
-        # deadlock waiting for us to release it.
-        if process:
-            self._terminate(process)
-
-        # 管道必须在进程结束之后才关：读线程正阻塞在 stdout.readline() 时，
-        # BufferedReader 的内部锁会让 close() 一直阻塞到子进程退出（实测一个
-        # 挂起 60s 的 server 会把 stop() 卡住 59s），而且因为旧实现把关管道
-        # 排在前面，SIGTERM 根本来不及发出去 —— 握手超时路径尤其明显。
-        if process:
-            if process.poll() is None:
-                # 进程还活着（D 状态等）：放弃关管道也比原地卡死好。管道会在
-                # 进程最终退出后随 GC 一起回收。
-                logger.warning(
-                    "MCP server '%s': pid %d still alive after terminate; "
-                    "skipping pipe close (would block on the reader thread)",
-                    self.name, process.pid,
-                )
-            else:
-                for pipe in (process.stdin, process.stdout, process.stderr):
-                    try:
-                        if pipe:
-                            pipe.close()
-                    except Exception:
-                        pass
-        # Clear pending requests under the lock.
-        with self._lock:
-            self._process = None
-            # Wake up any waiters
-            for ev in self._pending.values():
-                ev.set()
-            self._pending.clear()
-            self._results.clear()
-        # 写线程可能阻塞在 stdin.write()（server 不读、管道已满）或队列 get()。
-        # 先投递哨兵唤醒 get()，再 join；join 超时说明它卡在 write 里——那是
-        # daemon 线程，进程退出时随之回收，不会阻塞 shutdown。
-        try:
-            self._write_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        writer = self._writer_thread
-        self._writer_thread = None
-        if writer and writer.is_alive() and writer is not threading.current_thread():
-            writer.join(timeout=2)
-        # 无论 writer 是否退出，都换一个**全新**的写队列：
-        # 卡在 get() 里的旧 writer 会一直阻塞在那条旧队列上（daemon，无害），
-        # 但它若还挂在旧队列上，重启后就会和新 writer 变成同一队列的两个
-        # 消费者——旧 writer 拿到消息后往已置 None 的 stdin 写，抛错又走
-        # _fail_pending 把新连接再次判死。
-        self._write_queue = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
-        # Wait for reader threads to finish (they should exit once _running is
-        # False and stdin is closed, causing readline() to return "").
-        for t in (self._reader_thread, self._stderr_thread):
-            if t and t.is_alive():
-                t.join(timeout=3)
-
-    def _terminate(self, process: "subprocess.Popen") -> None:
-        """SIGTERM → wait → SIGKILL → wait，全程带超时，绝不无限等待。"""
-        try:
-            # 整棵进程组一起收：npx 之类的包装进程会把真正的 server 挂成
-            # 孙进程，只 terminate 顶层 PID 会留下孤儿。
-            try:
-                import os
-                import signal
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except Exception:
-                process.terminate()
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                import os
-                import signal
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except Exception:
-                process.kill()
-            # SIGKILL 后仍设超时：进程处于不可中断状态（D，常见于 NFS/
-            # FUSE I/O）时 wait() 会永久挂起，进而卡死 shutdown/重建。
-            # 这种情况下只能放弃等待，让 init 在进程退出后收尸。
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    "MCP server '%s': pid %d unkillable (D state?), giving up wait",
-                    self.name, process.pid,
-                )
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # public API
-    # ------------------------------------------------------------------
-
-    def list_tools(self) -> List[Dict[str, Any]]:
-        """Return the list of tools exposed by this MCP server."""
-        return list(self._tools)
-
-    def ensure_connected(self) -> bool:
-        """连接不在时尝试自动重连（瞬时故障自愈）。
-
-        旧实现：``_fail_pending`` / reader 退出把 ``_running`` 置 False 后，
-        ``_send`` 恒抛 "not running"，该 server 的全部工具在本次 Agent
-        生命周期内不可用，且用户无从得知。现在区分两种死亡：
-
-        * ``stop()`` 主动拆除 → ``_stopped=True``，永不重启；
-        * 连接自己断（server 崩溃 / stdin 写失败 / reader 退出）→ 下次
-          工具调用前重启一次，带 30s 冷却（持续崩溃不反复拉起进程）。
-
-        重启前必须 ``_teardown()``：旧 writer 线程还阻塞在旧写队列的
-        ``get()`` 上，不换队列的话新旧两个 writer 会共食同一队列，旧 writer
-        往已置 None 的 stdin 写 → 又把新连接判死。
-        """
-        with self._lock:
-            if self._running:
-                return True
-            if self._stopped:
-                return False
-        now = time.monotonic()
-        if now < self._restart_after:
-            return False
-        self._restart_after = now + _RESTART_COOLDOWN_SECS
-        logger.info("MCP server '%s' 连接已断开，尝试自动重连…", self.name)
-        try:
-            self._teardown()
-            self.start()
-            logger.info("MCP server '%s' 自动重连成功", self.name)
-            return True
-        except Exception as e:
-            logger.warning("MCP server '%s' 自动重连失败: %s", self.name, e)
-            return False
-
-    def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
-        """Call a tool on the MCP server and return the text content."""
-        # 连接断开过（瞬时故障）→ 先自动重连再调用，避免整个会话期内该
-        # server 的工具全部不可用。重连失败则继续走原路径，以明确的
-        # "not running" 错误失败（好过静默丢弃）。
-        self.ensure_connected()
-        # tools/call 与 initialize/tools/list 不能共用同一个 30s 超时：构建、
-        # 批量处理、爬取这类工具跑几分钟是常态。旧实现让它们共用初始化超时，
-        # 长任务必然超时失败——而服务端还在继续跑，结果被当迟到响应丢弃。
-        resp = self._call(
-            "tools/call",
-            {"name": name, "arguments": arguments},
-            timeout=max(self.timeout, _TOOL_CALL_TIMEOUT),
-        )
-        if resp.error:
-            raise MCPError(
-                f"MCP tool '{name}' error: {resp.error.get('message', 'unknown')}"
-            )
-        result = resp.result
-        if not isinstance(result, dict):
-            return str(result)
-        # MCP tools return content as a list of content blocks
-        content = result.get("content", [])
-        if isinstance(content, list):
-            texts = []
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        texts.append(block.get("text", ""))
-                    elif block.get("type") == "resource":
-                        texts.append(f"[resource: {block.get('resource', {})}]")
-                    else:
-                        texts.append(json.dumps(block, ensure_ascii=False))
-                else:
-                    texts.append(str(block))
-            text = _cap_output("\n".join(texts))
-        else:
-            text = _cap_output(json.dumps(result, ensure_ascii=False))
-        # MCP 规范：工具执行失败仍然是 JSON-RPC 成功响应，失败由 result.isError
-        # 标记。只检查 resp.error 会把 "permission denied" 之类的错误正文当成
-        # 成功结果喂给模型，模型会拿错误信息继续推理。
-        if result.get("isError"):
-            raise MCPError(f"MCP tool '{name}' failed: {text}")
-        return text
-
-    # ------------------------------------------------------------------
-    # JSON-RPC internals
-    # ------------------------------------------------------------------
-
-    def _call(
-        self,
-        method: str,
-        params: Dict[str, Any],
-        timeout: Optional[float] = None,
-    ) -> JSONRPCResponse:
-        """Send a JSON-RPC request and wait for the response.
-
-        ``timeout`` 缺省用初始化超时（适合握手/枚举类调用）；长任务方法应
-        传入更长的值（见 call_tool）。
-        """
-        with self._lock:
-            req_id = self._request_id
-            self._request_id += 1
-            ev = threading.Event()
-            self._pending[req_id] = ev
-
-        req = JSONRPCRequest(id=req_id, method=method, params=params or {})
-        try:
-            self._send(json.dumps(req.__dict__))
-        except MCPError:
-            with self._lock:
-                self._pending.pop(req_id, None)
-            raise
-
-        if not ev.wait(timeout=timeout if timeout is not None else self.timeout):
-            # 读线程可能刚好在此刻拿到锁、写入 _results 并 set(ev)。只 pop
-            # pending 会把那条响应永久留在 _results 里（含完整响应体，
-            # _results 只在 stop() 才 clear）→ 每命中一次泄漏一条。
-            with self._lock:
-                self._pending.pop(req_id, None)
-                self._results.pop(req_id, None)
-            raise MCPError(f"MCP server '{self.name}': timeout waiting for '{method}'")
-
-        with self._lock:
-            resp = self._results.pop(req_id, None)
-            self._pending.pop(req_id, None)
-
-        if resp is None:
-            raise MCPError(f"MCP server '{self.name}': no response for '{method}'")
-        if resp.error:
-            raise MCPError(
-                f"MCP server '{self.name}' RPC error: {resp.error.get('message', 'unknown')}"
-            )
-        return resp
-
-    def _send_notification(self, method: str, params: Dict[str, Any]) -> None:
-        """Send a JSON-RPC notification (no response expected)."""
-        msg = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-        self._send(json.dumps(msg))
-
-    def _send(self, line: str) -> None:
-        """Enqueue a single JSON-RPC message line for the writer thread.
-
-        旧实现在调用线程里持锁原地 ``stdin.write()``：server 停止读取 stdin 时，
-        管道缓冲区（64KB）写满后该调用**无限期阻塞**，并且因为持有写锁，所有
-        后续 _call() 全部排队等死——agent 线程彻底卡死。现在写入交给专用线程，
-        调用方只做有界入队；单消费者线程天然保证消息不会交错（旧写锁的存在
-        理由），最坏情况是入队超时后抛 MCPError。
-        """
-        if not self._running:
-            raise MCPError(f"MCP server '{self.name}': not running")
-        try:
-            self._write_queue.put(line, timeout=_WRITE_ENQUEUE_TIMEOUT)
-        except queue.Full:
-            raise MCPError(
-                f"MCP server '{self.name}': stdin write queue full "
-                f"(server not draining input?)"
-            )
-
-    def _write_loop(self) -> None:
-        """Dedicated stdin writer: the ONLY thread that writes to the pipe.
-
-        写失败（BrokenPipe/进程已死）时立刻唤醒所有等待中的 _call()——否则
-        他们要干等满超时（tools/call 是 300s）才知道请求根本没发出去。
-        """
-        while True:
-            line = self._write_queue.get()
-            if line is None:                      # stop() 的哨兵
-                return
-            process = self._process
-            try:
-                if process is None or not process.stdin:
-                    raise MCPError(f"MCP server '{self.name}': not running")
-                process.stdin.write(line + "\n")
-                process.stdin.flush()
-            except Exception as e:
-                logger.debug("MCP '%s' write failed: %s", self.name, e)
-                self._fail_pending("MCP server connection lost (stdin write failed)")
-                return
-
-    def _drain_stderr(self) -> None:
-        """Continuously read stderr to prevent buffer deadlock."""
-        if not self._process or not self._process.stderr:
-            return
-        try:
-            for line in self._process.stderr:
-                logger.debug("MCP '%s' stderr: %s", self.name, line.rstrip())
-        except Exception:
-            pass
-
-    def _read_loop(self) -> None:
-        """Continuously read JSON-RPC responses from the subprocess stdout."""
-        try:
-            # 局部持有 pipe 引用：旧实现每轮读 ``self._process``——stop() 会把
-            # 它置 None，reader 已通过检查后 stop() 关闭 stdout，readline()
-            # 抛 ValueError 被 except 吞掉并走 _fail_pending，把一次**正常停止**
-            # 误报成「连接丢失」（还会借机触发自动重连，白拉起一个 server）。
-            process = self._process
-            while self._running and process and process.stdout:
-                line = process.stdout.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning("MCP server '%s' non-JSON line: %s", self.name, line[:200])
-                    continue
-
-                # Skip notifications (no id)
-                if "id" not in obj:
-                    continue
-
-                resp = JSONRPCResponse(
-                    jsonrpc=obj.get("jsonrpc", "2.0"),
-                    id=obj["id"],
-                    result=obj.get("result"),
-                    error=obj.get("error"),
-                )
-                with self._lock:
-                    ev = self._pending.get(resp.id)
-                    if ev is None:
-                        # 迟到的响应：对应的 _call() 已超时/被取消，没人会再来
-                        # pop 它。旧实现无条件写入 _results，这些条目会永久
-                        # 驻留（内存泄漏）。直接丢弃。
-                        continue
-                    self._results[resp.id] = resp
-                ev.set()
-        except Exception as e:
-            logger.debug("MCP server '%s' reader exited: %s", self.name, e)
-        finally:
-            # The reader is exiting (server crashed, stdin closed, or stop()).
-            # Wake up any pending callers so they don't wait the full timeout.
-            # Store an error response so _call() reports a clear message instead
-            # of a generic "no response".
-            self._fail_pending("MCP server connection closed")
-
-    def _fail_pending(self, reason: str) -> None:
-        """唤醒所有等待中的 _call()，让它们以明确错误失败而不是干等超时。"""
-        with self._lock:
-            self._running = False
-            for req_id, ev in self._pending.items():
-                if req_id not in self._results:
-                    self._results[req_id] = JSONRPCResponse(
-                        id=req_id,
-                        error={"message": reason, "code": -1},
-                    )
-                ev.set()
-
-
-# ------------------------------------------------------------------
-# Helpers
+# 结果转换
 # ------------------------------------------------------------------
 
 
@@ -599,11 +107,555 @@ def _cap_output(text: str) -> str:
     )
 
 
+def _json_default(value: Any) -> str:
+    return str(value)
+
+
+def _dump_obj(obj: Any) -> str:
+    """pydantic 模型 / dict / 其它对象 → JSON 字符串（不抛异常）。"""
+    try:
+        if hasattr(obj, "model_dump"):
+            obj = obj.model_dump(by_alias=True, exclude_none=True)
+        elif hasattr(obj, "__dict__") and not isinstance(obj, (dict, list)):
+            obj = dict(obj.__dict__)
+        return json.dumps(obj, ensure_ascii=False, default=_json_default)
+    except Exception:
+        return str(obj)
+
+
+def _tool_to_dict(tool: Any) -> Dict[str, Any]:
+    """fastmcp 的 ``mcp.types.Tool`` → MCPTool 需要的 dict（含 inputSchema）。
+
+    ``model_dump(by_alias=True)`` 把字段 ``input_schema`` 还原成协议里的
+    ``inputSchema``。任何形状异常都兜底成空 schema，MCPTool 另有兜底逻辑。
+    """
+    try:
+        data = tool.model_dump(by_alias=True, exclude_none=True)
+        if not isinstance(data, dict):
+            raise TypeError("tool dump is not a dict")
+    except Exception:
+        data = {
+            "name": str(getattr(tool, "name", "") or ""),
+            "description": str(getattr(tool, "description", "") or ""),
+        }
+    schema = data.get("inputSchema")
+    if not isinstance(schema, dict):
+        data["inputSchema"] = {"type": "object", "properties": {}, "required": []}
+    return data
+
+
+def _block_to_text(block: Any) -> str:
+    """单个 MCP 内容块 → 可读文本。
+
+    覆盖三类：普通 ContentBlock / TextResourceContents（都有 ``.text``）、
+    PromptMessage（``.role`` + ``.content``）、以及 image/audio/resource 等
+    非文本块（转 JSON，保留结构信息）。
+    """
+    # PromptMessage：role + 内层 content（TextContent / ImageContent …）
+    role = getattr(block, "role", None)
+    if role is not None and hasattr(block, "content"):
+        return f"{role}: {_block_to_text(block.content)}"
+    if hasattr(block, "text"):
+        return str(getattr(block, "text", "") or "")
+    resource = getattr(block, "resource", None)
+    if resource is not None and not isinstance(block, dict):
+        return f"[resource: {_dump_obj(resource)}]"
+    if isinstance(block, dict):
+        if block.get("type") == "text":
+            return str(block.get("text", "") or "")
+        if block.get("type") == "resource":
+            return f"[resource: {_dump_obj(block.get('resource', {}))}]"
+    return _dump_obj(block)
+
+
+def _render_content(result: Any) -> str:
+    """fastmcp 各种结果 → 统一文本（200K 截断）。
+
+    fastmcp 4.x 的结果形状不统一，必须逐个适配，否则会退化成把整个
+    pydantic 对象 dump 成 JSON、可读性很差：
+      * ``CallToolResult``      → ``.content`` 列表
+      * ``read_resource``       → **直接返回** list（无 ``.content``）
+      * ``GetPromptResult``     → ``.messages`` 列表（每条是 PromptMessage）
+      * 结构化输出              → ``.structured_content``
+    """
+    blocks: Any = None
+    if isinstance(result, (list, tuple)):
+        blocks = result                       # read_resource
+    else:
+        content = getattr(result, "content", None)
+        if isinstance(content, (list, tuple)):
+            blocks = content                  # CallToolResult
+        else:
+            messages = getattr(result, "messages", None)
+            if isinstance(messages, (list, tuple)):
+                blocks = messages             # GetPromptResult
+    if blocks is not None:
+        return _cap_output("\n".join(_block_to_text(b) for b in blocks))
+    structured = getattr(result, "structured_content", None)
+    if structured:
+        return _cap_output(_dump_obj(structured))
+    return _cap_output(_dump_obj(result))
+
+
 # ------------------------------------------------------------------
-# Error type
+# 异步桥接：常驻 event loop + 单一 session task
 # ------------------------------------------------------------------
 
 
-class MCPError(Exception):
-    """Raised when MCP communication fails."""
-    pass
+class _AsyncSession:
+    """在一个后台线程里长期持有 fastmcp Client 的异步上下文。
+
+    所有 RPC 都排进 ``asyncio.Queue``，由持有上下文的那个 task 顺序执行；
+    同步线程用 Future 取结果。这样 ``__aenter__`` / ``__aexit__`` / 每次调用
+    都落在同一个 ``asyncio.Task`` 里，符合 fastmcp 对连接持有者的约束。
+    """
+
+    def __init__(self, client: Any, name: str, close_timeout: float = _CLOSE_TIMEOUT):
+        self._client = client
+        self._name = name
+        self._close_timeout = close_timeout
+        self._loop = asyncio.new_event_loop()
+        self._queue: Optional[asyncio.Queue] = None
+        self._ready = threading.Event()
+        self._error: Optional[BaseException] = None
+        self._closed = False
+        # 所有在途请求（含正在执行的）。stop() 靠它让同步调用方立即返回，
+        # 而不是等慢工具跑完（tools/call 上限 300s）。
+        self._inflight: "set[concurrent.futures.Future[Any]]" = set()
+        self._inflight_lock = threading.Lock()
+        # 仅由 event loop 线程读写：当前正在等待的 RPC task，供 stop() 取消。
+        self._current_task: Optional["asyncio.Task[Any]"] = None
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"mcp-session-{name}")
+
+    @property
+    def alive(self) -> bool:
+        return (not self._closed) and self._thread.is_alive()
+
+    def start(self, timeout: float) -> None:
+        self._thread.start()
+        if not self._ready.wait(max(1.0, timeout)):
+            self.stop()
+            raise MCPError(f"MCP server '{self._name}': initialize 握手超时")
+        if self._error is not None:
+            err = self._error
+            self.stop()
+            raise err
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._session_main())
+        except BaseException as e:  # pragma: no cover - 后台线程兜底
+            logger.debug("MCP '%s' event loop exited: %s", self._name, e)
+        finally:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+
+    async def _session_main(self) -> None:
+        q: asyncio.Queue = asyncio.Queue()
+        self._queue = q
+        entered = False
+        try:
+            await self._client.__aenter__()
+            entered = True
+            self._ready.set()
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                fn, fut, call_timeout = item
+                try:
+                    # 用显式 Task：stop() 可以 cancel 它，让 wait_for 立刻返回，
+                    # session 不必等慢工具自然结束就能退出。
+                    task = asyncio.ensure_future(fn())
+                    self._current_task = task
+                    value = await asyncio.wait_for(task, timeout=call_timeout)
+                except BaseException as e:
+                    if not fut.done():
+                        fut.set_exception(e)
+                else:
+                    if not fut.done():
+                        fut.set_result(value)
+                finally:
+                    self._current_task = None
+        except BaseException as e:
+            self._error = e
+            self._ready.set()
+        finally:
+            if entered:
+                try:
+                    # 退出也必须在同一 task 内；加超时防止挂起 server 卡死 stop()。
+                    await asyncio.wait_for(
+                        self._client.__aexit__(None, None, None),
+                        timeout=self._close_timeout)
+                except BaseException as e:
+                    logger.debug("MCP '%s' 上下文关闭异常(忽略): %s", self._name, e)
+            self._drain(q)
+
+    def _drain(self, q: "asyncio.Queue") -> None:
+        """连接关闭时叫醒所有还在等结果的同步调用方。"""
+        while True:
+            try:
+                item = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is None:
+                continue
+            _, fut, _ = item
+            if not fut.done():
+                fut.set_exception(MCPError(
+                    f"MCP server '{self._name}' 连接已关闭"))
+
+    def submit(self, fn: Callable[[], Coroutine[Any, Any, Any]],
+               timeout: float) -> Any:
+        """从同步线程提交一次 RPC，阻塞等待结果；任何异常交由调用方收敛。"""
+        if self._closed or self._queue is None or not self._loop.is_running():
+            raise MCPError(f"MCP server '{self._name}' not running")
+        if self._queue.qsize() >= _WRITE_QUEUE_MAX:
+            raise MCPError(
+                f"MCP server '{self._name}' request queue full "
+                f"({_WRITE_QUEUE_MAX} pending)")
+        fut: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
+        # 先登记再入队：避免 stop() 与「请求已被 session 取走但尚未登记」的竞态
+        # 窗口里漏掉一个等待方。
+        with self._inflight_lock:
+            self._inflight.add(fut)
+        try:
+            try:
+                self._loop.call_soon_threadsafe(
+                    self._queue.put_nowait, (fn, fut, timeout))
+            except RuntimeError as e:
+                raise MCPError(f"MCP server '{self._name}' event loop closed") from e
+            try:
+                return fut.result(timeout=timeout + 1.0)
+            except concurrent.futures.TimeoutError as e:
+                raise MCPError(
+                    f"MCP server '{self._name}' request timed out after {timeout:.0f}s") from e
+            except concurrent.futures.CancelledError as e:
+                raise MCPError(f"MCP server '{self._name}' request cancelled") from e
+        finally:
+            with self._inflight_lock:
+                self._inflight.discard(fut)
+
+    def stop(self) -> None:
+        """关闭连接：立即叫醒所有在途调用，取消正在执行的 RPC，优雅退出。
+
+        「终止对话」时后台可能有一个 tools/call 正跑长任务（上限 300s）。若等它
+        自然结束，调用方与 stop() 都会被拖住。这里先给所有 Future 置明确错误，
+        再取消当前 RPC task，让 session 立刻走到 __aexit__。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        with self._inflight_lock:
+            pending = list(self._inflight)
+        for fut in pending:
+            if not fut.done():
+                fut.set_exception(MCPError(
+                    f"MCP server '{self._name}' 已停止，请求被取消"))
+        if self._queue is not None and self._loop.is_running():
+            def _shutdown() -> None:
+                task = self._current_task
+                if task is not None and not task.done():
+                    task.cancel()
+                try:
+                    self._queue.put_nowait(None)
+                except Exception:
+                    pass
+            try:
+                self._loop.call_soon_threadsafe(_shutdown)
+            except RuntimeError:
+                pass
+        try:
+            self._thread.join(timeout=self._close_timeout + 1.0)
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------
+# MCP Client（同步门面）
+# ------------------------------------------------------------------
+
+
+class MCPClient:
+    """Manages one MCP server connection (stdio subprocess or remote HTTP/SSE).
+
+    Public interface is intentionally identical to the previous hand-written
+    JSON-RPC client, so ``ToolRegistry`` / ``MCPTool`` need no changes.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        command: str = "",
+        args: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+        timeout: float = 30.0,
+        *,
+        url: str = "",
+        transport: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        cwd: Optional[str] = None,
+        server: Any = None,
+    ):
+        self.name = name
+        self.command = command
+        self.args = args or []
+        self.env = env
+        self.timeout = float(timeout)
+        # 远程 server 配置（新增能力）；transport ∈ {http, sse}，缺省 http。
+        self.url = url or ""
+        self.transport_kind = (transport or "").strip().lower()
+        self.headers = headers or {}
+        self.cwd = cwd
+        # 直接传 fastmcp.FastMCP 实例 → 进程内连接（不拉起子进程），供测试
+        # 与嵌入式使用；为 None 时按 command/url 选择 stdio 或远程传输。
+        self._server = server
+
+        self._session: Optional[_AsyncSession] = None
+        self._client: Any = None
+        self._tools: List[Dict[str, Any]] = []
+        self._server_info: Dict[str, Any] = {}
+        self._running = False
+        self._stopped = False
+        self._restart_after = 0.0
+        # 保留 _lock：外部（UI 关闭路径）依赖它做串行化与状态保护。
+        self._lock = threading.RLock()
+
+    # -- 传输与环境 -------------------------------------------------
+
+    def _build_env(self) -> Optional[Dict[str, str]]:
+        """构造传给 MCP 子进程的最小环境变量（安全白名单 + 配置 env）。
+
+        fastmcp 的 ``StdioTransport`` 不会自动继承 ``os.environ``，所以这里
+        必须显式构造；同时绝不把父进程的 API_KEY/TOKEN 透传给第三方 server。
+        """
+        if self.env or _MCP_SAFE_ENV:
+            env = {k: os.environ[k] for k in _MCP_SAFE_ENV if k in os.environ}
+            if self.env:
+                env.update(self.env)
+            return env
+        return None
+
+    def _make_transport(self) -> Any:
+        if not _HAS_FASTMCP:
+            raise MCPError(
+                "未安装 fastmcp，无法连接 MCP server。请先安装依赖："
+                "pip install 'fastmcp>=4.0'"
+                + (f"（导入错误：{_FASTMCP_IMPORT_ERROR}）" if _FASTMCP_IMPORT_ERROR else "")
+            )
+        if self._server is not None:
+            return self._server  # Client 直接接受 FastMCP 实例
+        if self.url:
+            kind = self.transport_kind or "http"
+            if kind in ("http", "streamable-http", "streamable_http", "streamablehttp"):
+                return _StreamableHttpTransport(
+                    url=self.url, headers=self.headers or None)
+            if kind == "sse":
+                return _SSETransport(url=self.url, headers=self.headers or None)
+            raise MCPError(
+                f"MCP server '{self.name}': 未知 transport {kind!r}，"
+                "可选 'http'(streamable-HTTP) / 'sse'")
+        if not self.command:
+            raise MCPError(
+                f"MCP server '{self.name}': 配置缺少 command（stdio）或 url（HTTP/SSE）")
+        # keep_alive=False 关键：默认 True 时 fastmcp 在连接上下文退出后仍保留
+        # 子进程，stop() 会留下孤儿进程。
+        return _StdioTransport(
+            command=self.command,
+            args=list(self.args),
+            env=self._build_env(),
+            cwd=self.cwd,
+            keep_alive=False,
+        )
+
+    # -- 生命周期 ---------------------------------------------------
+
+    def start(self) -> None:
+        """建立连接、完成 initialize 握手并枚举工具（同步阻塞）。"""
+        with self._lock:
+            self._start_locked(reset_cooldown=True)
+
+    def _start_locked(self, reset_cooldown: bool) -> None:
+        """实际建连逻辑（调用方已持 _lock）。
+
+        ``reset_cooldown=False`` 供 ensure_connected() 的自动重连使用：显式
+        start 才清零冷却，否则一次失败重连会立刻把冷却抹掉，导致持续崩溃的
+        server 每个工具调用都重新拉起一次。
+        """
+        if self._running:
+            return
+        # 显式 start = 用户意图：清掉「已主动停止」，允许重新拉起。
+        self._stopped = False
+        if reset_cooldown:
+            self._restart_after = 0.0
+        self._teardown_locked()
+
+        transport = self._make_transport()
+        client = _FastMCPClient(
+            transport,
+            timeout=self.timeout,
+            init_timeout=self.timeout,
+        )
+        session = _AsyncSession(client, self.name)
+        try:
+            session.start(self.timeout)
+            tools = session.submit(
+                lambda: client.list_tools(), timeout=self.timeout)
+            self._tools = [_tool_to_dict(t) for t in (tools or [])]
+            info = getattr(client, "server_info", None)
+            self._server_info = _safe_dict(info) if info is not None else {}
+            caps = getattr(client, "server_capabilities", None)
+            if caps is not None:
+                self._server_info["capabilities"] = _safe_dict(caps)
+        except BaseException as e:
+            session.stop()
+            if isinstance(e, MCPError):
+                raise MCPError(
+                    f"MCP server '{self.name}': failed to start: {e}") from e
+            raise MCPError(
+                f"MCP server '{self.name}': failed to start: "
+                f"{type(e).__name__}: {e}") from e
+        self._session = session
+        self._client = client
+        self._running = True
+        logger.info("MCP server '%s' initialized: %d tools available",
+                    self.name, len(self._tools))
+
+    def stop(self) -> None:
+        """永久停牌：关闭连接、回收子进程，幂等且不抛异常。"""
+        with self._lock:
+            self._stopped = True
+            self._running = False
+            self._teardown_locked()
+
+    def _teardown_locked(self) -> None:
+        """关闭当前 session（调用方已持 _lock），异常一律吞掉。"""
+        session, self._session = self._session, None
+        self._client = None
+        self._tools = []
+        if session is not None:
+            try:
+                session.stop()
+            except Exception as e:
+                logger.debug("MCP '%s' stop 异常(忽略): %s", self.name, e)
+
+    def ensure_connected(self) -> bool:
+        """确认连接可用；断开时按冷却策略自动重连，失败吞异常返回 False。"""
+        with self._lock:
+            if self._stopped:
+                return False
+            if self._running and self._session is not None and self._session.alive:
+                try:
+                    if bool(self._client.is_connected()):
+                        return True
+                except Exception:
+                    pass
+            now = time.monotonic()
+            if now < self._restart_after:
+                return False
+            self._restart_after = now + _RESTART_COOLDOWN_SECS
+            self._running = False
+            try:
+                self._teardown_locked()
+                self._start_locked(reset_cooldown=False)
+                return True
+            except Exception as e:
+                logger.warning("MCP server '%s' 自动重连失败: %s", self.name, e)
+                return False
+
+    # -- 协议能力 ---------------------------------------------------
+
+    @property
+    def server_info(self) -> Dict[str, Any]:
+        """initialize 握手返回的 serverInfo / capabilities。"""
+        return dict(self._server_info)
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        """已注册工具定义（dict，含 ``inputSchema``），供 MCPTool 消费。"""
+        with self._lock:
+            return list(self._tools)
+
+    def _require_session(self) -> "_AsyncSession":
+        if not self.ensure_connected():
+            raise MCPError(f"MCP server '{self.name}' not running")
+        session = self._session
+        if session is None or not session.alive:
+            raise MCPError(f"MCP server '{self.name}' not running")
+        return session
+
+    def _rpc(self, coro_factory: Callable[[], Coroutine[Any, Any, Any]],
+             timeout: float, what: str) -> Any:
+        session = self._require_session()
+        try:
+            return session.submit(coro_factory, timeout=timeout)
+        except MCPError:
+            raise
+        except BaseException as e:
+            # fastmcp / mcp SDK 的 ToolError、MCPError、TimeoutError 等一律收敛成
+            # 本模块的 MCPError —— ToolRegistry 只认它，MCPTool 会把 str(e) 直接
+            # 喂给模型，不能泄漏底层英文异常类型。
+            raise MCPError(f"{what}: {type(e).__name__}: {e}") from e
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
+        """调用工具并返回文本内容（200K 截断；isError → MCPError）。"""
+        call_timeout = max(self.timeout, _TOOL_CALL_TIMEOUT)
+        result = self._rpc(
+            # 在 coroutine 真正执行时才取 self._client：_rpc 里的
+            # ensure_connected() 可能刚完成一次重连并替换了 client 实例。
+            lambda: self._client.call_tool(
+                name, arguments or {}, timeout=call_timeout,
+                raise_on_error=False),
+            call_timeout,
+            f"MCP tool '{name}' error",
+        )
+        text = _render_content(result)
+        # MCP 规范：工具执行失败仍是 JSON-RPC 成功响应，失败由 isError 标记。
+        # 只检查传输层异常会把 "permission denied" 当成功结果喂给模型。
+        if bool(getattr(result, "is_error", False)):
+            raise MCPError(f"MCP tool '{name}' failed: {text}")
+        return text
+
+    # 以下是旧客户端没有、由 fastmcp 直接带来的完整协议能力。ToolRegistry
+    # 目前只用到 tools，但这些入口让客户端可作为规范 MCP client 单独使用。
+    def list_resources(self) -> List[Dict[str, Any]]:
+        resources = self._rpc(
+            lambda: self._client.list_resources(), self.timeout,
+            "MCP resources/list error")
+        return [_safe_dict(r) for r in (resources or [])]
+
+    def read_resource(self, uri: str) -> str:
+        result = self._rpc(
+            lambda: self._client.read_resource(uri), self.timeout,
+            f"MCP resources/read '{uri}' error")
+        return _render_content(result)
+
+    def list_prompts(self) -> List[Dict[str, Any]]:
+        prompts = self._rpc(
+            lambda: self._client.list_prompts(), self.timeout,
+            "MCP prompts/list error")
+        return [_safe_dict(p) for p in (prompts or [])]
+
+    def get_prompt(self, name: str,
+                   arguments: Optional[Dict[str, Any]] = None) -> str:
+        result = self._rpc(
+            lambda: self._client.get_prompt(name, arguments or {}),
+            self.timeout, f"MCP prompts/get '{name}' error")
+        return _render_content(result)
+
+
+def _safe_dict(obj: Any) -> Dict[str, Any]:
+    """pydantic 模型 → dict；失败时给出最小可读结构。"""
+    try:
+        if hasattr(obj, "model_dump"):
+            data = obj.model_dump(by_alias=True, exclude_none=True)
+            if isinstance(data, dict):
+                return data
+        if isinstance(obj, dict):
+            return dict(obj)
+    except Exception:
+        pass
+    return {"value": str(obj)}

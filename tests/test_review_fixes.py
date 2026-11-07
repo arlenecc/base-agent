@@ -26,11 +26,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent.config import AgentConfig               # noqa: E402
 from agent.kernel.session import render_plan_dict  # noqa: E402
-from agent.tools.mcp_client import MCPClient, MCPError, _WRITE_QUEUE_MAX  # noqa: E402
+from agent.tools.mcp_client import MCPClient, MCPError  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# 1. MCP：stdin 写入走有界队列
+# 1. MCP：连接不可用时同步门面快速失败，不挂起调用线程
 # ---------------------------------------------------------------------------
 
 class _FakeCallbacks:
@@ -38,41 +38,29 @@ class _FakeCallbacks:
         return False
 
 
-def _mcp_client_full_queue() -> MCPClient:
-    """构造一个「运行中但写队列已满」的 client（不起真实子进程）。"""
+def test_mcp_protocol_calls_fail_fast_when_stopped():
+    """stop() 后所有协议入口都必须抛 MCPError，而不是 AttributeError/阻塞。"""
     c = MCPClient(name="t", command="true")
-    c._running = True
-    for _ in range(_WRITE_QUEUE_MAX):
-        c._write_queue.put('{"jsonrpc": "2.0"}')
-    return c
+    c.stop()
+    calls = (
+        lambda: c.call_tool("x", {}),
+        lambda: c.list_resources(),
+        lambda: c.read_resource("res://x"),
+        lambda: c.list_prompts(),
+        lambda: c.get_prompt("p"),
+    )
+    for call in calls:
+        with pytest.raises(MCPError):
+            call()
 
 
-def test_mcp_send_full_queue_raises_instead_of_hanging():
-    """队列满 → 快速抛 MCPError，绝不阻塞调用线程。"""
-    import queue as _q
+def test_mcp_stop_is_idempotent_and_permanent():
+    """stop() 幂等；停牌后 ensure_connected 不会再偷偷重连拉起子进程。"""
     c = MCPClient(name="t", command="true")
-    c._running = False
-    with pytest.raises(MCPError):
-        c._send("{}")                      # 未运行 → 立即失败
-    c = _mcp_client_full_queue()
-    # 模拟入队超时：monkeypatch put 直接抛 Full，验证 _send 转译为 MCPError
-    import agent.tools.mcp_client as m
-    orig = c._write_queue.put
-    def _full(*a, **kw):
-        raise _q.Full()
-    c._write_queue.put = _full
-    with pytest.raises(MCPError, match="queue full"):
-        c._send("{}")
-    c._write_queue.put = orig
-
-
-def test_mcp_send_running_enqueues_for_writer_thread():
-    """运行中 → 消息入队（由单消费者写线程落盘，调用方不碰管道）。"""
-    c = MCPClient(name="t", command="true")
-    c._running = True
-    c._send('{"id": 1}')
-    assert c._write_queue.qsize() == 1
-    assert c._write_queue.get() == '{"id": 1}'
+    c.stop()
+    c.stop()
+    assert c.ensure_connected() is False
+    assert c.list_tools() == []
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +224,10 @@ class _ScriptLLM:
     def __init__(self, raw):
         self._raw = raw
 
-    def chat_stream(self, messages, tools=None, temperature=0.1):
+    def chat_stream(self, messages, tools=None, temperature=0.1,
+                    kv_group="main"):
+        # extract_facts_via_llm 传 kv_group="aux"；替身必须接受，否则
+        # TypeError 被上游 except 吞掉，测试得到空图谱而非校验归一化。
         from agent.llm_client import StreamEvent
         return iter([StreamEvent(type="content", content=self._raw),
                      StreamEvent(type="done", usage={})])

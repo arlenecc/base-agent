@@ -57,7 +57,7 @@
 - **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→8 次、引用最近错误**和已试过且失败的方案**、明确禁止「停下来问用户是否继续」）；**首次失败**即要求换方法（禁止原样重发、禁止把错误念给用户）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 3 次就把步骤标 `blocked` 会被守卫拦回。失败上下文跨自动续跑段传递，续跑段仍知道上一段卡在哪
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性；「终止对话」会立即中断并回收 `code_run`/`shell_run` 子进程（旧实现子进程要跑到自身超时，最长 600s）
 - **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱 + 技能检索共用同一份本地 jina 嵌入实例）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + 本地 reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler。**MLX 缓存上限显式压到 1GB**（默认可达统一内存的 75%，16GB 机器上实测把同步进程 footprint 顶到 19GB 的元凶）；docling converter 空闲 90 秒自动释放 + 每次转换后 `torch.mps.empty_cache()` 归还 MPS 缓冲；HuggingFace 全程离线（`HF_HUB_OFFLINE=1`，根治 convert 期间联网 connect 挂死）；单文档转换 1 小时硬超时兜底；日志/思考/计划面板均有行数上限防无限增长
-- **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
+- **健壮性** — `shell_run` 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树；MCP stdio 连接由 fastmcp 的 `StdioTransport(keep_alive=False)` 在 `stop()` 时回收；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制（风险分级）** — 工作区内操作自动执行；`code_run` / `shell_run` 默认**直接执行**，仅破坏性/影响系统与安全的操作才弹确认（`tools/risk.py` 静态分级：sudo、系统电源控制、进程杀伤、磁盘操作、管道下载执行、`git push --force`、写工作区之外的路径；读系统文件、工作区内读写、`pip install` 等一律不拦），`config.always_confirm_code=True` 可恢复逐次确认；MCP 工具仍逐次确认；确认弹窗只显示**用途说明**（启发式优先：注释/docstring/命令名映射，零延迟；无注释时才用 LLM 兜底生成 ≤20 字用途），不贴代码全文，避免超长文本把按钮顶出屏幕
@@ -640,7 +640,9 @@ Agent 不再「超了才压」，而是**先分配后消费**：30k 预算按
 
 ## MCP 协议支持
 
-在 `~/.base-agent/config.json` 中配置 MCP 服务器：
+客户端与服务端**统一基于 [fastmcp](https://gofastmcp.com) 4.x**（核心依赖）：协议版本协商、`tools/list`、`tools/call`，以及 `resources/*`、`prompts/*` 都由 fastmcp 负责；`mcp_client.py` 提供一个同步门面（后台常驻 event loop + 单一 session task 持有 `Client` 上下文），供同步的 worker 线程调用。
+
+在 `~/.base-agent/config.json` 中配置 MCP 服务器，支持两类：
 
 ```json
 {
@@ -648,13 +650,33 @@ Agent 不再「超了才压」，而是**先分配后消费**：30k 预算按
     {
       "name": "filesystem",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "env": {"MY_TOKEN": "..."}
+    },
+    {
+      "name": "remote",
+      "url": "http://127.0.0.1:8080/mcp/",
+      "transport": "http",
+      "headers": {"Authorization": "Bearer ..."}
     }
   ]
 }
 ```
 
-启动后自动连接 MCP Server，注册其提供的工具。
+| 字段 | 说明 |
+|------|------|
+| `name` | 必填，server 标识 |
+| `command` / `args` | stdio 子进程（旧格式，继续兼容）；`cwd` 可选 |
+| `url` | 远程 server；`transport` 缺省 `http`（2025 streamable-HTTP），也可设 `sse` |
+| `headers` | 远程 server 的请求头 |
+| `env` | 传给 stdio 子进程的额外环境变量 |
+| `timeout` | 握手/枚举超时，默认 30s；`tools/call` 固定下限 300s |
+
+启动后自动连接、握手、注册其提供的工具。安全性：只向 stdio 子进程透传最小环境白名单（`PATH`/`HOME`/`LANG` 等）加配置里显式写的 `env`，父进程的 `API_KEY`/`TOKEN` 不会泄露给第三方 server；`stop()` 会关闭连接并回收子进程（fastmcp 的 `StdioTransport` 显式设为 `keep_alive=False`，避免孤儿进程）。工具输出仍按 200K 字符截断，`isError` 会转成失败结果。
+
+客户端还完整支持 `resources/list|read` 与 `prompts/list|get`（结果统一渲染成可读文本）。`stop()` 会立即叫醒所有在途调用并取消正在执行的 RPC——「终止对话」时不会等一个长工具跑满 300s。连接判活使用 `Client.is_connected()`（fastmcp 4.1.6 的服务端未实现 `ping` 方法）。
+
+回归测试见 `tests/test_mcp_client_fastmcp.py`（同步门面、`inputSchema` 形状、resources/prompts 渲染、三种传输选择、env 白名单、配置透传、停牌与在途请求取消、线程清理，以及真实 stdio 子进程往返）。
 
 ## 项目结构
 
@@ -695,7 +717,7 @@ src/agent/
 │   ├── memory.py         # 记忆工具（work_memory / memory_graph / memory_search）
 │   ├── skill_search.py   # 技能工具（skill_search / skill_load）
 │   ├── rag_tool.py       # RAG 检索工具
-│   ├── mcp_client.py     # MCP JSON-RPC 客户端
+│   ├── mcp_client.py     # MCP 客户端（fastmcp 4.x + 同步桥接）
 │   └── mcp_tool.py       # MCP 工具适配
 └── ui/
     └── main_window.py    # PyQt6 主窗口（QTimer 日志轮询、信号槽、QThread worker）
@@ -724,7 +746,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 内核专项回归：`max_turns` 是「每次 run()」而非会话累计、reask 不掉最终轮、周期性 CONSOLIDATE 真的折叠、旧轮折叠后无悬挂 `tool` 消息、长任务 prompt 峰值不越过 30k。工具/RAG 专项：`skill_save` 后索引被标脏并能召回、`code_run` 超时关闭缓冲区、删除的知识库文件不再被 Step 7 复活、mtime 被保留的内容变更能被重新同步。
 
-失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启清理残留等。
+失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 停牌后快速失败、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启重建干净 session 等。
 
 当前共 682 个用例全部通过（`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`；未安装这些可选依赖时报环境错误，不影响其余测试）。
 
@@ -1132,11 +1154,11 @@ rapidocr 模块上验证 CoreML providers 真的排到最前、CPU 保留作回�
 
 ### 安装
 
-fastmcp 为可选依赖，需先安装；同时需启用 RAG 能力（否则 MCP 工具返回「RAG 引擎未就绪」）：
+fastmcp 现为**核心依赖**（客户端与服务端共用），随主程序一起安装；但对外提供 RAG 工具仍需启用 RAG 能力（否则 MCP 工具返回「RAG 引擎未就绪」）：
 
 ```bash
-pip install "base-agent[mcp]"   # 或单独：pip install fastmcp>=4.0
 pip install "base-agent[rag]"   # RAG 能力（向量库 / 嵌入 / 重排 / 解析）
+# 兼容旧命令：pip install "base-agent[mcp]"（fastmcp 已在核心依赖里）
 ```
 
 ### 两种接入方式

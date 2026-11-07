@@ -684,36 +684,34 @@ def test_mcp_client_caps_tool_output():
     assert "1234" in capped  # 标注里写明原始长度
 
 
-def test_mcp_client_send_after_stop_raises_clean_error():
-    """stop() 之后 _send 必须抛 MCPError，而不是与 stop() 竞态抛 AttributeError。"""
+def test_mcp_call_after_stop_raises_clean_error():
+    """stop() 之后协议调用必须快速抛 MCPError，而不是 AttributeError/挂起。"""
     from agent.tools.mcp_client import MCPClient, MCPError
 
     c = MCPClient(name="t", command="true")
-    try:
-        c._send("{}")
-        raised = None
-    except MCPError:
-        raised = "mcp"
-    except AttributeError:
-        raised = "attr"
-    assert raised == "mcp"
+    c.stop()                              # 永久停牌
+    with pytest.raises(MCPError):
+        c.call_tool("anything", {})
 
 
 def test_mcp_call_tool_reports_iserror_as_failure():
     """MCP 规范里工具失败是 result.isError=true，必须报错而不是当成功结果。"""
-    from agent.tools.mcp_client import MCPClient, MCPError, JSONRPCResponse
+    from fastmcp import FastMCP
+    from agent.tools.mcp_client import MCPClient, MCPError
 
-    c = MCPClient(name="t", command="true")
-    c._call = lambda method, params, timeout=None: JSONRPCResponse(
-        id=0,
-        result={"content": [{"type": "text", "text": "permission denied"}],
-                "isError": True},
-    )
+    mcp = FastMCP("mcp-iserror")
+
+    @mcp.tool()
+    def boom() -> str:
+        raise ValueError("permission denied")
+
+    c = MCPClient(name="t", server=mcp)
+    c.start()
     try:
-        c.call_tool("boom", {})
-        assert False, "isError=true 必须被当作失败"
-    except MCPError as e:
-        assert "permission denied" in str(e)
+        with pytest.raises(MCPError, match="permission denied"):
+            c.call_tool("boom", {})
+    finally:
+        c.stop()
 
 
 def test_mcp_stop_does_not_block_on_hung_server(tmp_path):

@@ -311,9 +311,18 @@ class AgentConfig:
     # localhost 时在配置中开启。重定向目标始终受 _is_blocked_host 约束。
     web_allow_private_hosts: bool = False
 
-    # MCP servers – list of {name, command, args?, env?} dicts.
-    # Example:
-    #   [{"name": "filesystem", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}]
+    # MCP servers —— 由 fastmcp 4.x Client 连接，支持两类配置（逐项 dict）：
+    #   stdio 子进程（旧格式，继续兼容）:
+    #     {"name", "command", "args"?, "env"?, "cwd"?, "timeout"?}
+    #   远程 server（新增）:
+    #     {"name", "url", "transport"?: "http"|"sse", "headers"?, "timeout"?}
+    #     transport 缺省为 "http"（2025 streamable-HTTP）。
+    # env 只透传白名单变量 + 配置内显式值，不会把父进程的密钥带给 server。
+    # 例：
+    #   [{"name": "filesystem", "command": "npx",
+    #     "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]},
+    #    {"name": "remote", "url": "http://127.0.0.1:8080/mcp/",
+    #     "headers": {"Authorization": "Bearer ..."}}]
     mcp_servers: list = field(default_factory=list)
 
     # ---- RAG MCP 服务（2025 streamable-HTTP）----

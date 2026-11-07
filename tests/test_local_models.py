@@ -526,7 +526,7 @@ def test_gguf_kv_reuse_disabled_uses_legacy_path(monkeypatch):
     c._loaded = True      # 跳过真实权重加载
     calls = {"legacy": 0}
 
-    def fake_legacy(self, messages, tools, temperature):
+    def fake_legacy(self, messages, tools, temperature, max_tokens=None):
         calls["legacy"] += 1
         return iter([])
 
@@ -557,7 +557,7 @@ def test_gguf_kv_reuse_enabled_tries_reuse_then_falls_back(monkeypatch):
     def boom_reuse(self, messages, tools, temperature):
         raise RuntimeError("boom")
 
-    def fake_legacy(self, messages, tools, temperature):
+    def fake_legacy(self, messages, tools, temperature, max_tokens=None):
         calls["legacy"] += 1
         return iter([])
 

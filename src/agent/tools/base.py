@@ -215,18 +215,29 @@ class ToolRegistry:
                 continue
             name = server_cfg.get("name", "")
             command = server_cfg.get("command", "")
-            if not name or not command:
-                # server_cfg 可能含 mcp_servers[].env（整份 API key/token）
-                logger.warning("MCP server config missing name or command (keys=%s)",
-                               list(server_cfg.keys()))
+            url = server_cfg.get("url", "")
+            if not name or (not command and not url):
+                # server_cfg 可能含 mcp_servers[].env / headers（整份 API
+                # key/token），日志里只打印键名，绝不打印值。
+                logger.warning(
+                    "MCP server config missing name or command/url (keys=%s)",
+                    list(server_cfg.keys()))
                 continue
 
             try:
+                # command → stdio 子进程（旧配置，继续兼容）；url → fastmcp
+                # 的 streamable-HTTP（默认）或 SSE 远程 server。transport /
+                # headers / cwd / timeout 均为可选。
                 client = MCPClient(
                     name=name,
                     command=command,
                     args=server_cfg.get("args", []),
                     env=server_cfg.get("env"),
+                    timeout=float(server_cfg.get("timeout") or 30.0),
+                    url=url,
+                    transport=server_cfg.get("transport"),
+                    headers=server_cfg.get("headers"),
+                    cwd=server_cfg.get("cwd"),
                 )
                 client.start()
                 self._mcp_clients.append(client)
@@ -248,9 +259,10 @@ class ToolRegistry:
                             t.name, name,
                         )
                 if registered == 0:
-                    # 一个工具都没注册上（全重名 / server 暴露空列表）→ 这个
-                    # server 的子进程 + 3 个线程纯属白占。立刻停掉并不留在
-                    # _mcp_clients 里，否则要挂到 shutdown 才回收。
+                    # 一个工具都没注册上（全重名 / server 暴露空列表）→ 这条
+                    # 连接（stdio 子进程 / HTTP 会话 + 后台 event loop 线程）
+                    # 纯属白占。立刻停掉并不留在 _mcp_clients 里，否则要挂到
+                    # shutdown 才回收。
                     logger.warning(
                         "MCP server '%s' 未注册任何工具（重名或空列表），停止该 server",
                         name,

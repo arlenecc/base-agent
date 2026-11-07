@@ -905,15 +905,21 @@ class Agent:
 
     # ------------------------------------------------------------------
     def warm_up(self, client=None) -> None:
-        """模型加载完成后预热一次：用完整 system prompt + 一条 'hi' 触发一次真实
-        形状的推理（本地模型首次 generate 要编译/预热，常需 20-30s），让用户的
-        首条消息无需再等冷启动。
+        """模型加载完成后预热一次：触发首次推理的编译/初始化，让首句不等冷启动。
 
-        只做推理、不执行工具、不写 session、不触发任何 UI 回调——纯预热。失败
-        不影响主流程：真对话时还会再调，且可能是权重/网络问题。
+        **仅 MLX 需要**：``mlx_lm`` 首次 generate 要编译计算图（常 20-30s）。
+        GGUF(llama.cpp)/ONNX 没有图编译，首次 decode 的 kernel 初始化由紧接着
+        的 ``preload_kv()`` 系统段 prefill 承担。这里再跑一次 "hi" 推理，会走
+        ``create_chat_completion(reset=True)`` 冲掉上下文、白付一次完整 prefill
+        （实测真实 system prompt 下约 1.8s），随后 preload 仍需 reset 从头再算
+        5263 token——纯浪费。故直接跳过。
+
+        网络后端 / 未标注 backend 的 mock 保持原行为。失败不影响主流程。
         """
         client = client or self.llm
         if client is None:
+            return
+        if getattr(client, "_backend", None) in ("gguf", "onnx"):
             return
         try:
             messages = [

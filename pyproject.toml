@@ -11,6 +11,10 @@ dependencies = [
     "PyQt6>=6.5",
     "httpx>=0.27",
     "beautifulsoup4>=4.12",
+    # MCP 协议统一由 fastmcp 4.x 实现：mcp_client.py（连接外部 server，核心
+    # 路径）+ rag_mcp_server.py（对外暴露 RAG）。协议版本协商、三种传输、
+    # tools/resources/prompts 都由它负责，因此不再是可选依赖。
+    "fastmcp>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -51,10 +55,11 @@ rag = [
 # rapidocr 3.x 起为统一包名（兼容层 rapidocr-onnxruntime 仅供旧环境回退，
 # 见 parsers._get_ocr_engine）；模型目录与 docling 共享，且支持 CoreML EP。
 ocr = ["rapidocr>=3.10"]
-# MCP server (2025 streamable-HTTP): 将 RAG 能力以 MCP 工具形式对外暴露，
-# 供其它大模型应用对接使用（需启用 RAG 可选依赖）。
-# 代码使用 fastmcp 4.x API（http_app() / run(transport="stdio") /
-# fastmcp.client.transports.StdioTransport），故锁定 >=4.0。
+# MCP server（2025 streamable-HTTP）：将 RAG 能力以 MCP 工具形式对外暴露，
+# 供其它大模型应用对接（需启用 rag 可选依赖）。fastmcp 现已是核心依赖，这里
+# 保留同名 extra，避免旧的 `pip install "base-agent[mcp]"` 命令/脚本失效。
+# 代码使用 fastmcp 4.x API（Client / http_app() / run(transport="stdio") /
+# StdioTransport / StreamableHttpTransport / SSETransport），故锁定 >=4.0。
 mcp = ["fastmcp>=4.0"]
 # All optional features
 #all = ["base-agent[test,rag,ocr,mcp]"]

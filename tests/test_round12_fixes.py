@@ -9,7 +9,7 @@
 * cleaner：字母比例计数与旧逐字符实现等价
 * risk：``> ~/...`` / ``>> ../...`` 重定向判风险
 * skill_search：external-dir 基线用检索器自己的 skills 根
-* mcp_client：start() 清掉上一次连接的写队列残留
+* mcp_client：stop() 后显式 start() 重建干净 session
 """
 import json
 import os
@@ -287,22 +287,27 @@ class TestExternalSkillDir:
 
 
 class TestMCPClientRestart:
-    def test_start_drains_stale_state(self, tmp_path):
+    def test_restart_rebuilds_clean_session(self):
+        """stop() 之后显式 start() 能复活，且不残留上一次 session 的状态。"""
+        from fastmcp import FastMCP
         from agent.tools.mcp_client import MCPClient
 
-        client = MCPClient(name="t", command="true", timeout=5.0)
-        # 模拟上一次连接残留的哨兵 + 迟到条目
-        client._write_queue.put(None)
-        with client._lock:
-            client._pending[999] = threading.Event()
-            client._results[999] = object()
+        mcp = FastMCP("mcp-restart")
 
-        # start() 的清理发生在 Popen 之前；用一个必然起不来的命令触发，
-        # 验证清理确实执行了（清理段在任何子进程逻辑之前）。
-        client.command = os.path.join(str(tmp_path), "definitely-missing-binary")
-        with pytest.raises(Exception):
-            client.start()
+        @mcp.tool()
+        def echo(msg: str) -> str:
+            return msg
 
-        assert client._write_queue.empty()
-        assert client._pending == {}
-        assert client._results == {}
+        c = MCPClient(name="t", server=mcp)
+        c.start()
+        try:
+            assert c.call_tool("echo", {"msg": "one"}) == "one"
+            c.stop()
+            assert c.ensure_connected() is False
+            # 显式 start 是用户意图：清掉停牌并重建全新 session
+            c.start()
+            assert c.ensure_connected() is True
+            assert c.call_tool("echo", {"msg": "two"}) == "two"
+            assert [t["name"] for t in c.list_tools()] == ["echo"]
+        finally:
+            c.stop()

@@ -1565,6 +1565,15 @@ class LocalLLMClient:
         logger.info(
             "GGUF KV: cached=%d prompt=%d reuse=%d eval=%d",
             len(cached), len(ids), reuse_n, len(suffix))
+        if reuse_n == 0 and len(ids) > 1000:
+            # WARNING 才能到 UI 日志面板（INFO 被桥接 Filter 挡掉）。全量
+            # 预填充是本模型唯一的秒级卡顿来源，必须让用户/排查者看得见：
+            # 命中复用时每轮只 eval 十余个 token（~15ms），退化则要按
+            # ~900 tok/s 重算整个 system+tools（真实配置 5k+ token ≈ 6s）。
+            logger.warning(
+                "GGUF KV: 本轮全量预填充 %d token（约数秒），常见原因："
+                "系统提示预热未命中 / 历史窗口变化 / 上下文容量保护触发",
+                len(ids))
 
         # 上下文容量保护：prompt + 生成上限超出 n_ctx 时必须全量重来（reset
         # 后从 0 开始），否则 llama.cpp 会在 eval 时截断/报错。
@@ -1619,9 +1628,11 @@ class LocalLLMClient:
                 gen_ids.append(tok_id)
                 if first_ts[0] is None:
                     first_ts[0] = time.time() - t0
-                # 增量解码：带上少量前文，避免多字节字符在 token 边界被拆坏
-                # （llama-cpp-python 自己的流式也是带 prev_tokens 解码的）。
-                prev = ids[-8:] + gen_ids[:-1]
+                # 增量解码：只带最近少量前文，避免多字节字符在 token 边界被
+                # 拆坏（一个 UTF-8 字符最多跨 3~4 个 token，8 个足够）。
+                # 旧实现传 gen_ids[:-1] 全量历史，每轮做 O(n) 拷贝，长回答
+                # 退化为 O(n²)；实测对 detokenize 结果无影响。
+                prev = ids[-8:] + gen_ids[-8:]
                 try:
                     piece = self._model.detokenize([tok_id], prev_tokens=prev)
                 except TypeError:  # 旧版 detokenize 无 prev_tokens 参数
