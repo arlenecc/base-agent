@@ -292,6 +292,22 @@ class _AgentKernelHooks(KernelHooks):
             return bool(self.agent._shrink_session(reason))
         return False
 
+    def before_consolidate(self, session: Session, reason: str) -> None:
+        # 折叠丢弃旧轮「之前」：把即将被折掉的旧轮先抽一次事实，避免裁剪丢事实。
+        # 与 finished 的批量沉淀共用 _fact_extract_lock（持锁期间跑 LLM），若上一次
+        # 沉淀仍在进行则自动跳过，不会堆叠。抽完清零批量计数器，避免紧接着的
+        # finished 又重复抽同一段。
+        agent = self.agent
+        keep = session.raw_turns + 1
+        n_discard = max(0, len(session.turns) - keep)
+        if n_discard <= 0:
+            return
+        try:
+            agent._extract_turns_async(session.turns[:n_discard])
+        except Exception as e:
+            agent._log(f"[kernel] pre-trim extraction error: {e}")
+        agent._turns_since_extract = 0
+
     def failed(self, session: Session, err: str) -> None:
         self.agent.callbacks.on_error(err)
 
@@ -313,6 +329,16 @@ class _AgentKernelHooks(KernelHooks):
 
     def finished(self, session: Session, text: str) -> None:
         agent = self.agent
+        # 批量沉淀：不再每轮都抽。累计 session.raw_turns 个真实轮才做一次
+        # 事实抽取 + 经验蒸馏；内核「裁剪丢弃旧轮前」的 before_consolidate 也会
+        # 强制沉淀一次并清零计数器（见下方）。distill_requested 时立即沉淀。
+        # 批大小用 session.raw_turns，与内核折叠窗口对齐——保证裁剪前总已把
+        # 最近 raw_turns 轮的内容抽过，不会因折叠丢事实。
+        agent._turns_since_extract += 1
+        batch_due = agent._turns_since_extract >= max(1, session.raw_turns)
+        if not (batch_due or agent.kernel.distill_requested):
+            return
+        agent._turns_since_extract = 0
         # 既有能力：异步抽取事实写知识图谱（不阻塞回复）
         try:
             agent._maybe_extract_facts_async(text)
@@ -323,15 +349,13 @@ class _AgentKernelHooks(KernelHooks):
             agent._run_memory_maintenance_async()
         except Exception as e:
             agent._log(f"[kernel] memory maintenance error: {e}")
-        # 新增能力：L4 经验蒸馏（模型显式调用 start_long_term_update，或长任务）
-        #
-        # 阈值用 ``session.current_turn``（真实轮数 = start_turn 次数，不含
-        # 反思门 reask / 上下文收缩重试）：后者会让「3 真实轮 + 8 次 reask
-        # 被拦」的用例误判为长任务触发蒸馏。current_turn 跨 run() 单调递增、
-        # 只在 reset() 清零——长会话累计 6 真实轮后每次 run 触发一次蒸馏是
-        # 可接受的（蒸馏本身有 _fact_extract_lock 串行 + 跳过上次未完成的）。
+        # L4 经验蒸馏（模型显式调用 start_long_term_update，或长任务）。
+        # 阈值用 session.current_turn（真实轮数）；distill_requested 时立即蒸馏。
         if agent.kernel.distill_requested or session.current_turn >= agent._distill_min_turns:
-            agent._distill_experience_async(session)
+            try:
+                agent._distill_experience_async(session)
+            except Exception as e:
+                agent._log(f"[kernel] distill error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +416,7 @@ class Agent:
         )
         self.session = Session(
             budget=self._budget,
-            raw_turns=int(getattr(config, "kernel_raw_turns", 2) or 2),
+            raw_turns=int(getattr(config, "kernel_raw_turns", 8) or 8),
             max_digest_lines=int(getattr(config, "kernel_max_digest_lines", 40) or 40),
         )
         # 工具通过 registry.session 读写工作记忆（update_working_checkpoint 等）
@@ -429,6 +453,9 @@ class Agent:
         # 后台记忆维护自己的防堆叠锁：与事实抽取锁分开，避免多个维护线程
         # 同时排队等锁（每个用户轮次都会在终止边触发一次）。
         self._memory_maint_lock = threading.Lock()
+        # 事实抽取/蒸馏的批量计数器：每累计 session.raw_turns 个真实轮才沉淀
+        # 一次（不再每轮都抽）。内核「裁剪丢弃旧轮前」也会强制沉淀一次并清零。
+        self._turns_since_extract = 0
 
         # ---- 改进 1~4：L0~L4 记忆体系 ----
         self._memory_layout = MemoryLayout(config.workspace)
@@ -471,6 +498,7 @@ class Agent:
         self.kernel._last_call_sigs = []
         self.kernel._step_fails = 0
         self.kernel._shrink_guard = 0
+        self._turns_since_extract = 0
         self._last_user_text = ""
         # Invalidate cached prompt
         self._cached_prompt_turn = -1
@@ -674,6 +702,33 @@ class Agent:
             args=(conversation,),
             daemon=True,
             name="fact-extraction",
+        )
+        thread.start()
+
+    def _extract_turns_async(self, turns: List[Any]) -> None:
+        """对给定的轮次集合异步抽取事实（通常用于「裁剪丢弃历史对话前」）。
+
+        与 ``_maybe_extract_facts_async`` 不同：后者取最近窗口，本方法抽取**指定的**
+        轮次集合，用于内核 ``before_consolidate`` 把即将被 ``force_fold`` 折掉、
+        即将消失于上下文的旧轮先沉淀一遍，避免裁剪丢事实。同样走 daemon 线程 +
+        ``_fact_extract_lock``，不会阻塞用户看到回复、也不会与别处沉淀堆叠。
+        """
+        convs: List[str] = []
+        for t in turns:
+            if (t.prompt or "").strip():
+                convs.append(f"User: {t.prompt.strip()}")
+            if (t.assistant_text or "").strip():
+                convs.append(f"Assistant: {t.assistant_text.strip()}")
+        if len(convs) < 2:
+            # 至少要有一对 user/assistant 才有可抽取的事实，否则白费一次 LLM 调用。
+            return
+        conversation = "\n\n".join(convs)
+        import threading
+        thread = threading.Thread(
+            target=self._extract_facts_sync,
+            args=(conversation,),
+            daemon=True,
+            name="fact-extraction-trim",
         )
         thread.start()
 

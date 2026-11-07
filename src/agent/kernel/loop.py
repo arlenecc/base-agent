@@ -173,6 +173,8 @@ class KernelHooks:
 
     def consolidated(self, session: Session, reason: str) -> bool:
         """折叠/沉淀回调。返回 True 表示上下文真的变小了。"""
+    def before_consolidate(self, session: Session, reason: str) -> None:
+        """折叠丢弃旧轮「前」的回调（可选）。默认 no-op。用于裁剪前做经验沉淀。"""
     def finished(self, session: Session, text: str) -> None: ...
     def failed(self, session: Session, err: str) -> None: ...
 
@@ -434,6 +436,11 @@ class KernelLoop:
                 # （每条都带 raw_content / prompt / tool_results，推理模型
                 # 单轮几十 KB）无界增长，与「L2+L3 历史 O(1)」的设计直接
                 # 矛盾。现在一律压到 raw_turns + 1（原文窗口 + 当前轮）。
+                # 折叠**前**：先把即将被丢弃的旧轮沉淀（事实抽取），避免裁剪丢事实。
+                try:
+                    self.hooks.before_consolidate(session, reason)
+                except Exception as e:
+                    self.log(f"[kernel] before_consolidate hook error: {e}")
                 keep = session.raw_turns + 1
                 folded = session.force_fold(max(1, len(session.turns) - keep))
                 if folded:

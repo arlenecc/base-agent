@@ -49,7 +49,9 @@ class AgentConfig:
     kernel_max_context_tokens: int = 30_000
     # 保留「原文」（未折叠）的最近轮数。更早的轮次折叠成一行摘要（L3）。
     # 这是历史从 O(轮次) 变 O(1) 的旋钮：调大 → 上下文更准但更贵。
-    kernel_raw_turns: int = 2
+    # 同时作为后台「事实抽取/经验蒸馏」的批量单位：每 raw_turns 个真实轮
+    # 沉淀一次（见 agent.py 的 before_consolidate / finished 钩子）。
+    kernel_raw_turns: int = 8
     # 每多少轮进入一次 CONSOLIDATE（不消耗 LLM 决策的压缩态）。
     kernel_consolidate_every: int = 4
     # 单个工具结果注入上下文的字符上限（L1 裁剪后的目标值）。
