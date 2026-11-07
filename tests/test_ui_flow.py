@@ -223,6 +223,10 @@ def test_load_model_button_shows_ready_state(qtbot, tmp_path, monkeypatch):
     win._on_load_main_model()
     qtbot.waitUntil(lambda: GREEN in win.load_main_btn.styleSheet(), timeout=3000)
     assert win.load_main_btn.text() == "重新加载"
+    # 后台 worker 加载完会紧接着做预热，状态栏会短暂经过「预热中」再回到
+    # 最终态；等最终态而不是断言某一瞬时值，避免与 worker 线程竞态。
+    qtbot.waitUntil(
+        lambda: win.status_label.text() == "主模型已就绪，可对话", timeout=3000)
     assert win.status_label.text() == "主模型已就绪，可对话"
     # 卸载 → 复位
     win._on_unload_main_model()

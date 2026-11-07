@@ -464,6 +464,7 @@ class LocalLLMClient:
         prefill_step_size: int = 0,
         kv_reuse: bool = True,
         kv_quant: bool = True,
+        flash_attn: bool = True,
         mmproj: str = "",
         tokenizer_path: str = "",
     ):
@@ -479,6 +480,12 @@ class LocalLLMClient:
         self._kv_quant = True if kv_quant is None else bool(kv_quant)
         # KV 量化是否真正生效（部分构建/模型不支持时降级为 False，仅作状态记录）。
         self._kv_quant_applied = self._kv_quant
+        # Flash attention：默认开（跨设备通用，长上下文/显存受限收益明显；GGUF
+        # 上实测 Metal compute buffer -19%）。None 同样按默认 True。
+        self._flash_attn = True if flash_attn is None else bool(flash_attn)
+        # 实际是否生效：GGUF 加载可能因构建/量化组合不支持而逐级降级；MLX
+        # 由 mlx_lm 原生使用融合 SDPA，加载时探测后回填。
+        self._flash_attn_applied = self._flash_attn
         # gguf 视觉塔（mmproj）路径与 onnx 分词器路径（均可选，留空走默认）。
         # mmproj 传给 llama.cpp 的 clip_model_path（多模态 GGUF 才需要）；
         # tokenizer_path 覆盖 ONNX 的 AutoTokenizer 加载位置（缺则随模型目录）。
@@ -619,6 +626,24 @@ class LocalLLMClient:
         # 场景尤明显）。mlx_lm.load 的 tokenizer_config 会透传给
         # AutoTokenizer.from_pretrained，这里显式修掉；老版本 transformers
         # 不认识该参数时退回默认加载（功能不降级）。
+        # MLX 侧本就默认使用 flash attention：mlx_lm 的
+        # models.base.scaled_dot_product_attention 无条件调用
+        # mx.fast.scaled_dot_product_attention（融合 SDPA kernel），load() 没有
+        # flash_attn 开关。这里做能力探测并记录状态，便于 UI/日志确认；
+        # 注意开启 KV 量化时会改走 quantized_scaled_dot_product_attention。
+        try:
+            import mlx.core as mx
+            self._flash_attn_applied = callable(
+                getattr(getattr(mx, "fast", None),
+                        "scaled_dot_product_attention", None))
+        except Exception:
+            self._flash_attn_applied = False
+        if self._flash_attn_applied:
+            logger.info("LLM: MLX 使用融合 SDPA（flash attention，mlx-lm 默认启用）")
+        else:
+            logger.warning(
+                "LLM: 当前 MLX 缺少 mx.fast.scaled_dot_product_attention，"
+                "注意力将走通用实现")
         try:
             self._model, self._tokenizer = load(
                 self._path, trust_remote_code=True,
@@ -658,52 +683,69 @@ class LocalLLMClient:
         # 报错，max_tokens 形同虚设且静默发生。预留 1k 给 prompt 余量，
         # 下限 8192（短 max_tokens 时也有基本的多轮空间）。
         n_ctx = max(8192, min(self._max_tokens + 1024, 131072))
-        # KV cache INT8 量化（type_k/type_v=GGML_TYPE_Q8_0=8）：同等上下文长度下
-        # KV 显存减半，质量损失可忽略。type_k/type_v 是 llama.cpp 的**整数枚举**
-        # （不是字符串 "q8_0"），传错类型会 TypeError；关闭时退回默认 f16 KV。
-        gguf_kwargs: Dict[str, Any] = {}
-        if self._kv_quant:
-            try:
-                from llama_cpp import GGML_TYPE_Q8_0  # 部分版本在顶层暴露
-            except Exception:
-                GGML_TYPE_Q8_0 = getattr(__import__("llama_cpp"), "GGML_TYPE_Q8_0", 8)
-            gguf_kwargs["type_k"] = GGML_TYPE_Q8_0
-            gguf_kwargs["type_v"] = GGML_TYPE_Q8_0
-        # mmproj 视觉塔（多模态 GGUF 才需要）：传给 clip_model_path。仅当用户
-        # 显式配置时加入——纯文本 GGUF 传了反而会被 llama.cpp 拒绝。
+        # Flash attention 默认启用：长上下文与显存受限设备收益明显（Metal 上
+        # compute buffer 实测 612→493 MiB，-19%）。但不同 llama.cpp 构建/后端
+        # 对 FA 与量化 KV 的支持并不一致——尤其 type_k/type_v=q8_0 必须与
+        # flash_attn=True 配套，否则 "Failed to create llama_context"。所以按
+        # 「能力从强到保守」逐级尝试，任何一级成功即用，绝不让开关把加载搞挂。
+        common: Dict[str, Any] = dict(
+            model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False)
+        # mmproj 视觉塔（多模态 GGUF 才需要）：仅当用户显式配置时加入——
+        # 纯文本 GGUF 传了反而会被 llama.cpp 拒绝。降级时必须保留它。
         if self._mmproj:
-            gguf_kwargs["clip_model_path"] = self._mmproj
+            common["clip_model_path"] = self._mmproj
         try:
-            self._model = Llama(
-                model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False,
-                **gguf_kwargs,
-            )
-            if self._kv_quant:
-                logger.info("LLM: GGUF KV cache 启用 INT8 量化 (type_k/type_v=q8_0)")
-        except Exception as e:
-            # 部分 llama.cpp 构建 / 模型不支持 type_k/type_v 覆盖（任何取值都
-            # 触发 "Failed to create llama_context"）——退回默认 f16 KV，绝不
-            # 因量化把模型加载搞挂（与 MLX 线性注意力模型的跳过逻辑一致）。
-            if self._kv_quant:
+            from llama_cpp import GGML_TYPE_Q8_0  # 部分版本在顶层暴露
+        except Exception:
+            GGML_TYPE_Q8_0 = getattr(__import__("llama_cpp"), "GGML_TYPE_Q8_0", 8)
+
+        attempts: List[tuple] = []
+        if self._kv_quant:
+            attempts.append((True, self._flash_attn))     # 量化 KV + FA
+        attempts.append((False, self._flash_attn))        # f16 KV + FA
+        if self._flash_attn:
+            attempts.append((False, False))               # 最保守：都不启用
+        unique: List[tuple] = []
+        for combo in attempts:
+            if combo not in unique:
+                unique.append(combo)
+        attempts = unique
+
+        last_err: Optional[Exception] = None
+        self._model = None
+        for use_kv, use_fa in attempts:
+            kw = dict(common)
+            if use_kv:
+                kw["type_k"] = GGML_TYPE_Q8_0
+                kw["type_v"] = GGML_TYPE_Q8_0
+            if use_fa:
+                kw["flash_attn"] = True
+            try:
+                self._model = Llama(**kw)
+            except Exception as e:
+                last_err = e
+                self._model = None
+                continue
+            self._kv_quant_applied = use_kv
+            self._flash_attn_applied = use_fa
+            logger.info(
+                "LLM: GGUF 上下文已就绪（KV=%s, flash_attn=%s, n_ctx=%d）",
+                "q8_0" if use_kv else "f16", "on" if use_fa else "off", n_ctx)
+            if (use_kv, use_fa) != (self._kv_quant, self._flash_attn):
                 logger.warning(
-                    "LLM: GGUF KV INT8 量化不可用（%s: %s），退回默认 KV",
-                    type(e).__name__, e)
-                try:
-                    self._model = Llama(
-                        model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1,
-                        verbose=False)
-                except Exception as e2:
-                    e = e2  # 退回也失败 → 走下面的 RuntimeError
-                else:
-                    self._kv_quant_applied = False
-            if self._model is None:
-                raise RuntimeError(
-                    f"GGUF 模型加载失败: {os.path.basename(gguf)}"
-                    f"（{type(e).__name__}: {e}）。常见原因：文件损坏或不是 GGUF 格式、"
-                    "量化类型不被当前 llama-cpp-python 构建支持（PTQ/IQ 等特殊量化需"
-                    "对应定制构建）、或显存不足（n_gpu_layers=-1 全量 offload，可换更"
-                    "小量化或减小 max_tokens）。"
-                ) from e
+                    "LLM: 当前构建不支持所请求组合，已自动降级为 KV=%s / "
+                    "flash_attn=%s（功能不受影响）",
+                    "q8_0" if use_kv else "f16", "on" if use_fa else "off")
+            break
+        if self._model is None:
+            raise RuntimeError(
+                f"GGUF 模型加载失败: {os.path.basename(gguf)}"
+                f"（{type(last_err).__name__}: {last_err}）。常见原因：文件损坏或不是 "
+                "GGUF 格式、量化类型不被当前 llama-cpp-python 构建支持（PTQ/IQ 等"
+                "特殊量化需对应定制构建）、或显存不足（n_gpu_layers=-1 全量 "
+                "offload，可换更小量化或减小 max_tokens）。可在配置里关闭 "
+                "local_llm_flash_attn / local_llm_kv_quantize 后再试。"
+            ) from last_err
         # GGUF 的对话模板由 llama.cpp 内建处理（create_chat_completion），
         # 不需要 HF tokenizer；预填/校验等路径对非 mlx 后端均提前返回。
         self._tokenizer = None
@@ -951,6 +993,9 @@ class LocalLLMClient:
             return None, None
 
     def _load_onnx(self) -> None:
+        # ONNX Runtime 的注意力融合由其内部 EP 决定，我们没有 flash_attn 开关；
+        # 状态字段据实标为未由本层启用，避免 UI/日志误报。
+        self._flash_attn_applied = False
         onnx_path = self._path
         if os.path.isdir(self._path):
             cand = [os.path.join(self._path, n) for n in ("model.onnx", "model_quantized.onnx")]

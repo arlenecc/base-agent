@@ -185,6 +185,11 @@ class AgentConfig:
     # 量化不适用，自动退回默认缓存（功能不降级）。GGUF 走 llama.cpp 的
     # type_k/type_v="q8_0"。None 同样按默认 True（bool(None) 会被当成 False）。
     local_llm_kv_quantize: bool = True
+    # Flash attention（融合注意力），默认启用：长上下文与显存受限设备收益明显，
+    # GGUF 上实测 Metal compute buffer 612→493 MiB(-19%)。GGUF 通过 llama.cpp 的
+    # flash_attn=True 生效，加载失败会自动逐级降级；MLX 由 mlx_lm 原生使用
+    # mx.fast.scaled_dot_product_attention，本身即融合注意力、无独立开关。
+    local_llm_flash_attn: bool = True
     # 本地 GGUF 视觉塔（mmproj）路径与本地 ONNX 分词器路径（均可选，留空走默认）：
     #   local_llm_mmproj_path      GGUF 的 clip_model_path（多模态 GGUF 才需要）
     #   local_llm_tokenizer_path   ONNX 的独立 tokenizer 目录/文件（缺则随模型目录）
@@ -243,8 +248,10 @@ class AgentConfig:
     #   aux_local_llm_kv_reuse    跨轮 KV 复用（默认 False：辅助 prompt 每轮都变，
     #                           复用通常无意义；开放给用户按需开启）
     #   aux_local_llm_kv_quantize KV INT8 量化（默认 True，与主模型同款省显存）
+    #   aux_local_llm_flash_attn  Flash attention（默认 True，同主模型）
     aux_local_llm_kv_reuse: bool = False
     aux_local_llm_kv_quantize: bool = True
+    aux_local_llm_flash_attn: bool = True
     # 同主模型：辅助 GGUF 的 mmproj 路径、辅助 ONNX 的 tokenizer 路径（均可选）。
     aux_local_llm_mmproj_path: str = ""
     aux_local_llm_tokenizer_path: str = ""
@@ -375,6 +382,7 @@ class AgentConfig:
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
                     "rag_ocr_scale_dynamic", "aux_llm_enabled",
                     "local_llm_enable_thinking", "aux_local_llm_enable_thinking",
+                    "local_llm_flash_attn", "aux_local_llm_flash_attn",
                     "rag_matryoshka_enabled", "rag_binary_prefilter_enabled",
                     "web_allow_private_hosts", "rag_mcp_enabled")
 
@@ -517,6 +525,11 @@ class AgentConfig:
             self.aux_local_llm_kv_reuse = False
         if getattr(self, "aux_local_llm_kv_quantize", None) is None:
             self.aux_local_llm_kv_quantize = True
+        # 同上：flash attention 字段被写成 null → 默认 True（否则 FA 被静默关掉）。
+        if getattr(self, "local_llm_flash_attn", None) is None:
+            self.local_llm_flash_attn = True
+        if getattr(self, "aux_local_llm_flash_attn", None) is None:
+            self.aux_local_llm_flash_attn = True
         # Old LLMClient builds defaulted to max_tokens=4096. Only rewrite the
         # value when it is still that legacy default — an explicitly chosen
         # small budget (e.g. 4096 for a local 4K model) must survive; silently

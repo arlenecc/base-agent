@@ -686,7 +686,10 @@ class AgentWorker(QThread):
                 self._callbacks.bridge.status.emit(
                     "系统提示预热中（预填上下文，请稍候）")
                 self._agent.preload_kv()
-                self._callbacks.bridge.status.emit("系统提示已预热，可开始对话")
+                # 预热只是内部优化，用户只关心「能不能对话」：最终态统一回
+                # 「主模型已就绪，可对话」（与 model_loaded 后的文案一致），
+                # 避免状态栏停在临时提示上。
+                self._callbacks.bridge.status.emit("主模型已就绪，可对话")
             except Exception:
                 self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
         while True:
@@ -1830,12 +1833,21 @@ class MainWindow(QMainWindow):
             "减半。MLX 在模型默认缓存为标准 KV 缓存时生效（Qwen3.5 等线性注意力模型"
             "无标准 KV，自动跳过）；GGUF 通过 llama.cpp 的 type_k/type_v=q8_0 生效。"
             "主模型与辅助模型都启用。")
+        self.flash_attn_check = QCheckBox("FA")
+        self.flash_attn_check.setToolTip(
+            "Flash attention（融合注意力），默认启用：长上下文与显存受限设备收益明显，"
+            "GGUF 上 Metal compute buffer 约省 19%。\n"
+            "GGUF 通过 llama.cpp 的 flash_attn=True 生效；某些构建/量化组合不支持时"
+            "会自动逐级降级（关闭 FA 或 KV 量化），不会导致加载失败。\n"
+            "MLX 由 mlx-lm 原生使用 mx.fast.scaled_dot_product_attention（即融合"
+            "注意力），没有独立开关，此选项对 MLX 不产生影响。")
         self.main_params_w = QWidget()
         r = QHBoxLayout(self.main_params_w); r.setContentsMargins(0, 0, 0, 0); r.setSpacing(6)
         r.addWidget(_params_widget(self.max_tokens_edit, self.temp_edit, self.top_p_edit,
                                    self.min_p_edit, self.top_k_edit, self.repeat_penalty_edit,
                                    self.thinking_check,
-                                   self.kv_reuse_check, self.kv_quant_check))
+                                   self.kv_reuse_check, self.kv_quant_check,
+                                   self.flash_attn_check))
         r.addStretch(1)
         self.load_main_btn = QPushButton("加载模型")
         self.load_main_btn.setStyleSheet("font-weight:600;")
@@ -1897,11 +1909,14 @@ class MainWindow(QMainWindow):
         self.aux_kv_reuse_check.setToolTip(self.kv_reuse_check.toolTip())
         self.aux_kv_quant_check = QCheckBox("KV量化")
         self.aux_kv_quant_check.setToolTip(self.kv_quant_check.toolTip())
+        self.aux_flash_attn_check = QCheckBox("FA")
+        self.aux_flash_attn_check.setToolTip(self.flash_attn_check.toolTip())
         r = QHBoxLayout(); r.setSpacing(6)
         r.addWidget(_params_widget(self.aux_max_tokens_edit, self.aux_temp_edit, self.aux_top_p_edit,
                                    self.aux_min_p_edit, self.aux_top_k_edit, self.aux_repeat_penalty_edit,
                                    self.aux_thinking_check,
-                                   self.aux_kv_reuse_check, self.aux_kv_quant_check))
+                                   self.aux_kv_reuse_check, self.aux_kv_quant_check,
+                                   self.aux_flash_attn_check))
         r.addStretch(1)
         self.load_aux_btn = QPushButton("加载模型")
         self.load_aux_btn.setStyleSheet("font-weight:600;")
@@ -2798,6 +2813,7 @@ class MainWindow(QMainWindow):
         self.thinking_check.setChecked(bool(getattr(self.config, "local_llm_enable_thinking", True)))
         self.kv_reuse_check.setChecked(bool(getattr(self.config, "local_llm_kv_reuse", True)))
         self.kv_quant_check.setChecked(bool(getattr(self.config, "local_llm_kv_quantize", True)))
+        self.flash_attn_check.setChecked(bool(getattr(self.config, "local_llm_flash_attn", True)))
         self.workspace_edit.setText(self.config.workspace)
         self.knowledge_base_edit.setText(self.config.knowledge_base)
         # 主模型模式（本地 / OpenAI 兼容接口）+ 本地类型与路径
@@ -2833,6 +2849,8 @@ class MainWindow(QMainWindow):
         self.aux_thinking_check.setChecked(bool(getattr(self.config, "aux_local_llm_enable_thinking", False)))
         self.aux_kv_reuse_check.setChecked(bool(getattr(self.config, "aux_local_llm_kv_reuse", False)))
         self.aux_kv_quant_check.setChecked(bool(getattr(self.config, "aux_local_llm_kv_quantize", True)))
+        self.aux_flash_attn_check.setChecked(
+            bool(getattr(self.config, "aux_local_llm_flash_attn", True)))
         # Embedding / Reranker：实现下拉 + 模型名 + 本地路径
         self.embedding_impl_combo.setCurrentText(_provider_backend_to_impl(
             self.config.embedding_provider, self.config.local_embedding_backend))
@@ -2953,6 +2971,7 @@ class MainWindow(QMainWindow):
         self.config.local_llm_enable_thinking = self.thinking_check.isChecked()
         self.config.local_llm_kv_reuse = self.kv_reuse_check.isChecked()
         self.config.local_llm_kv_quantize = self.kv_quant_check.isChecked()
+        self.config.local_llm_flash_attn = self.flash_attn_check.isChecked()
         # 辅助模型参数（本地专用）
         _num(self.aux_temp_edit, "aux_temperature", 0.7, float, "辅助温度")
         _num(self.aux_max_tokens_edit, "aux_max_tokens", 32768, int, "辅助最大Token")
@@ -2963,6 +2982,7 @@ class MainWindow(QMainWindow):
         self.config.aux_local_llm_enable_thinking = self.aux_thinking_check.isChecked()
         self.config.aux_local_llm_kv_reuse = self.aux_kv_reuse_check.isChecked()
         self.config.aux_local_llm_kv_quantize = self.aux_kv_quant_check.isChecked()
+        self.config.aux_local_llm_flash_attn = self.aux_flash_attn_check.isChecked()
         if invalid:
             # 状态栏提示一次；不打断流程（回退值是安全的默认）。
             self.status_label.setText(
