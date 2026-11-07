@@ -71,7 +71,9 @@ _QWEEN_PARAM_RE = re.compile(
 # Hermes / 通用 JSON: {"name": ..., "arguments": {...}}（arguments 可为字符串）
 _JSON_CALL_RE = re.compile(r"\{[^{}]*\"name\"\s*:.*?\}", re.DOTALL)
 # 残留的孤立 think 标签字面量（模型偶发不配对输出）——从正文里剔除。
-_STRAY_THINK_RE = re.compile(r"<think>|</think>")
+# 兼容长写法 <thinking>/</thinking>（部分模型/模板使用）；只认短写法会
+# 让长写法整段漏过拆分、被当成正文文本渲染成「空思考块」。
+_STRAY_THINK_RE = re.compile(r"</?think(?:ing)?>")
 
 
 def _new_tool_call_id(n: int) -> str:
@@ -255,7 +257,40 @@ def _dict_to_tool_call(obj: Any, idx: int) -> Dict[str, Any]:
 
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
-_TAG_PREFIX_LEN = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1
+# 同时兼容长写法 <thinking>/</thinking>（部分模型/模板使用）。只认短写法会
+# 让长写法整段漏过拆分、被当成正文文本渲染成「空思考块」。
+_THINK_OPEN_TAGS = (_THINK_OPEN, "<thinking>")
+_THINK_CLOSE_TAGS = (_THINK_CLOSE, "</thinking>")
+_TAG_PREFIX_LEN = max(len(t) for t in _THINK_OPEN_TAGS + _THINK_CLOSE_TAGS) - 1
+
+
+def _find_any_think_tag(buf: str, i: int):
+    """从 i 起找最近的 think 开/闭标签，返回 (pos, is_open, tag_len)。
+
+    同时识别短写法 ``<think>``/``</think>`` 与长写法 ``<thinking>``/``</thinking>``。
+    没有完整标签返回 (None, False, 0)。
+    """
+    best = None
+    best_open = False
+    best_len = 0
+    for t in _THINK_OPEN_TAGS:
+        p = buf.find(t, i)
+        if p != -1 and (best is None or p < best):
+            best, best_open, best_len = p, True, len(t)
+    for t in _THINK_CLOSE_TAGS:
+        p = buf.find(t, i)
+        if p != -1 and (best is None or p < best):
+            best, best_open, best_len = p, False, len(t)
+    return best, best_open, best_len
+
+
+def _prompt_endswith_think_open(prompt: str) -> bool:
+    """生成提示是否以 think 开标签结尾（已被预填进提示，模型从推理正文起步）。
+
+    同时匹配短写法 ``<think>`` 与长写法 ``<thinking>``。
+    """
+    p = (prompt or "").rstrip()
+    return p.endswith(_THINK_OPEN) or p.endswith("<thinking>")
 
 
 class _ThinkSplitter:
@@ -278,37 +313,52 @@ class _ThinkSplitter:
         i = 0
         n = len(self._buf)
         while i < n:
-            tag = _THINK_CLOSE if self._in_think else _THINK_OPEN
-            kind = "reasoning" if self._in_think else "content"
-            # 完整标签落在当前位置 → 切换状态并跳过标签本身
-            if self._buf.startswith(tag, i):
-                self._in_think = not self._in_think
-                i += len(tag)
-                continue
-            k = self._buf.find(tag, i)
-            if k != -1:
-                # 前方有完整标签：先把 [i, k) 作为当前 kind 发出，跳到标签处
-                seg = self._buf[i:k]
-                if seg:
-                    out.append((kind, seg))
-                i = k
-                continue
-            # 前方无完整标签：只消费到安全边界，保留可能的半截标签尾部给下次
-            safe = n - (len(tag) - 1)
-            if safe <= i:
+            k, is_open, tag_len = _find_any_think_tag(self._buf, i)
+            if k is None:
+                # 无完整标签：只消费到安全边界，保留可能的半截标签尾部给下次
+                safe = n - _TAG_PREFIX_LEN
+                if safe <= i:
+                    break
+                seg = self._buf[i:safe]
+                if seg and seg.strip():
+                    out.append(("reasoning" if self._in_think else "content", seg))
+                i = safe
                 break
-            seg = self._buf[i:safe]
-            if seg:
-                out.append((kind, seg))
-            i = safe
-            break
+            # 发出 [i, k)：上一个标签之后到本标签之前的内容。纯空白不发出，
+            # 否则孤立/stray 标签之间的空白会被渲染成「空思考块」。
+            seg = self._buf[i:k]
+            if seg and seg.strip():
+                out.append(("reasoning" if self._in_think else "content", seg))
+            # 标签方向不符（已在 think 内又遇 <think>，或不在 think 内又遇
+            # </think>/</thinking>）视为孤立标签：吃掉且不翻转状态；方向相符
+            # 才切换。这样模型偶发的重复/错位 think 标签不会产出空推理段。
+            if is_open:
+                if not self._in_think:
+                    self._in_think = True
+            else:
+                if self._in_think:
+                    self._in_think = False
+            i = k + tag_len
+            continue
         self._buf = self._buf[i:]
         return out
 
     def flush(self) -> List[Tuple[str, str]]:
         buf, self._buf = self._buf, ""
-        if not buf:
+        # 末尾残留纯空白不发出，避免冒出空思考块。
+        if not buf or not buf.strip():
             return []
+        # 末尾半截 think 标签（如 "...推理中<thi"）剥掉，避免乱码；仅当尾部片段
+        # 是某已知标签的前缀（且不含 '>'）才判定为半截标签，避免误删正文里的 "<"。
+        lt = buf.rfind("<")
+        if lt != -1:
+            tail = buf[lt:]
+            if ">" not in tail and any(
+                t.startswith(tail) for t in _THINK_OPEN_TAGS + _THINK_CLOSE_TAGS
+            ):
+                buf = buf[:lt]
+                if not buf or not buf.strip():
+                    return []
         return [("reasoning" if self._in_think else "content", buf)]
 
 
@@ -1260,7 +1310,7 @@ class LocalLLMClient:
         # 模板把 <think> 预填进生成提示时（enable_thinking 默认开），模型输出
         # 直接以推理正文开始、只含闭合标签——按「已在 think 内」起步，否则
         # 推理会全部落进正文（对话区）。
-        start_in_think = prompt.rstrip().endswith(_THINK_OPEN)
+        start_in_think = _prompt_endswith_think_open(prompt)
 
         sampler = make_sampler(
             temperature if temperature > 0 else 0.0,
@@ -1649,7 +1699,7 @@ class LocalLLMClient:
             reuse_n = 0
         self._gguf_ids = list(ids)
 
-        start_in_think = bool(prompt and prompt.rstrip().endswith(_THINK_OPEN))
+        start_in_think = _prompt_endswith_think_open(prompt)
         stop_ids = self._gguf_stop_ids()
         gen_ids: List[int] = []
 
@@ -1885,7 +1935,7 @@ class LocalLLMClient:
         generated: List[int] = []
         # 同 MLX：模板可能已把 <think> 预填进生成提示（见 _stream_mlx 注释）。
         splitter = _ThinkSplitter(
-            start_in_think=prompt.rstrip().endswith(_THINK_OPEN))
+            start_in_think=_prompt_endswith_think_open(prompt))
         # past / present 输入名在会话生命周期内不变，循环外探测一次即可
         # （旧实现每轮 get_inputs()，纯浪费）。
         kv_inputs = [i.name for i in self._session.get_inputs()
