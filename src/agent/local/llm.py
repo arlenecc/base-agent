@@ -596,6 +596,11 @@ class LocalLLMClient:
         # "partial kv removal not supported" 并退回全量重算）。因此这里只能做
         # 「严格扩展则复用、分叉/回退则 reset 全量」的 append-only 复用。
         self._gguf_ids: List[int] = []
+        # 每轮「真实生成 token 序列」（client 自己采样得到，绝非 detokenize 后
+        # 再 tokenize 的不可逆产物）。按历史 assistant 顺序存放，供下一轮把重渲染
+        # 出来的历史 assistant 内容区段替换回真实 token，使 form① 严格前缀命中、
+        # KV 缓存跨轮复用。与 self._gguf_ids 同步清空。
+        self._gguf_gen_history: List[List[int]] = []
         # 思考类模板边界修正：(bot_token, hist_tail, gen_tail)，见
         # _gguf_detect_boundary_fix；None 表示无需修正（如 ChatML）。
         self._gguf_boundary_fix = None
@@ -804,6 +809,7 @@ class LocalLLMClient:
         # 不需要 HF tokenizer；预填/校验等路径对非 mlx 后端均提前返回。
         self._tokenizer = None
         self._gguf_ids = []
+        self._gguf_gen_history = []
         # add_generation_prompt 是**构造期**参数（Jinja2ChatFormatter 会在
         # render 时自带它，调用时再传会 TypeError），因此构造两个：
         # _gguf_fmt 用于生成（带 assistant 起始标记），_gguf_fmt_sys 用于
@@ -1006,10 +1012,12 @@ class LocalLLMClient:
                     pass
                 self._model.eval(ids)
                 self._gguf_ids = list(ids)
+                self._gguf_gen_history = []
                 logger.info("LLM: GGUF 系统提示已预填（%d token）", len(ids))
             except Exception as e:
                 logger.warning("GGUF 系统提示预填失败(忽略): %s", e)
                 self._gguf_ids = []
+                self._gguf_gen_history = []
 
     def _gguf_render(self, messages, tools=None, add_generation_prompt: bool = True):
         """渲染 GGUF chat prompt → ``(prompt_text, token_ids)``；不可用返回 (None, None)。
@@ -1045,6 +1053,61 @@ class LocalLLMClient:
         except Exception as e:
             logger.debug("GGUF prompt 渲染失败（降级为无前缀复用）: %s", e)
             return None, None
+
+    def _gguf_splice_assistant_ids(self, ids_full, prompt, messages, gen_history):
+        """把全量渲染 ``ids_full`` 中「历史 assistant 内容」区段替换为真实生成 token。
+
+        根因：GGUF（llama.cpp）的 detokenize→tokenize 不可逆（subword 合并，如
+        「搜索」+「资料」→「搜索资料」），且 Qwen 模板重渲染历史 assistant 时会把
+        其头部思考前缀（<think>...）剥离。两者都导致下轮 prompt 在 assistant 处
+        与上一轮真实 token 序列分叉，form① 严格前缀永远命中不了、每轮全量重算。
+
+        这里不依赖字符串 round-trip：直接用本轮真实 gen_ids（client 自己采样得到）
+        替换历史 assistant 内容区段，使 ids 成为 cached 的严格扩展。
+
+        返回拼接后的 ids；若无法安全拼接（历史条数不匹配 / 找不到区段 / tokenize
+        异常）返回 None，调用方退回全量重算（不降级、不损坏）。
+        """
+        hist = [m for m in messages
+                if isinstance(m, dict) and m.get("role") == "assistant"]
+        H = len(hist)
+        if H == 0 or len(gen_history) != H:
+            return None
+        try:
+            im_start = self._model.tokenize(b"<|im_start|>", add_bos=False, special=True)
+            im_end = self._model.tokenize(b"<|im_end|>", add_bos=False, special=True)
+            hdr = self._model.tokenize(b"<|im_start|>assistant\n",
+                                      add_bos=False, special=True)
+        except Exception:
+            return None
+        if not im_start or not im_end or not hdr:
+            return None
+        im_end_id = im_end[0]
+        hdr_len = len(hdr)
+        # gen_prefix 固定头部（思考模板预置片段），重渲染时常被剥离，这里重新补回。
+        gp = _assistant_prompt_prefix(prompt)
+        gp_ids = (self._model.tokenize(gp.encode("utf-8"), add_bos=False, special=True)
+                  if gp else [])
+        # 找所有 <|im_start|>assistant\n 位置：历史 H 个 + 末尾生成提示 1 个。
+        n = len(ids_full)
+        positions = []
+        for i in range(0, n - hdr_len + 1):
+            if ids_full[i:i + hdr_len] == hdr:
+                positions.append(i)
+        if len(positions) < H + 1:
+            return None  # 区段数不匹配，无法安全替换
+        out = list(ids_full)
+        # 从后往前替换，避免索引偏移影响未处理区段。
+        for k in range(H - 1, -1, -1):
+            p = positions[k]
+            content_start = p + hdr_len
+            e = content_start
+            while e < n and ids_full[e] != im_end_id:
+                e += 1
+            if e >= n:
+                return None
+            out[content_start:e] = list(gp_ids) + list(gen_history[k])
+        return out
 
     def _load_onnx(self) -> None:
         # ONNX Runtime 的注意力融合由其内部 EP 决定，我们没有 flash_attn 开关；
@@ -1605,6 +1668,7 @@ class LocalLLMClient:
                 except Exception:
                     pass
                 self._gguf_ids = []
+                self._gguf_gen_history = []
         yield from self._stream_gguf_legacy(messages, tools, temperature, max_tokens)
 
     def _stream_gguf_reuse(self, messages, tools, temperature):
@@ -1625,6 +1689,22 @@ class LocalLLMClient:
                                         add_generation_prompt=True)
         if not ids:
             raise RuntimeError("GGUF prompt 为空（渲染失败）")
+
+        # 用真实生成 token 替换历史 assistant 内容（绕过不可逆的 detokenize→tokenize
+        # 与 Qwen 模板重渲染剥离思考前缀），使 ids 成为 cached 的严格扩展、命中 form①。
+        # 历史条数与缓存不一致（会话折叠/重置）时清空缓存，退回全量重算而非错拼。
+        hist_n = sum(1 for m in messages
+                     if isinstance(m, dict) and m.get("role") == "assistant")
+        if len(self._gguf_gen_history) != hist_n:
+            self._gguf_gen_history = []
+        try:
+            spliced = self._gguf_splice_assistant_ids(
+                ids, prompt, messages, self._gguf_gen_history)
+        except Exception as e:  # 拼接失败不应中断生成，退回全量重算
+            logger.debug("GGUF splice 跳过: %s", e)
+            spliced = None
+        if spliced is not None:
+            ids = spliced
 
         cached = self._gguf_ids
         # 状态一致性校验：``_gguf_ids`` 记录的是「底层 llama.cpp 上下文里应当
@@ -1744,6 +1824,9 @@ class LocalLLMClient:
                 self._model.eval([tok_id])
             # 生成结束：上下文 = prompt + 已生成 token（供下轮复用）
             self._gguf_ids = list(ids) + gen_ids
+            # 记录本轮真实生成 token（client 采样得到，非 round-trip），供下一轮
+            # 把重渲染的历史 assistant 内容替换回来，维持 form① 跨轮严格前缀命中。
+            self._gguf_gen_history.append(list(gen_ids))
 
         # 模板在 assistant 起始标记后预置的片段（<think>\n\n</think>\n\n 等）。
         # raw_content 必须带上它：下轮渲染中间轮 assistant 消息时模板才会生成
@@ -1831,6 +1914,7 @@ class LocalLLMClient:
         # 这里显式 reset 一次，把手动 eval 留下的 KV（尤其 SWA memory）清干净，
         # 否则 create_chat_completion 自己可能在 decode 时报 llama_decode -3。
         self._gguf_ids = []
+        self._gguf_gen_history = []
         try:
             self._model.reset()
         except Exception:
