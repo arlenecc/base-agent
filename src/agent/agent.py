@@ -323,7 +323,7 @@ class _AgentKernelHooks(KernelHooks):
             agent._extract_turns_async(session.turns[:n_discard])
         except Exception as e:
             agent._log(f"[kernel] pre-trim extraction error: {e}")
-        agent._turns_since_extract = 0
+        agent._last_extract_turn = session.current_turn
 
     def failed(self, session: Session, err: str) -> None:
         self.agent.callbacks.on_error(err)
@@ -346,16 +346,16 @@ class _AgentKernelHooks(KernelHooks):
 
     def finished(self, session: Session, text: str) -> None:
         agent = self.agent
-        # 批量沉淀：不再每轮都抽。累计 session.raw_turns 个真实轮才做一次
-        # 事实抽取 + 经验蒸馏；内核「裁剪丢弃旧轮前」的 before_consolidate 也会
-        # 强制沉淀一次并清零计数器（见下方）。distill_requested 时立即沉淀。
-        # 批大小用 session.raw_turns，与内核折叠窗口对齐——保证裁剪前总已把
-        # 最近 raw_turns 轮的内容抽过，不会因折叠丢事实。
-        agent._turns_since_extract += 1
-        batch_due = agent._turns_since_extract >= max(1, session.raw_turns)
+        # 批量沉淀：不再每轮都抽。按会话累计轮数差值——每累计 raw_turns 个
+        # 真实内核轮做一次事实抽取 + 经验蒸馏（自动续跑段/长任务自然计入）；
+        # 内核「裁剪丢弃旧轮前」的 before_consolidate 强制沉淀并同步推进基准。
+        # distill_requested 时立即沉淀。批大小与内核折叠窗口对齐——保证裁剪前
+        # 总已把最近 raw_turns 轮的内容抽过，不会因折叠丢事实。
+        turn_now = session.current_turn
+        batch_due = (turn_now - agent._last_extract_turn) >= max(1, session.raw_turns)
         if not (batch_due or agent.kernel.distill_requested):
             return
-        agent._turns_since_extract = 0
+        agent._last_extract_turn = turn_now
         # 既有能力：异步抽取事实写知识图谱（不阻塞回复）
         try:
             agent._maybe_extract_facts_async(text)
@@ -441,8 +441,17 @@ class Agent:
         # rag_ingest 工具由模型自行触发同步时，通知这里失效知识库状态缓存，
         # 避免随后 volatile_context 继续注入 30s 前的旧 chunks 数。
         self.tools.on_rag_data_changed = self.invalidate_rag_status
+        # MCP 后台连接就绪后失效内核 schema 缓存：MCP 工具并入注册表后，
+        # 下一轮 run 下发的 schema 才包含它们（lite 模式不含 MCP，不受影响）。
+        def _on_mcp_tools_changed() -> None:
+            self.kernel.invalidate_schemas()
+            self._log("[mcp] 后台连接完成，工具已并入（下一轮生效）")
+        self.tools.on_mcp_tools_changed = _on_mcp_tools_changed
         self._last_user_text = ""
         self._distill_min_turns = 6
+        # L4 蒸馏的「已蒸馏摘要行数」快照：下轮只蒸新增内容（见
+        # _distill_experience_async），避免窗口滑动重叠导致语义重复。
+        self._last_distill_lines = 0
         # 自动续跑开关（MAX_TURNS 截断 / 提前收尾但计划未完成时自动续跑，
         # 替代「停车等用户手动输入继续」）。测试可置 False 关闭。
         self._auto_continue = True
@@ -476,9 +485,12 @@ class Agent:
         # 不再被后台任务排到后面（本地后端 aux 与主模型共用同一实例时，
         # 插队还会冲掉跨轮 KV 缓存，见 _get_extract_llm 注释）。
         self._last_activity = time.monotonic()
-        # 事实抽取/蒸馏的批量计数器：每累计 session.raw_turns 个真实轮才沉淀
-        # 一次（不再每轮都抽）。内核「裁剪丢弃旧轮前」也会强制沉淀一次并清零。
-        self._turns_since_extract = 0
+        # 事实抽取/蒸馏的批量计数：按「会话累计轮数」的差值计——每累计
+        # session.raw_turns 个真实内核轮才沉淀一次。旧实现用「每个用户轮 +1」
+        # 的计数器，emit_finished 收口到用户轮次末尾后，自动续跑 5 段 × 15 轮
+        # 只算 1 次，长任务的事实抽取频率大幅下降；差值对续跑段/长任务自然
+        # 累积。内核「裁剪丢弃旧轮前」强制沉淀时同步推进基准（见 before_consolidate）。
+        self._last_extract_turn = 0
 
         # ---- 改进 1~4：L0~L4 记忆体系 ----
         self._memory_layout = MemoryLayout(config.workspace)
@@ -490,8 +502,13 @@ class Agent:
             self._log(f"[memory] L0 materialize error: {e}")
         # 全文/摘要落盘挂在 Session.finish_turn 的统一回调：所有收尾分支都覆盖。
         # 传方法本身（callable），只有当天首轮才会真正取 system prompt。
-        self.session.on_turn_finished = lambda rec: record_turn(
-            self._memory_layout, rec, self._system_prompt)
+        # 包一层 try/except + UI 日志：落盘失败用户必须看得见（旧实现静默）。
+        def _record_turn(rec) -> None:
+            try:
+                record_turn(self._memory_layout, rec, self._system_prompt)
+            except Exception as e:
+                self._log(f"[memory] 会话落盘失败（对话可能未存档）: {e}")
+        self.session.on_turn_finished = _record_turn
         # 应用启动时先把「今天之前」的会话归档掉（纯文件 IO，不碰任何 LLM，
         # 避免 UI 构造 Agent 时隐式加载辅助模型权重）。
         try:
@@ -521,7 +538,9 @@ class Agent:
         self.kernel._last_call_sigs = []
         self.kernel._step_fails = 0
         self.kernel._shrink_guard = 0
-        self._turns_since_extract = 0
+        # 会话已重置（current_turn 归零）→ 抽取基准同步归零。
+        self._last_extract_turn = 0
+        self._last_distill_lines = 0
         self._last_user_text = ""
         # Invalidate cached prompt
         self._cached_prompt_turn = -1
@@ -1416,7 +1435,15 @@ class Agent:
           facts/lessons → 知识图谱（``memory_search`` 可召回）
           skill         → ``workspace/skills/<name>/SKILL.md``（自动进向量索引）
         """
-        transcript = "\n".join(session.all_digest_lines()[-25:])
+        # 窗口改增量：从上次蒸馏的行数快照往后取（留 2 行衔接上下文）。旧实现
+        # 固定取最近 25 行，窗口随会话滑动重叠——同一批经验被反复蒸馏，知识
+        # 图谱堆满措辞变体（字面去重挡不住语义重复）。无足够新增则跳过本次。
+        lines = session.all_digest_lines()
+        start = max(0, min(self._last_distill_lines, len(lines)) - 2)
+        new_lines = lines[start:]
+        if len(new_lines) < 3:
+            return          # 没有足够的新增内容，不值得一次蒸馏 LLM 调用
+        transcript = "\n".join(new_lines)
         if not transcript.strip():
             return
 
@@ -1438,6 +1465,9 @@ class Agent:
                 prompt = DISTILL_PROMPT.format(transcript=transcript[:4000])
                 raw = self._summarize_via_llm(prompt, system=DISTILL_SYSTEM, llm=llm)
                 data = l4_normalize(l4_extract_json(raw))
+                # 蒸馏成功后推进行数快照（下轮只蒸新增），失败不推进——
+                # 下次会带上这批内容重试。
+                self._last_distill_lines = len(session.all_digest_lines())
                 observations = list(data["facts"]) + list(data["lessons"])
                 if observations:
                     from .tools.memory import _get_long_memory
@@ -1622,10 +1652,24 @@ class Agent:
             with lock:
                 out[idx] = res
 
+        def _acquire_until_deadline() -> bool:
+            """带超时与取消的信号量排队：旧实现裸 acquire() 无限阻塞——前 8 个
+            槽位全部挂住（web_scan 黑洞目标）时，deadline 与「终止对话」在
+            槽位释放前都不生效（取消延迟可达数十秒）。超时/取消返回 False，
+            该任务不启动线程，由既有兜底填「未完成」结果。
+            """
+            while True:
+                if sem.acquire(blocking=False):
+                    return True
+                if time.monotonic() >= deadline or self.callbacks.is_cancelled():
+                    return False
+                time.sleep(0.05)
+
         threads = []
         for idx, name, args in jobs:
             self.callbacks.on_tool_start(name, args)
-            sem.acquire()       # 并发超上限时在此排队（on_tool_start 仍已发出）
+            if not _acquire_until_deadline():
+                continue     # 不启动线程：out[idx] 保持 None → 兜底「未完成」
             t = threading.Thread(target=_run, args=(idx, name, args),
                                 name=f"tool-par-{name}-{idx}", daemon=True)
             t.start()
@@ -1928,30 +1972,10 @@ class Agent:
             if not heuristic.startswith(("执行代码片段", "执行一段代码")):
                 return heuristic
 
-        # Fallback: ask the LLM (dedicated client, with a short timeout).
-        try:
-            llm = self._get_extract_llm()
-            if llm is not None and llm is not self.llm:
-                prompt = (
-                    "用 ≤20 字中文说明以下代码/命令做什么，只输出这一句，"
-                    "不要贴代码、不要以「这段代码」开头：\n\n"
-                    + code[:2000]
-                )
-                # chat_stream 产出的是 StreamEvent 数据类，不是 dict。旧代码写
-                # `ev.get(...)` 会抛 AttributeError 并被下面的 except 吞掉，
-                # 导致 LLM 兜底永远是死代码、只能退回通用描述。这里按属性访问。
-                answer_parts = []
-                for ev in llm.chat_stream([{"role": "user", "content": prompt}],
-                                          kv_group="aux"):
-                    if ev.type == "content":
-                        answer_parts.append(ev.content)
-                    elif ev.type == "done":
-                        break
-                answer = "".join(answer_parts).strip()
-                if answer:
-                    return answer[:80]
-        except Exception:
-            pass
+        # 不再回退 LLM：确认弹框在交互关键路径上，兜底描述延迟弹框 1-3s
+        # （本地后端 aux 还与主模型共用实例、抢 _gen_lock/冲 KV）。启发式给
+        # 不出的就显示通用描述——弹框里始终有完整代码/命令原文可看，描述只是
+        # 辅助，不值得为此拖慢每一次确认。
         return heuristic
 
     @staticmethod

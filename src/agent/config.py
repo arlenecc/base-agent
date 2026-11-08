@@ -31,6 +31,8 @@ class AgentConfig:
     knowledge_base: str = ""
     request_timeout: float = 120.0
     max_iterations: int = 15
+    # [LEGACY 不驱动行为] 上下文治理已由内核五级压缩接管（kernel_max_context_
+    # tokens 预算 + L3 折叠）。字段仅为旧配置文件兼容保留——改它没有任何效果。
     max_history: int = 50  # max messages retained in conversation history
     # Context window budget (tokens). When the estimated prompt size reaches
     # 90% of this value, the agent proactively summarizes older messages and
@@ -41,6 +43,7 @@ class AgentConfig:
     max_context_tokens: int = 32768
     # Shrink ratio: trigger proactive shrink when estimated context size
     # exceeds this fraction of max_context_tokens.
+    # [LEGACY 不驱动行为] 同 max_history：被动收缩已被内核预算制折叠取代。
     context_shrink_ratio: float = 0.9
 
     # ---- 内核（三态自动机 + 五级压缩）----
@@ -52,7 +55,8 @@ class AgentConfig:
     # 同时作为后台「事实抽取/经验蒸馏」的批量单位：每 raw_turns 个真实轮
     # 沉淀一次（见 agent.py 的 before_consolidate / finished 钩子）。
     kernel_raw_turns: int = 8
-    # 每多少轮进入一次 CONSOLIDATE（不消耗 LLM 决策的压缩态）。
+    # [LEGACY 仅日志文案] CONSOLIDATE 已改为「仅预算溢出触发」（见
+    # KernelLoop._needs_consolidate），周期值只出现在折叠日志的原因文案里。
     kernel_consolidate_every: int = 4
     # 单个工具结果注入上下文的字符上限（L1 裁剪后的目标值）。
     kernel_max_tool_chars: int = 6_000

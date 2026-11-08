@@ -202,11 +202,24 @@ class ToolRegistry:
         self._register_mcp_tools()
 
     def _register_mcp_tools(self) -> None:
-        """Connect to configured MCP servers and register their tools."""
+        """Connect to configured MCP servers and register their tools.
+
+        连接移到 daemon 后台线程：旧实现在构造函数里同步 `client.start()`
+        （握手 timeout，默认 30s）+ `list_tools()`（再等一个 timeout），且
+        `ToolRegistry.__init__` 跑在 **UI 主线程**（_rebuild_agent）——配置
+        N 个 server 最坏 N×60s 冻结整个界面。改为后台连接：注册表先以内置
+        工具可用，MCP 就绪后一次性并入（dict.update 原子），并通过
+        ``on_mcp_tools_changed`` 回调让内核失效 schema 缓存（下一轮生效）。
+        """
         mcp_servers = getattr(self.config, "mcp_servers", None) or []
         if not mcp_servers:
             return
 
+        import threading
+        threading.Thread(target=self._connect_mcp_servers, args=(mcp_servers,),
+                         daemon=True, name="mcp-connect").start()
+
+    def _connect_mcp_servers(self, mcp_servers: list) -> None:
         from .mcp_client import MCPClient, MCPError
         from .mcp_tool import MCPTool
 
@@ -242,12 +255,17 @@ class ToolRegistry:
                 client.start()
                 self._mcp_clients.append(client)
 
+                # 先并进 staging dict，最后一次性 update 进注册表：后台线程
+                # 逐键写 `self._tools` 会与 worker 线程的 dispatch/schemas 读
+                # 交错（半注册状态）。dict.update 单调用原子，读侧只会看到
+                # 「全有或全无」。
+                staged = {}
                 registered = 0
                 for tool_def in client.list_tools():
                     t = MCPTool(client, tool_def)
-                    if t.name and t.name not in self._tools:
+                    if t.name and t.name not in self._tools and t.name not in staged:
                         t.bind(self.config, self)
-                        self._tools[t.name] = t
+                        staged[t.name] = t
                         registered += 1
                         logger.info("MCP tool registered: %s (server: %s)", t.name, name)
                     elif t.name:
@@ -272,6 +290,15 @@ class ToolRegistry:
                         client.stop()
                     except Exception:
                         pass
+                    continue
+                if staged:
+                    self._tools.update(staged)
+                    cb = getattr(self, "on_mcp_tools_changed", None)
+                    if callable(cb):
+                        try:
+                            cb()
+                        except Exception as e:
+                            logger.warning("MCP tools-changed callback error: %s", e)
             except MCPError as e:
                 logger.warning("MCP server '%s' init failed: %s", name, e)
             except Exception as e:

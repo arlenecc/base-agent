@@ -12,6 +12,8 @@ import os
 import re
 from typing import Any, Optional
 
+import datetime as _dt
+
 from ..config import AgentConfig
 from ..kernel.compressor import compact_json
 from ..memory_v2 import (
@@ -181,5 +183,11 @@ def restore_checkpoint(config: AgentConfig, session: Any) -> str:
     except Exception:
         return ""
     if text and not session.get_key_info():
+        # 剥掉上次恢复时注入的标记（persist=True 会把 key_info 原样存回，
+        # 不剥的话标记会逐次叠加），再带上本次恢复时间。
+        text = re.sub(r"\[checkpoint 恢复于 [^\]]*\]\n?", "", text)
+        stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        text = (f"[checkpoint 恢复于 {stamp}——可能是已完成的旧任务，"
+                f"与当前任务无关时请忽略或更新]\n{text}")
         session.set_key_info(text)
     return text

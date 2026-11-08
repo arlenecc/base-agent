@@ -15,6 +15,7 @@ servers reject the request with HTTP 400).
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -179,9 +180,12 @@ class Session:
         if self.on_turn_finished is not None:
             try:
                 self.on_turn_finished(rec)
-            except Exception:
+            except Exception as e:
                 # 落盘是旁路能力：磁盘满/权限问题都不该让 agent 循环挂掉。
-                pass
+                # 但绝不能静默——旧实现裸 except 连日志都没有，用户对话数据
+                # 丢了都查不到原因。
+                logging.getLogger(__name__).warning(
+                    "[memory] on_turn_finished 回调失败（会话未落盘）: %s", e)
 
     # ------------------------------------------------------------------
     # 工作记忆（L4 的落地位置）

@@ -195,7 +195,15 @@ def record_turn(layout: MemoryLayout, rec: Any,
         for c in calls:
             tool_lines.append(f"- call {getattr(c, 'name', '')}: {getattr(c, 'args', {})}")
         for r in results:
-            tool_lines.append(f"- result {r.get('name', '')}: {str(r.get('content', ''))}")
+            # blocked=True = 内核拦截轮（规划门/反思门重定向）：工具从未执行，
+            # content 只是纠正提示。旧实现原样写成「result xxx: [System] …」，
+            # 归档里看起来像工具真的执行过并返回了这句提示。
+            if r.get("blocked"):
+                tool_lines.append(
+                    f"- result {r.get('name', '')}: [内核拦截，未执行] "
+                    f"{str(r.get('content', ''))[:200]}")
+            else:
+                tool_lines.append(f"- result {r.get('name', '')}: {str(r.get('content', ''))}")
         chunks.append(f"{_H_TOOLS}\n" + "\n".join(tool_lines) + "\n\n")
     try:
         _append(full_path, "".join(chunks))
@@ -207,8 +215,11 @@ def record_turn(layout: MemoryLayout, rec: Any,
             + "\n\n"
         )
         _append(layout.digest_path(day), digest)
-    except OSError as e:  # 落盘失败绝不影响主流程
-        logger.warning("[memory] record_turn failed: %s", e)
+    except Exception as e:  # 落盘失败绝不影响主流程
+        # 旧实现只捕 OSError：UnicodeEncodeError（surrogate 字符）等会一路
+        # 冒泡到 Session 回调层被吞——现在这里兜住一切异常，并带上路径方便排查。
+        logger.warning("[memory] record_turn failed (%s): %s",
+                       getattr(e, "filename", "") or type(e).__name__, e)
 
 
 # ---------------------------------------------------------------------------

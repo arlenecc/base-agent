@@ -1768,8 +1768,26 @@ class LocalLLMClient:
             suffix = ids
             reuse_n = 0
 
+        # 分块预填充：整段 eval 大 prompt（数千 token）期间 UI 完全静默，
+        # 用户只能干等（全量重建 ~6s 是本地模型最大的单点沉默）。按 1024
+        # token 分块并在块间发进度日志（进 UI 日志面板），让「正在读题」可见。
+        # 分块对 llama.cpp 的 KV 结果与整段 eval 等价（位置编码按绝对位置）。
+        _CHUNK = 1024
+        t_prefill = time.time()
         try:
-            self._model.eval(suffix)
+            if len(suffix) <= _CHUNK:
+                self._model.eval(suffix)
+                if len(suffix) > 512:
+                    logger.info("GGUF prefill: %d token（%.2fs）",
+                                len(suffix), time.time() - t_prefill)
+            else:
+                done_n = 0
+                while done_n < len(suffix):
+                    piece = suffix[done_n:done_n + _CHUNK]
+                    self._model.eval(piece)
+                    done_n += len(piece)
+                    logger.info("GGUF prefill: %d/%d token（%.1fs）…",
+                                done_n, len(suffix), time.time() - t_prefill)
         except Exception as e:
             # 兜底：即使状态校验通过，llama.cpp 仍可能因 SWA memory 残留等
             # 内部状态不一致在 decode 时返回 -3。彻底 reset 后全量重建，保证
@@ -1856,6 +1874,10 @@ class LocalLLMClient:
                     "prompt_tokens": len(ids),
                     "completion_tokens": len(gen_ids),
                     "total_tokens": len(ids) + len(gen_ids),
+                    # KV 命中可观测：内核据此把 reuse/eval 推到 UI 日志，
+                    # 用户报「慢」时无需翻 /tmp/base-agent-kv.log。
+                    "kv_reuse": reuse_n,
+                    "kv_eval": len(suffix),
                 }
             yield ev
 

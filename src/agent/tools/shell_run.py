@@ -353,7 +353,11 @@ def _run_capture(command: str, cwd: str, timeout: float,
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        # errors="replace"：二进制/非 UTF-8 输出（如 head -c100 /dev/urandom）
+        # 在 strict 模式下会让 reader 线程在 decode 处抛异常被吞，输出无声
+        # 截断且无任何标注。replace 把坏字节变成 U+FFFD，输出完整可见。
         text=True,
+        errors="replace",
         bufsize=1,
         start_new_session=True,
     )

@@ -546,7 +546,10 @@ class BridgeCallbacks(AgentCallbacks):
 
     # blocking dialogs (called from worker thread)
     # 等待用户回话的最长时间（秒）。超过则视为未获授权 → 拒绝 / 无回答。
-    _DIALOG_TIMEOUT = 600.0
+    # 600s 太长：用户离开工位时整个回合停在这里空等（期间预填的 KV 也可能
+    # 被后台任务冲掉）。120s 足够读完一个确认框；ask_user 场景用户真要离开
+    # 会主动点「终止对话」，超时按安全侧处理（拒绝/无回答）。
+    _DIALOG_TIMEOUT = 120.0
 
     def confirm(self, message: str) -> bool:
         if self._cancelled:
@@ -655,15 +658,28 @@ class AgentWorker(QThread):
         """断开 ``_callbacks.bridge`` 的所有信号连接。
 
         AgentWorker 自身**不定义任何 pyqtSignal**——``run()`` 里 emit 的是
-        ``self._callbacks.bridge.*``（Bridge 的信号）。``QObject.disconnect()``
-        只断本对象自身的连接，对 worker 调用恒为 no-op。强杀 / 关窗口时若
+        ``self._callbacks.bridge.*``（Bridge 的信号）。强杀 / 关窗口时若
         worker 线程还在跑并 emit bridge 信号，会打到已删除的 C++ 对象
         （``RuntimeError: wrapped C/C++ object has been deleted``，PyQt6 下
         可能直接 qFatal）。要断的必须是 bridge。
+
+        **必须逐信号断开**：PyQt6 下 ``bridge.disconnect()``（无参全断）是
+        静默 no-op——只打一条 ``wildcard call disconnects from destroyed
+        signal`` 警告，实测断开前后 emit 行为完全一样（旧实现因此从未真正
+        断开过）。逐信号调用在重复断开时抛 TypeError，属预期，吞掉即可。
         """
         bridge = getattr(getattr(self, "_callbacks", None), "bridge", None)
-        if bridge is not None:
-            bridge.disconnect()
+        if bridge is None:
+            return
+        for sig in (bridge.content, bridge.reasoning, bridge.tool_start,
+                    bridge.tool_end, bridge.log, bridge.usage, bridge.speed,
+                    bridge.skill, bridge.plan, bridge.finished, bridge.error,
+                    bridge.confirm_request, bridge.ask_request,
+                    bridge.status, bridge.warmup_done, bridge.final_answer):
+            try:
+                sig.disconnect()
+            except (TypeError, RuntimeError):
+                pass    # 未连接 / C++ 对象已销毁：本就无需再断
 
     def run(self) -> None:  # type: ignore[override]
         # 模型加载完成后本线程即启动，先做「空闲期预热」，跑在 worker 线程、
@@ -1352,11 +1368,9 @@ class MainWindow(QMainWindow):
         )
         self._bridge = Bridge()
         self._callbacks = BridgeCallbacks(self._bridge)
-        # bridge.status 复用 warmup 状态入口：worker 线程预填系统提示 KV 时，
-        # 跨线程把「系统提示预热中…/已预热」投到状态栏 + 进度条不确定态。
-        self._bridge.status.connect(self._on_warmup_status)
-        self._bridge.warmup_done.connect(self._on_warmup_done)
-        self._bridge.final_answer.connect(self._on_final_answer)
+        # bridge 的全部信号连接统一走 _connect_bridge()（在 _wire_signals 里
+        # 调用）：强杀会整组断开再重连，连接清单分散在两处必然出现「断开清单
+        # 含 X、重连清单漏 X」的失联。这里不再单独 connect。
         self._llm: Optional[LLMClient] = None
         self._agent: Optional[Agent] = None
         self._worker: Optional[AgentWorker] = None
@@ -2573,6 +2587,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "正在运行", "Agent 正在运行，请先「终止对话」再加载模型。")
             return
+        if self._warming:
+            # 预热期间 worker 线程正在 warm_up/preload_kv 使用同一份权重；
+            # 此处 rebuild + preload 会与它并发抢 GPU（MLX/llama.cpp 前向
+            # 非线程安全，可能段错误）。预热有时限（GGUF ~8s / MLX ~40s），
+            # 等待即可；warmup_done 会自动解锁。
+            QMessageBox.warning(
+                self, "正在预热",
+                "主模型正在预热（首次推理 / 系统提示预填），请稍候再操作。")
+            return
         # 先收集控件再保存：旧实现先 save 再 rebuild（rebuild 内部才 gather），
         # 新填的路径/后端只进了内存、没写进 config.json——重启应用后丢失，
         # 且磁盘上存的是旧值，与内存不一致。
@@ -2588,6 +2611,15 @@ class MainWindow(QMainWindow):
         if self._busy:
             QMessageBox.warning(
                 self, "正在运行", "Agent 正在运行，请先「终止对话」再卸载模型。")
+            return
+        if self._warming:
+            # 高危：worker 线程此刻正在预热中使用这份模型；UI 线程在此
+            # close() 释放权重与前向并发，MLX/llama.cpp 都可能直接崩进程。
+            # 旧 worker 未被停掉，迟到的 warmup_done 还会把已卸载状态误报成
+            # 「已就绪，可对话」。等预热完成（自动解锁）后再卸载。
+            QMessageBox.warning(
+                self, "正在预热",
+                "主模型正在预热，请等状态栏显示「已就绪」后再卸载。")
             return
         old = getattr(self, "_llm", None)
         if old is not None:
@@ -2620,6 +2652,13 @@ class MainWindow(QMainWindow):
         if self._busy:
             QMessageBox.warning(
                 self, "正在运行", "Agent 正在运行，请先「终止对话」再加载模型。")
+            return
+        if self._warming:
+            # 同 _on_load_main_model：预热期 rebuild/preload 会与 worker 的
+            # 预热并发抢同一份主模型权重。
+            QMessageBox.warning(
+                self, "正在预热",
+                "主模型正在预热，请稍候再加载辅助模型。")
             return
         # 先收集控件再保存（与 _on_load_main_model 同款修正：旧实现 save 在
         # gather 之前，新填的辅助模型路径不落盘，重启即丢）。
@@ -2867,7 +2906,24 @@ class MainWindow(QMainWindow):
         self.send_editor.send_requested.connect(self._on_send)
         self.stop_btn.clicked.connect(self._on_stop)
 
+        self._connect_bridge()
+
+    def _connect_bridge(self) -> None:
+        """(重)连接 bridge → 主窗口的全部信号。
+
+        `_force_stop_agent` 强杀前会 `bridge.disconnect()` 全断（防止 terminate
+        瞬间的 emit 打进正在销毁的对象）；旧实现断开后**没有任何重连路径**——
+        `_wire_signals` 只在 __init__ 跑一次，`_on_send` 换新 worker 也不重连，
+        结果强杀一次后新 worker 的 content/finished/error 全部收不到，UI 永久
+        无响应。本方法与 `disconnect_bridge()` 必须配对调用：先断后连，不重复。
+        """
         b = self._bridge
+        # 清单必须与 disconnect_bridge 的断开清单一一对应（含 status /
+        # warmup_done / final_answer——它们最初散落在 __init__ 里单独连接，
+        # 漏一项就是「强杀后该通道永久失联」）。
+        b.status.connect(self._on_warmup_status)
+        b.warmup_done.connect(self._on_warmup_done)
+        b.final_answer.connect(self._on_final_answer)
         b.content.connect(self._on_content)
         b.reasoning.connect(self._on_reasoning)
         b.tool_start.connect(self._on_tool_start)
@@ -2877,7 +2933,6 @@ class MainWindow(QMainWindow):
         b.speed.connect(self._on_speed)
         b.skill.connect(self._on_skill_suggested)
         b.plan.connect(self._on_plan_updated)
-        self.plan_toggle_btn.toggled.connect(self._on_plan_toggle)
         b.finished.connect(self._on_finished)
         b.error.connect(self._on_error)
         b.confirm_request.connect(self._on_confirm_request)
@@ -3314,6 +3369,14 @@ class MainWindow(QMainWindow):
                 self, "正在运行",
                 "Agent 正在运行，请先点击「终止对话」停止当前任务，再应用配置。",
             )
+            return
+        if self._warming:
+            # 旧实现此处只查 _busy：预热期应用配置 → _rebuild_agent 替换
+            # agent/worker 却不复位 _warming，发送按钮永久禁用（只能重载
+            # 模型解套）。与加载/卸载同款拒绝，等 warmup_done 自动解锁。
+            QMessageBox.warning(
+                self, "正在预热",
+                "主模型正在预热，请稍候再应用配置。")
             return
         # 先收集控件再保存：旧实现先 save 再 rebuild（rebuild 内部才 gather），
         # 新填的配置不写盘，重启后回旧值。
@@ -3932,9 +3995,14 @@ class MainWindow(QMainWindow):
         if not self._busy:
             return
         worker = self._worker
+        disconnected = False
         if worker is not None and self._is_worker_running(worker):
             logger.warning("UI: 终止请求超时，强制结束 agent 工作线程")
             self._append_log("[ui] 终止请求超时，强制结束工作线程")
+            # 先置位再断开：disconnect 的任何失败（PyQt6 下已无连接可断时
+            # `disconnect()` 也会抛 TypeError）都不能阻止随后的重连——否则
+            # 「断了一半 + 不重连」比不断更糟。逐信号版断开是尽力而为的。
+            disconnected = True
             try:
                 # 断的是 bridge（worker 自身没有信号，disconnect() 是 no-op）
                 worker.disconnect_bridge()
@@ -3975,6 +4043,13 @@ class MainWindow(QMainWindow):
         # 强杀会 disconnect_bridge()，任何在途的 warmup_done 都收不到了；
         # 这里兜底复位，绝不让发送按钮停在禁用态。
         self._set_warming(False)
+        # 断开的 bridge 必须重连：否则下一次发送换的新 worker 信号全部落空
+        # （content/finished/error 都收不到，UI 永久无响应）。配对调用。
+        if disconnected:
+            try:
+                self._connect_bridge()
+            except (TypeError, RuntimeError) as e:
+                logger.warning("UI: reconnect bridge after force stop failed: %s", e)
         self._set_controls_busy(False)
         self.status_label.setText("已强制终止（工具进程可能仍在后台运行）")
 
@@ -4607,6 +4682,15 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
         self._orphan_workers = []
+        # --- 预加载 daemon 线程：注释（_preload_client）一直承诺 join，实现
+        # 没做。它们只做权重加载（无子进程/锁风险），join 最多等 5s，避免
+        # 进程退出时 daemon 线程被强杀丢掉加载完成的落盘/状态写入。
+        for t in list(getattr(self, "_preload_threads", {}).values()):
+            try:
+                if t.is_alive():
+                    t.join(timeout=5.0)
+            except RuntimeError:
+                pass
         # --- Release agent resources: MCP subprocesses, httpx client, RAG.
         # 线程被 terminate() 强杀时，它可能正持有这些子系统内部的锁，此处
         # 任何取锁操作都会永久阻塞 → 直接跳过，交给进程退出时由 OS 回收

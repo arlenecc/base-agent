@@ -69,7 +69,14 @@ _SHELL_VERB_RE = re.compile(
 # 重定向到工作区之外的路径（> /etc/hosts、> ~/.bashrc、>> ../outside）。
 # 旧正则只匹配 ``>/``：``~`` 展开与 ``../`` 逃逸两种工作区外写入零确认。
 # 注意 ``./`` 是工作区内相对路径，不能算风险（旧行为就不算）。
-_SHELL_REDIRECT_RE = re.compile(r">>?\s*(?:~|\.\./|/)")
+# 2026-11 修补：``>`` 后跟引号或 ``$``（shell 变量）同样不命中旧正则——
+# ``echo x > $HOME/.zshrc`` / ``>> "$HOME/x"`` 这类**零确认写穿到主目录**的
+# 变体完全漏网。现在引号/变量前缀一并视为重定向；变量落点无法静态判定，
+# 由下方独立的「变量重定向」条目安全侧兜底（宁可多确认）。
+_SHELL_REDIRECT_RE = re.compile(r">>?\s*[\"']?(?:~|\$|\.\./|/)")
+# 重定向目标含 shell 变量（$HOME / ${VAR} / $out …）：落点只能运行时确定，
+# 静态分析不可信 → 一律要求确认，不依赖 mentions_outside_path 的字面量提取。
+_SHELL_REDIRECT_VAR_RE = re.compile(r">>?\s*[\"']?\s*\$")
 # sudo / 系统-电源-进程-磁盘控制
 _SHELL_CTRL_RE = re.compile(
     r"\b(sudo|doas|su\s+-|shutdown|reboot|halt|poweroff|pmset|csrutil"
@@ -136,6 +143,12 @@ def _command_risks(command: str, workspace: str) -> List[str]:
     if (_SHELL_VERB_RE.search(low) or _SHELL_REDIRECT_RE.search(low)) \
             and mentions_outside_path(cmd, workspace):
         risks.append("向工作区之外的路径写入")
+    # 重定向到 shell 变量（> $HOME/x、> "$out"）：落点运行时才确定，字面量
+    # 路径比对（mentions_outside_path）帮不上忙 → 安全侧倾斜，一律确认。
+    # 旧实现里 ``echo x > $HOME/.zshrc`` 因此零确认写穿主目录（e 以外无任何
+    # 拦截：echo 不是动词、redirect 不命中、路径提取不到 $HOME）。
+    if _SHELL_REDIRECT_VAR_RE.search(cmd):
+        risks.append("重定向目标含 shell 变量（无法确认落点是否在工作区内）")
     return risks
 
 

@@ -57,6 +57,11 @@ def _atomic_write(full: str, content: str, encoding: str = "utf-8") -> None:
             os.fchmod(fd, mode)
             with os.fdopen(fd, "w", encoding=encoding) as f:
                 f.write(content)
+                # 与 atomic_io.atomic_write_text 对齐：replace 前 fsync。
+                # 否则断电/崩溃时 os.replace 后的目标文件可能是空/半写内容
+                # （page cache 未落盘），file_write 的持久性承诺是假的。
+                f.flush()
+                os.fsync(f.fileno())
             fd = -1  # fdopen 已接管， finally 不再重复 close
             os.replace(tmp, full)
         finally:

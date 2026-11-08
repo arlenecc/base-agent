@@ -69,6 +69,16 @@ _DEGENERATE_REPEAT_LIMIT = 5
 
 _MIN_SINGLE_GEN_TOKENS = 8192
 
+# 轻量工具子集：一句话任务（问候 / 单文件读写 / 单命令 / 知识库问答）用不到
+# 技能管理 / 记忆图谱 / checkpoint / 计划 / 批量检索这些「任务编排类」工具。
+# 下发前缀从 ~6200 token 降到 ~4100（实测 schema 全量 3984 / system 2238）。
+# 注意：不放进 update_plan——简单任务本就被规划门豁免，给了反而诱导建计划。
+_LITE_TOOL_NAMES = frozenset({
+    "file_read", "file_write", "file_modify", "file_append",
+    "code_run", "shell_run", "web_scan",
+    "ask_user", "rag_search", "memory_search",
+})
+
 # 寒暄 / 自我认知（能力、功能、身份）类问答：答案就在系统提示里，不需要
 # 推理也不需要工具。但本地小模型会无视系统提示的软禁令：连发 rag_* 空转
 # 6 次才熔断（10s+），或把几百字内心独白塞进 <summary>、夹带工具 XML 残片，
@@ -97,6 +107,38 @@ _SELF_QUERY_FALLBACK = (
     "直接告诉我你想完成什么即可。"
 )
 
+# ---- 门禁地图（gates map）------------------------------------------------
+# 内核对模型输出共设以下门禁。**新增门禁前先读这里**：每道门都有自己的
+# 预算/豁免与跨段传递语义，随意叠加会让交互路径组合爆炸（历史教训见
+# _MAX_SAME_REDIRECTS 注释）。改动任何一道门前，先核对本表：
+#
+# ┌─────────────────────┬──────────┬───────────────────────┬───────────────┐
+# │ 门禁（位置）         │ 触发条件 │ 预算 / 豁免            │ 动作          │
+# ├─────────────────────┼──────────┼───────────────────────┼───────────────┤
+# │ 寒暄短路（run 头）   │ 本地后端 │ _is_smalltalk_query    │ 0 次 LLM 直接 │
+# │                     │ + 纯问答 │ 且非 resume            │ 文字收尾      │
+# │ 规划门软提示（THINK）│ 无 plan  │ local/resume/simple 豁免│ pending 追加  │
+# │ 规划前置门（ACT）    │ 无 plan  │ _redirect 同 hint ≤2； │ 提交+纠正反馈 │
+# │                     │ 发实际工具│ local/resume/simple 豁免│ 不 rollback  │
+# │ 反思门·未建计划      │ 多步收尾 │ local 豁免、resume 豁免│ 提交+纠正反馈 │
+# │  （no_tool 分支）    │ 未动手   │ _FINISH_NUDGE_PLAN_MAX │               │
+# │ 反思门·未完成步骤    │ open>0   │ 三档预算(无活2/普通3/  │ 提交+纠正反馈 │
+# │  （no_tool 分支）    │          │ 失败8)；same-hint ≤2   │               │
+# │ ask_user 门禁（ACT） │ 严格问候 │ _is_greeting           │ blocked 占位  │
+# │ rag_search 上限(ACT)│ 每轮 >3  │ _RAG_SEARCH_MAX_PER_RUN│ blocked 占位  │
+# │ 补建计划提示(ACT尾)  │ 干了活   │ _PLAN_NUDGE_MAX；local │ parts 追加    │
+# │                     │ 无 plan  │ 豁免                   │               │
+# │ 空回复重试(no_tool)  │ 空/截断/ │ _MAX_EMPTY_RETRY=3     │ rollback      │
+# │                     │ 退化复读 │                        │               │
+# │ 无 EOS 熔断（_ask） │ >16k tok │ max(8k, max_tokens//2) │ 中止流收尾    │
+# │ 重复调用熔断（ACT） │ 同签名5/ │ _REPEAT_CALL_LIMIT 等  │ 收尾          │
+# │                     │ 同工具6  │                        │               │
+# └─────────────────────┴──────────┴───────────────────────┴───────────────┘
+# 跨段传递：finish_nudge / plan_finish_nudge / block_nudge / empty_retry /
+# reask_guard / plan_nudged / same_redirect_streak 等计数走 failure_snapshot
+# → seed_failures，防止 5 段续跑放大额度。guard 语义是「提示用尽后放行」，
+# 不是终止——终止由三级失败熔断与 max_turns 兜底。
+#
 # ---- 规划门 / 反思门（防止「跑丢」与「半路停」）---------------------------
 # 规划门：任务开始后、还没干过实际活、且还没有计划时，每轮提醒先规划；一旦
 # 开始干实际活就停止（一句话任务如「读 a.txt」不被强制规划）。多步任务真正
@@ -309,6 +351,9 @@ class KernelLoop:
         self.state: KernelState = KernelState.THINK
         self.distill_requested = False
         self._schemas: Optional[List[Dict[str, Any]]] = None
+        self._lite_schemas: Optional[List[Dict[str, Any]]] = None
+        # 当前 run 的工具下发模式（run() 开始时确定，整段固定——见 schemas()）
+        self._tool_mode = "full"
         self._schema_tokens = 0
         self._empty_retry = 0
         self._shrink_guard = 0
@@ -355,7 +400,40 @@ class KernelLoop:
         self._schema_tokens = estimate_tokens(json.dumps(self._schemas, ensure_ascii=False)) if self._schemas else 0
         self.budget.set_used("tools", self._schema_tokens)
 
+    def invalidate_schemas(self) -> None:
+        """工具注册表发生变化（如 MCP 后台连接就绪）时清空缓存。
+
+        注意：只在 run 边界生效——_ask 进行中读到的仍是旧列表（本地变量），
+        下一轮 build prompt 时才用新清单，KV 前缀的分叉因此只发生在轮次边界。
+        """
+        self._schemas = None
+        self._lite_schemas = None
+        self._schema_tokens = 0
+
     def schemas(self) -> List[Dict[str, Any]]:
+        # 双模式下发：简单任务（一句话能完成的）只给轻量工具子集。23 个工具
+        # 的 schema 实测 ~3984 token，占常驻前缀（system 2238 + tools 3984
+        # ≈ 6200）的 64%——对 2B/4B 小模型是注意力稀释（不守协议、乱调工具
+        # 的诱因之一），也是 KV 预填 6s 的主要构成。轻量组把前缀降到 ~4100。
+        # 模式在 run() 开始时确定并**整段固定**：tools 注入 system 段，中途
+        # 切换会让 KV 前缀分叉 → 每轮全量预填充。resume/多步任务用全量。
+        if self._tool_mode == "lite":
+            if self._lite_schemas is None:
+                if self._schemas is None:
+                    # 先拉全量（复用 set_schemas 的错误处理），再过滤出轻量组。
+                    # 不能递归调 self.schemas()：mode 仍为 lite 会死循环。
+                    try:
+                        self.set_schemas(self.dispatcher.schemas())
+                    except Exception as e:
+                        self.log(f"[kernel] 工具 schema 获取失败，本轮将无工具可用: {e}")
+                        logger.warning("kernel: tool schema unavailable: %s", e)
+                        self.set_schemas([])
+                self._lite_schemas = [
+                    s for s in self._schemas
+                    if s.get("function", {}).get("name") in _LITE_TOOL_NAMES]
+            self.budget.set_used("tools", estimate_tokens(
+                json.dumps(self._lite_schemas, ensure_ascii=False)))
+            return self._lite_schemas
         if self._schemas is None:
             try:
                 self.set_schemas(self.dispatcher.schemas())
@@ -428,6 +506,12 @@ class KernelLoop:
         _client = self._llm()
         self._is_local_backend = getattr(_client, "_backend", None) in (
             "mlx", "gguf", "onnx")
+        # 工具下发模式：简单任务给轻量子集（整段固定，见 schemas() 注释）。
+        # 续跑段/多步任务用全量；切模式只发生在 run 边界，KV 前缀在同段内稳定。
+        # _lite_schemas 是全量的确定性子集，**不随 run 重置**——保持同一对象
+        # 是「schema 不每轮重建」契约的一部分（test_tools_schemas_are_cached）。
+        self._tool_mode = "lite" if (
+            not resume and self._is_simple_input(user_input)) else "full"
         # 重复调用检测（成功调用同样空转，见 ACT 态的重复调用检测注释）
         self._repeat_streak = 0
         # rag_search 轮内计数（硬上限见 _RAG_SEARCH_MAX_PER_RUN）
@@ -519,7 +603,11 @@ class KernelLoop:
                 return None
             tcs = list(tool_calls or [])
             results = [
-                {"id": tc.id, "name": tc.name, "content": hint}
+                # blocked=True：这些调用从未执行，content 只是内核纠正提示。
+                # _turn_messages 只读 id/name/content（模型仍能看到反馈）；
+                # record_turn 据此把落盘 TOOLS 段标注成「内核拦截，未执行」，
+                # 不再伪装成真实工具结果污染记忆/归档。
+                {"id": tc.id, "name": tc.name, "content": hint, "blocked": True}
                 for tc in tcs
             ]
             session.finish_turn(
@@ -623,7 +711,8 @@ class KernelLoop:
             # 1 步」上，表现为反复发无意义的工具调用。
             if (session.get_plan() is None and not self._did_work
                     and not self._is_simple_input(user_input)
-                    and not self._is_local_backend):   # ③ 本地后端不强制建计划
+                    and not self._is_local_backend   # ③ 本地后端不强制建计划
+                    and not self._resume):   # 续跑段免强制规划（与前置门/反思门对齐）
                 pending = (pending or "") + _PLAN_GATE_HINT
             user_text = session.anchor_prompt(extra=pending)
             # 每轮易变上下文（工作记忆 / 当天事实 / 匹配技能）从系统提示移到用户
@@ -1247,6 +1336,14 @@ class KernelLoop:
                         calls = getattr(ev, "tool_calls", None) or []
                         usage = getattr(ev, "usage", None) or {}
                         raw_buf = getattr(ev, "raw_content", "") or ""
+                        # KV 命中可观测：reuse≈cached 即命中（只付增量），
+                        # reuse=0 说明本轮全量预填充——用户报「这句特别慢」时
+                        # UI 日志面板直接能看到原因，不用翻 /tmp 诊断文件。
+                        kv_reuse = usage.get("kv_reuse")
+                        kv_eval = usage.get("kv_eval")
+                        if kv_reuse is not None and kv_eval:
+                            self.log(f"[perf] KV reuse={kv_reuse} eval={kv_eval}"
+                                     + ("（全量预填充）" if not kv_reuse else ""))
                         continue
                     # 无 EOS 熔断：模型漏 EOS / 退化复读时会一直生成到 max_tokens
                     # （本地 2B 实测单轮 4.7 万字 / 663s）。超阈值即中止流——
