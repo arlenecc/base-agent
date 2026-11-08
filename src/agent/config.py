@@ -58,6 +58,10 @@ class AgentConfig:
     # [LEGACY 仅日志文案] CONSOLIDATE 已改为「仅预算溢出触发」（见
     # KernelLoop._needs_consolidate），周期值只出现在折叠日志的原因文案里。
     kernel_consolidate_every: int = 4
+    # web_scan 专用代理（如 http://127.0.0.1:7890）。空 = 不走显式代理
+    # （httpx 仍会读 HTTP(S)_PROXY 环境变量，但不会读系统级代理设置——
+    # GUI 启动的应用常没有代理环境变量，直连被墙目标会一直 30s 超时）。
+    web_proxy: str = ""
     # 单个工具结果注入上下文的字符上限（L1 裁剪后的目标值）。
     kernel_max_tool_chars: int = 6_000
     # L3 折叠摘要区保留的最大摘要行数。

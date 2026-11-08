@@ -454,8 +454,21 @@ class WebScanTool(Tool):
         self.registry = registry
         # follow_redirects=False：重定向由 _read_capped **手动**跟随并逐跳
         # 校验目标网段（SSRF 防护），httpx 的自动跟随只禁跨协议、不管跨网络。
+        #
+        # 连接级自动重试：跨境目标「TLS 握手超时」是间歇性的（实测同一 URL
+        # 一次成功一次 ConnectTimeout），GET 的连接建立阶段重试是安全的。
+        # HTTPTransport(retries=N) 只重试连接建立（含握手），不重试请求本身。
+        #
+        # web_proxy：显式代理（http://host:port）。httpx 默认只读环境变量
+        # （HTTP(S)_PROXY），不读 macOS/Windows 系统代理设置——GUI 启动的
+        # 应用常没有代理环境变量，直连被墙目标就是「永远 30s 超时」。配置
+        # web_proxy 后所有 web_scan 走该代理。
+        proxy = (getattr(self.config, "web_proxy", "") or "").strip() or None
+        transport = httpx.HTTPTransport(retries=2, proxy=proxy) if proxy \
+            else httpx.HTTPTransport(retries=2)
         self._http = httpx.Client(timeout=30.0, follow_redirects=False,
-                                  headers={"User-Agent": "base-agent/0.1"})
+                                  headers={"User-Agent": "base-agent/0.1"},
+                                  transport=transport)
 
     def run(self, url: str, raw: bool = False) -> ToolResult:
         # 协议白名单：url 由模型提供，不加限制的话 file:// / gopher:// 等
@@ -535,6 +548,20 @@ class WebScanTool(Tool):
                 hint += " 页面脚本中发现的候选数据端点:\n" + "\n".join(
                     f"  - {c}" for c in cands[:_MAX_API_CANDIDATES])
             return ToolResult(True, output=_truncate_marked(hint, 20000))
+        # 提示语区分「可见文本少」与「有加载特征串」，并告知正文已在上方——
+        # 旧文案一律说「页面为 JS 动态渲染」，模型容易误以为上方正文无效。
+        if _looks_js_rendered(visible):
+            if visible.strip():
+                reason = ("含加载特征串" if any(m in visible.lower()
+                          for m in _LOADER_MARKERS)
+                          else f"可见文本仅 {len(visible.strip())} 字符")
+                out += (f"\n\n[提示] 页面可见文本较少（{reason}），可能需要 "
+                        f"JS 渲染或登录；上方为已提取到的正文。如内容不完整，"
+                        f"可尝试 raw=true 查看原始 HTML。")
+            else:
+                out += ("\n\n[提示] 未提取到任何可见文本：页面很可能是纯 JS "
+                        "渲染、需要登录或仅对浏览器 UA 开放。可尝试 raw=true "
+                        "查看原始 HTML，或改用目标站点的公开 API。")
         return ToolResult(True, output=_truncate_marked(out, 20000))
 
     # ------------------------------------------------------------------
@@ -685,10 +712,10 @@ class WebScanTool(Tool):
                     return sections, notes
 
         if tried:
-            notes.append("[提示] 页面为 JS 动态渲染，已试探以下脚本中的数据端点但未取得可用数据: "
+            notes.append("[提示] 页面可见文本较少，已试探以下脚本中的数据端点但未取得可用数据: "
                          + ", ".join(tried))
         else:
-            notes.append("[提示] 页面为 JS 动态渲染，未在脚本中发现数据端点")
+            notes.append("[提示] 页面可见文本较少，未在脚本中发现数据端点")
         return sections, notes
 
 

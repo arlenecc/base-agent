@@ -1632,9 +1632,12 @@ class Agent:
         n = len(jobs)
         if n == 0:
             return
-        # 终止对话场景下的总等待上限：常规并行检索几秒完成，最坏情况（web_scan
-        # 多跳 180s+）也最多等这么多秒，避免 UI 卡死。
-        allow = max(30.0, 10.0 * n)
+        # 终止对话场景下的总等待上限：常规并行检索几秒完成。公式必须覆盖
+        # 「单工具自身超时」：web_scan 自身 30s 超时，n 个并发全慢时总耗时
+        # ≈30s——旧公式 max(30, 10n) 在 n≤3 时恰好卡在 30s 边缘，后完成的
+        # 结果会被砍成「未完成」（用户看到的就是扫了几个页面什么都没回来）。
+        # 放宽到 max(60, 15n)：仍是有限等待，且大于任何单工具自身超时。
+        allow = max(60.0, 15.0 * n)
         deadline = time.monotonic() + allow
         out: List[Any] = [None] * n
         lock = threading.Lock()
