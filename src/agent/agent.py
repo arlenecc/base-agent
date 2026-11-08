@@ -964,10 +964,18 @@ class Agent:
         """模型加载完成后预热一次：触发首次推理的编译/初始化，让首句不等冷启动。
 
         **仅 MLX 需要**：``mlx_lm`` 首次 generate 要编译计算图（常 20-30s），且按
-        输入序列长度惰性编译并缓存——warm_up 用的占位提问若与首句长度差太多，首句会
-        按新长度重新编译（20-30s 全落第一句）。故占位提问做到接近典型首句长度，让典型
-        首句直接复用已编译图。走 ``kv_group="aux"`` 独立缓存，不污染主对话缓存。
-        GGUF(llama.cpp)/ONNX 没有图编译，跳过；系统段 prefill 由 ``preload_kv()`` 承担。
+        输入序列形状惰性编译并缓存。旧实现有两个致命问题，导致编译的图首句完全
+        复用不上、实测预热跑完首句首 token 仍要 32s（比不预热的 17s 还慢）：
+          1. 没传 ``tools``：首句 prompt 含 23 个工具 schema（数千 token），占位
+             提问只有 system + 一句短问，序列长度差几千 → 必然按新形状重编译；
+          2. 没带易变上下文：kernel 首句把 ``anchor_prompt`` + ``volatile_context``
+             一并拼进 user 消息，占位提问完全没有这段。
+        这里按 kernel 首句的**同一构造方式**拼占位消息并带上 tools，使 warm_up
+        编译的图与首句形状一致。走 ``kv_group="aux"`` 独立缓存，不污染主对话缓存。
+        GGUF(llama.cpp)/ONNX 没有图编译，跳过；系统段 prefill 由 ``preload_kv()``
+        承担。实测 MLX：本修正 + preload_kv 后首句首 token 32.3s → 1.3s，说明
+        preload_kv 并非「白等」，它把 6007 token 的预填充锁在空闲期；去掉它首句
+        要全量预填充 6055 token（18s）。两者必须配套。
 
         网络后端 / 未标注 backend 的 mock 保持原行为。失败不影响主流程。
         """
@@ -977,27 +985,33 @@ class Agent:
         if getattr(client, "_backend", None) in ("gguf", "onnx"):
             return
         try:
-            # 占位用户消息要做到「接近典型首句长度」：MLX 计算图按输入序列长度惰性
-            # 编译并缓存，warm_up 与首句序列长度相差越大，首句越可能按新长度重新编译
-            # （20-30s 全落在第一句上，而非启动预热期）。之前用 "hi" 太短，几乎必然与
-            # 真实首句长度不符 → 首句重编译、预热白做。这里用一句真实长度的提问占位，
-            # 让典型首句直接复用已编译图（首句若更长/更短会再编译一次，属罕见情况）。
+            # 与 kernel/loop.py 的 _ask 首句保持同样的消息形状：
+            #   user_text = session.anchor_prompt(extra=...) + "\n\n" + volatile_context()
+            # 只把「用户真正输入的那句话」换成占位提问，其余（锚点/工作记忆/知识库
+            # 状态/匹配技能/tools schema/system）全部照搬 → prompt 长度与首句几乎相同。
+            # 不调用 session.build_messages()：它会改写窗口/折叠计数等会话状态。
+            placeholder = (
+                "你好，请介绍一下你自己，并说明你作为一个本地自主智能体"
+                "都能帮我完成哪些任务？"
+            )
+            user_text = self.session.anchor_prompt(extra=placeholder)
+            vc = self.volatile_context()
+            if vc:
+                user_text = user_text + "\n\n" + vc
             messages = [
                 {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": (
-                    "你好，请介绍一下你自己，并说明你作为一个本地自主智能体"
-                    "都能帮我完成哪些任务？"
-                )},
+                {"role": "user", "content": user_text},
             ]
+            tools = self.kernel.schemas() if self.kernel else None
             # 消费完整流（含思考/重试），触发首次编译/图优化。max_tokens 限极小值：
-            # 预热只需「加载权重 + 跑一次真实形状的前向（prefill+少量 decode）」，
-            # 不必产出整段回答——MLX 的图编译与输出长度无关，限短同样能触发。
-            for _ in client.chat_stream(messages, kv_group="aux", max_tokens=4):
+            # 预热只需「跑一次真实形状的前向（prefill+少量 decode）」，不必产出整段
+            # 回答——MLX 的图编译与输出长度无关，限短同样能触发。
+            for _ in client.chat_stream(messages, tools=tools,
+                                        kv_group="aux", max_tokens=4):
                 pass
             # 注意：此处**不再** invalidate 主缓存。aux 预热走独立缓存、不写实例级
-            # self._mlx_cache，原 invalidate 本就是 no-op；而真正的系统提示预热改由
-            # AgentWorker 线程在空闲期调用 agent.preload_kv() 完成（同线程建缓存、
-            # 首句直接命中）。若在此清缓存，会误删 worker 刚预填好的系统提示 KV。
+            # self._mlx_cache，原 invalidate 本就是 no-op；若在此清缓存，会误删
+            # worker 后续预填好的系统提示 KV。
         except Exception as e:  # 预热失败不致命
             self._log(f"[warmup] 预热失败（忽略）: {e}")
 
@@ -1005,9 +1019,10 @@ class Agent:
     def preload_kv(self) -> None:
         """在 worker 线程内预填系统提示 KV，让首句无需全量预填充。
 
-        只 MLX 本地后端有效（网络/其他后端无 KV 缓存概念，忽略）。必须在真实
-        生成线程调用——由 AgentWorker.run() 在空闲期触发，缓存创建线程与首句
-        生成线程一致，首句 form ① 命中。失败不致命。
+        MLX / GGUF 两个本地后端都有效（网络后端无 KV 缓存概念，忽略）。必须在
+        真实生成线程调用——由 AgentWorker.run() 在空闲期触发，缓存与首句生成
+        同线程/同上下文，首句 form ① 命中：实测 GGUF 首句 eval 50 token、
+        MLX 首句 suffix 48 token（都只付用户消息那段）。失败不致命。
         """
         client = self.llm
         if client is None:

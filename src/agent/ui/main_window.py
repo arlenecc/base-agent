@@ -475,6 +475,14 @@ class Bridge(QObject):
     error = pyqtSignal(str)
     # 通用状态栏提示（worker / 预加载线程 → 主线程底部状态栏，跨线程安全入队）。
     status = pyqtSignal(str)
+    # 主模型「预热结束」的单一收口信号：worker.run() 用 try/finally 保证无论
+    # 预热成功/失败/跳过、队列是否有消息都 emit 一次，UI 据此解锁发送按钮并
+    # 显示最终「已就绪，可对话」。避免旧的「权重加载完就报已就绪」与预热状态
+    # 互相打架（用户看到已就绪就发消息 → 队列非空 → 整段跳过预热 → 首句 45s）。
+    # 参数是「发出者」：worker 传 self；没有 worker 可预热时的兜底传 None（强制
+    # 解锁）。UI 只接受当前 worker 的信号——预热期间重建 agent 时，旧 worker
+    # 迟到的收尾信号不能把新一轮预热提前解锁。
+    warmup_done = pyqtSignal(object)
     # blocking requests (worker -> UI)
     confirm_request = pyqtSignal(str)
     ask_request = pyqtSignal(str)
@@ -649,54 +657,41 @@ class AgentWorker(QThread):
             bridge.disconnect()
 
     def run(self) -> None:  # type: ignore[override]
-        # 模型加载完成后本线程即启动，先做两件「空闲期预热」，都跑在 worker 线程、
-        # 与真实生成同线程（缓存不被线程隔离丢弃），且二者串行避免并发抢同一份权重
+        # 模型加载完成后本线程即启动，先做「空闲期预热」，跑在 worker 线程、
+        # 与真实生成同线程（缓存不被线程隔离丢弃），串行避免并发抢同一份权重
         # （MLX 前向非线程安全）：
-        #  (1) 用 system prompt 预填 KV（数秒）——首句直接命中缓存、跳过数千 token
-        #      全量预填充；
-        #  (2) warm_up 跑一次真实形状推理，触发 MLX 首推图编译（20-30s），首句不再
-        #      等冷启动。
-        # 两步都失败不致命；预填/编译完才进入消息循环，用户打字前本线程已空闲。
-        # 但若用户手快、消息已经在队列里等着：跳过空闲期预热，先处理真实消息
-        # （首句自己会把编译/预填一并付掉——反正躲不掉；让它干等 warm_up 完成是
-        # 纯浪费，实测表现为「发了消息 18s 没动静」）。空队列时才值得预热。
-        if not self._queue.empty():
-            self._callbacks.bridge.status.emit(
-                "已有消息在排队，跳过空闲期预热（首句将自行完成编译与预填）")
-            logger.info("AgentWorker: 队列已有待处理消息，跳过空闲期预热")
-        else:
-            # warm_up 必须先跑：MLX 走 kv_group="aux" 做一次「真实形状」推理
-            # （占位提问做到接近典型首句长度）以触发图编译——首句长度与之接近时
-            # 直接复用已编译图，编译成本锁在启动期而非落在第一句；GGUF 走
-            # create_chat_completion(reset=True) 会 reset 共享 llama.cpp 上下文、
-            # 清空主缓存计数器 _gguf_ids，若排在 preload_kv 之后会把刚预填好的
-            # 系统提示 KV 整个冲掉，首句退回全量预填充。排在前面，reset 无害；
-            # 随后的 preload_kv 再重新预填。
+        #  warm_up 先跑：MLX 用真实形状（tools + 易变上下文）推理一次，触发
+        #    按序列长度惰性编译的计算图，编译成本锁在启动期而非落在第一句；
+        #    GGUF/ONNX 无图编译，内部直接返回。
+        #  preload_kv 后跑：把系统提示 eval 进上下文，使首句 prompt 是缓存的
+        #    严格扩展 → 命中 form①，跳过数千 token 全量预填充。
+        #
+        # 关键：预热**无条件执行**。旧实现在「队列已有消息」时整段跳过预热，
+        # 理由是不让用户干等，但代价是首句自己承担图编译 + 全量预填充（实测
+        # 45s），而用户又常因状态栏过早显示「已就绪」而抢跑 → 预热几乎必然被
+        # 跳过、形同虚设。现在 UI 在预热完成前就禁用发送（_warming），队列正常
+        # 为空；即便真有消息排队，也先预热再处理，状态机只有一条路径。
+        try:
             try:
                 self._callbacks.bridge.status.emit(
-                    "主模型预热中（编译计算图 + 首次推理，约 20-30s）")
+                    "主模型预热中（首次推理 / 计算图编译，请稍候）")
                 self._agent.warm_up()
-                # 编译阶段结束、进入系统提示预填前，用过渡文案衔接，避免直接
-                # 弹「可开始对话」后又被下方「预填中」覆盖造成「完成↔预热」反复。
-                self._callbacks.bridge.status.emit(
-                    "主模型编译完成，正在预填系统提示…")
             except Exception as e:
                 logger.warning("主模型预热失败(忽略): %s", e)
                 self._callbacks.bridge.status.emit(
                     "预热失败，但仍可对话（首句会偏慢）")
-            # preload_kv（系统提示 KV 预填）必须**最后**跑：在 warm_up 的 reset 之后
-            # 把系统提示 eval 进上下文，使首句 prompt 是其严格扩展 → 直接命中缓存，
-            # 跳过系统提示的全量预填充（首句只付用户消息那段）。
             try:
                 self._callbacks.bridge.status.emit(
                     "系统提示预填中（预填上下文 KV，请稍候）")
                 self._agent.preload_kv()
-                # 预热只是内部优化，用户只关心「能不能对话」：最终态统一回
-                # 「主模型已就绪，可对话」（与 model_loaded 后的文案一致），
-                # 避免状态栏停在临时提示上。
-                self._callbacks.bridge.status.emit("主模型已就绪，可对话")
-            except Exception:
+            except Exception as e:
+                logger.warning("系统提示预热失败(忽略): %s", e)
                 self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
+        finally:
+            # 无论预热成功/失败/异常，都必须解锁发送按钮并显示最终态。
+            # 漏掉这一步会把 UI 永久锁在「预热中」，比预热本身失效更糟。
+            # 传 self 让 UI 能识别「已被替换的旧 worker」的迟到信号。
+            self._callbacks.bridge.warmup_done.emit(self)
         while True:
             text = self._queue.get()
             if text is None:
@@ -1351,6 +1346,7 @@ class MainWindow(QMainWindow):
         # bridge.status 复用 warmup 状态入口：worker 线程预填系统提示 KV 时，
         # 跨线程把「系统提示预热中…/已预热」投到状态栏 + 进度条不确定态。
         self._bridge.status.connect(self._on_warmup_status)
+        self._bridge.warmup_done.connect(self._on_warmup_done)
         self._llm: Optional[LLMClient] = None
         self._agent: Optional[Agent] = None
         self._worker: Optional[AgentWorker] = None
@@ -1361,6 +1357,11 @@ class MainWindow(QMainWindow):
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         self._busy = False
+        # True = 主模型权重加载/预热尚未结束。此时发送按钮禁用、_on_send 拒绝
+        # 入队：否则用户看到「已就绪」就发消息，worker.run() 会因队列非空整段
+        # 跳过预热，图编译 + 全量预填充全压在首句（实测 45s）。由 warmup_done
+        # 信号（worker.run() 的 try/finally）统一复位，保证不会永久锁死。
+        self._warming = False
         self._total_tokens = 0
         # 工作线程被 terminate() 强杀后置位：此后不能再走任何需要取锁的
         # 资源释放（tools.shutdown 等）—— 被杀线程持有的锁永远不会被释放。
@@ -2382,13 +2383,31 @@ class MainWindow(QMainWindow):
         btn.setStyleSheet(_MODEL_IDLE_STYLE)
 
     def _on_model_loaded(self, key: str, success: bool) -> None:
-        """后台预加载完成（跨线程信号入队到主线程）后更新按钮态。"""
+        """后台**权重加载**完成（跨线程信号入队到主线程）后更新按钮态。
+
+        注意：这里只表示权重已加载，**绝不能**写「主模型已就绪，可对话」——
+        空闲期预热（MLX 图编译 / GGUF 系统提示预填）此时才刚要开始。最终态
+        由 AgentWorker.run() 的 warmup_done 信号统一给出，避免两个时机互相
+        覆盖、也避免用户据此在预热完成前发消息。
+        """
         if success:
             self._mark_model_loaded(key)
-            self.status_label.setText(
-                "主模型已就绪，可对话" if key == "main" else "辅助模型已就绪")
+            if key != "main":
+                # 主模型仍在预热时，不要让辅助模型的加载完成覆盖预热进度。
+                if not self._warming:
+                    self.status_label.setText("辅助模型已就绪")
+            elif self._warming:
+                # model_loaded 与 warmup_done 分别来自预加载线程 / worker 线程，
+                # 都是跨线程 queued 信号，到达顺序不保证。若预热已完成（_warming
+                # 已被复位），就不要用中间文案覆盖最终的「已就绪，可对话」。
+                self.status_label.setText("主模型权重已加载，正在预热…（请稍候）")
+                self.progress.setRange(0, 0)
         else:
             self._mark_model_unloaded(key)
+            if key == "main":
+                # 加载失败也要解锁，否则发送按钮永久禁用。
+                self._set_warming(False)
+                self.status_label.setText("主模型加载失败，请重新加载")
 
     def _on_warmup_status(self, msg: str) -> None:
         """预热/加载阶段的状态提示（warmup_status / bridge.status 信号，跨线程安全入队）。
@@ -2405,20 +2424,49 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
 
-    def _start_worker(self) -> None:
+    def _set_warming(self, warming: bool) -> None:
+        """统一维护「预热中，禁止发送」状态（只由 UI 线程调用）。"""
+        self._warming = bool(warming)
+        # _busy 期间 _set_controls_busy 已经禁用发送，此处不要误开。
+        self.send_btn.setEnabled(not self._busy and not self._warming)
+
+    def _on_warmup_done(self, worker=None) -> None:
+        """主模型预热收口：解锁发送并显示最终「可对话」。
+
+        worker.run() 用 try/finally emit，成功/失败/跳过预热/队列非空都会走到，
+        因此这里不需要区分结果，也不会把 UI 永久锁死。
+        ``worker`` 为发出者；None = 无 worker 可预热时的强制解锁。只接受当前
+        worker，避免预热期间重建 agent 后旧 worker 的迟到信号提前解锁。
+        """
+        if worker is not None and worker is not self._worker:
+            logger.info("忽略已被替换的旧 worker 的预热收尾信号")
+            return
+        self._set_warming(False)
+        # 若用户已在对话中（例如重新加载模型时旧 worker 的收尾信号延迟到达），
+        # 不要用「可对话」覆盖运行状态文案。
+        if not self._busy:
+            self.status_label.setText("主模型已就绪，可对话")
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+
+    def _start_worker(self) -> bool:
         """启动常驻 worker 线程（空闲期预填系统提示 KV，首句直接命中缓存）。
 
         必须在模型已加载、agent 就绪后调用。旧实现在用户首次点发送时才创建
         worker，导致 preload_kv() 作为首句处理的一部分执行、首句仍需全量预填充。
         改为加载完成后立即启动，预填发生在用户打字前的空闲期——worker 线程与真实
         生成同线程，缓存不被线程隔离丢弃。重复调用幂等（已在跑则跳过）。
+
+        返回是否新启动了线程：调用方据此判断有没有 worker 来 emit warmup_done，
+        没有就必须自行解锁，避免「预热中」把发送按钮永久禁用。
         """
         if self._worker is not None and self._worker.isRunning():
-            return
+            return False
         if self._agent is None:
-            return
+            return False
         self._worker = AgentWorker(self._agent, self._callbacks)
         self._worker.start()
+        return True
 
     def _preload_client(self, client, label: str, key: str) -> None:
         """后台预加载本地模型权重（LocalLLMClient._ensure_model），不阻塞 UI。
@@ -2429,24 +2477,6 @@ class MainWindow(QMainWindow):
         ensure = getattr(client, "_ensure_model", None)
         if ensure is None:
             return
-
-        def _run():
-            try:
-                ensure()
-                logger.info("%s 权重已预加载", label)
-                # 先置绿：加载成功即标记为「已就绪」（变绿），用户可立即开始对话。
-                self.model_loaded.emit(key, True)
-                # 主模型加载完成后**立即**启动常驻 worker：run() 内会先用 system
-                # prompt 预填 KV（数秒）、再串行跑 warm_up 编译（20-30s），都在
-                # worker 线程内完成、与真实生成同线程。用户打字前 worker 已空闲，
-                # 首句直接命中缓存。绝不在本（预加载）线程里再跑 warm_up——否则会和
-                # worker 内的预填/编译并发抢同一份权重（MLX 前向非线程安全）。
-                if key == "main" and not self._busy:
-                    self._start_worker()
-            except Exception as e:  # 预加载失败不影响主流程，首次用时再报错
-                logger.warning("%s 预加载失败: %s", label, e)
-                self.model_loaded.emit(key, False)
-
         # 旧实现 daemon 线程不跟踪：连续点「加载模型」会同时起 N 个加载线程
         # 抢 GPU 内存，各自独立 _ensure_model → 同一进程里 MLX/Llama 加载
         # N 次，内存翻倍。同 key 的前一个没结束就不再起新的；线程引用归
@@ -2456,6 +2486,37 @@ class MainWindow(QMainWindow):
         if prev is not None and prev.is_alive():
             logger.info("%s 预加载已在进行，跳过本次", label)
             return
+
+        if key == "main":
+            # 从「开始加载」到「预热完成」全程禁止发送，状态栏如实显示进度。
+            # 必须在起线程前置位：结束信号可能比下面的文案更早到达。
+            self._set_warming(True)
+            self.status_label.setText("主模型加载中…（请稍候）")
+            self.progress.setRange(0, 0)
+
+        def _run():
+            try:
+                ensure()
+                logger.info("%s 权重已预加载", label)
+                # 先置绿：权重加载成功即可标记模型可用，但**不代表可对话**——
+                # 最终态由 worker 的 warmup_done 给出。
+                self.model_loaded.emit(key, True)
+                # 主模型加载完成后**立即**启动常驻 worker：run() 内会先跑
+                # warm_up、再 preload_kv，都在 worker 线程内完成、与真实生成
+                # 同线程。预热结束由 run() 的 try/finally 统一 emit warmup_done。
+                # 绝不在本（预加载）线程里跑 warm_up——否则会和 worker 内的
+                # 预填/编译并发抢同一份权重（MLX 前向非线程安全）。
+                if key == "main":
+                    started = self._start_worker() if not self._busy else False
+                    if not started:
+                        # 没有 worker 来 emit warmup_done（正在对话中 / agent
+                        # 尚未就绪 / 已在运行的旧 worker）→ 必须自行解锁，
+                        # 否则发送按钮会永久禁用。传 None 表示强制解锁。
+                        self._bridge.warmup_done.emit(None)
+            except Exception as e:  # 预加载失败不影响主流程，首次用时再报错
+                logger.warning("%s 预加载失败: %s", label, e)
+                self.model_loaded.emit(key, False)
+
         t = threading.Thread(target=_run, daemon=True, name=f"preload-{label}")
         self._preload_threads[key] = t
         t.start()
@@ -2487,7 +2548,9 @@ class MainWindow(QMainWindow):
             if aux is not None and getattr(aux, "_ensure_model", None) is not None:
                 self._preload_client(aux, "辅助模型", "aux")
                 started = True
-        if started:
+        if started and not self._warming:
+            # _preload_client 已给出更精确的「主模型加载中…（请稍候）」，
+            # 别用笼统文案覆盖掉预热进度。
             self.status_label.setText("正在后台加载模型…")
 
     def _on_load_main_model(self) -> None:
@@ -2504,7 +2567,7 @@ class MainWindow(QMainWindow):
         # 若要同时换辅助模型路径，点「重新加载辅助模型」或「应用配置」。
         self._rebuild_agent(rebuild_aux=False)
         self._preload_client(getattr(self, "_llm", None), "主模型", "main")
-        self.status_label.setText("主模型加载中…")
+        # 文案由 _preload_client / warmup_done 统一给出，此处不再覆盖。
 
     def _on_unload_main_model(self) -> None:
         if self._busy:
@@ -2534,6 +2597,8 @@ class MainWindow(QMainWindow):
         self._llm = None
         self._agent = None
         self._mark_model_unloaded("main")
+        # 卸载后不再等任何 warmup_done，避免残留的预热态把发送锁死。
+        self._set_warming(False)
         self.status_label.setText("主模型已卸载，请选择新模型并加载")
 
     def _on_load_aux_model(self) -> None:
@@ -2565,7 +2630,9 @@ class MainWindow(QMainWindow):
             if self._llm is not None:
                 self._llm.set_draft_source(aux)
         self._preload_client(aux, "辅助模型", "aux")
-        self.status_label.setText("辅助模型加载中…")
+        # 辅助模型加载不能覆盖主模型的预热进度文案。
+        if not self._warming:
+            self.status_label.setText("辅助模型加载中…")
 
     def _on_unload_aux_model(self) -> None:
         if self._busy:
@@ -3768,6 +3835,13 @@ class MainWindow(QMainWindow):
     # chat send / stop
     # ------------------------------------------------------------------
     def _on_send(self) -> None:
+        if getattr(self, "_warming", False):
+            # 输入框可继续编辑（用户能提前打字），但回车/发送按钮都不入队：
+            # 预热期间排队只会让消息干等图编译 + 预填充，且状态栏「已就绪」尚未
+            # 出现，用户会误判为卡死。等 warmup_done 解锁后发送，首句只需几十
+            # token 的增量预填充（实测 ~1.3s）。
+            self.status_label.setText("主模型仍在预热…（请稍候）")
+            return
         if self._busy:
             # 旧实现静默丢弃：用户按了 Enter 却毫无反应，像「输入框坏了」。
             # Agent 运行中不能发新消息（输入框可编辑但回车无效），但「终止对话」
@@ -3881,6 +3955,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.debug("UI: invalidate_kv_cache on force stop failed: %s", e)
         self._busy = False
+        # 强杀会 disconnect_bridge()，任何在途的 warmup_done 都收不到了；
+        # 这里兜底复位，绝不让发送按钮停在禁用态。
+        self._set_warming(False)
         self._set_controls_busy(False)
         self.status_label.setText("已强制终止（工具进程可能仍在后台运行）")
 
@@ -3955,7 +4032,9 @@ class MainWindow(QMainWindow):
             logger.debug("UI: _poll_sync_logs error: %s", e)
 
     def _set_controls_busy(self, busy: bool) -> None:
-        self.send_btn.setEnabled(not busy)
+        # 预热期间即使回合结束也不能开放发送（否则用户抢跑 → 跳过预热 → 首句
+        # 承担全部冷启动）。统一由 _warming / _busy 两个标志决定。
+        self.send_btn.setEnabled(not busy and not getattr(self, "_warming", False))
         self.stop_btn.setEnabled(busy)
         self.connect_btn.setEnabled(not busy)
         self.fetch_btn.setEnabled(not busy)
