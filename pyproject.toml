@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "base-agent"
-version = "0.1.0"
+version = "1.2.18"
 description = "A streamlined local agent with PyQt6 GUI, OpenAI-compatible LLM, and pluggable tools."
 requires-python = ">=3.10"
 dependencies = [
