@@ -549,6 +549,8 @@ def test_auto_continue_finishes_premature_stop(cfg):
         # 自动续跑段：按提示把步骤补成 done 后正常收尾
         [_evt("done", tool_calls=_plan_call("patch", step_id="1", status="done",
                                             note="补记"), usage={"total_tokens": 1})],
+        # 计划全关闭后触发「成果核验反思」：先被拦一次（核验），再收尾
+        [_evt("content", "全部完成"), _evt("done", usage={"total_tokens": 1})],
         [_evt("content", "全部完成"), _evt("done", usage={"total_tokens": 1})],
     ])
     agent = Agent(llm=mock, config=cfg, callbacks=Noop())

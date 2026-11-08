@@ -200,6 +200,12 @@ _FINISH_NUDGE_FAIL_MAX = 8
 # 生」本身就是最强的不该停车信号。默认 2 次会让它第 3 次就放行，正是用户
 # 看到的「规划完不执行，得手动说继续」。
 _FINISH_NUDGE_PLAN_MAX = 6
+# 收尾前的「成果核验反思」次数：计划所有步骤都关闭（done/skipped/blocked）且
+# 真干过活后，放行收尾之前注入一次质量核验——让模型对照原始目标，逐项核验
+# 每个 done 步骤是否真的产出了可用结论（note 是否写明）、最终答复是否完整
+# 准确、是否有遗漏。反思门（open_steps>0）管「半路停」，本门管「草草交卷」。
+# 一次核验成本 = 一轮 LLM + 可能的补做，收益是最终答复质量。上限 1 防死循环。
+_FINAL_REFLECT_MAX = 1
 # 失败调用签名保留数（识别「原样重试」：同名工具 + 相同参数再次失败）
 _MAX_FAIL_SIGS = 8
 # 把步骤标记 blocked 前至少要有多少次失败尝试（步骤边界 = 上次 update_plan）。
@@ -378,6 +384,8 @@ class KernelLoop:
         self._last_consolidated_turn = -1
         self._total_tokens = 0
         self._finish_nudge = 0
+        # 收尾前成果核验反思计数（见 _FINAL_REFLECT_MAX）
+        self._final_reflect = 0
         # 「同一条纠正提示」连续重复计数（见 _MAX_SAME_REDIRECTS）
         self._last_redirect_hint = ""
         self._same_redirect_streak = 0
@@ -507,6 +515,7 @@ class KernelLoop:
         self._shrink_guard = 0
         self._reask_guard = 0
         self._finish_nudge = 0
+        self._final_reflect = 0
         self._fail_streak = 0
         self._failed_total = 0
         self._last_fail = None
@@ -558,6 +567,7 @@ class KernelLoop:
             self._fail_streak = int(seed.get("fail_streak", 0) or 0)
             # 防死循环计数跨段续上（见 failure_snapshot 注释）
             self._finish_nudge = int(seed.get("finish_nudge", 0) or 0)
+            self._final_reflect = int(seed.get("final_reflect", 0) or 0)
             self._plan_finish_nudge = int(seed.get("plan_finish_nudge", 0) or 0)
             self._block_nudge = int(seed.get("block_nudge", 0) or 0)
             self._empty_retry = int(seed.get("empty_retry", 0) or 0)
@@ -915,6 +925,40 @@ class KernelLoop:
                         self.log(f"[kernel] 反思门：还有 {len(open_steps)} 步未完成，追加纠正反馈")
                         continue
                     self.log("[kernel] 反思门同一提醒达上限 → 放行收尾")
+                # ---- 成果核验反思门（计划已全部关闭时）----
+                # 反思门只拦「还有未完成步骤」；计划全部 done/skipped/blocked 后，
+                # 旧实现直接放行收尾 —— 模型常草草把步骤标 done（note 没写结论）、
+                # 或给一个不完整/不准确的总结就交卷。这里在放行前注入一次核验：
+                # 对照原始目标，逐项核验每步是否真产出可用结论、最终答复是否完整
+                # 准确、有无遗漏；发现遗漏就继续工具补做，确认无误再收尾。
+                # 仅在有计划 + 真干过活 + 非简单任务时触发，成本一轮 LLM。
+                if (not open_steps and session.get_plan() and self._did_work
+                        and self._final_reflect < _FINAL_REFLECT_MAX
+                        and not self._is_simple_input(user_input)):
+                    self._final_reflect += 1
+                    goal = str(session.get_plan().get("goal", "") or "").strip()
+                    plan_txt = session.render_plan()
+                    pending = (
+                        "[System] 执行计划的所有步骤都已标记完成。在给出最终答复"
+                        "之前，请做一次成果核验（反思）：\n"
+                        f"目标：{goal}\n"
+                        f"当前计划状态：\n{plan_txt}\n"
+                        "请逐项核验：\n"
+                        "1) 每个 done 步骤是否真的产出了**可用的结论**——若某步 note "
+                        "为空或只是「完成」「OK」这类空话，说明结论没有沉淀，请补充"
+                        "实质性结论（数据/结果/验证方式）；\n"
+                        "2) 最终答复是否**完整、准确**地回答了用户的原始问题，而不是"
+                        "只复述过程或罗列步骤；\n"
+                        "3) 是否有遗漏的关键信息、未验证的假设，或可以补充/修正之处。\n"
+                        "若发现遗漏或不准确：立即调用工具补做/核实，然后重新总结；\n"
+                        "若确认无误：直接输出最终的完整答复（本轮之后不再追问）。"
+                    )
+                    p = _redirect(pending, rec, resp, pending=pending)
+                    if p is not None:
+                        pending = p
+                        self.log("[kernel] 反思门：计划已全部关闭，注入最终成果核验")
+                        continue
+                    self.log("[kernel] 成果核验同一提醒达上限 → 放行收尾")
                 event = self._no_tool_event(resp)
                 if event == "retry_summary":
                     # summary-only 专用重试：明确把模型推向工具调用，而不是
@@ -1612,6 +1656,7 @@ class KernelLoop:
             # 成 4×N 次，单次用户输入最坏 4×15 轮 LLM 调用且没有墙钟上限，
             # 推理模型下可能几十分钟不返回任何结果。
             "finish_nudge": self._finish_nudge,
+            "final_reflect": self._final_reflect,
             "plan_finish_nudge": self._plan_finish_nudge,
             "block_nudge": self._block_nudge,
             "empty_retry": self._empty_retry,

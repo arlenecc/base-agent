@@ -434,6 +434,8 @@ def test_auto_continue_segment_sees_the_previous_error(cfg):
         [_evt("done", tool_calls=_plan("patch", step_id="2", status="done", note="已写"),
               usage={"total_tokens": 1})],
         # --- 第三段：收尾 ---
+        # 计划全关闭后触发「成果核验反思」：先被拦一次（核验），再收尾
+        [_evt("content", "全部完成"), _evt("done", usage={"total_tokens": 1})],
         [_evt("content", "全部完成"), _evt("done", usage={"total_tokens": 1})],
     ])
     agent = Agent(llm=mock, config=cfg, callbacks=Noop())
