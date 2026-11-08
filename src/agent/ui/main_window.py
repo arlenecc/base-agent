@@ -483,6 +483,13 @@ class Bridge(QObject):
     # 解锁）。UI 只接受当前 worker 的信号——预热期间重建 agent 时，旧 worker
     # 迟到的收尾信号不能把新一轮预热提前解锁。
     warmup_done = pyqtSignal(object)
+    # 一轮的【最终答复】。内核/agent 事后构造的兜底文本（问候收尾、工具失败
+    # 熔断占位、MAX_TURNS、关思考兜底作答、空回复提示）只写进 session 与
+    # agent.run() 返回值，从未经过 on_content 流式通道 → UI 对话气泡一片空白，
+    # 用户看到「想了半天最后什么也没回答」。Agent.run() 的 finally 在
+    # on_finished 之前经 BridgeCallbacks emit 本信号；两者都是 worker → UI
+    # 的 queued 信号，FIFO 保序。UI 据此在「本轮没有可见正文」时补显示一次。
+    final_answer = pyqtSignal(str)
     # blocking requests (worker -> UI)
     confirm_request = pyqtSignal(str)
     ask_request = pyqtSignal(str)
@@ -534,6 +541,8 @@ class BridgeCallbacks(AgentCallbacks):
         self.bridge.error.emit(message)
     def on_finished(self) -> None:
         self.bridge.finished.emit()
+    def on_final_answer(self, text: str) -> None:
+        self.bridge.final_answer.emit(text)
 
     # blocking dialogs (called from worker thread)
     # 等待用户回话的最长时间（秒）。超过则视为未获授权 → 拒绝 / 无回答。
@@ -1347,6 +1356,7 @@ class MainWindow(QMainWindow):
         # 跨线程把「系统提示预热中…/已预热」投到状态栏 + 进度条不确定态。
         self._bridge.status.connect(self._on_warmup_status)
         self._bridge.warmup_done.connect(self._on_warmup_done)
+        self._bridge.final_answer.connect(self._on_final_answer)
         self._llm: Optional[LLMClient] = None
         self._agent: Optional[Agent] = None
         self._worker: Optional[AgentWorker] = None
@@ -1356,6 +1366,11 @@ class MainWindow(QMainWindow):
         self._deps_worker: Optional[InstallDepsWorker] = None
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
+        # 本轮是否真的往对话气泡写入过可见正文（_summary_stripper 剥离后）。
+        # 内核事后构造的兜底答复不走 on_content，气泡会一片空白；收尾时若本标志
+        # 仍为 False，就用 _pending_final_answer 补显示一次。
+        self._turn_has_visible = False
+        self._pending_final_answer = ""
         self._busy = False
         # True = 主模型权重加载/预热尚未结束。此时发送按钮禁用、_on_send 拒绝
         # 入队：否则用户看到「已就绪」就发消息，worker.run() 会因队列非空整段
@@ -3874,6 +3889,8 @@ class MainWindow(QMainWindow):
         # 不复位的话下一回合的整条回复会被吞进 stripper 缓冲区——用户看到
         # 空回复。比只在 _force_stop_agent 里复位更稳（它是兜底而非唯一入口）。
         self._streaming_assistant = False
+        self._turn_has_visible = False
+        self._pending_final_answer = ""
         self._summary_stripper = _SummaryStripper()
         self._blank_shrinker = _BlankShrinker()
         self._set_controls_busy(True)
@@ -4112,6 +4129,10 @@ class MainWindow(QMainWindow):
             return
         text = "".join(buf)
         buf.clear()
+        # 真正写进气泡的非空白正文（含 final 时 stripper 归还的残留）才算可见。
+        # 只认 strip() 非空，避免「助手:」后面一片空白仍被判成有答复。
+        if text.strip():
+            self._turn_has_visible = True
         # 先记录「用户是否在底部」：插入内容本身会把 value < maximum，事后
         # 判断会把每个在底部的用户都误判成「已上翻」。
         sb = self.chat_view.verticalScrollBar()
@@ -4261,6 +4282,35 @@ class MainWindow(QMainWindow):
                 self._agent.skills.reload()
                 self._append_log(f"[skill] saved '{name}'")
 
+    def _on_final_answer(self, text: str) -> None:
+        """缓存本轮内核给出的最终答复（可能在流式正文之后、finished 之前到达）。
+
+        只缓存不立即显示：显示统一放在 _on_finished 的 final flush 之后，
+        那时才能可靠判断「本轮到底有没有可见正文」。
+        """
+        self._pending_final_answer = text or ""
+
+    def _show_fallback_answer(self, text: str) -> None:
+        """把内核/agent 事后构造的兜底答复补进对话气泡。
+
+        这类文本（问候收尾、工具失败熔断占位、MAX_TURNS、关思考兜底作答、
+        空回复提示）从未经过 on_content 流式通道；旧实现里 UI 只靠流式渲染，
+        于是用户看到「模型想了半天，最后一个字也没有」。这里走与流式相同的
+        标签剥离 / 空白收缩 / 合并刷新路径，保证格式一致且不重复。
+        """
+        text = _sanitize_stream_text(text)
+        if not (text or "").strip():
+            return
+        text = self._summary_stripper.feed(text)
+        text = self._blank_shrinker.feed(text)
+        if not (text or "").strip():
+            return
+        if not self._streaming_assistant:
+            self._append_chat('<p><b class="a">助手</b>: </p>')
+            self._streaming_assistant = True
+        self._pending_content.append(text)
+        self._append_log("[ui] 已补显示内核兜底答复（本轮无流式正文）")
+
     def _on_finished(self) -> None:
         if not self._busy:  # guard against double-call from _on_error + bridge.finished
             return
@@ -4271,6 +4321,12 @@ class MainWindow(QMainWindow):
             wd.stop()
         # 收尾前把还没刷出去的流式文本落盘，否则最后几个 chunk 会丢。
         self._flush_stream(final=True)
+        # 内核事后构造的答复没走过 on_content；若本轮气泡一片空白，补显示一次。
+        # 正常情况下 _turn_has_visible 为 True，这里不会重复输出。
+        if not self._turn_has_visible and (self._pending_final_answer or "").strip():
+            self._show_fallback_answer(self._pending_final_answer)
+            self._flush_stream(final=True)
+        self._pending_final_answer = ""
         self._busy = False
         self._streaming_assistant = False
         self._set_controls_busy(False)

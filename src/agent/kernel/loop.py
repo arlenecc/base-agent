@@ -27,6 +27,17 @@ from .session import Session
 logger = logging.getLogger(__name__)
 
 
+# 规划门 / 反思门「同一条纠正提示」连续重复拦截的上限。
+# 实测「查项目计划文档」被规划前置门（hint 恒为同一句）与反思门轮流拦了
+# 9 次、13 次完整 LLM 生成共 93s，模型每次都看到同一句话却始终不照做。
+# 因此按 hint 去重：同一句提醒连发 N 次仍无效就放行，不再原地打转。
+#
+# 刻意**不用**全局总次数预算：反思门的失败感知路径有 _FINISH_NUDGE_FAIL_MAX
+# 的合法宽预算（发生失败时给模型多次机会换方案）、「建完计划只复述」也有
+# _FINISH_NUDGE_PLAN_MAX，这些 hint 带「第 n 次提醒」逐轮变化，按 hint 去重
+# 不会削减它们；全局总预算则会把二者一起误砍（test_failure_recovery 断言）。
+_MAX_SAME_REDIRECTS = 2
+
 # 空响应 / 流中断的重试上限
 _MAX_EMPTY_RETRY = 3
 _LLM_RETRY_BASE_DELAY = 1.5
@@ -48,6 +59,43 @@ _RAG_SEARCH_MAX_PER_RUN = 3
 # 退化复读判定：协议片段在单轮输出里重复超过该次数（如 <summary>×1000）
 # 即视为退化输出，按空回复重试。
 _DEGENERATE_REPEAT_LIMIT = 5
+
+# 单次生成的「无 EOS 熔断」下限（估算 token）。模型偶尔漏 EOS / 退化复读时
+# 会一直生成到 max_tokens（默认 32768，本地 2B 实测单轮吐 4.7 万字、耗时
+# 663s），用户全程看着字滚却等不到结束。超过该阈值即判定异常生成：中止流、
+# 保留已生成内容直接收尾。实际阈值 = max(此值, max_tokens//2)，在 __init__
+# 里由 self.config 计算（正常回答含长代码也远达不到）。
+
+
+_MIN_SINGLE_GEN_TOKENS = 8192
+
+# 寒暄 / 自我认知（能力、功能、身份）类问答：答案就在系统提示里，不需要
+# 推理也不需要工具。但本地小模型会无视系统提示的软禁令：连发 rag_* 空转
+# 6 次才熔断（10s+），或把几百字内心独白塞进 <summary>、夹带工具 XML 残片，
+# 最后只留下一句占位文本甚至一片空白。内核对这类输入直接短路（见
+# KernelLoop.run），由 _smalltalk_fallback 给出确定性文字答复。
+_SELF_QUERY_RE = re.compile(
+    r"(你能(做|干|帮|完成)?(什么|啥|哪些)|你会(什么|啥|哪些)|"
+    r"(介绍|说说|讲讲|谈谈|描述|列举|列一下)(一下|下)?"
+    r"(你|自己|你的|你们的|功能|能力|技能|工具|本领)|"
+    r"你(都)?有(哪些|什么|啥)(功能|能力|技能|工具|本领)|"
+    r"你是谁|你是什么|你叫(什么|啥)|你的(功能|能力|作用|用途)|"
+    r"what can you do|who are you|what are your (features|capabilities|functions))",
+    re.I,
+)
+# 带具体任务对象时不算纯问答——「你能做什么？顺便帮我读 config.json」必须
+# 保留工具能力，不能被门禁误伤。
+_TASK_OBJECT_RE = re.compile(
+    r"(https?://|```|\.py\b|\.txt\b|\.md\b|\.json\b|\.csv\b|\.pdf\b|"
+    r"帮我\s*(写|读|改|跑|执行|创建|删除|打开|查|找|分析)|"
+    r"请\s*(写|读|改|跑|执行|创建|删除|打开)|请帮我|读一下|打开|运行)",
+    re.I,
+)
+_SELF_QUERY_FALLBACK = (
+    "我是 base-agent，本地自主智能体：可以读写工作区文件、执行 Python 与 shell "
+    "命令、检索知识库与长期记忆、访问网页，并规划推进多步任务。"
+    "直接告诉我你想完成什么即可。"
+)
 
 # ---- 规划门 / 反思门（防止「跑丢」与「半路停」）---------------------------
 # 规划门：任务开始后、还没干过实际活、且还没有计划时，每轮提醒先规划；一旦
@@ -197,11 +245,16 @@ class KernelResult:
     """一次 run() 的产物。"""
 
     def __init__(self, text: str = "", reason: ExitReason = ExitReason.DONE,
-                 turns: int = 0, distilled: bool = False):
+                 turns: int = 0, distilled: bool = False,
+                 no_memory: bool = False):
         self.text = text
         self.reason = reason
         self.turns = turns
         self.distilled = distilled
+        # 短路轮（寒暄/能力类直接文字作答）不写 session 历史、也不该触发
+        # 事实抽取 / L4 蒸馏：那会启动一次 aux LLM 调用，对 GGUF 还会 reset
+        # 掉刚预热好的主对话 KV 缓存。
+        self.no_memory = no_memory
 
     def __repr__(self) -> str:
         return f"<KernelResult {self.reason.value} turns={self.turns} len={len(self.text)}>"
@@ -245,6 +298,12 @@ class KernelLoop:
         self.budget = self.session.budget
         self.consolidate_every = max(1, int(getattr(config, "kernel_consolidate_every", 4) or 4))
         self.max_tool_chars = int(getattr(config, "kernel_max_tool_chars", 6_000) or 6_000)
+        # 单次生成「无 EOS 熔断」阈值：漏 EOS / 退化复读时模型会一直生成到
+        # max_tokens（本地 2B 实测 4.7 万字 / 663s），用户看着字滚等不到结束。
+        # 阈值 = max(8k, max_tokens//2)：正常回答（含长代码）远达不到。
+        self._max_single_gen_tokens = max(
+            _MIN_SINGLE_GEN_TOKENS,
+            int(getattr(config, "max_tokens", 32768) or 32768) // 2)
         self.max_turns = max(1, int(max_turns or getattr(config, "max_iterations", 15) or 15))
 
         self.state: KernelState = KernelState.THINK
@@ -258,6 +317,11 @@ class KernelLoop:
         self._last_consolidated_turn = -1
         self._total_tokens = 0
         self._finish_nudge = 0
+        # 「同一条纠正提示」连续重复计数（见 _MAX_SAME_REDIRECTS）
+        self._last_redirect_hint = ""
+        self._same_redirect_streak = 0
+        # 本地后端标记：决定是否跳过「强制先建执行计划」（见 run()）。
+        self._is_local_backend = False
         # ---- 失败恢复记账（每次 run() 重置）----
         self._fail_streak = 0        # 连续失败的工具调用数（任一批全成功即清零）
         self._failed_total = 0       # 本次 run 失败总数；>0 即放宽反思门预算
@@ -356,6 +420,14 @@ class KernelLoop:
         self._did_work = False
         self._plan_nudged = 0
         self._plan_finish_nudge = 0
+        # 同 hint 连续拦截计数：续跑段继承（seed 在下方覆盖），否则每段
+        # 重新获得额度，5 段又能各拦 2 次。
+        self._last_redirect_hint = ""
+        self._same_redirect_streak = 0
+        # 本地小模型不遵守「先建计划」的软提示；由 run() 检测后端后跳过该门。
+        _client = self._llm()
+        self._is_local_backend = getattr(_client, "_backend", None) in (
+            "mlx", "gguf", "onnx")
         # 重复调用检测（成功调用同样空转，见 ACT 态的重复调用检测注释）
         self._repeat_streak = 0
         # rag_search 轮内计数（硬上限见 _RAG_SEARCH_MAX_PER_RUN）
@@ -386,6 +458,8 @@ class KernelLoop:
             self._empty_retry = int(seed.get("empty_retry", 0) or 0)
             self._reask_guard = int(seed.get("reask_guard", 0) or 0)
             self._plan_nudged = int(seed.get("plan_nudged", 0) or 0)
+            self._last_redirect_hint = str(seed.get("last_redirect_hint", "") or "")
+            self._same_redirect_streak = int(seed.get("same_redirect_streak", 0) or 0)
             self._fail_repeat_streak = int(seed.get("fail_repeat_streak", 0) or 0)
             self._same_tool_fail_streak = int(
                 seed.get("same_tool_fail_streak", 0) or 0)
@@ -411,6 +485,73 @@ class KernelLoop:
 
         def _carry_task(hint: str) -> str:
             return _carry_task_text(task_text, hint)
+
+        def _redirect(hint: str, rec, resp, tool_calls=None,
+                      pending: Optional[str] = None) -> Optional[str]:
+            """把被拦截的一轮**正常提交**（不 rollback），纠正反馈注入下一轮。
+
+            旧实现用 _rollback_turn 摘掉整轮。但本轮 token 已经 eval 进
+            llama.cpp / MLX 上下文（_gguf_ids 记的是 prompt + gen_ids）；摘掉后
+            下一轮 build_messages 渲染出的历史少了这一轮，prompt 与缓存前缀分叉
+            → 每轮全量预填充 6300 token（实测 8~9s × 9 轮）。而且 splice 依赖
+            「每个历史 assistant 对应一条真实 gen_ids」，rollback 会让两者数量
+            对不齐，进一步退回全量重建。
+
+            改为正常 finish_turn：历史保持追加式，下一轮 prompt 是缓存的严格
+            前缀扩展，form①/splice 都能命中；纠正反馈同时作为本轮工具结果与
+            下一轮 user 提示，模型既能看到自己刚才做了什么，也知道该改什么。
+
+            ``pending`` 可由调用方直接给出（反思门已精心拼好提示文本）；不传时
+            用 `_carry_task(hint)` 保留用户原始任务。① 同一条 hint 连发
+            _MAX_SAME_REDIRECTS 次仍无效时返回 None，调用方应放行（不再
+            continue）；hint 变化（如「第 n 次提醒」）则重新计数，因此不削减
+            反思门的失败感知 / 只规划不执行等合法宽预算。
+            """
+            # 必须用完整 hint：反思门的「这是第 n 次提醒」在文本靠后位置，
+            # 截断前缀会把逐轮变化的合法提醒误判成同一句，反而削掉宽预算。
+            key = hint or ""
+            if key == self._last_redirect_hint:
+                self._same_redirect_streak += 1
+            else:
+                self._last_redirect_hint = key
+                self._same_redirect_streak = 1
+            if self._same_redirect_streak > _MAX_SAME_REDIRECTS:
+                return None
+            tcs = list(tool_calls or [])
+            results = [
+                {"id": tc.id, "name": tc.name, "content": hint}
+                for tc in tcs
+            ]
+            session.finish_turn(
+                rec, resp.content, tcs, results,
+                resp.summary or l2_summary(resp.content, [tc.name for tc in tcs]),
+                raw_content=resp.raw_content,
+            )
+            self._reset_retry_guards()
+            return pending if pending is not None else _carry_task(hint)
+
+        # ---- 寒暄 / 能力类问答：直接文字作答，完全不进 LLM 循环 ----
+        # 答案就在系统提示里，不需要推理、不需要工具。但本地小模型在
+        # enable_thinking 下会把几百字内心独白塞进 <summary>（且不闭合）、
+        # 夹带 <function=…> 工具 XML 残片，或干脆连发 rag_* 空转 6 次才熔断；
+        # 用户看到的就是「想了半天，最后什么也没回答」。系统提示的软禁令对
+        # 这类模型不可靠（项目已多次验证），因此在内核层短路：一次 on_content
+        # 推出干净文字，0 次 LLM 调用、不动 KV 缓存、不污染对话气泡。
+        # 网络 API 后端不强模型不受此限，保留其自由作答能力。
+        client = self._llm()
+        is_local = getattr(client, "_backend", None) in ("mlx", "gguf", "onnx")
+        if (is_local and not resume
+                and self._is_smalltalk_query(user_input)):
+            final_text = self._smalltalk_fallback(user_input)
+            self._emit_ui("on_content", final_text)
+            # 刻意**不写 session 历史**：这轮没有任何 token 被 eval 进
+            # llama.cpp / MLX 上下文，若往 session.turns 追加一轮，下一轮
+            # build_messages 会把它渲染进 prompt，而 KV 缓存里没有对应 token，
+            # 前缀分叉 → 全量预填充（GGUF 实测 reuse=0）。寒暄/能力问答对
+            # 后续任务无信息量，不进历史既保住跨轮 KV 复用，也不污染上下文。
+            self.log("[kernel] 寒暄/能力类问答，直接文字作答（跳过 LLM 循环）")
+            return KernelResult(final_text, ExitReason.DONE, 0, False,
+                                no_memory=True)
 
         while self._turns_used < self.max_turns:
             if self._cancelled():
@@ -481,7 +622,8 @@ class KernelLoop:
             # 而「询问」根本不是可执行的工具动作——模型随即卡在「立即开始第
             # 1 步」上，表现为反复发无意义的工具调用。
             if (session.get_plan() is None and not self._did_work
-                    and not self._is_simple_input(user_input)):
+                    and not self._is_simple_input(user_input)
+                    and not self._is_local_backend):   # ③ 本地后端不强制建计划
                 pending = (pending or "") + _PLAN_GATE_HINT
             user_text = session.anchor_prompt(extra=pending)
             # 每轮易变上下文（工作记忆 / 当天事实 / 匹配技能）从系统提示移到用户
@@ -537,6 +679,9 @@ class KernelLoop:
                 exit_reason = ExitReason.CANCELLED
                 break
 
+            # 本地后端的寒暄/能力类问答已在进入循环前短路（不调 LLM、不派发
+            # 工具），这里只处理网络 API 后端及未命中判定的输入，沿用原有
+            # ask_user 硬门禁 / 问候熔断 / 失败熔断，不再额外 rollback。
             if not resp.has_calls:
                 # 反思门：模型想收尾，但计划里还有未完成步骤 —— 不能就这么放它
                 # 走。这正是「半路任务跑丢 / 直接就停了」的主因：模型自认为做完
@@ -572,12 +717,15 @@ class KernelLoop:
                              or _MULTISTEP_VERB_RE.search(user_input or ""))
                         and not self._did_work
                         and self._plan_finish_nudge < _FINISH_NUDGE_PLAN_MAX
+                        and not self._is_local_backend   # ③ 本地后端免强制建计划
                         and not self._resume):
-                    self._plan_finish_nudge += 1
-                    self._rollback_turn(session)
-                    pending = _carry_task(_PLAN_FINISH_HINT)
-                    self.log("[kernel] 反思门：多步任务未写计划也未动手，强制要求先 create 并开工")
-                    continue
+                    p = _redirect(_PLAN_FINISH_HINT, rec, resp)
+                    if p is not None:                    # ① 预算未耗尽
+                        self._plan_finish_nudge += 1
+                        pending = p                      # ② 不 rollback
+                        self.log("[kernel] 反思门：多步任务未写计划也未动手，追加纠正反馈")
+                        continue
+                    self.log("[kernel] 反思门同一提醒达上限 → 放行收尾")
                 # 预算分三档。「停下来问用户是否继续」在两种情况下尤其不该放行：
                 #   1. 发生过失败 → 应依据错误信息自动恢复（最宽）；
                 #   2. 计划建好了但本段一次实际工具调用都没有 → 只是把计划念了
@@ -593,7 +741,7 @@ class KernelLoop:
                     todo = "; ".join(
                         f"{s.get('id')}.{s.get('title')}" for s in open_steps[:5]
                     )
-                    self._rollback_turn(session)
+                    # ② 不再 rollback：历史保持追加式，保住跨轮 KV 前缀
                     if self._failed_total and self._last_fail:
                         # 失败感知的提醒：把最近一次失败摆到模型眼前，并要求
                         # 「依据失败信息自动解决」而不是停下来等用户发话。
@@ -646,8 +794,14 @@ class KernelLoop:
                             "不要为响应提醒而重复已完成的工作；若某步确实无法完成，"
                             "把它标为 blocked/skipped 并写明原因。"
                         )
-                    self.log(f"[kernel] 反思门：还有 {len(open_steps)} 步未完成，提醒继续")
-                    continue
+                    # ② 正常提交本轮（不 rollback），历史追加式 → KV 前缀命中。
+                    # ① 同一提醒连发到上限 → 放行收尾，不再重定向。
+                    p = _redirect(pending, rec, resp, pending=pending)
+                    if p is not None:
+                        pending = p
+                        self.log(f"[kernel] 反思门：还有 {len(open_steps)} 步未完成，追加纠正反馈")
+                        continue
+                    self.log("[kernel] 反思门同一提醒达上限 → 放行收尾")
                 event = self._no_tool_event(resp)
                 if event == "retry":
                     self._rollback_turn(session)
@@ -707,22 +861,30 @@ class KernelLoop:
             if (session.get_plan() is None
                     and not self._did_work
                     and has_actual and not has_plan_op
+                    and not self._is_local_backend   # ③ 本地后端免强制建计划
                     and not self._resume):
                 simple = (self._turns_used <= 1
                           and len(user_input or "") <= 60
                           and not _MULTISTEP_HINT.search(user_input or "")
                           and not _MULTISTEP_VERB_RE.search(user_input or ""))
                 if not simple:
-                    self._rollback_turn(session)
-                    pending = _carry_task(
+                    hint = (
                         "[System] 你准备执行实际工具，但还没有执行计划（Session 中 plan 为空）。"
                         "请先用 update_plan(op='create', goal='一句话目标', steps=[...]) 把目标与 "
                         "2~7 个可验证步骤规划好；创建后工具结果会指示『立即开始第一步』，"
                         "不要停下来问用户是否开始。计划每轮回注，是后续多步任务跟踪的依据，"
                         "必须先于执行写入。"
                     )
-                    self.log("[kernel] 规划前置门：拦截首次执行，要求先 update_plan(create)")
-                    continue
+                    # ② 不 rollback：把本轮（含未执行的工具调用）正常落地，
+                    # 纠正反馈同时作为 tool 结果与下一轮提示。历史追加式 →
+                    # KV 前缀不再每轮分叉。① 同一提醒达上限则放行，不再拦。
+                    p = _redirect(hint, rec, resp, tool_calls=tool_calls)
+                    if p is not None:
+                        pending = p
+                        self.log("[kernel] 规划前置门：追加纠正反馈，要求先 update_plan(create)")
+                        continue
+                    self.log("[kernel] 规划前置门同一提醒达上限 → 放行执行")
+                    # 上限耗尽：本轮仍由下方 dispatch 正常派发，无需 rollback
 
             # ---- 寒暄硬门禁：问候输入下拦截 ask_user 弹框 ----
             # 问候不需要任何信息；弹框追问「要做什么任务」是纯打扰（用户还得
@@ -890,7 +1052,8 @@ class KernelLoop:
             # 补建提示：已开始执行但 plan 仍空 → 提醒补建计划（兜底）。
             # 防止「首轮误执行」导致全程无 plan 可跟踪；最多提醒 _PLAN_NUDGE_MAX 次。
             if (self._did_work and session.get_plan() is None
-                    and self._plan_nudged < _PLAN_NUDGE_MAX):
+                    and self._plan_nudged < _PLAN_NUDGE_MAX
+                    and not self._is_local_backend):   # ③ 本地后端不强制建计划
                 self._plan_nudged += 1
                 parts.append(
                     "[System] 你已经开始执行但 Session 中还没有执行计划（plan 为空）——"
@@ -1057,11 +1220,12 @@ class KernelLoop:
             got_any = False
             seen_done = False
             try:
-                for ev in self._llm().chat_stream(
+                stream = self._llm().chat_stream(
                     messages,
                     tools=self.schemas(),
                     temperature=getattr(self.config, "temperature", 0.7),
-                ):
+                )
+                for ev in stream:
                     got_any = True
                     if self._cancelled():
                         cancelled = True
@@ -1084,6 +1248,19 @@ class KernelLoop:
                         usage = getattr(ev, "usage", None) or {}
                         raw_buf = getattr(ev, "raw_content", "") or ""
                         continue
+                    # 无 EOS 熔断：模型漏 EOS / 退化复读时会一直生成到 max_tokens
+                    # （本地 2B 实测单轮 4.7 万字 / 663s）。超阈值即中止流——
+                    # 保留已生成内容直接收尾。刻意**不**追加 _TRUNCATION_MARKS
+                    # 里的标记（否则 _no_tool_event 会按「流截断」整轮重试，
+                    # 复读 × 3 更糟），也不计入空回复重试。
+                    if live_est > self._max_single_gen_tokens:
+                        self.log(f"[kernel] 单次生成超过 {self._max_single_gen_tokens} "
+                                 "token 仍未结束（疑似漏 EOS/退化复读），中止并收尾")
+                        try:
+                            stream.close()   # 终止底层采样循环
+                        except Exception:
+                            pass
+                        break
                     if last_emit is None:
                         last_emit = now
                     elif live_est and now - last_emit >= 0.3:
@@ -1287,6 +1464,9 @@ class KernelLoop:
             "empty_retry": self._empty_retry,
             "reask_guard": self._reask_guard,
             "plan_nudged": self._plan_nudged,
+            # 同 hint 连续拦截计数跨段继承：否则每段各重置，5 段又能各拦 2 次。
+            "last_redirect_hint": self._last_redirect_hint,
+            "same_redirect_streak": self._same_redirect_streak,
             "fail_repeat_streak": self._fail_repeat_streak,
             "same_tool_fail_streak": self._same_tool_fail_streak,
             "same_tool_fail_name": self._same_tool_fail_name,
@@ -1503,6 +1683,31 @@ class KernelLoop:
         "你好", "您好", "您好呀", "嗨", "在吗", "在么", "在不在", "在的",
         "有人吗", "在不在呀",
     }
+
+    @classmethod
+    def _smalltalk_fallback(cls, user_input: str) -> str:
+        """短路轮的确定性文字答复：问候回一句招呼，能力类回能力概述。"""
+        return ("你好！有什么可以帮你的吗？" if cls._is_greeting(user_input)
+                else _SELF_QUERY_FALLBACK)
+
+    @classmethod
+    def _is_smalltalk_query(cls, user_input: str) -> bool:
+        """纯寒暄 / 自我认知类问答：答案在系统提示里，不该调用任何工具。
+
+        用严格判定而非「任何短输入」：误伤「读 a.txt」这类短任务会让它们
+        丧失工具能力。含具体任务对象（路径/URL/帮我执行…）或多步信号时
+        一律放行。
+        """
+        t = (user_input or "").strip()
+        if not t or len(t) > 60:
+            return False
+        if cls._is_greeting(t):
+            return True
+        if _TASK_OBJECT_RE.search(t):
+            return False
+        if _MULTISTEP_HINT.search(t) or _MULTISTEP_VERB_RE.search(t):
+            return False
+        return bool(_SELF_QUERY_RE.search(t))
 
     @staticmethod
     def _is_greeting(user_input: str) -> bool:

@@ -69,6 +69,14 @@ class AgentCallbacks:
         return None
 
     def on_finished(self) -> None: ...
+    def on_final_answer(self, text: str) -> None:
+        """一轮的【最终答复】（含内核事后构造的兜底文本）。
+
+        与 ``on_content`` 不同：后者是流式片段，前者只在收尾时出现一次且是
+        权威结果。UI 用它在本轮没有可见流式正文时补显示，避免「模型其实给了
+        兜底答复、气泡却一片空白」。默认 no-op 以兼容非 GUI 调用方。
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +162,16 @@ _MAX_PARALLEL_TOOLS = 8
 # 4 段 × max_iterations(默认 15) = 最多 60 轮，长任务基本能自己跑完。段与段
 # 之间通过 seed_failures 传递失败上下文，所以续跑段不是「从零重试」，而是
 # 接着上一段的错误继续找方案。
+#
+# 另加墙钟上限：自动续跑原先只有段数/轮次约束，没有墙钟。本地推理模型
+# 4 段 × 15 轮、每轮几十秒，最坏几十分钟不返回任何结果。到点后把已完成的
+# 进展交回用户（MAX_TURNS 收尾文本本身就会总结进展），避免无限等待。
 _AUTO_CONTINUE_MAX = 4
+_AUTO_CONTINUE_WALL_CLOCK = 600.0   # 单次用户输入的全部续跑总时长（秒）
+
+# 后台 aux 任务（事实抽取 / L4 蒸馏 / 记忆维护）让路的空闲阈值：主对话
+# 安静这么久才动手，避免插队在两轮对话之间抢 GPU / _gen_lock / 冲 KV 缓存。
+_AUX_IDLE_DELAY = 2.0
 # 允许并发的工具白名单：纯只读、彼此无顺序依赖。写操作（file_write /
 # file_modify）即使 destructive=False（工作区锁定）也不能并发——两个写操作
 # 可能落在同一个文件上。
@@ -453,6 +470,12 @@ class Agent:
         # 后台记忆维护自己的防堆叠锁：与事实抽取锁分开，避免多个维护线程
         # 同时排队等锁（每个用户轮次都会在终止边触发一次）。
         self._memory_maint_lock = threading.Lock()
+        # 最近一次「用户在等回复」的活动时刻（monotonic）。后台 aux 任务
+        # （事实抽取 / L4 蒸馏 / 记忆维护）据此让路：主对话刚结束的几秒内
+        # 不抢 GPU/`_gen_lock`，等用户继续提问时后台已经让位，回复首 token
+        # 不再被后台任务排到后面（本地后端 aux 与主模型共用同一实例时，
+        # 插队还会冲掉跨轮 KV 缓存，见 _get_extract_llm 注释）。
+        self._last_activity = time.monotonic()
         # 事实抽取/蒸馏的批量计数器：每累计 session.raw_turns 个真实轮才沉淀
         # 一次（不再每轮都抽）。内核「裁剪丢弃旧轮前」也会强制沉淀一次并清零。
         self._turns_since_extract = 0
@@ -654,6 +677,25 @@ class Agent:
         except Exception as e:  # pragma: no cover - defensive
             self._log(f"[context] failed to append memory.md: {e}")
 
+    def _wait_for_idle(self, max_wait: float = 15.0) -> None:
+        """后台 aux 任务让路：等主对话空闲后再动 GPU / `_gen_lock`。
+
+        用户点发送 → run() 更新 _last_activity。后台线程（事实抽取 / L4 蒸馏 /
+        记忆维护）在动手前先等主对话安静 `_AUX_IDLE_DELAY` 秒；最多等
+        max_wait 秒，防止后台任务被高频对话无限饿死。轮询 0.2s，用户取消时
+        立即放行（后台任务本身也要响应取消语义）。
+
+        本地后端的 aux 与主模型**共用同一实例**（见 _get_extract_llm）：若
+        不让路，事实抽取会插在两轮对话之间抢 `_gen_lock`，用户等回复的首
+        token 被排到后台任务后面；GGUF 上 aux 走 legacy 还会 reset 掉刚预热
+        好的跨轮 KV 缓存，下一轮退回全量预填充（实测 6~9s）。
+        """
+        deadline = time.monotonic() + max_wait
+        while (time.monotonic() - self._last_activity) < _AUX_IDLE_DELAY:
+            if time.monotonic() >= deadline or self._cancelled():
+                return
+            time.sleep(0.2)
+
     def _maybe_extract_facts_async(self, assistant_reply: str) -> None:
         """Launch fact extraction in a daemon thread.
 
@@ -733,6 +775,9 @@ class Agent:
         thread.start()
 
     def _extract_facts_sync(self, conversation: str) -> None:
+        # 先让路：主对话可能刚结束、用户正在等下一轮首 token（本地后端 aux
+        # 与主模型共用实例，抢锁还会冲 KV 缓存）。
+        self._wait_for_idle()
         """Best-effort: use the LLM to extract entities/relations/observations
         from a conversation fragment and persist them to the knowledge
         graph.  Runs on a daemon thread — any failure is logged and swallowed.
@@ -1048,6 +1093,8 @@ class Agent:
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
         self._last_user_text = user_input
+        # 标记「用户在等回复」：后台 aux 任务据此让路（见 _last_activity 注释）
+        self._last_activity = time.monotonic()
         self._log(f"USER: {user_input}")
 
         # skill suggestion (固化) - non-blocking
@@ -1123,11 +1170,16 @@ class Agent:
             # _finish_nudge 等记账也随 run 重置）；最多续 _AUTO_CONTINUE_MAX 段，
             # 期间用户点「终止」立即停。额度用尽才真正交回用户。
             segments = 0
+            t_run_start = time.monotonic()
             while (segments < _AUTO_CONTINUE_MAX
                    and self._auto_continue
                    and result.reason in (ExitReason.MAX_TURNS, ExitReason.DONE)
                    and not self._cancelled()
-                   and self._should_auto_continue(result)):
+                   and self._should_auto_continue(result)
+                   # 墙钟上限：段数/轮次约束不了「每轮都很慢」——本地推理模型
+                   # 4 段 × 15 轮、每轮几十秒，最坏几十分钟不返回。到点交回用户
+                   # （MAX_TURNS 收尾文本本身会总结已完成的进展）。
+                   and time.monotonic() - t_run_start < _AUTO_CONTINUE_WALL_CLOCK):
                 segments += 1
                 # 把上一段的失败上下文带进本段：否则 run() 重置记账后，续跑段既不
                 # 知道上一段卡在哪，也拿不到失败感知的反思门预算 —— 表现为「续跑
@@ -1238,8 +1290,17 @@ class Agent:
                 text,
                 allow_memory=(result is not None
                               and result.reason in (ExitReason.DONE, ExitReason.MAX_TURNS)
+                              and not getattr(result, "no_memory", False)
                               and bool((text or "").strip())),
             )
+            # 先于 on_finished 发出：两者都是 worker 线程 → UI 线程的 queued
+            # 信号，FIFO 保序，UI 收尾时能读到本轮最终答复。内核/agent 事后
+            # 构造的兜底文本（问候收尾、工具失败熔断占位、关思考作答、空回复
+            # 提示）从未走过 on_content 流式通道，只靠这里补到对话气泡。
+            try:
+                self.callbacks.on_final_answer(text)
+            except Exception as e:
+                self._log(f"[agent] on_final_answer 失败(忽略): {e}")
             self.callbacks.on_finished()
         return text
 
@@ -1360,6 +1421,8 @@ class Agent:
             return
 
         def _target() -> None:
+            # 先让路：主对话可能刚结束、用户正在等下一轮首 token。
+            self._wait_for_idle()
             # 与事实抽取共用同一把锁：长会话里 run() 可能连着触发多次蒸馏，
             # 没有上限会同时跑 N 个 LLM 调用（也各自占一个连接池）。
             if not self._fact_extract_lock.acquire(blocking=False):
@@ -1418,6 +1481,8 @@ class Agent:
         layout = self._memory_layout
 
         def _target() -> None:
+            # 先让路：主对话可能刚结束、用户正在等下一轮首 token。
+            self._wait_for_idle()
             if not self._memory_maint_lock.acquire(blocking=False):
                 return  # 已有维护线程在跑，本次直接让位
             try:
@@ -1543,15 +1608,24 @@ class Agent:
         deadline = time.monotonic() + allow
         out: List[Any] = [None] * n
         lock = threading.Lock()
+        # 并发上限：_MAX_PARALLEL_TOOLS 定义后一直没被引用，模型一次发 N 个
+        # rag_search/web_scan 就会起 N 个线程，各自可能触发 embedding/reranker
+        # 首次加载（~130MB / ~2.3GB）互相踩。用信号量把实际并发压到上限内，
+        # 其余排队（总等待 allow 已按 n 放宽，排队不会提前超时）。
+        sem = threading.Semaphore(_MAX_PARALLEL_TOOLS)
 
         def _run(idx: int, name: str, args: Dict[str, Any]) -> None:
-            res = self._exec_tool_blocking(name, args)
+            try:
+                res = self._exec_tool_blocking(name, args)
+            finally:
+                sem.release()
             with lock:
                 out[idx] = res
 
         threads = []
         for idx, name, args in jobs:
             self.callbacks.on_tool_start(name, args)
+            sem.acquire()       # 并发超上限时在此排队（on_tool_start 仍已发出）
             t = threading.Thread(target=_run, args=(idx, name, args),
                                 name=f"tool-par-{name}-{idx}", daemon=True)
             t.start()

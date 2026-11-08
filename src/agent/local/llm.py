@@ -1669,7 +1669,8 @@ class LocalLLMClient:
                     pass
                 self._gguf_ids = []
                 self._gguf_gen_history = []
-        yield from self._stream_gguf_legacy(messages, tools, temperature, max_tokens)
+        yield from self._stream_gguf_legacy(messages, tools, temperature,
+                                            max_tokens, kv_group=kv_group)
 
     def _stream_gguf_reuse(self, messages, tools, temperature):
         """GGUF 跨轮前缀复用：只把**新增**的 token eval 进 llama.cpp 上下文。
@@ -1906,13 +1907,23 @@ class LocalLLMClient:
         except Exception:
             return False
 
-    def _stream_gguf_legacy(self, messages, tools, temperature, max_tokens: Optional[int] = None):
+    def _stream_gguf_legacy(self, messages, tools, temperature,
+                            max_tokens: Optional[int] = None,
+                            kv_group: str = "main"):
         """旧路径：整轮走 ``create_chat_completion``（无跨轮复用）。"""
         # 旧路径每轮 reset（create_chat_completion → generate(reset=True)），
         # 预填/复用状态不再有效 → 清空，避免下轮拿过期序列做前缀判断。
         # aux 调用（事实抽取/技能选择/预热）与主对话复用**同一 Llama 实例**时，
         # 这里显式 reset 一次，把手动 eval 留下的 KV（尤其 SWA memory）清干净，
         # 否则 create_chat_completion 自己可能在 decode 时报 llama_decode -3。
+        #
+        # aux 场景下主对话的跨轮 KV（_gguf_ids 预填的 system+tools，数千 token
+        # ≈ 数秒）会随 reset 一起被冲掉。事后在后台把它**重放回上下文**：
+        # 用户隔一会儿再问时首轮即可命中前缀（否则必然全量预填充）。重放走
+        # 非阻塞抢锁——主对话正在生成就放弃（它结束时 KV 反正会被重建）。
+        is_aux = (kv_group != "main")
+        prev_ids = list(self._gguf_ids) if is_aux else []
+        prev_hist = list(self._gguf_gen_history) if is_aux else []
         self._gguf_ids = []
         self._gguf_gen_history = []
         try:
@@ -1981,7 +1992,51 @@ class LocalLLMClient:
             self._model.reset()
         except Exception:
             pass
+        if is_aux and prev_ids:
+            self._schedule_main_kv_restore(prev_ids, prev_hist)
         yield StreamEvent("done", tool_calls=calls_acc_list, usage={})
+
+    def _schedule_main_kv_restore(self, ids: List[int],
+                                  gen_history: List[List[int]]) -> None:
+        """aux 生成结束后，在后台把主对话的跨轮 KV 重放回上下文。
+
+        aux 与主对话共用同一 Llama 实例，`create_chat_completion` 的 reset
+        会把主对话预填好的 system+tools KV（数千 token ≈ 数秒）整个冲掉；
+        不重放的话，用户下一次提问必然全量预填充。这里在 daemon 线程里
+        重放：拿不到 `_gen_lock` 就放弃——注意**调度点在 aux 流内部**，而
+        `chat_stream` 在整个流式期间持有该锁，恢复线程必须在启动后先等锁
+        释放（最多 ~2s）；等待期间用户若发起主对话，主对话会先抢到锁，此时
+        放弃恢复（主对话结束时上下文反正会重建），保证主对话永远优先。
+        """
+        if not ids:
+            return
+
+        def _restore() -> None:
+            try:
+                # 调度点在 aux 流内部（锁仍被 aux 流持有），先等锁释放。
+                got = False
+                for _ in range(40):          # 最多 ~2s
+                    if self._gen_lock.acquire(blocking=False):
+                        got = True
+                        break
+                    time.sleep(0.05)
+                if not got:
+                    logger.debug(
+                        "KV 恢复：锁未在等待窗口内释放（主对话已开始），跳过")
+                    return
+                try:
+                    self._model.reset()
+                    self._model.eval(ids)
+                    self._gguf_ids = list(ids)
+                    self._gguf_gen_history = list(gen_history)
+                    logger.info("KV: aux 调用后已重放主对话缓存（%d token）", len(ids))
+                finally:
+                    self._gen_lock.release()
+            except Exception as e:      # 恢复失败不致命：下轮全量预填充兜底
+                logger.warning("KV: aux 后重放主缓存失败(忽略): %s", e)
+
+        threading.Thread(target=_restore, daemon=True,
+                         name="gguf-kv-restore").start()
 
     # ---- ONNX ----
     def _stream_onnx(self, messages, tools, temperature, kv_group: str = "main",
