@@ -42,6 +42,11 @@ _MAX_API_CANDIDATES = 8     # 最多试探几个候选 URL（含参数变体）
 _MAX_SUB_FETCHES = 10       # 单次 web_scan 的子请求总上限
 _DISCOVERY_DEADLINE_S = 25.0  # 发现阶段的总时间预算（含子请求）
 _MIN_VISIBLE_CHARS = 200    # 可见文本少于此长度视为「空壳」
+# 真实浏览器 UA：自定义 UA（base-agent/0.1）会被大量 CDN 直接 403/挑战页，
+# 新闻媒体站（cnn.com 等）尤其严格。
+_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/131.0.0.0 Safari/537.36")
 # 「空壳」特征串（加载提示/反爬挑战页）。
 _LOADER_MARKERS = (
     "loading jobs please wait", "please wait while loading",
@@ -261,6 +266,106 @@ def _visible_text(html: str) -> str:
     return "\n".join(lines)
 
 
+def _looks_xml_feed(text: str) -> bool:
+    """响应体是 RSS/Atom feed（新闻站的通用结构化数据源）。
+
+    不要求 ``<?xml`` 声明——hnrss 等生成器的输出直接以 ``<rss`` 开头。
+    """
+    head = (text or "").lstrip()[:300].lower()
+    return head.startswith(("<?xml", "<rss", "<feed")) \
+        or ("<rss" in head and "<channel" in head) \
+        or ("<feed" in head and "<entry" in head)
+
+
+def _summarize_feed(text: str, url: str, max_items: int = 20) -> str:
+    """把 RSS/Atom feed 压成「标题 | 链接 | 日期 | 摘要」的条目列表。
+
+    新闻站的 feed 是最稳的信息源（纯 XML、体积小、无反爬），比抓首页 HTML
+    靠谱得多。解析失败退回 _visible_text（feed 也是 XML，正文提取能剥出
+    title/description 的混合文本，聊胜于无）。
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        # 真实世界的 feed 常含 XML 1.0 非法控制字符（\x00-\x08 等，多来自
+        # 用户投稿内容）——ET 解析直接抛 not well-formed。剥掉后再解析。
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "",
+                         text or "", flags=re.S)
+        root = ET.fromstring(cleaned.encode("utf-8", errors="ignore"))
+    except Exception:
+        visible = _visible_text(text)
+        return f"[XML feed] {url}\n{visible[:4000]}" if visible.strip() \
+            else f"[XML feed] {url}\n（feed 解析失败）"
+
+    def _txt(el) -> str:
+        return (el.text or "").strip() if el is not None else ""
+
+    def _link(el) -> str:
+        # Atom 的链接在 <link href="...">；RSS 在 <link> 文本里。
+        for child in el:
+            if child.tag.rsplit("}", 1)[-1] == "link":
+                href = child.get("href") or _txt(child)
+                if href:
+                    return href
+        return ""
+
+    def _date(el) -> str:
+        for name in ("pubDate", "published", "updated", "date"):
+            for child in el.iter():
+                if child.tag.rsplit("}", 1)[-1] == name:
+                    return _txt(child)
+        return ""
+
+    items: List[str] = []
+    channel_title = ""
+    for chan in root.iter():
+        if chan.tag.rsplit("}", 1)[-1] == "channel":
+            channel_title = _txt(chan.find("title")) or _txt(
+                next((c for c in chan if c.tag.rsplit("}", 1)[-1] == "title"), None))
+            break
+    for el in root.iter():
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag not in ("item", "entry"):
+            continue
+        title = _txt(next((c for c in el if c.tag.rsplit("}", 1)[-1] == "title"), None))
+        link = _link(el)
+        desc = _txt(next((c for c in el if c.tag.rsplit("}", 1)[-1] in
+                          ("description", "summary", "content")), None))
+        date = _date(el)
+        if not title and not link:
+            continue
+        line = f"- {title or link}"
+        if date:
+            line += f"（{date}）"
+        if link:
+            line += f"\n  {link}"
+        if desc and desc != title:
+            # feed 的 description 常是内嵌 HTML（<p>、<a> 等），剥成纯文本，
+            # 换行压成空格——否则会打断「- 标题」条目结构。
+            clean_desc = _visible_text(desc).strip() or desc
+            line += f"\n  {' '.join(clean_desc.split())[:220]}"
+        items.append(line)
+        if len(items) >= max_items:
+            break
+    head = f"[RSS/Atom feed] {url}" + (f"（{channel_title}）" if channel_title else "")
+    if not items:
+        return f"{head}\n（未解析出条目；正文提取：{_visible_text(text)[:2000]}）"
+    body = "\n".join(items)
+    return f"{head}\n共列出 {len(items)} 条\n{body}"
+
+
+def _discover_feed_links(html: str, url: str) -> List[str]:
+    """从 HTML <head> 里发现声明的 RSS/Atom feed（<link rel="alternate">）。"""
+    feeds: List[str] = []
+    for m in re.findall(
+            r"""<link[^>]+rel=["']alternate["'][^>]*>""", html or "", re.I):
+        if not re.search(r"""type=["']application/(?:rss|atom)\+xml""", m, re.I):
+            continue
+        href = re.search(r"""href=["']([^"']+)["']""", m, re.I)
+        if href:
+            feeds.append(urljoin(url, href.group(1).strip()))
+    return feeds
+
+
 def _looks_js_rendered(text: str) -> bool:
     """可见文本是否薄到像「JS 渲染空壳」（或含加载提示串）。"""
     t = (text or "").strip().lower()
@@ -463,12 +568,18 @@ class WebScanTool(Tool):
         # （HTTP(S)_PROXY），不读 macOS/Windows 系统代理设置——GUI 启动的
         # 应用常没有代理环境变量，直连被墙目标就是「永远 30s 超时」。配置
         # web_proxy 后所有 web_scan 走该代理。
+        #
+        # UA 用真实浏览器串：`base-agent/0.1` 这类自定义 UA 会被大量 CDN
+        # （Cloudflare 等）直接 403/挑战页，cnn.com 之类媒体站尤其严格。
         proxy = (getattr(self.config, "web_proxy", "") or "").strip() or None
         transport = httpx.HTTPTransport(retries=2, proxy=proxy) if proxy \
             else httpx.HTTPTransport(retries=2)
-        self._http = httpx.Client(timeout=30.0, follow_redirects=False,
-                                  headers={"User-Agent": "base-agent/0.1"},
-                                  transport=transport)
+        self._http = httpx.Client(
+            timeout=30.0, follow_redirects=False, transport=transport,
+            headers={"User-Agent": _BROWSER_UA,
+                     "Accept": "text/html,application/xhtml+xml,"
+                               "application/xml;q=0.9,*/*;q=0.8",
+                     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"})
 
     def run(self, url: str, raw: bool = False) -> ToolResult:
         # 协议白名单：url 由模型提供，不加限制的话 file:// / gopher:// 等
@@ -485,12 +596,18 @@ class WebScanTool(Tool):
             text = _read_capped(http, url)
         except httpx.TimeoutException as e:
             # 传输层错误透出 httpx 原文（如 "[Errno 61] Connection refused"）
-            # 对模型难以据此改参数。分类给出可操作提示。
+            # 对模型难以据此改参数。分类给出可操作提示：大型媒体站首页普遍
+            # 重 JS + 数 MB HTML，直连常超时——引导模型换轻量入口（lite/
+            # 文本版、RSS feed）而不是原样重试。
             return ToolResult(
                 False,
                 error=f"Request failed (network unreachable or timed out after 30s): "
-                      f"{type(e).__name__}: {e}. Check the URL/host and retry, "
-                      f"or use shell_run(curl) to diagnose connectivity.",
+                      f"{type(e).__name__}: {e}. Large media sites (cnn.com etc.) "
+                      f"often time out — try a lighter entry point of the same "
+                      f"site (e.g. lite.cnn.com / text-only version / its RSS "
+                      f"feed at a feeds.* or rss.* subdomain, discoverable from "
+                      f"the homepage's <link rel=alternate>), or diagnose with "
+                      f"shell_run(curl -I <url>).",
             )
         except httpx.HTTPError as e:
             return ToolResult(False, error=f"Request failed: {type(e).__name__}: {e}")
@@ -500,6 +617,14 @@ class WebScanTool(Tool):
             return ToolResult(False, error=f"HTTP {text[len('__HTTP_ERROR__'):]}")
         if raw:
             return ToolResult(True, output=_truncate_marked(text, 20000))
+
+        # ---- 形状 0：响应体本身就是 RSS/Atom feed（新闻站的数据源）----
+        # 新闻站首页普遍重 JS + 反爬，而 feed 是纯 XML、轻量、无挑战页。
+        # 模型给 feed URL（或模型发现 HTML 里的 feed 后跟进）时直接结构化输出。
+        if _looks_xml_feed(text):
+            return ToolResult(
+                True,
+                output=_truncate_marked(_summarize_feed(text, url), 20000))
 
         # ---- 形状 1：响应体本身就是 JSON（API 类数据源）----
         # 模型直接给 JSON 端点时，旧实现会把它当 HTML 剥成一行乱码。
@@ -531,10 +656,24 @@ class WebScanTool(Tool):
             if sub_visible.strip():
                 sections.append(f"[iframe: {ifr}]\n{sub_visible}")
 
-        # ---- 形状 3：JS 渲染空壳 → 自动发现站点自己的数据端点 ----
+        # ---- 形状 3：JS 渲染空壳 → 先试站点声明的 RSS/Atom，再挖数据端点 ----
+        # 新闻/媒体站几乎都在 <head> 里声明 feed（<link rel="alternate"
+        # type="application/rss+xml">）；feed 是纯 XML 无反爬，比首页可靠得多，
+        # 且轻量（ cnn.com 首页 30s 读不完，feed 几十 KB）。
         if _looks_js_rendered(visible):
-            sections, notes = self._discover_and_fetch(
-                http, url, text, sections, notes)
+            for feed_url in _discover_feed_links(text, url)[:2]:
+                try:
+                    sub = _read_capped(http, feed_url)
+                except Exception:
+                    continue
+                if sub.startswith("__HTTP_ERROR__") or not _looks_xml_feed(sub):
+                    continue
+                sections.append(_summarize_feed(sub, feed_url, max_items=15))
+                notes.append(f"[提示] 正文取自站点声明的 feed {feed_url}")
+                break
+            if not any(s.startswith("[RSS/Atom feed]") for s in sections):
+                sections, notes = self._discover_and_fetch(
+                    http, url, text, sections, notes)
 
         if notes:
             sections.append("\n".join(notes))
