@@ -235,30 +235,38 @@ def _snapshot_real_streams() -> tuple:
         )
 
 
-def _schedule_stream_restore(buffers: tuple, delay: float = _LEAK_RESTORE_DELAY) -> None:
-    """延迟恢复全局 stdout/stderr（超时/取消路径专用）。
+def _restore_streams_immediately(buffers: tuple) -> None:
+    """**立即**恢复全局 stdout/stderr（超时/取消路径专用）。
 
-    恢复前检查全局流是否仍指向**本场**缓冲：后续场次已换上新缓冲时不动
-    （它们会恢复到自己快照的真实流，幂等）。
+    恢复前检查全局流是否仍指向本场缓冲（后续场次已换新缓冲则不动，幂等）。
+
+    为什么不能延迟：旧实现 50ms 定时器恢复——但这 50ms 窗口内，agent 拿到
+    ToolResult 后立即 _log_tool_result / on_tool_end 会 print 到**已关闭**的
+    缓冲，抛 `ValueError: I/O operation on closed file`，未捕获 → 解释器退出时
+    stderr 仍是死流 → `lost sys.stderr`（真实复现：抓 cnn.com 时 code_run
+    超时直接崩掉整个 agent 回合，UI 表现为「不知道怎么失败就没了」）。
+    泄漏线程是 daemon，print 到真实流最多刷屏、绝不崩主流程。
     """
     out_buf, err_buf = buffers
+    with _REAL_STREAMS_LOCK:
+        try:
+            if sys.stdout is out_buf:
+                sys.stdout = _LAST_REAL_STDOUT or sys.stdout
+        except Exception:
+            pass
+        try:
+            if sys.stderr is err_buf:
+                sys.stderr = _LAST_REAL_STDERR or sys.stderr
+        except Exception:
+            pass
 
-    def _restore() -> None:
-        time.sleep(delay)
-        with _REAL_STREAMS_LOCK:
-            try:
-                if sys.stdout is out_buf:
-                    sys.stdout = _LAST_REAL_STDOUT or sys.stdout
-            except Exception:
-                pass
-            try:
-                if sys.stderr is err_buf:
-                    sys.stderr = _LAST_REAL_STDERR or sys.stderr
-            except Exception:
-                pass
 
-    threading.Thread(target=_restore, daemon=True,
-                     name="code-run-restore").start()
+def _schedule_stream_restore(buffers: tuple, delay: float = _LEAK_RESTORE_DELAY) -> None:
+    """延迟恢复全局 stdout/stderr（兼容旧调用点，实际已改为立即恢复）。
+
+    保留此函数名以兼容其它调用点；语义上等同立即恢复。
+    """
+    _restore_streams_immediately(buffers)
 
 
 class CodeRunTool(Tool):

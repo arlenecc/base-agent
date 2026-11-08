@@ -575,7 +575,12 @@ class WebScanTool(Tool):
         transport = httpx.HTTPTransport(retries=2, proxy=proxy) if proxy \
             else httpx.HTTPTransport(retries=2)
         self._http = httpx.Client(
-            timeout=30.0, follow_redirects=False, transport=transport,
+            # 15s 读超时（原 30s）：大型媒体站首页（cnn.com 等）数 MB HTML +
+            # 跨境直连慢时，30s ReadTimeout 后还要再走 20s discovery 挖掘，
+            # 单次 web_scan 拖到 60s 才失败（超出并行 allow）——模型卡在
+            # 第一步绕路。15s 快速失败，错误信息引导 lite/feed 入口，模型
+            # 更快转向可达的数据源。
+            timeout=15.0, follow_redirects=False, transport=transport,
             headers={"User-Agent": _BROWSER_UA,
                      "Accept": "text/html,application/xhtml+xml,"
                                "application/xml;q=0.9,*/*;q=0.8",
