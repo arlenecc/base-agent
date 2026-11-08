@@ -582,6 +582,11 @@ class WebScanTool(Tool):
                      "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"})
 
     def run(self, url: str, raw: bool = False) -> ToolResult:
+        # raw 参数归一化：模型会把 false 传成**字符串** "false"（实测），
+        # 字符串恒为 truthy → 全部请求都走 raw 模式返回 20k 原始 HTML，
+        # 正文提取/截断/feed 解析全部被绕过（模型拿不到可用正文 → 反复重抓）。
+        if not isinstance(raw, bool):
+            raw = str(raw).strip().lower() not in ("false", "0", "", "no", "off")
         # 协议白名单：url 由模型提供，不加限制的话 file:// / gopher:// 等
         # 可被用来读取本地文件或探测内网。
         if not url.lower().startswith(("http://", "https://")):
@@ -678,6 +683,11 @@ class WebScanTool(Tool):
         if notes:
             sections.append("\n".join(notes))
         out = "\n\n".join(s for s in sections if s.strip())
+        # 输出上限 8000（原 20000=全局 L0 硬帽贴边）：本地 2B/4B 模型的注意力
+        # 撑不住 20k 工具结果——实测塞满 20k 后模型直接 57 字符收尾不做总结；
+        # 8k 字符 ≈ 5k token，与 raw 配额（30000×0.4）匹配，不会一轮就把预算
+        # 吃穿导致上轮正文被折叠（模型失忆 → 重抓死循环）。
+        out = _truncate_marked(out, 8000)
         if not out.strip():
             # 仍然空：把已发现的候选端点回给模型（比一句「无内容」有用）。
             cands = _scan_endpoints(text, url)
@@ -701,7 +711,8 @@ class WebScanTool(Tool):
                 out += ("\n\n[提示] 未提取到任何可见文本：页面很可能是纯 JS "
                         "渲染、需要登录或仅对浏览器 UA 开放。可尝试 raw=true "
                         "查看原始 HTML，或改用目标站点的公开 API。")
-        return ToolResult(True, output=_truncate_marked(out, 20000))
+        # 12000 截断已在上方完成（含 JS 渲染提示之后），此处直接返回。
+        return ToolResult(True, output=out)
 
     # ------------------------------------------------------------------
     # 动态页兜底：从页面脚本里挖站点自己的数据端点并试探

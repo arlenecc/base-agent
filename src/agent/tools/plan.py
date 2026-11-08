@@ -131,7 +131,16 @@ class UpdatePlanTool(Tool):
         if op == "clear":
             sess.clear_plan()
             self._notify(sess)
-            return ToolResult(True, output="plan cleared")
+            # clear 后必须给「下一步」指引：实测本地模型 clear 完就停在原地，
+            # 原样重发 clear 直到撞上重复调用熔断（用户看到的是「计划建了又
+            # 没了、然后整个回合退出」）。两条路都写明：重建 → create；
+            # 已完成 → 直接总结收尾。
+            return ToolResult(True, output=(
+                "plan cleared.\n"
+                "▶ 若你正要开始一个新任务：立即调用 update_plan(op='create', "
+                "goal='一句话目标', steps=[{'title': '步骤1'}, ...]) 重建计划，"
+                "然后马上开始执行第 1 步。\n"
+                "▶ 若当前任务已经完成：不要再调用工具，直接输出最终总结收尾。"))
 
         if op == "create":
             plan = normalize_plan({"goal": goal, "steps": steps if steps is not None else []})
@@ -215,6 +224,52 @@ class UpdatePlanTool(Tool):
             cur = sess.get_plan()
             if cur is None:
                 return ToolResult(False, error="no plan to patch — call op='create' first")
+            # **兼容 steps 数组形式**：本地模型最自然的写法是把每步的新状态
+            # 放进 steps=[{"title"/"id", "status", "note"}]（与 create 同形），
+            # 而旧实现只认顶层 status/note——实测模型因此连发
+            # 「patch needs status and/or note」→ 计划推进不了 → 疯狂重抓。
+            # 有 steps 时逐项按 id（无 id 按 title）匹配更新。
+            if isinstance(steps, list) and steps:
+                working = copy.deepcopy(cur)
+                steps_list = working.get("steps", [])
+                touched = 0
+                for upd in steps:
+                    if not isinstance(upd, dict):
+                        continue
+                    uid = str(upd.get("id", "") or "").strip()
+                    utitle = str(upd.get("title", "") or "").strip()
+                    ustatus = str(upd.get("status", "") or "").strip().lower()
+                    unote = str(upd.get("note", "") or "").strip()
+                    if ustatus and ustatus not in ("pending", "doing", "done",
+                                                   "blocked", "skipped"):
+                        return ToolResult(False, error=f"invalid status: {ustatus!r}")
+                    if not ustatus and not unote:
+                        continue
+                    match = next(
+                        (s for s in steps_list
+                         if (uid and str(s.get("id", "")) == uid)
+                         or (not uid and utitle
+                             and str(s.get("title", "")) == utitle)), None)
+                    if match is None:
+                        continue
+                    if ustatus:
+                        match["status"] = ustatus
+                    if unote:
+                        match["note"] = unote
+                    touched += 1
+                if not touched:
+                    return ToolResult(
+                        False,
+                        error=(f"no step in steps[] matched; current plan:\n"
+                               f"{sess.render_plan()}"))
+                if not sess.set_plan(working):
+                    return ToolResult(False, error="patched plan failed validation")
+                self._notify(sess)
+                remaining = len(sess.plan_open_steps())
+                return ToolResult(
+                    True,
+                    output=(f"patched {touched} step(s); {remaining} open step(s) "
+                            f"left\n{sess.render_plan()}"))
             new_status = str(status or "").strip().lower()
             if new_status and new_status not in ("pending", "doing", "done",
                                                  "blocked", "skipped"):

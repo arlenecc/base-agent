@@ -18,7 +18,9 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .budget import ContextBudget, estimate_tokens
-from .compressor import has_summary_tag, l0_capture, l1_trim, l2_summary
+from .compressor import (
+    has_summary_tag, l0_capture, l1_trim, l2_summary, strip_summary_tags,
+)
 from .outcome import (
     ExitReason, KernelState, LLMResponse, StepOutcome, ToolCall, next_state,
 )
@@ -78,6 +80,16 @@ _LITE_TOOL_NAMES = frozenset({
     "code_run", "shell_run", "web_scan",
     "ask_user", "rag_search", "memory_search",
 })
+# 输入含 URL/域名/明确点名工具时**强制全量工具组**：这类输入是用户在指挥
+# 具体的工具操作，几乎必然是多步（抓取 → 处理 → 输出），需要 update_plan
+# 建计划、需要完整工具面。实测「用 web_scan 抓 cnn.com 今日新闻并总结」
+# 被判成简单任务 → lite 组（无 update_plan）→ 模型直接文字收尾，计划面板
+# 空白、任务不执行——正是用户报告的「计划不执行」。
+_NEEDS_FULL_TOOLS_RE = re.compile(
+    r"(https?://|\b[a-z0-9-]+\.(?:com|cn|net|org|io|dev|app|xyz)\b|"
+    r"web_scan|webexec_js|code_run|shell_run|file_read|file_write|"
+    r"file_modify|file_append|rag_search|rag_ingest|memory_search|"
+    r"memory_graph|skill_search|skill_load)", re.I)
 
 # 寒暄 / 自我认知（能力、功能、身份）类问答：答案就在系统提示里，不需要
 # 推理也不需要工具。但本地小模型会无视系统提示的软禁令：连发 rag_* 空转
@@ -200,6 +212,10 @@ _BLOCK_NUDGE_MAX = 2
 # 上限则直接结束本轮。注意这里管的是**成功**调用——失败调用由 _fail_sigs 负责。
 _REPEAT_CALL_WARN = 2      # 第 3 次相同调用 → 提醒换动作
 _REPEAT_CALL_LIMIT = 4     # 第 5 次 → 收尾，不再烧轮次
+# 同签名**累计**上限（不要求连续，run 内全局计数）：覆盖「交替变体绕过连续
+# 检测」的空转形态（如 web_scan{url} 与 web_scan{} 交替）。参数每次都变的
+# 调用（code_run 迭代调试）不受影响。
+_SIG_TOTAL_LIMIT = 6
 # 失败调用「原样重试」的熔断：与成功调用的 _REPEAT_CALL_LIMIT 对等。
 # 模型对同一无效参数反复重试（如 update_working_checkpoint({}) 缺 key_info）
 # 只提示不收敛会烧满 max_iterations。连续相同失败签名达到上限 → 强制结束本轮。
@@ -382,6 +398,8 @@ class KernelLoop:
         self._plan_finish_nudge = 0
         # 重复调用检测（成功调用也会空转，见 ACT 态同名注释）；run() 会重置。
         self._repeat_streak = 0
+        # 同签名累计计数（run 内全局，见 _SIG_TOTAL_LIMIT）
+        self._sig_counts: Dict[str, int] = {}
         self._last_call_sigs: List[str] = []
         # 失败调用「原样重试」熔断计数（连续相同失败签名次数）；run() 会重置。
         self._fail_repeat_streak = 0
@@ -507,13 +525,16 @@ class KernelLoop:
         self._is_local_backend = getattr(_client, "_backend", None) in (
             "mlx", "gguf", "onnx")
         # 工具下发模式：简单任务给轻量子集（整段固定，见 schemas() 注释）。
+        # 含 URL/域名/点名工具的输入强制全量（见 _NEEDS_FULL_TOOLS_RE）；
         # 续跑段/多步任务用全量；切模式只发生在 run 边界，KV 前缀在同段内稳定。
         # _lite_schemas 是全量的确定性子集，**不随 run 重置**——保持同一对象
         # 是「schema 不每轮重建」契约的一部分（test_tools_schemas_are_cached）。
         self._tool_mode = "lite" if (
-            not resume and self._is_simple_input(user_input)) else "full"
+            not resume and self._is_simple_input(user_input)
+            and not _NEEDS_FULL_TOOLS_RE.search(user_input or "")) else "full"
         # 重复调用检测（成功调用同样空转，见 ACT 态的重复调用检测注释）
         self._repeat_streak = 0
+        self._sig_counts = {}
         # rag_search 轮内计数（硬上限见 _RAG_SEARCH_MAX_PER_RUN）
         self._rag_search_calls = 0
         self._last_call_sigs: List[str] = []
@@ -711,8 +732,11 @@ class KernelLoop:
             # 1 步」上，表现为反复发无意义的工具调用。
             if (session.get_plan() is None and not self._did_work
                     and not self._is_simple_input(user_input)
-                    and not self._is_local_backend   # ③ 本地后端不强制建计划
-                    and not self._resume):   # 续跑段免强制规划（与前置门/反思门对齐）
+                    and not self._resume):
+                # 软提示对本地后端**保留**：它不 rollback、不消耗重定向预算，
+                # 不会造成死循环（硬拦仍有 local 豁免兜底）。去掉它的代价是
+                # 本地模型几乎从不建计划 → 计划面板空白、open_steps 推进机制
+                # 整个失效——用户实测报告「计划不执行」正源于此。
                 pending = (pending or "") + _PLAN_GATE_HINT
             user_text = session.anchor_prompt(extra=pending)
             # 每轮易变上下文（工作记忆 / 当天事实 / 匹配技能）从系统提示移到用户
@@ -892,6 +916,17 @@ class KernelLoop:
                         continue
                     self.log("[kernel] 反思门同一提醒达上限 → 放行收尾")
                 event = self._no_tool_event(resp)
+                if event == "retry_summary":
+                    # summary-only 专用重试：明确把模型推向工具调用，而不是
+                    # 泛泛的「重新生成」（实测泛化提示拉不回这种形态）。
+                    self._rollback_turn(session)
+                    pending = _carry_task(
+                        "[ERROR] 你上一条回复只有一个 <summary> 任务复述，"
+                        "没有任何正文、也没有调用任何工具——这不是有效的执行。"
+                        "请立即：1) 调用完成本任务所需的第一个工具（例如 "
+                        "web_scan 抓取页面 / file_read 读取文件）；2) 等工具"
+                        "结果返回后再输出正文。不要只复述计划。")
+                    continue
                 if event == "retry":
                     self._rollback_turn(session)
                     pending = _carry_task(
@@ -1045,6 +1080,24 @@ class KernelLoop:
             # 触发，于是把 max_iterations 全耗在空转上（用户看到的就是一串一模
             # 一样的工具调用）。
             sigs = [self._call_sig(tc) for tc in tool_calls]
+            # 同签名**累计**熔断（不要求连续）：实测「交替发 web_scan{url} +
+            # web_scan{}（缺参）」会让批签名每轮不同 → 连续检测永不触发，
+            # 同一 URL 被抓了 8+ 遍烧穿 max_iterations。同名同参在整个 run
+            # 里出现 _SIG_TOTAL_LIMIT 次即判定空转收尾；参数每次都变的
+            # code_run 迭代调试不受影响。
+            for s in sigs:
+                self._sig_counts[s] = self._sig_counts.get(s, 0) + 1
+            _hot_sig, _hot_n = max(self._sig_counts.items(), key=lambda kv: kv[1]) \
+                if self._sig_counts else ("", 0)
+            if _hot_n >= _SIG_TOTAL_LIMIT:
+                self.log("[kernel] 同一调用（%s）在本轮已累计 %d 次 → 空转收尾"
+                         % (_hot_sig.split("(", 1)[0], _hot_n))
+                if not (final_text or "").strip():
+                    final_text = (resp.content or "").strip() or (
+                        "（同一工具调用已重复多次，已停止本轮以避免空转。"
+                        "请基于已获取的信息换一种做法，或换个说法再问一次。）")
+                exit_reason = ExitReason.DONE
+                break
             if sigs and sigs == self._last_call_sigs:
                 self._repeat_streak += 1
             else:
@@ -1141,8 +1194,11 @@ class KernelLoop:
             # 补建提示：已开始执行但 plan 仍空 → 提醒补建计划（兜底）。
             # 防止「首轮误执行」导致全程无 plan 可跟踪；最多提醒 _PLAN_NUDGE_MAX 次。
             if (self._did_work and session.get_plan() is None
-                    and self._plan_nudged < _PLAN_NUDGE_MAX
-                    and not self._is_local_backend):   # ③ 本地后端不强制建计划
+                    and self._plan_nudged < _PLAN_NUDGE_MAX):
+                # 补建提示对本地后端**保留**：模型常先动手后想收尾（实测「抓完
+                # 新闻 57 字符直接结束」，计划面板全程空白）。该提示只是往
+                # pending 追加一段文字，不拦不 rollback，无死循环风险；硬拦
+                # 的 local 豁免仍在，不会回到每轮 rollback 的老路。
                 self._plan_nudged += 1
                 parts.append(
                     "[System] 你已经开始执行但 Session 中还没有执行计划（plan 为空）——"
@@ -1890,9 +1946,18 @@ class KernelLoop:
             self._empty_retry += 1
             return "retry" if self._empty_retry <= _MAX_EMPTY_RETRY else "done"
         tail = content[-120:]
-        if any(m in tail for m in _TRUNCATION_MARKS) or (
-            content.endswith("</summary>") and len(content) < 100
-        ):
+        # summary-only 判定改为「剥掉协议标签后无正文」：旧阈值 len<100 挡不住
+        # 复述任务的长 summary（实测 216 字符的任务复述被当合法收尾，工具一次
+        # 都不调）。合法输出是 <summary>…</summary> + 正文，剥掉后必有剩余。
+        # 单独事件 + 专用重试提示：通用「回复为空」提示拉不回这种形态
+        # （实测重试 3 次仍是 summary 复述）。
+        body = strip_summary_tags(content).strip()
+        if content.endswith("</summary>") and not body:
+            self._empty_retry += 1
+            if self._empty_retry <= _MAX_EMPTY_RETRY:
+                return "retry_summary"
+            return "done"
+        if any(m in tail for m in _TRUNCATION_MARKS):
             self._empty_retry += 1
             return "retry" if self._empty_retry <= _MAX_EMPTY_RETRY else "done"
         if self._looks_like_unexecuted_code(content):
