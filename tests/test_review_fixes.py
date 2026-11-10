@@ -84,27 +84,27 @@ def tool_registry(tmp_path):
 
 def test_memory_graph_destructive_ops_need_confirm(tool_registry):
     reg, _cfg = tool_registry
-    tool = reg.get("memory_graph")
+    tool = reg.get("long_memory")
     assert tool is not None
-    assert tool.should_confirm({"op": "clear"}) is True
-    assert tool.should_confirm({"op": "delete_entity", "name": "x"}) is True
-    assert tool.should_confirm({"op": "list_entities"}) is False
-    assert tool.should_confirm({"op": "add_observations",
+    assert tool.should_confirm({"op": "graph", "action": "clear"}) is True
+    assert tool.should_confirm({"op": "graph", "action": "delete_entity", "name": "x"}) is True
+    assert tool.should_confirm({"op": "graph", "action": "list_entities"}) is False
+    assert tool.should_confirm({"op": "graph", "action": "add_observations",
                                 "name": "x", "observations": ["y"]}) is False
 
 
 def test_memory_graph_rejects_string_observations(tool_registry):
     reg, _cfg = tool_registry
     # 模型把 observations 传成字符串：旧实现按字符迭代生成逐字符 observation
-    res = reg.execute("memory_graph", {
-        "op": "add_observations", "name": "e",
+    res = reg.execute("long_memory", {
+        "op": "graph", "action": "add_observations", "name": "e",
         "observations": "a whole sentence",
     })
     assert not res.success
     assert "list of strings" in (res.error or "")
     # 正常列表仍可用
-    res = reg.execute("memory_graph", {
-        "op": "add_observations", "name": "e", "observations": ["a", "b"],
+    res = reg.execute("long_memory", {
+        "op": "graph", "action": "add_observations", "name": "e", "observations": ["a", "b"],
     })
     assert res.success, res.error
 
@@ -376,7 +376,7 @@ def test_file_read_cjk_under_char_limit_not_truncated(tmp_path, monkeypatch):
         content = "一二三四五"          # 5 个字符 = 15 字节 > 10，但 5 字符 < 10
         with open(os.path.join(tmp_path, "cjk.txt"), "w", encoding="utf-8") as f:
             f.write(content)
-        res = reg.execute("file_read", {"path": "cjk.txt"})
+        res = reg.execute("file_tools", {"op": "read", "path": "cjk.txt"})
         assert res.success
         assert res.output == content, "字节数超限但字符数未超 → 不应截断"
         assert "仅显示前" not in res.output

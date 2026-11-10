@@ -240,8 +240,8 @@ class SkillManager:
                     keywords=list(keywords),
                     prompt=(
                         f"A saved skill '{name}' matches this task. "
-                        f"Call skill_load with path=\"{dir_name}\" to read its "
-                        f"instructions, then follow them."
+                        f"Call skill_tools with op=\"load\" and path=\"{dir_name}\" "
+                        f"to read its instructions, then follow them."
                     ),
                 ))
                 self._store.set("skills", [asdict(s) for s in skills])

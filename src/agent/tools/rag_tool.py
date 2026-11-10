@@ -5,7 +5,7 @@ import logging
 import os
 from typing import Any, Dict, TYPE_CHECKING
 
-from .base import Tool, ToolResult, ToolRegistry
+from .base import Tool, ToolResult, ToolRegistry, _FanoutTool
 from ..rag.postprocess import (
     condense_retrieved_chunks,
     build_condensed_output,
@@ -57,7 +57,7 @@ class RagSearchTool(Tool):
     description = (
         "在本地知识库中检索**资料内容**。仅当问题依赖用户的资料时使用"
         "（如查某主题的原文、某本书的细节）；「知识库里有什么/你能做什么」"
-        "这类问题不适用——前者用 rag_outline（不带参数）列文档，后者直接回答。"
+        "这类问题不适用——前者用 rag_tools(op='outline') 列文档，后者直接回答。"
     )
     parameters = {
         "type": "object",
@@ -104,7 +104,7 @@ class RagSearchTool(Tool):
         if query is None:
             return ToolResult(
                 False,
-                error=("rag_search 的 query 必须是字符串检索词。合法参数："
+                error=("rag_tools(op='search') 的 query 必须是字符串检索词。合法参数："
                        "query(字符串) / top_k(1-10 整数) / source(可选字符串)。"
                        "不要重试同样的错误参数。"),
             )
@@ -114,8 +114,8 @@ class RagSearchTool(Tool):
             return ToolResult(
                 success=False,
                 error=(
-                    "rag_search 缺少必需参数 query（搜索查询词）。"
-                    "不要重复调用空参的 rag_search——先停下来：若 rag_outline 已返回【全书摘要】或目录里已有章节摘要，直接据此作答；"
+                    "rag_tools(op=\"search\") 缺少必需参数 query（搜索查询词）。"
+                    "不要重复调用空参的 rag_tools(op=\"search\")——先停下来：若 rag_tools(op=\"outline\") 已返回【全书摘要】或目录里已有章节摘要，直接据此作答；"
                     "确需细节，用一句中文查询词（如 \"薄伽梵歌 主要思想\"）再调用一次；仍拿不到就如实说明。"
                 ),
             )
@@ -202,7 +202,7 @@ class RagOutlineTool(Tool):
     description = (
         "知识库文档总览。用户问「知识库里有什么/有哪些资料/文档」时，"
         "**不带 book_name** 调用即可列出全部文档；用户提到具体书名时带上书名"
-        "调用，先掌握该文档的目录结构，再用 rag_search 检索章节细节。"
+        "调用，先掌握该文档的目录结构，再用 rag_tools(op='search') 检索章节细节。"
     )
     parameters = {
         "type": "object",
@@ -227,7 +227,7 @@ class RagOutlineTool(Tool):
         if book_name is None:
             return ToolResult(
                 False,
-                error=("rag_outline 的 book_name 必须是字符串；不带参数表示"
+                error=("rag_tools(op='outline') 的 book_name 必须是字符串；不带参数表示"
                        "列出全部文档。不要重试同样的错误参数。"),
             )
         if self._engine is None:
@@ -248,7 +248,7 @@ class RagOutlineTool(Tool):
             if len(docs) == 1:
                 lines.append(
                     "\n只有这一篇：直接对它执行先总后分"
-                    "（rag_outline(book_name=…) 拿目录/摘要 → 按需 rag_search）。")
+                    "（rag_tools(op='outline', book_name=…) 拿目录/摘要 → 按需 rag_tools(op='search')）。")
             else:
                 lines.append(
                     "\n用户问题没点名文档时：挑文档名/主题与问题最相关的一篇"
@@ -262,13 +262,13 @@ class RagOutlineTool(Tool):
             if doc is None:
                 return ToolResult(
                     success=False,
-                    error=f"未找到文档「{book_name}」的缩略版本。可先调用 rag_outline（不带参数）查看可用文档列表。",
+                    error=f"未找到文档「{book_name}」的缩略版本。可先调用 rag_tools(op='outline') 查看可用文档列表。",
                 )
             digest = doc.get("digest", "")
             if not digest:
                 return ToolResult(success=False, error=f"文档「{doc.get('doc_name', book_name)}」暂无缩略版本")
             # 附带后台闲时生成的全书摘要（若有）：目录结构 + 全书摘要一起给，
-            # 模型无需逐章 rag_search 即可把握全书脉络。
+            # 模型无需逐章 rag_tools(op='search') 即可把握全书脉络。
             book_summary = ""
             try:
                 book_summary = self._engine.get_book_summary(
@@ -281,8 +281,8 @@ class RagOutlineTool(Tool):
             # 旧实现只在有摘要时才拼，导致「先总后分」约束在冷库期完全缺失。
             digest += (
                 "\n\n（问整体内容（主要思想/讲了什么）直接据此作答，"
-                "无需再 rag_search；确需细节只检索目标章节——"
-                "本轮 rag_search 至多 3 次，超过会被内核拦截。）")
+                "无需再 rag_tools(op='search')；确需细节只检索目标章节——"
+                "本轮 rag_tools(op='search') 至多 3 次，超过会被内核拦截。）")
             # 带参分支同样要过体积兜底：大书目录 + 全书摘要可能非常长。
             return ToolResult(success=True, output=_cap_output(digest))
         except Exception as e:
@@ -431,3 +431,46 @@ class RagIngestTool(Tool):
         except Exception as e:
             logger.error("rag_ingest failed: %s", e, exc_info=True)
             return ToolResult(success=False, error=f"知识库索引失败: {e}")
+
+
+class RagToolsTool(_FanoutTool):
+    """RAG 统一门面：op 分发到 search / outline / status / ingest。"""
+
+    # op 级参数隔离：status 无参，ingest 只认 force，outline 只认 book_name。
+    # 子工具 ingest/outline/status 都带 **kwargs，若不隔离会静默吞掉误传的
+    # query/source 等参数，模型会以为检索生效了。
+    _op_params = {
+        "search": {"query", "top_k", "source"},
+        "outline": {"book_name"},
+        "status": set(),
+        "ingest": {"force"},
+    }
+
+    name = "rag_tools"
+    description = (
+        "Unified local knowledge-base operations. op one of:\n"
+        "- search(query, top_k?, source?): retrieve material content\n"
+        "- outline(book_name?): list all docs (no arg) or a document's outline\n"
+        "- status(): knowledge-base status (chunks, sources)\n"
+        "- ingest(force?): re-index the knowledge-base directory"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "op": {"type": "string", "enum": ["search", "outline", "status", "ingest"]},
+            "query": {"type": "string", "description": "检索词（search）"},
+            "top_k": {"type": "integer", "description": "返回结果数，默认 5，范围 1-10（search）"},
+            "source": {"type": "string", "description": "限定书名/文档名关键词（search）"},
+            "book_name": {"type": "string", "description": "书名/文档名关键词（outline）"},
+            "force": {"type": "boolean", "description": "强制重新处理所有文件（ingest，默认 false）"},
+        },
+        "required": ["op"],
+    }
+
+    def __init__(self, engine: "RAGEngine", aux_llm_getter: Any = None):
+        self._sub_tools = {
+            "search": RagSearchTool(engine, aux_llm_getter=aux_llm_getter),
+            "outline": RagOutlineTool(engine),
+            "status": RagStatusTool(engine),
+            "ingest": RagIngestTool(engine),
+        }

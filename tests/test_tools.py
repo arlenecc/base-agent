@@ -24,21 +24,21 @@ def test_file_read_returns_contents(config):
     with open(p, "w") as f:
         f.write("hello world")
     reg = _reg(config)
-    res = reg.execute("file_read", {"path": "a.txt"})
+    res = reg.execute("file_tools", {"op": "read", "path": "a.txt"})
     assert res.success
     assert res.output == "hello world"
 
 
 def test_file_read_missing_file_returns_error(config):
     reg = _reg(config)
-    res = reg.execute("file_read", {"path": "nope.txt"})
+    res = reg.execute("file_tools", {"op": "read", "path": "nope.txt"})
     assert not res.success
     assert "not exist" in res.error.lower() or "no such" in res.error.lower()
 
 
 def test_file_read_rejects_escape(config):
     reg = _reg(config)
-    res = reg.execute("file_read", {"path": "../../etc/passwd"})
+    res = reg.execute("file_tools", {"op": "read", "path": "../../etc/passwd"})
     assert not res.success
     assert "workspace" in res.error.lower() or "outside" in res.error.lower()
 
@@ -54,7 +54,7 @@ def test_file_write_rejects_symlink_escape(config, tmp_path):
     if not os.path.exists(link_path):
         os.symlink(outside, link_path)
     reg = _reg(config)
-    res = reg.execute("file_write", {"path": "escape_link", "content": "escaped"})
+    res = reg.execute("file_tools", {"op": "write", "path": "escape_link", "content": "escaped"})
     assert not res.success, "write via symlink to outside must be rejected"
     assert not os.path.exists(outside), "target outside workspace must not be created"
 
@@ -63,7 +63,7 @@ def test_file_write_atomic_no_tmp_leftover(config):
     """file_write must use atomic write (temp + os.replace); after a successful
     write no .tmp file should remain in the workspace."""
     reg = _reg(config)
-    reg.execute("file_write", {"path": "atom.txt", "content": "data"})
+    reg.execute("file_tools", {"op": "write", "path": "atom.txt", "content": "data"})
     assert not os.path.exists(os.path.join(config.workspace, "atom.txt.tmp"))
 
 
@@ -72,7 +72,7 @@ def test_file_modify_atomic_no_tmp_leftover(config):
     with open(os.path.join(config.workspace, "mod.txt"), "w") as f:
         f.write("hello")
     reg = _reg(config)
-    reg.execute("file_modify", {"path": "mod.txt", "old": "hello", "new": "world"})
+    reg.execute("file_tools", {"op": "modify", "path": "mod.txt", "old": "hello", "new": "world"})
     with open(os.path.join(config.workspace, "mod.txt")) as f:
         assert f.read() == "world"
     assert not os.path.exists(os.path.join(config.workspace, "mod.txt.tmp"))
@@ -84,7 +84,7 @@ def test_file_modify_atomic_no_tmp_leftover(config):
 
 def test_file_write_creates_file(config):
     reg = _reg(config)
-    res = reg.execute("file_write", {"path": "out.txt", "content": "abc"})
+    res = reg.execute("file_tools", {"op": "write", "path": "out.txt", "content": "abc"})
     assert res.success
     with open(os.path.join(config.workspace, "out.txt")) as f:
         assert f.read() == "abc"
@@ -94,14 +94,14 @@ def test_file_write_overwrites_existing(config):
     with open(os.path.join(config.workspace, "out.txt"), "w") as f:
         f.write("old")
     reg = _reg(config)
-    reg.execute("file_write", {"path": "out.txt", "content": "new"})
+    reg.execute("file_tools", {"op": "write", "path": "out.txt", "content": "new"})
     with open(os.path.join(config.workspace, "out.txt")) as f:
         assert f.read() == "new"
 
 
 def test_file_write_creates_subdirs(config):
     reg = _reg(config)
-    res = reg.execute("file_write", {"path": "sub/dir/x.txt", "content": "y"})
+    res = reg.execute("file_tools", {"op": "write", "path": "sub/dir/x.txt", "content": "y"})
     assert res.success
     with open(os.path.join(config.workspace, "sub", "dir", "x.txt")) as f:
         assert f.read() == "y"
@@ -115,7 +115,7 @@ def test_file_modify_replaces_text(config):
     with open(os.path.join(config.workspace, "m.txt"), "w") as f:
         f.write("foo bar foo")
     reg = _reg(config)
-    res = reg.execute("file_modify", {"path": "m.txt", "old": "bar", "new": "baz"})
+    res = reg.execute("file_tools", {"op": "modify", "path": "m.txt", "old": "bar", "new": "baz"})
     assert res.success
     with open(os.path.join(config.workspace, "m.txt")) as f:
         assert f.read() == "foo baz foo"
@@ -125,7 +125,7 @@ def test_file_modify_missing_old_string(config):
     with open(os.path.join(config.workspace, "m.txt"), "w") as f:
         f.write("foo")
     reg = _reg(config)
-    res = reg.execute("file_modify", {"path": "m.txt", "old": "zzz", "new": "yy"})
+    res = reg.execute("file_tools", {"op": "modify", "path": "m.txt", "old": "zzz", "new": "yy"})
     assert not res.success
 
 
@@ -366,18 +366,19 @@ def test_work_memory_set_get_list_clear(config):
 def test_memory_graph_create_and_search(config):
     reg = _reg(config)
     # add_observations creates the entity + observations
-    res = reg.execute("memory_graph", {
-        "op": "add_observations",
+    res = reg.execute("long_memory", {
+        "op": "graph",
+        "action": "add_observations",
         "name": "TestUser",
         "observations": ["prefers dark mode", "uses python"],
     })
     assert res.success
     # search should find the observation
-    res2 = reg.execute("memory_search", {"query": "python", "top_k": 5})
+    res2 = reg.execute("long_memory", {"op": "search", "query": "python", "top_k": 5})
     assert res2.success
     assert "python" in res2.output.lower()
     # cleanup
-    reg.execute("memory_graph", {"op": "clear"})
+    reg.execute("long_memory", {"op": "graph", "action": "clear"})
 
 
 # ---------------------------------------------------------------------------
@@ -392,20 +393,15 @@ def test_destructive_flags(config):
     are destructive.
     """
     reg = _reg(config)
-    assert reg.get("file_read").destructive is False
-    assert reg.get("file_write").destructive is False
-    assert reg.get("file_modify").destructive is False
+    assert reg.get("file_tools").destructive is False
     assert reg.get("code_run").destructive is True
     assert reg.get("shell_run").destructive is True
     assert reg.get("web_scan").destructive is False
-    # webexec_js is only registered when browser_endpoint is configured
-    webexec = reg.get("webexec_js")
-    if webexec is not None:
-        assert webexec.destructive is False
     assert reg.get("ask_user").destructive is False
     assert reg.get("work_memory").destructive is False
-    assert reg.get("memory_graph").destructive is False
-    assert reg.get("memory_search").destructive is False
+    assert reg.get("long_memory").destructive is False
+    assert reg.get("skill_tools").destructive is False
+    assert reg.get("rag_tools").destructive is False
 
 
 def test_should_confirm_default_follows_destructive(config):
@@ -414,8 +410,11 @@ def test_should_confirm_default_follows_destructive(config):
     assert reg.get("code_run").should_confirm({"code": "print(1)"}) is False
     assert reg.get("code_run").should_confirm(
         {"code": "os.system('sudo x')"}) is True
-    assert reg.get("file_write").should_confirm({"path": "a", "content": "b"}) is False
-    assert reg.get("file_read").should_confirm({"path": "a"}) is False
+    assert reg.get("file_tools").should_confirm({"op": "write", "path": "a", "content": "b"}) is False
+    assert reg.get("file_tools").should_confirm({"op": "read", "path": "a"}) is False
+    # long_memory 的 graph 破坏性 op（clear/delete_entity）仍需确认
+    assert reg.get("long_memory").should_confirm({"op": "graph", "action": "clear"}) is True
+    assert reg.get("long_memory").should_confirm({"op": "search", "query": "x"}) is False
 
 
 def test_unknown_tool_returns_error(config):
@@ -430,9 +429,9 @@ def test_registry_exposes_function_schemas(config):
     schemas = reg.schemas()
     names = {s["function"]["name"] for s in schemas}
     expected = {
-        "code_run", "shell_run", "file_read", "file_write", "file_modify",
+        "code_run", "shell_run", "file_tools",
         "web_scan", "ask_user",
-        "work_memory", "memory_graph", "memory_search",
+        "work_memory", "long_memory", "skill_tools",
     }
     assert expected <= names
 
@@ -447,9 +446,7 @@ def test_rag_tools_registered_with_default_knowledge_base(config):
     config.knowledge_base = ""
     reg = _reg(config)
     names = {s["function"]["name"] for s in reg.schemas()}
-    assert "rag_search" in names
-    assert "rag_status" in names
-    assert "rag_ingest" in names
+    assert "rag_tools" in names
     reg.shutdown()
 
 
@@ -464,9 +461,7 @@ def test_rag_tools_registered_with_knowledge_base(config, tmp_path):
 
     reg = _reg(config)
     names = {s["function"]["name"] for s in reg.schemas()}
-    assert "rag_search" in names, "rag_search must be registered when knowledge_base is set"
-    assert "rag_status" in names
-    assert "rag_ingest" in names
+    assert "rag_tools" in names, "rag_tools must be registered when knowledge_base is set"
 
     # Verify engine is available but no ingest was performed (lazy init).
     engine = reg.get_rag_engine()
@@ -540,7 +535,7 @@ def test_rag_outline_with_summary_discourages_extra_search():
     res = RagOutlineTool(_Eng()).run("神之所欲")
     assert res.success
     assert "【全书摘要】" in res.output
-    assert "无需再 rag_search" in res.output
+    assert "无需再 rag_tools" in res.output
     assert "至多 3 次" in res.output
 
 
@@ -608,7 +603,7 @@ def test_file_modify_binary_file_returns_clear_error(config):
     with open(p, "wb") as f:
         f.write(bytes(range(256)) * 64)  # 无效 UTF-8
     reg = _reg(config)
-    res = reg.execute("file_modify", {"path": "img.bin", "old": "x", "new": "y"})
+    res = reg.execute("file_tools", {"op": "modify", "path": "img.bin", "old": "x", "new": "y"})
     assert not res.success
     assert "utf-8" in res.error.lower()
     reg.shutdown()
@@ -625,10 +620,10 @@ def test_file_modify_huge_file_is_rejected(config):
     with open(p, "w") as f:
         f.write("hello world\n" * 100)
     with mock.patch.object(fo, "_MAX_MODIFY_BYTES", 100):
-        res = reg.execute("file_modify", {"path": "big.log", "old": "hello", "new": "bye"})
+        res = reg.execute("file_tools", {"op": "modify", "path": "big.log", "old": "hello", "new": "bye"})
     assert not res.success
     assert "too large" in res.error.lower()
-    assert "file_write" in res.error or "sed" in res.error
+    assert "file_tools" in res.error or "sed" in res.error
     reg.shutdown()
 
 
@@ -641,8 +636,8 @@ def test_file_write_preserves_mode_and_default_0644(config):
     os.chmod(p2, 0o640)
 
     reg = _reg(config)
-    assert reg.execute("file_write", {"path": "mode_new.txt", "content": "x"}).success
-    assert reg.execute("file_write", {"path": "mode_exist.txt", "content": "y"}).success
+    assert reg.execute("file_tools", {"op": "write", "path": "mode_new.txt", "content": "x"}).success
+    assert reg.execute("file_tools", {"op": "write", "path": "mode_exist.txt", "content": "y"}).success
     reg.shutdown()
 
     # 新文件按 umask 得到常规权限（非 0600）；已有文件继承原权限。
@@ -654,9 +649,9 @@ def test_file_write_preserves_mode_and_default_0644(config):
 def test_memory_search_clamps_top_k(config):
     """top_k=100000 不能把全部观察灌进上下文。"""
     reg = _reg(config)
-    reg.execute("memory_graph", {"op": "create_entity",
+    reg.execute("long_memory", {"op": "graph", "action": "create_entity",
                                  "name": "E", "observations": ["fact1", "fact2"]})
-    res = reg.execute("memory_search", {"query": "fact", "top_k": 100000})
+    res = reg.execute("long_memory", {"op": "search", "query": "fact", "top_k": 100000})
     assert res.success
     # 钳制到 20：JSON 里最多 20 条结果。
     import json as _json
@@ -667,7 +662,7 @@ def test_memory_search_clamps_top_k(config):
 
 def test_memory_search_rejects_blank_query(config):
     reg = _reg(config)
-    res = reg.execute("memory_search", {"query": "   "})
+    res = reg.execute("long_memory", {"op": "search", "query": "   "})
     assert not res.success
     reg.shutdown()
 
@@ -774,18 +769,18 @@ def test_execute_reports_bad_args_as_invalid_arguments(config):
     reg = _reg(config)
 
     # 缺 required 参数。
-    res = reg.execute("file_read", {})
+    res = reg.execute("file_tools", {"op": "read", })
     assert not res.success
     assert "Invalid arguments" in res.error
     assert "path" in res.error
 
     # 传了签名里不存在的参数。
-    res = reg.execute("file_read", {"path": "a.txt", "bogus": 1})
+    res = reg.execute("file_tools", {"op": "read", "path": "a.txt", "bogus": 1})
     assert not res.success
     assert "Invalid arguments" in res.error
 
     # args 不是 dict。
-    res = reg.execute("file_read", ["not", "a", "dict"])
+    res = reg.execute("file_tools", ["not", "a", "dict"])
     assert not res.success
     assert "Invalid arguments" in res.error
     reg.shutdown()
@@ -915,7 +910,7 @@ def test_skill_save_marks_index_stale(config):
         pytest.skip("技能向量索引不可用（缺少 lancedb/fastembed）")
     retriever._dirty = False
 
-    res = reg.execute("skill_save", {
+    res = reg.execute("skill_tools", {"op": "save", 
         "name": "indexed-skill", "description": "测试索引同步",
         "steps": "1. do\n2. done",
     })
@@ -928,6 +923,8 @@ def test_skill_search_normalizes_bad_top_k(config):
     """模型传 null / 非数字的 top_k 不能抛裸异常。"""
     reg = ToolRegistry(config=config, callbacks=AgentCallbacks())
     for bad in (None, "abc", -5, 9999, 3.7):
-        res = reg.execute("skill_search", {"op": "list", "top_k": bad})
+        # op=search 且不带 query 时门面工具走「列出全部技能」分支，
+        # top_k 归一化逻辑与旧 skill_search(op="list") 完全一致。
+        res = reg.execute("skill_tools", {"op": "search", "top_k": bad})
         assert res.success, f"top_k={bad!r} 应被归一化，而不是失败"
     reg.shutdown()

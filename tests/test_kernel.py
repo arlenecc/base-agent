@@ -544,16 +544,18 @@ def test_atomic_and_capability_tools_are_registered(cfg):
     reg = ToolRegistry(config=cfg, callbacks=Noop())
     names = set(reg.names())
 
-    # GenericAgent 的 9 个原子工具
-    for t in ("code_run", "file_read", "file_write", "file_patch", "web_scan",
-              "update_working_checkpoint", "ask_user", "start_long_term_update"):
-        assert t in names, f"缺少原子工具 {t}"
+    # 合并后的工具集：文件/记忆/技能/RAG 各自收敛为单个门面工具，
+    # 其余保持独立。
+    for t in ("code_run", "file_tools", "web_scan", "update_plan",
+              "update_working_checkpoint", "ask_user", "start_long_term_update",
+              "shell_run", "work_memory", "long_memory", "skill_tools",
+              "rag_tools"):
+        assert t in names, f"缺少工具 {t}"
 
-    # base-agent 的能力工具（全部保留）
-    for t in ("shell_run", "work_memory", "memory_graph", "memory_search",
-              "skill_search", "skill_semantic_search", "skill_load", "skill_save",
-              "rag_search", "rag_outline", "rag_status", "rag_ingest"):
-        assert t in names, f"缺少能力工具 {t}"
+    # 兼容别名不暴露给模型（不在 schema/names 里），但 execute 仍可命中。
+    for t in ("file_read", "file_patch", "memory_graph", "rag_search"):
+        assert t not in names, f"兼容别名 {t} 不应出现在模型可见工具集"
+        assert reg.get(t) is not None, f"兼容别名 {t} 应仍可执行"
     reg.shutdown()
 
 
@@ -564,7 +566,7 @@ def test_alias_tool_delegates_to_target(cfg):
     with open(os.path.join(cfg.workspace, "p.txt"), "w") as f:
         f.write("old content")
     # file_patch 是 file_modify 的别名（对齐 GenericAgent 命名）
-    res = reg.execute("file_patch", {"path": "p.txt", "old": "old", "new": "new"})
+    res = reg.execute("file_tools", {"op": "patch", "path": "p.txt", "old": "old", "new": "new"})
     assert res.success
     with open(os.path.join(cfg.workspace, "p.txt")) as f:
         assert f.read() == "new content"
@@ -629,7 +631,7 @@ def test_skill_save_freezes_reusable_procedure(cfg):
     from agent.tools import ToolRegistry
 
     reg = ToolRegistry(config=cfg, callbacks=Noop())
-    res = reg.execute("skill_save", {
+    res = reg.execute("skill_tools", {"op": "save", 
         "name": "Extract PDF Tables!",
         "description": "从 PDF 抽取表格为 CSV",
         "when_to_use": "用户要求导出 PDF 表格时",
@@ -650,7 +652,7 @@ def test_skill_save_rejects_path_traversal(cfg):
     from agent.tools import ToolRegistry
 
     reg = ToolRegistry(config=cfg, callbacks=Noop())
-    res = reg.execute("skill_save", {
+    res = reg.execute("skill_tools", {"op": "save", 
         "name": "../../evil", "description": "d", "steps": "s",
     })
     assert res.success  # 名字被清洗成合法 slug

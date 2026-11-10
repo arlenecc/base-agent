@@ -296,7 +296,7 @@ class Session:
             )
         if n % (every_n * 2) == 0:
             parts.append(
-                "[TIPS] 长任务：如已有可复用流程，用 skill_save 固化；"
+                "[TIPS] 长任务：如已有可复用流程，用 skill_tools(op=\"save\") 固化；"
                 "阶段性成果用 start_long_term_update 蒸馏进长期记忆。"
             )
         return "\n".join(parts)

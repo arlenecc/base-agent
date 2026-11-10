@@ -901,10 +901,13 @@ def test_agent_calls_rag_tools_when_knowledge_base_configured(
     registry = ToolRegistry(config=config, callbacks=recording_callbacks)
 
     # 4. Verify RAG tools are exposed to the LLM via schemas().
+    # 合并后只有一个 rag_tools 门面（search/outline/status/ingest 由 op 区分）。
     schema_names = {s["function"]["name"] for s in registry.schemas()}
-    assert "rag_search" in schema_names, "rag_search must be in tool schemas"
-    assert "rag_status" in schema_names, "rag_status must be in tool schemas"
-    assert "rag_ingest" in schema_names, "rag_ingest must be in tool schemas"
+    assert "rag_tools" in schema_names, "rag_tools must be in tool schemas"
+    # 旧名只作为兼容别名存在（可 execute），不暴露给模型。
+    for legacy in ("rag_search", "rag_status", "rag_ingest"):
+        assert legacy not in schema_names
+        assert registry.get(legacy) is not None
 
     # 5. Ingest synchronously so the vector store has data to search.
     rag_engine = registry.get_rag_engine()
@@ -981,9 +984,7 @@ def test_agent_registers_rag_tools_with_default_knowledge_base(
     config.knowledge_base = ""
     registry = ToolRegistry(config=config, callbacks=recording_callbacks)
     schema_names = {s["function"]["name"] for s in registry.schemas()}
-    assert "rag_search" in schema_names
-    assert "rag_status" in schema_names
-    assert "rag_ingest" in schema_names
+    assert "rag_tools" in schema_names
     registry.shutdown()
 
 
@@ -1400,18 +1401,19 @@ def test_system_prompt_splits_greeting_from_simple_qa():
 
     # 纯寒暄规则仍在，且只针对寒暄
     assert "纯寒暄" in SYSTEM_PROMPT
-    assert "不调用工具、不建计划、不写记忆" in SYSTEM_PROMPT
+    assert "绝不调用任何工具" in SYSTEM_PROMPT
+    assert "不建计划、不写记忆" in SYSTEM_PROMPT
     # 自我认知类：直接回答，不查库（第二次反馈的修复）
     assert "自我认知" in SYSTEM_PROMPT
     assert "不查知识库、不查记忆" in SYSTEM_PROMPT
     # 依赖用户资料的问题：允许调工具，且给出正确姿势
     assert "该调的工具照调" in SYSTEM_PROMPT
-    assert "不带参数" in SYSTEM_PROMPT          # 列文档 → rag_outline 无参
+    assert "不带参数" in SYSTEM_PROMPT          # 列文档 → rag_tools(op=outline) 无参
     assert "原样当检索词" in SYSTEM_PROMPT       # 问句 ≠ 检索词
     # 旧的一刀切文案必须已移除（曾把简单问答和寒暄混为一谈）
     assert "禁止调用任何工具，禁止建计划，禁止写记忆" not in SYSTEM_PROMPT
-    # 知识库查询指引在位（分布 → rag_outline）
-    assert "rag_outline" in SYSTEM_PROMPT
+    # 知识库查询指引在位（分布 → rag_tools outline）
+    assert 'rag_tools(op="outline")' in SYSTEM_PROMPT
     # 2026-10-24 用户反馈（第三次）：本地小模型拿到明确任务却反复自问
     # 「你没有给出具体任务内容」进入复读循环。规则必须硬性禁止这种行为。
     assert "直接开做" in SYSTEM_PROMPT            # 有目标就执行
@@ -1434,7 +1436,7 @@ def test_system_prompt_book_content_outline_then_search():
     from agent.agent import SYSTEM_PROMPT
 
     # 先摸全书结构（带书名），再针对性检索（限定 source），最后组织回答
-    assert 'rag_outline(book_name="书名")' in SYSTEM_PROMPT
+    assert 'rag_tools(op="outline", book_name="书名")' in SYSTEM_PROMPT
     assert 'source="书名"' in SYSTEM_PROMPT
     assert "先总后分" in SYSTEM_PROMPT
     assert "不要跳过 outline 直接 search" in SYSTEM_PROMPT

@@ -923,7 +923,7 @@ Rules:
 - Only concrete, durable facts about the user, their projects, preferences,
   decisions, or domain knowledge. Skip chitchat, transient state, file contents
   and raw tool output.
-- Skip the assistant's own tools/capabilities (no entities for "rag_search", etc.).
+- Skip the assistant's own tools/capabilities (no entities for "rag_tools", etc.).
 - Observations are short self-contained sentences still useful weeks later.
 - Canonical entity names ("PostgreSQL", not "postgres db").
 - Write observations in the same language as the conversation (mismatched

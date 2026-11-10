@@ -174,7 +174,7 @@ def test_create_dir_skill(tmp_path):
     # Flat record registered so match() hits it
     matched = sm.match("pdf extract")
     assert matched is not None and matched.name == "PDF Extract"
-    assert "skill_load" in matched.prompt
+    assert "skill_tools" in matched.prompt
 
 
 def test_create_dir_skill_unique_names(tmp_path):
@@ -218,8 +218,8 @@ def test_skill_search_tool_search_and_list(registry, config):
                 description="Extract tables from PDF",
                 keywords=["pdf", "table"])
 
-    tool = registry.get("skill_search")
-    assert isinstance(tool, SkillSearchTool)
+    tool = SkillSearchTool()
+    tool.bind(config, registry)
 
     # search
     res = tool.run(op="search", query="extract pdf table")
@@ -243,8 +243,8 @@ def test_skill_load_tool(registry, config):
     _make_skill(skills_dir, "web-scrape", "Web Scrape",
                 prompt="# Scrape\nStep 1...")
 
-    tool = registry.get("skill_load")
-    assert isinstance(tool, SkillLoadTool)
+    tool = SkillLoadTool()
+    tool.bind(config, registry)
 
     res = tool.run(path="web-scrape")
     assert res.success
@@ -265,7 +265,8 @@ def test_skill_load_rejects_absolute_entry(registry, config):
     skills_dir = os.path.join(config.workspace, ".agent", "skills")
     _make_skill(skills_dir, "web-scrape", "Web Scrape", prompt="# Scrape")
 
-    tool = registry.get("skill_load")
+    tool = SkillLoadTool()
+    tool.bind(config, registry)
 
     # Absolute path escapes the skill directory entirely.
     res = tool.run(path="web-scrape", entry="/etc/passwd")
@@ -294,5 +295,4 @@ def test_skill_search_tracks_workspace_change(config, recording_callbacks):
 
 
 def test_skill_tools_registered_by_default(registry):
-    assert registry.get("skill_search") is not None
-    assert registry.get("skill_load") is not None
+    assert registry.get("skill_tools") is not None

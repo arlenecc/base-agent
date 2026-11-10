@@ -213,7 +213,7 @@ def test_l0_pointer_readable_by_real_file_read_tool(cfg, layout):
 
     ensure_l0(layout)
     reg = ToolRegistry(config=cfg, callbacks=_Noop())
-    res = reg.execute("file_read", {"path": "memory/memory_management_sop.md"})
+    res = reg.execute("file_tools", {"op": "read", "path": "memory/memory_management_sop.md"})
     assert res.success
     assert "各层职责与原则" in res.output
     assert "信息分类快速决策树" in res.output
@@ -347,8 +347,8 @@ def test_file_append_never_overwrites(cfg):
     with open(p, "w", encoding="utf-8") as f:
         f.write("## [OLD]\nkeep me\n")
     reg = ToolRegistry(config=cfg, callbacks=_Noop())
-    res = reg.execute("file_append",
-                      {"path": "memory/global_mem.txt", "content": "## [NEW]\nfact\n"})
+    res = reg.execute("file_tools", {"op": "append",
+                      "path": "memory/global_mem.txt", "content": "## [NEW]\nfact\n"})
     assert res.success
     text = open(p, encoding="utf-8").read()
     assert "keep me" in text and "## [NEW]" in text

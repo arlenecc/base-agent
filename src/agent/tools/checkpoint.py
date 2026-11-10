@@ -108,7 +108,7 @@ class StartLongTermUpdateTool(Tool):
     """L2/L3 长期记忆的唯一正式写入触发点（改进 6）。
 
     它自己不写任何记忆文件：只做门控，并把【记忆提纯】prompt + 会话摘要 +
-    L0 决策树回执给模型；模型再按决策树用 ``file_append`` 追加到 L2/L3。
+    L0 决策树回执给模型；模型再按决策树用 ``file_tools(op="append")`` 追加到 L2/L3。
     内核检测到该工具（未被门控拒绝时）仍会打上 distill 标记，终止边由
     Agent hook 做既有的知识图谱异步蒸馏。
     """
@@ -119,9 +119,10 @@ class StartLongTermUpdateTool(Tool):
         "a task or reaching an important checkpoint; rejected if the session has "
         f"fewer than {LONG_TERM_MIN_TURNS} turns (short tasks must not touch "
         "long-term memory). Returns the 【记忆提纯】prompt; then classify verified "
-        "facts by the L0 decision tree and append them with file_append to "
-        "memory/global_mem.txt (L2) or memory/xxx_sop.md (L3). "
-        "Never overwrite, never store unverified/volatile data."
+        "facts by the L0 decision tree and append them with "
+        "file_tools(op='append') to memory/global_mem.txt (L2) or "
+        "memory/xxx_sop.md (L3). Never overwrite, never store unverified/"
+        "volatile data."
     )
     parameters = {
         "type": "object",

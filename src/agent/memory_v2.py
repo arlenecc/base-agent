@@ -359,9 +359,31 @@ def sync_l1(layout: MemoryLayout) -> bool:
 # ---------------------------------------------------------------------------
 # 改进 5 + 6：内核侧工具识别
 # ---------------------------------------------------------------------------
+# 合并前的旧文件工具名 → 门面 op。历史会话 / 技能 SOP 里记录的仍是旧名，
+# 分类函数必须同时认，否则 L3 SOP 读取提示与 L2/L3 写入同步会对旧调用失效。
+_LEGACY_FILE_OP = {
+    "file_read": "read",
+    "file_write": "write",
+    "file_append": "append",
+    "file_modify": "modify",
+    "file_patch": "patch",
+}
+
+
+def _file_op(call: Any) -> str:
+    """返回该文件调用对应的门面 op（read/write/append/…）。
+
+    同时支持新形态 file_tools(op=…) 与旧形态 file_read/file_write/…。
+    """
+    name = getattr(call, "name", "") or ""
+    if name == "file_tools":
+        return str((getattr(call, "args", {}) or {}).get("op", "") or "").strip().lower()
+    return _LEGACY_FILE_OP.get(name, "")
+
+
 def is_l3_sop_read(call: Any) -> bool:
-    """file_read 是否读了 memory/ 下的 L3 SOP（改进 5 的触发条件）。"""
-    if getattr(call, "name", "") != "file_read":
+    """file_tools(op=read) 是否读了 memory/ 下的 L3 SOP（改进 5 的触发条件）。"""
+    if _file_op(call) != "read":
         return False
     p = _normalize_rel(getattr(call, "args", {}).get("path", ""))
     if not p.startswith("memory/"):
@@ -372,7 +394,7 @@ def is_l3_sop_read(call: Any) -> bool:
 
 def is_l23_write(call: Any) -> bool:
     """是否是 L2/L3 的正式写入（改进 6：写完后同步 L1）。"""
-    if getattr(call, "name", "") not in ("file_append", "file_write", "file_modify"):
+    if _file_op(call) not in ("append", "write", "modify", "patch"):
         return False
     p = _normalize_rel(getattr(call, "args", {}).get("path", ""))
     if not p.startswith("memory/"):

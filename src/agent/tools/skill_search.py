@@ -19,7 +19,7 @@ from typing import Optional
 from ..atomic_io import atomic_write_text
 from ..config import AgentConfig
 from ..skill_index import SkillIndex
-from .base import Tool, ToolRegistry, ToolResult
+from .base import Tool, ToolRegistry, ToolResult, _FanoutTool
 
 
 logger = logging.getLogger(__name__)
@@ -491,8 +491,92 @@ class SkillSaveTool(Tool):
         except OSError as e:
             logger.warning("skill_save: mirror to .agent/skills failed: %s", e)
 
-        note = ("下次可用 skill_semantic_search 或 skill_search 召回"
-                "（索引会自动增量同步）")
+        note = ("下次可用 skill_tools(op=\"semantic_search\") 或 "
+                "skill_tools(op=\"search\") 召回（索引会自动增量同步）")
         if mirrored:
             note += f"；已镜像到 {mirrored} 以便关键词检索命中"
         return ToolResult(True, output=f"skill saved: {path}\n{note}。")
+
+
+class SkillToolsTool(_FanoutTool):
+    """技能统一门面：op 分发到 search / load / semantic_search / save。"""
+
+    name = "skill_tools"
+    description = (
+        "Unified skill operations. op one of:\n"
+        "- search(query, top_k?): keyword search over .agent/skills; "
+        "omit query to list all skills\n"
+        "- semantic_search(query, top_k?): hybrid (vector+BM25) search over "
+        "workspace/skills (SKILL.md)\n"
+        "- load(path, entry?): read a skill's full instructions (path = 'dir' "
+        "from search results)\n"
+        "- save(name, description, steps, when_to_use?, pitfalls?, tags?): "
+        "freeze a verified procedure into a reusable skill"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "op": {"type": "string", "enum": ["search", "load", "semantic_search", "save"]},
+            "query": {"type": "string", "description": "Task/keywords to find matching skills (search/semantic_search)"},
+            "top_k": {"type": "integer", "default": 5},
+            "path": {"type": "string", "description": "Skill dir to load (search result 'dir' field)"},
+            "entry": {"type": "string", "description": "Entry file name, default SKILL.md"},
+            "name": {"type": "string", "description": "kebab-case id (save)"},
+            "description": {"type": "string", "description": "One-line summary (save)"},
+            "when_to_use": {"type": "string", "description": "Trigger conditions (save)"},
+            "steps": {"type": "string", "description": "Numbered verified steps (save)"},
+            "pitfalls": {"type": "string", "description": "Gotchas (save)"},
+            "tags": {"type": "string", "description": "Comma-separated tags (save)"},
+        },
+        "required": ["op"],
+    }
+
+    # op 级参数隔离：search/semantic_search 用 query/top_k，load 用 path/entry，
+    # save 用 name/description/steps/…；避免扁平 schema 下互相串参。
+    _op_params = {
+        "search": {"query", "top_k"},
+        "semantic_search": {"query", "top_k"},
+        "load": {"path", "entry"},
+        "save": {"name", "description", "steps", "when_to_use", "pitfalls", "tags"},
+    }
+    # 合并前 skill_search 本身有 op="list"（列出全部），现在等价形态是
+    # skill_tools(op="search") 不带 query。
+    _legacy_op_hints = {
+        "list": "这是合并前 skill_search 的 op 值；现在请用 "
+                "skill_tools(op='search') 且不带 query（即列出全部技能）。",
+    }
+
+    def __init__(self):
+        self._sub_tools = {
+            "search": SkillSearchTool(),
+            "semantic_search": SkillSemanticSearchTool(),
+            "load": SkillLoadTool(),
+            "save": SkillSaveTool(),
+        }
+
+    def run(self, op: str = "", **kwargs) -> ToolResult:
+        op = (op or "").strip().lower()
+        sub = self._sub_tools.get(op)
+        if sub is None:
+            return self._unknown_op_error(op)
+        err = self._validate_params(op, kwargs)
+        if err is not None:
+            return err
+        query = str(kwargs.get("query", "") or "")
+        top_k = kwargs.get("top_k", 5)
+        if op == "search":
+            # SkillSearchTool 自身也有 op（search/list）：keyword search 在
+            # query 为空时退化为「列出全部技能」，保留其 list 能力。
+            sub_op = "list" if not query.strip() else "search"
+            return self._sub_tools["search"].run(sub_op, query=query, top_k=top_k)
+        if op == "load":
+            return self._sub_tools["load"].run(path=kwargs.get("path", ""),
+                                              entry=kwargs.get("entry", "SKILL.md"))
+        if op == "semantic_search":
+            return self._sub_tools["semantic_search"].run(query=query, top_k=top_k)
+        # op == "save"
+        return self._sub_tools["save"].run(
+            name=kwargs.get("name", ""), description=kwargs.get("description", ""),
+            steps=kwargs.get("steps", ""), when_to_use=kwargs.get("when_to_use", ""),
+            pitfalls=kwargs.get("pitfalls", ""), tags=kwargs.get("tags", ""),
+        )

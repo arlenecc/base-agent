@@ -65,6 +65,12 @@ _STATIC_ASSET_RE = re.compile(
     r"\.(?:png|jpe?g|gif|svg|css|js|woff2?|ttf|eot|ico|mp4|webp)(?:\?|$)",
     re.IGNORECASE,
 )
+# 透明代理 / VPN（Clash、WARP 等）把**所有**域名解析到 fake-ip 段
+# 198.18.0.0/15（RFC 2544 基准测试网段，非真实内网）。ipaddress 把该段归为
+# is_reserved，旧实现据此拦截 → 走代理的用户 web_scan 全部被误判为「私网」。
+# 真实内网是 10/172.16-31/192.168/127/169.254，与 fake-ip 段互不重叠，
+# 豁免它不放松对真正内网/云元数据的 SSRF 防护。
+_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
 
 
 def _check_initial_url(url: str, allow_private: bool):
@@ -110,6 +116,9 @@ def _is_blocked_host(host: str, unresolvable_is_blocked: bool = True) -> bool:
             ip = ipaddress.ip_address(ip_str.split("%")[0])
         except ValueError:
             return True
+        if ip in _FAKE_IP_NET:
+            # fake-ip 段（透明代理）不是真实内网，豁免（见 _FAKE_IP_NET 注释）。
+            continue
         if (ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             return True
@@ -539,13 +548,16 @@ class WebScanTool(Tool):
         "summary of the payload; (3) JS-rendered/empty-shell pages → follows "
         "iframes and auto-discovers the page's own XHR/JSON endpoints (from "
         "inline and same-origin scripts) and returns their data when found. "
-        "Use raw=true to get the original HTML."
+        "Use raw=true to get the original HTML; render=true to first render "
+        "with an attached browser bridge (needs browser_endpoint) for "
+        "JS-heavy pages."
     )
     parameters = {
         "type": "object",
         "properties": {
             "url": {"type": "string"},
             "raw": {"type": "boolean", "description": "Return raw HTML instead of extracted text (default false)."},
+            "render": {"type": "boolean", "description": "Render the page in an attached browser first (requires browser_endpoint) and return the rendered text. For JS-heavy/SPA pages."},
         },
         "required": ["url"],
     }
@@ -586,12 +598,14 @@ class WebScanTool(Tool):
                                "application/xml;q=0.9,*/*;q=0.8",
                      "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"})
 
-    def run(self, url: str, raw: bool = False) -> ToolResult:
-        # raw 参数归一化：模型会把 false 传成**字符串** "false"（实测），
+    def run(self, url: str, raw: bool = False, render: bool = False) -> ToolResult:
+        # raw / render 参数归一化：模型会把 false 传成**字符串** "false"（实测），
         # 字符串恒为 truthy → 全部请求都走 raw 模式返回 20k 原始 HTML，
         # 正文提取/截断/feed 解析全部被绕过（模型拿不到可用正文 → 反复重抓）。
         if not isinstance(raw, bool):
             raw = str(raw).strip().lower() not in ("false", "0", "", "no", "off")
+        if not isinstance(render, bool):
+            render = str(render).strip().lower() not in ("false", "0", "", "no", "off")
         # 协议白名单：url 由模型提供，不加限制的话 file:// / gopher:// 等
         # 可被用来读取本地文件或探测内网。
         if not url.lower().startswith(("http://", "https://")):
@@ -599,6 +613,10 @@ class WebScanTool(Tool):
         blocked = _check_initial_url(url, getattr(self.config, "web_allow_private_hosts", False))
         if blocked is not None:
             return blocked
+        # render=true：先经浏览器 bridge 渲染（合并自原 webexec_js 的能力），
+        # 拿到渲染后的文本直接返回；不再走静态抓取。
+        if render:
+            return self._render_via_bridge(url)
         http = getattr(self, "_http", None)
         if http is None:
             return ToolResult(False, error="web_scan 未绑定（registry.bind 未执行）")
@@ -611,7 +629,7 @@ class WebScanTool(Tool):
             # 文本版、RSS feed）而不是原样重试。
             return ToolResult(
                 False,
-                error=f"Request failed (network unreachable or timed out after 30s): "
+                error=f"Request failed (network unreachable or timed out after 15s): "
                       f"{type(e).__name__}: {e}. Large media sites (cnn.com etc.) "
                       f"often time out — try a lighter entry point of the same "
                       f"site (e.g. lite.cnn.com / text-only version / its RSS "
@@ -718,6 +736,63 @@ class WebScanTool(Tool):
                         "查看原始 HTML，或改用目标站点的公开 API。")
         # 12000 截断已在上方完成（含 JS 渲染提示之后），此处直接返回。
         return ToolResult(True, output=out)
+
+    def _render_via_bridge(self, url: str) -> ToolResult:
+        """render=true 时：经浏览器 bridge 导航并取渲染后的可见文本。
+
+        合并自原 webexec_js 的「浏览器渲染」能力：对 JS 重/SPA 页面，静态抓取
+        只能拿到空壳，这里让已连接的浏览器真实渲染后再取 innerText。依赖
+        config.browser_endpoint（Playwright 式 HTTP bridge）。
+        """
+        endpoint = (getattr(self.config, "browser_endpoint", "") or "").strip()
+        if not endpoint:
+            return ToolResult(False, error=(
+                "render=true 需要浏览器 bridge：请先在配置里设置 browser_endpoint "
+                "（Playwright HTTP bridge，如 http://localhost:9222）。未配置时可"
+                "先用默认抓取（web_scan 会自动走 RSS/JSON/端点发现兜底）。"
+            ))
+        # 取渲染后的可见文本（含必要的等待由 bridge 自行处理）。
+        payload = {
+            "url": url,
+            "script": ("document.body && document.body.innerText"
+                       " ? document.body.innerText"
+                       " : (document.documentElement || {}).innerText || ''"),
+            "action": "",
+            "selector": "",
+            "value": "",
+        }
+        # 复用抓取用的连接池，但单次请求放宽到 60s：浏览器渲染（导航 +
+        # JS 执行）远比静态 GET 慢，15s 会误判超时。不另建 client，
+        # shutdown 时的 _http 回收即可覆盖，避免连接池泄漏。
+        try:
+            resp = self._http.post(endpoint.rstrip("/") + "/exec",
+                                   json=payload, timeout=60.0)
+        except Exception as e:
+            return ToolResult(False, error=f"Browser bridge error: {e}")
+        try:
+            if resp.status_code >= 400:
+                return ToolResult(False, error=f"HTTP {resp.status_code}: {resp.text[:500]}")
+            try:
+                data = (resp.json() if resp.headers.get("content-type", "")
+                        .startswith("application/json") else {"result": resp.text})
+            except ValueError:
+                data = {"result": resp.text[:2000],
+                        "note": "bridge 返回了非 JSON 内容，已按原文截断返回"}
+        finally:
+            resp.close()
+        # 优先取 result 文本；渲染为空时提示。
+        text = ""
+        if isinstance(data, dict):
+            for k in ("result", "text", "content", "innerText"):
+                v = data.get(k)
+                if isinstance(v, str) and v.strip():
+                    text = v
+                    break
+        if not text:
+            text = json.dumps(data, ensure_ascii=False)
+        if not text.strip():
+            return ToolResult(False, error=f"浏览器渲染后未取到文本（{url}），页面可能需登录或为空白")
+        return ToolResult(True, output=_truncate_marked(text, 20000))
 
     # ------------------------------------------------------------------
     # 动态页兜底：从页面脚本里挖站点自己的数据端点并试探
@@ -872,69 +947,3 @@ class WebScanTool(Tool):
         else:
             notes.append("[提示] 页面可见文本较少，未在脚本中发现数据端点")
         return sections, notes
-
-
-class WebExecJsTool(Tool):
-    name = "webexec_js"
-    description = (
-        "Control a browser via a Playwright-style bridge: navigate to a URL and "
-        "evaluate JavaScript. Requires the agent's browser_endpoint to be set; "
-        "otherwise returns guidance on enabling it."
-    )
-    # Browser-scoped: does not touch the local filesystem or system. The agent
-    # is expected to ask the user (via ask_user) before irreversible web actions.
-    destructive = False
-    parameters = {
-        "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "URL to navigate to (optional if only evaluating)."},
-            "script": {"type": "string", "description": "JavaScript to evaluate in the page."},
-            "action": {"type": "string", "description": "Optional action: 'click','type','screenshot'."},
-            "selector": {"type": "string"},
-            "value": {"type": "string"},
-        },
-        "required": ["script"],
-    }
-
-    config: AgentConfig
-    registry: ToolRegistry
-    _http: httpx.Client  # shared connection pool (lazy-init per instance)
-
-    def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
-        self.config = config
-        self.registry = registry
-        self._http = httpx.Client(timeout=60.0)
-
-    def run(self, script: str, url: str = "", action: str = "",
-            selector: str = "", value: str = "") -> ToolResult:
-        endpoint = getattr(self.config, "browser_endpoint", "") or ""
-        if not endpoint:
-            return ToolResult(False, error=(
-                "Browser bridge not configured. Set config.browser_endpoint to a "
-                "Playwright HTTP bridge (e.g. http://localhost:9222) to use webexec_js."
-            ))
-        payload = {"url": url, "script": script, "action": action,
-                   "selector": selector, "value": value}
-        if url:
-            blocked = _check_initial_url(url, getattr(self.config, "web_allow_private_hosts", False))
-            if blocked is not None:
-                return blocked
-        try:
-            resp = self._http.post(endpoint.rstrip("/") + "/exec", json=payload)
-        except Exception as e:
-            return ToolResult(False, error=f"Browser bridge error: {e}")
-        try:
-            if resp.status_code >= 400:
-                return ToolResult(False, error=f"HTTP {resp.status_code}: {resp.text[:500]}")
-            # content-type 声称 JSON 而 body 畸形时 resp.json() 抛
-            # JSONDecodeError（ValueError 子类）——旧实现只 catch 了外面的
-            # 请求异常，这个异常会逃逸成无上下文的 "JSONDecodeError: ..."。
-            try:
-                data = (resp.json() if resp.headers.get("content-type", "")
-                        .startswith("application/json") else {"result": resp.text})
-            except ValueError:
-                data = {"result": resp.text[:2000],
-                        "note": "bridge 返回了非 JSON 内容，已按原文截断返回"}
-        finally:
-            resp.close()
-        return ToolResult(True, output=json.dumps(data, ensure_ascii=False)[:8000])

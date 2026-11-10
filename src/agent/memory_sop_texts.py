@@ -10,7 +10,7 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 MEMORY_MANAGEMENT_SOP_FULL = """## 0. 核心公理 (Core Axioms - 最高优先级)
 1.  **行动验证原则 (Action-Verified Only)**
-    *   **定义**：任何写入 L1/L2/L3 的信息，必须源自**成功的工具调用结果**（如 `shell` 执行成功、`file_read` 确认内容存在、代码运行通过）。
+    *   **定义**：任何写入 L1/L2/L3 的信息，必须源自**成功的工具调用结果**（如 `shell` 执行成功、`file_tools(op="read")` 确认内容存在、代码运行通过）。
     *   **禁止**：严禁将模型的“固有知识”、“推理猜测”、“未执行的计划”或“未验证的假设”作为事实写入。
     *   **口号**：**No Execution, No Memory. (无行动，不记忆)**
 2.  **神圣不可删改性 (Sanctity of Verified Data)**
@@ -60,7 +60,7 @@ L4: 工作目录下的memory目录下raw_sessions子目录(历史会话层 - sch
 ### L3：任务级精简记录库 (工作目录下，memory子目录内)
 职责：补充 L1/L2 无法容纳、但对**特定任务**未来复用至关重要的少量详细信息。内容必须在满足复用需求的前提下**尽可能短**。
 原则：
-- 只记录：**跨会话**仍重要、且难以通过少量 file_read / web_scan / 简单脚本快速重建的要点。
+- 只记录：**跨会话**仍重要、且难以通过少量 file_tools / web_scan / 简单脚本快速重建的要点。
 - 优先写：该任务特有的隐藏前置条件、典型易踩坑点，一旦遗忘会导致高成本重试的信息。
 - 不记录：普通操作步骤、可在几步探测中重新获得的路径或状态信息。不记录项目特定事实（不符合跨会话要求，应当放入项目目录中）
 形式：
@@ -121,7 +121,7 @@ MEMORY_MANAGEMENT_SOP = """## 0. 核心公理 (Core Axioms - 最高优先级)
 L1 memory/global_mem_insight.txt（极简索引，≤30 行）→ L2 memory/global_mem.txt（事实库，`## [SECTION]`）→ L3 memory/*.md|*.py（任务级 SOP / 脚本）→ L4 memory/raw_sessions/（历史会话）。上层只做导航，细节在下层。
 
 ## 写记忆前必读
-**写任何 L1/L2/L3 前，先 `file_read("memory/memory_management_sop.md")` 读 META-SOP 全文**（各层职责与禁止项、L1↔L2/L3 同步规则、信息分类快速决策树与反例）。读完按「只读一次 SOP」原则把要点提炼进 key_info，之后不再重复读。
+**写任何 L1/L2/L3 前，先 `file_tools(op="read", path="memory/memory_management_sop.md")` 读 META-SOP 全文**（各层职责与禁止项、L1↔L2/L3 同步规则、信息分类快速决策树与反例）。读完按「只读一次 SOP」原则把要点提炼进 key_info，之后不再重复读。
 
 ## 决策树速记
 环境特异性事实（IP / 非标路径 / 凭证 / ID）→ L2，并同步 L1 导航行；全局通用避坑规律 → L1 [RULES] 一句；特定任务技术（艰难尝试才成功、未来复用）→ L3 专项 SOP；通用常识 / 易变状态 / 可几步重建的细节 → 判定冗余，直接丢弃。
@@ -283,7 +283,7 @@ L4: raw_sessions/ 历史会话
 [RULES]
 1. 搜索先行: 搜文件名禁长时间递归, 网络搜索一定优先使用bing, 优先看cwd，禁猜路径
 2. 交叉验证: 禁信摘要, 数值进详情页核实
-3. 编码安全: 禁PS cat/type用file_read; 改前必读
+3. 编码安全: 禁PS cat/type用file_tools(op="read"); 改前必读
 4. 分步执行，控制粒度，限制失败半径
 5. 闭环: 物理模拟后确认; 3次失败请求干预
 6. 进程: 禁无条件杀python(杀自己), 精确PID, 禁os.kill判活

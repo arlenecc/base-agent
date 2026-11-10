@@ -120,7 +120,7 @@ def test_outline_guidance_present_even_without_book_summary():
     eng = _Engine()
     res = RagOutlineTool(eng).run(book_name="a")
     assert res.success
-    assert "至多 3 次" in res.output and "无需再 rag_search" in res.output
+    assert "至多 3 次" in res.output and "无需再 rag_tools" in res.output
 
     eng.summary = "全书讲了 X"
     res2 = RagOutlineTool(eng).run(book_name="a")

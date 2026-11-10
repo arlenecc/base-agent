@@ -21,7 +21,7 @@ from typing import Any, Dict, List
 
 from ..config import AgentConfig
 from ..memory import LongTermMemory, WorkMemory
-from .base import Tool, ToolRegistry, ToolResult
+from .base import Tool, ToolRegistry, ToolResult, _FanoutTool
 
 logger = logging.getLogger(__name__)
 
@@ -374,3 +374,93 @@ class MemorySearchTool(Tool):
         # 统一体积兜底：单个观察可达数十 KB，20 条巨块全塞进上下文会挤爆
         # 窗口（与 mcp_client 的 200K 策略一致）。
         return ToolResult(True, output=_cap_output(json.dumps(results, ensure_ascii=False)))
+
+
+class LongMemoryTool(_FanoutTool):
+    """长期记忆统一门面：op 分发到 graph（知识图谱 CRUD）与 search（语义召回）。
+
+    ``memory_graph`` 内部还有自己的子操作（create_entity / delete_entity /
+    add_observations / create_relation / list_entities / get_entity / snapshot /
+    clear），合并后由 ``action`` 参数承载；``memory_search`` 直接是 op=search。
+    """
+
+    name = "long_memory"
+    description = (
+        "Long-term memory: op 'graph' for knowledge-graph CRUD, 'search' for "
+        "semantic recall.\n"
+        "- op=graph, action=create_entity(name, entity_type?, observations?)\n"
+        "  action=delete_entity(name) | add_observations(name, observations)\n"
+        "  action=create_relation(source, target, label)\n"
+        "  action=list_entities | get_entity(name) | snapshot | clear\n"
+        "- op=search, query=…, top_k? : semantic recall over observations"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "op": {"type": "string", "enum": ["graph", "search"]},
+            "action": {
+                "type": "string",
+                "description": "graph 专用：create_entity/delete_entity/add_observations/create_relation/list_entities/get_entity/snapshot/clear",
+            },
+            "name": {"type": "string"},
+            "entity_type": {"type": "string", "description": "person/project/concept/tool/place/other"},
+            "observations": {"type": "array", "items": {"type": "string"}},
+            "source": {"type": "string"},
+            "target": {"type": "string"},
+            "label": {"type": "string"},
+            "query": {"type": "string", "description": "search 专用：要回忆的内容（用用户原始措辞）"},
+            "top_k": {"type": "integer", "default": 5},
+        },
+        "required": ["op"],
+    }
+
+    # op 级参数隔离：graph 用 action/name/…，search 用 query/top_k，互不混用。
+    _op_params = {
+        "graph": {"action", "name", "entity_type", "observations",
+                  "source", "target", "label"},
+        "search": {"query", "top_k"},
+    }
+    # 合并前 memory_graph 自己的 op 值（clear/create_entity/…）现在都是
+    # long_memory 的 action。历史 SOP / 模型若误用旧值，给出可自纠的提示。
+    _legacy_op_hints = dict.fromkeys(
+        ("create_entity", "delete_entity", "add_observations",
+         "create_relation", "list_entities", "get_entity", "snapshot", "clear"),
+        "这是合并前 memory_graph 的 op 值；现在请用 long_memory(op='graph', "
+        "action=<该值>)。",
+    )
+
+    def __init__(self):
+        self._sub_tools = {
+            "graph": MemoryGraphTool(),
+            "search": MemorySearchTool(),
+        }
+
+    def should_confirm(self, args: Dict[str, Any]) -> bool:
+        # 保留 memory_graph 的破坏性确认：清空图谱 / 删实体不可逆。
+        op = str((args or {}).get("op", "") or "").strip().lower()
+        if op == "graph":
+            action = str((args or {}).get("action", "") or "").strip().lower()
+            return action in ("clear", "delete_entity")
+        return False
+
+    def run(self, op: str = "", **kwargs) -> ToolResult:
+        op = (op or "").strip().lower()
+        sub = self._sub_tools.get(op)
+        if sub is None:
+            return self._unknown_op_error(op)
+        err = self._validate_params(op, kwargs)
+        if err is not None:
+            return err
+        if op == "graph":
+            return self._sub_tools["graph"].run(
+                str(kwargs.get("action", "") or "").strip().lower(),
+                name=kwargs.get("name", ""),
+                entity_type=kwargs.get("entity_type", ""),
+                observations=kwargs.get("observations"),
+                source=kwargs.get("source", ""),
+                target=kwargs.get("target", ""),
+                label=kwargs.get("label", ""),
+            )
+        # op == "search"
+        return self._sub_tools["search"].run(
+            str(kwargs.get("query", "") or ""), top_k=kwargs.get("top_k", 5))

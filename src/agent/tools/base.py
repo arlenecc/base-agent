@@ -112,6 +112,179 @@ class AliasTool(Tool):
         return self.registry.execute(self._target_name, kwargs)
 
 
+class _FanoutTool(Tool):
+    """把多个原子工具合并成一个「门面」工具：``op`` 参数分发到子工具。
+
+    用于按用户要求把一组同域工具收敛成单个工具（file_* → file_tools、
+    memory_* → long_memory、skill_* → skill_tools、rag_* → rag_tools）。
+    子类只需声明合并后的 ``name`` / ``description`` / ``parameters``，并
+    在 ``__init__`` 里填 ``self._sub_tools = {op: 子工具实例}``。
+
+    关键语义：
+    - ``bind`` 会同时给所有子工具 bind（它们各自持有 config/registry 引用）；
+    - ``should_confirm`` 按 op 分发到子工具（保留 rag_ingest 的破坏性确认、
+      memory clear/delete_entity 的确认等细粒度策略）；
+    - ``run`` 按 op 分发，子工具抛 TypeError（参数错误）时转成可读的错误，
+      而不是被 execute() 误报成「工具内部缺陷」。
+
+    参数隔离（合并工具的核心风险）：所有子工具的参数被平铺进**同一张**
+    schema 表。若不校验，模型把 A op 的参数误传给 B op 时，带 ``**kwargs``
+    的子工具会静默吞掉（模型以为生效），不带 ``**kwargs`` 的会抛 TypeError，
+    行为不一致。因此子类声明 ``_op_params``：每个 op 允许的参数名集合，
+    分发前统一拒绝越界参数并给出该 op 的正确参数表。
+    """
+
+    _op_key = "op"
+    _sub_tools: Dict[str, Tool] = {}
+    # 子类声明：{op: 该 op 允许的参数名集合}（不含 op 本身）
+    _op_params: Dict[str, Any] = {}
+    # 子类可选：合并前原子工具自身 op 参数的旧值域 → 提示如何改写成新形态。
+    # 例：memory_graph(op="clear") → long_memory(op="graph", action="clear")
+    _legacy_op_hints: Dict[str, str] = {}
+
+    def bind(self, config: "AgentConfig", registry: "ToolRegistry") -> None:
+        self.config = config
+        self.registry = registry
+        for sub in self._sub_tools.values():
+            sub.bind(config, registry)
+
+    def should_confirm(self, args: Dict[str, Any]) -> bool:
+        op = str((args or {}).get(self._op_key, "") or "").strip().lower()
+        sub = self._sub_tools.get(op)
+        if sub is not None:
+            return sub.should_confirm(args)
+        return bool(self.destructive)
+
+    def _validate_params(self, op: str, supplied: Dict[str, Any]):
+        """拒绝不属于该 op 的参数；返回 ToolResult 错误或 None。"""
+        allowed = self._op_params.get(op)
+        if allowed is None:
+            return None  # 子类未声明 → 不做白名单（保持宽松）
+        extra = set(supplied) - set(allowed) - {self._op_key}
+        if extra:
+            return ToolResult(
+                False,
+                error=(f"Invalid arguments for {self._op_key}={op!r}: "
+                       f"unexpected parameter(s) {', '.join(sorted(extra))}. "
+                       f"For op={op!r} use only: {', '.join(sorted(allowed))}. "
+                       f"(其它 op 的参数不能混用)"),
+            )
+        return None
+
+    def _unknown_op_error(self, op: str) -> ToolResult:
+        hint = self._legacy_op_hints.get(op)
+        detail = (f"unknown {self._op_key} {op!r}; valid ops: "
+                  f"{', '.join(sorted(self._sub_tools))}")
+        if hint:
+            # 合并前该值曾是某个原子工具自己的 op 值（如 clear / list），
+            # 直接告诉模型新形态，避免它反复用旧值重试。
+            detail += f"。{hint}"
+        return ToolResult(False, error=detail)
+
+    def run(self, op: str = "", **kwargs) -> ToolResult:
+        op = str(op or "").strip().lower()
+        sub = self._sub_tools.get(op)
+        if sub is None:
+            return self._unknown_op_error(op)
+        err = self._validate_params(op, kwargs)
+        if err is not None:
+            return err
+        try:
+            return sub.run(**kwargs)
+        except TypeError as e:
+            # 子工具因缺参抛 TypeError：转成与 execute 签名预检一致的
+            # 「Invalid arguments」措辞，避免被上层误读成「工具内部缺陷」。
+            return ToolResult(
+                False,
+                error=f"Invalid arguments for {self._op_key}={op!r}: {e}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# 向后兼容别名：把合并前的旧工具名路由到新的门面工具 + 固定 op。
+#
+# 设计要点（模型可见面 vs 执行面分离）：
+# - 这些别名**不进 schemas()/names()**：LLM 只看到 12 个合并工具，不会因
+#   新旧两套名字混淆，也不重复占用 schema token。
+# - 但已落盘的会话历史、L3 SOP / 技能里记录的旧调用，以及既有测试脚本，
+#   仍可通过 get()/execute() 命中，避免「工具重命名后历史数据全部失效」。
+# - should_confirm 委托给门面工具（按 op 分发到原子工具），因此 rag_ingest /
+#   graph clear 等破坏性操作的确认策略不因合并而丢失。
+# - webexec_js 按本次需求**彻底删除**（其渲染能力已并入 web_scan 的
+#   render=true），刻意不设别名。
+# ---------------------------------------------------------------------------
+# (旧名, 门面工具名, 固定 op, 旧参数中需要改名的键, 需要从旧参数里丢弃的键)
+_LEGACY_ALIASES = [
+    ("file_read", "file_tools", "read", {}, ()),
+    ("file_write", "file_tools", "write", {}, ()),
+    ("file_append", "file_tools", "append", {}, ()),
+    ("file_modify", "file_tools", "modify", {}, ()),
+    ("file_patch", "file_tools", "patch", {}, ()),
+    ("file_list", "file_tools", "list", {}, ()),
+    ("file_delete", "file_tools", "delete", {}, ()),
+    ("file_move", "file_tools", "move", {}, ()),
+    ("file_copy", "file_tools", "copy", {}, ()),
+    ("file_search", "file_tools", "search", {}, ()),
+    ("memory_graph", "long_memory", "graph", {"op": "action"}, ()),
+    ("memory_search", "long_memory", "search", {}, ()),
+    ("skill_search", "skill_tools", "search", {}, ("op",)),
+    ("skill_load", "skill_tools", "load", {}, ()),
+    ("skill_semantic_search", "skill_tools", "semantic_search", {}, ()),
+    ("skill_save", "skill_tools", "save", {}, ()),
+    ("rag_search", "rag_tools", "search", {}, ()),
+    ("rag_outline", "rag_tools", "outline", {}, ()),
+    ("rag_status", "rag_tools", "status", {}, ()),
+    ("rag_ingest", "rag_tools", "ingest", {}, ()),
+]
+
+
+class _LegacyAliasTool(Tool):
+    """旧工具名的兼容入口：把调用规范化后交给门面工具执行。
+
+    本身不出现在 schemas/names 里（``_legacy=True``），只服务于 get/execute。
+    """
+
+    _legacy = True
+
+    def __init__(self, old_name: str, facade: str, op: str,
+                 renames: Dict[str, str], drop: tuple):
+        self.name = old_name
+        self._facade = facade
+        self._op = op
+        self._renames = dict(renames)
+        self._drop = tuple(drop)
+        self.destructive = False
+        self.description = f"(legacy alias) use {facade}(op={op!r}) instead."
+        self.parameters = {"type": "object", "properties": {}}
+
+    def bind(self, config: "AgentConfig", registry: "ToolRegistry") -> None:
+        self.config = config
+        self.registry = registry
+
+    def _normalize(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in (args or {}).items():
+            if k in self._drop:
+                continue
+            if k == "op":
+                # 旧调用的 op 是「原子工具自己的 op」（如 memory_graph 的
+                # create_entity）：有改名规则就保留为 action，否则丢弃
+                # （门面工具的 op 由 self._op 覆盖）。
+                if "op" in self._renames:
+                    out[self._renames["op"]] = v
+                continue
+            out[self._renames.get(k, k)] = v
+        out["op"] = self._op
+        return out
+
+    def should_confirm(self, args: Dict[str, Any]) -> bool:
+        facade = self.registry.get(self._facade)
+        return facade.should_confirm(self._normalize(args)) if facade else False
+
+    def run(self, **kwargs) -> ToolResult:
+        return self.registry.execute(self._facade, self._normalize(kwargs))
+
+
 class ToolRegistry:
     # run 的 Signature 缓存（按工具类）：工具集注册后固定，没必要每次
     # execute() 都重新构造 Signature 对象。
@@ -140,29 +313,26 @@ class ToolRegistry:
 
     # ------------------------------------------------------------------
     def _register_defaults(self) -> None:
-        from .file_ops import FileReadTool, FileWriteTool, FileModifyTool, FileAppendTool
+        from .file_ops import FileToolsTool
         from .code_run import CodeRunTool
         from .shell_run import ShellRunTool
-        from .web import WebScanTool, WebExecJsTool
+        from .web import WebScanTool
         from .interact import AskUserTool
-        from .memory import WorkMemoryTool, MemoryGraphTool, MemorySearchTool
-        from .skill_search import SkillSearchTool, SkillLoadTool, SkillSemanticSearchTool, SkillSaveTool
+        from .memory import WorkMemoryTool, LongMemoryTool
+        from .skill_search import SkillToolsTool
         from .checkpoint import UpdateWorkingCheckpointTool, StartLongTermUpdateTool
         from .plan import UpdatePlanTool
 
         tools_to_register = [
-            FileReadTool(), FileWriteTool(), FileModifyTool(), FileAppendTool(),
+            # 合并后的门面工具（op 参数分发）
+            FileToolsTool(),          # read/write/append/modify/patch/list/delete/move/copy/search
+            LongMemoryTool(),         # graph/search
+            SkillToolsTool(),         # search/load/semantic_search/save
             CodeRunTool(),
             ShellRunTool(),
-            WebScanTool(),
+            WebScanTool(),            # 唯一 web 工具（含 render=true 浏览器渲染）
             AskUserTool(),
             WorkMemoryTool(),
-            MemoryGraphTool(),
-            MemorySearchTool(),
-            SkillSearchTool(),
-            SkillLoadTool(),
-            SkillSemanticSearchTool(),
-            SkillSaveTool(),
             # 沉淀态原子工具（对齐 GenericAgent）
             UpdateWorkingCheckpointTool(),
             StartLongTermUpdateTool(),
@@ -170,33 +340,20 @@ class ToolRegistry:
             UpdatePlanTool(),
         ]
 
-        # webexec_js: only register when browser_endpoint is configured.
-        # Saves ~146 tokens of schema when no browser bridge is available
-        # (the common case).  Without an endpoint the tool just returns
-        # guidance text — no functional value.
-        if getattr(self.config, "browser_endpoint", ""):
-            tools_to_register.append(WebExecJsTool())
-
         for t in tools_to_register:
             t.bind(self.config, self)
             self._tools[t.name] = t
 
-        # 原子工具命名对齐 GenericAgent（同一实现，只是多一个入口名）
-        for target, alias, desc in (
-            ("file_modify", "file_patch",
-             "Replace a unique block of text (old) with new. old must match "
-             "exactly (whitespace/indentation). Use file_read first to get "
-             "current content."),
-            ("webexec_js", "web_execute_js",
-             "Execute JavaScript in the attached browser for full page control."),
-        ):
-            if target in self._tools and alias not in self._tools:
-                a = AliasTool(target, alias, desc)
-                a.bind(self.config, self)
-                self._tools[alias] = a
-
-        # Register RAG tools
+        # Register RAG tools（rag_tools 在这里注册，别名要等它就绪）
         self._register_rag_tools()
+
+        # 向后兼容别名：注册进 _tools（get/execute 能命中），但带 _legacy
+        # 标记，不进 schemas()/names()——模型只看到合并后的工具集。
+        for old, facade, op, renames, drop in _LEGACY_ALIASES:
+            if facade in self._tools and old not in self._tools:
+                a = _LegacyAliasTool(old, facade, op, renames, drop)
+                a.bind(self.config, self)
+                self._tools[old] = a
 
         # Register MCP tools from configured servers
         self._register_mcp_tools()
@@ -329,7 +486,7 @@ class ToolRegistry:
 
             from ..rag.engine import RAGEngine, effective_embedding_model
             from ..rag.vector_store import DEFAULT_RERANK_MODEL
-            from .rag_tool import RagSearchTool, RagStatusTool, RagIngestTool, RagOutlineTool
+            from .rag_tool import RagToolsTool
 
             # 打印 RAG 管线「实际采用」的各模型：local 模式优先 *_local_* 字段，
             # 与 engine 的 effective_embedding_model 同口径；api 模式才用
@@ -408,9 +565,7 @@ class ToolRegistry:
             self._rag_engine = engine
 
             registered = []
-            for t in [RagSearchTool(engine, aux_llm_getter=self._aux_llm_getter),
-                      RagStatusTool(engine), RagIngestTool(engine),
-                      RagOutlineTool(engine)]:
+            for t in [RagToolsTool(engine, aux_llm_getter=self._aux_llm_getter)]:
                 if t.name not in self._tools:
                     t.bind(self.config, self)
                     self._tools[t.name] = t
@@ -543,10 +698,18 @@ class ToolRegistry:
             # 工具对象仍持有刚 close 的引擎；若不摘掉，shutdown 后一次
             # execute() 会经 _get_store() 静默重建 LanceDB 连接并重新加载
             # embedding 权重（~600MB C++ 堆），且拿到半死引擎的状态。
-            for _rag_name in ("rag_search", "rag_outline", "rag_status", "rag_ingest"):
-                _rag_tool = self._tools.get(_rag_name)
-                if _rag_tool is not None and hasattr(_rag_tool, "_engine"):
-                    _rag_tool._engine = None
+            # 覆盖两种形态：合并后的 rag_tools 门面（引擎在 _sub_tools 里）
+            # 与直接注册进 _tools 的 RAG 原子工具（含测试/兼容别名场景）。
+            _seen: set = set()
+            for _t in list(self._tools.values()):
+                _candidates = [_t]
+                _candidates.extend(getattr(_t, "_sub_tools", {}).values())
+                for _cand in _candidates:
+                    if id(_cand) in _seen:
+                        continue
+                    _seen.add(id(_cand))
+                    if hasattr(_cand, "_engine"):
+                        _cand._engine = None
         # Release the singleton LongTermMemory's GraphMemoryStore (LanceDB +
         # FastEmbed ONNX model ~137MB).  Without this, each _rebuild_agent()
         # call leaks the model loaded for the knowledge graph.
@@ -593,10 +756,14 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def names(self) -> List[str]:
-        return list(self._tools.keys())
+        # 兼容别名不对外暴露：模型只看到合并后的工具名。
+        return [n for n, t in self._tools.items()
+                if not getattr(t, "_legacy", False)]
 
     def schemas(self) -> List[Dict[str, Any]]:
-        return [t.schema() for t in self._tools.values()]
+        # 同上：别名不进下发给 LLM 的 schema（省 token、避免新旧名混淆）。
+        return [t.schema() for t in self._tools.values()
+                if not getattr(t, "_legacy", False)]
 
     # ------------------------------------------------------------------
     def execute(self, name: str, args: Dict[str, Any]) -> ToolResult:

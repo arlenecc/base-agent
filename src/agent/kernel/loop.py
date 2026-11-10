@@ -76,9 +76,8 @@ _MIN_SINGLE_GEN_TOKENS = 8192
 # 下发前缀从 ~6200 token 降到 ~4100（实测 schema 全量 3984 / system 2238）。
 # 注意：不放进 update_plan——简单任务本就被规划门豁免，给了反而诱导建计划。
 _LITE_TOOL_NAMES = frozenset({
-    "file_read", "file_write", "file_modify", "file_append",
-    "code_run", "shell_run", "web_scan",
-    "ask_user", "rag_search", "memory_search",
+    "file_tools", "code_run", "shell_run", "web_scan",
+    "ask_user", "rag_tools", "long_memory",
 })
 # 输入含 URL/域名/明确点名工具时**强制全量工具组**：这类输入是用户在指挥
 # 具体的工具操作，几乎必然是多步（抓取 → 处理 → 输出），需要 update_plan
@@ -87,9 +86,8 @@ _LITE_TOOL_NAMES = frozenset({
 # 空白、任务不执行——正是用户报告的「计划不执行」。
 _NEEDS_FULL_TOOLS_RE = re.compile(
     r"(https?://|\b[a-z0-9-]+\.(?:com|cn|net|org|io|dev|app|xyz)\b|"
-    r"web_scan|webexec_js|code_run|shell_run|file_read|file_write|"
-    r"file_modify|file_append|rag_search|rag_ingest|memory_search|"
-    r"memory_graph|skill_search|skill_load)", re.I)
+    r"web_scan|code_run|shell_run|file_tools|rag_tools|long_memory|"
+    r"skill_tools)", re.I)
 
 # 寒暄 / 自我认知（能力、功能、身份）类问答：答案就在系统提示里，不需要
 # 推理也不需要工具。但本地小模型会无视系统提示的软禁令：连发 rag_* 空转
@@ -977,7 +975,7 @@ class KernelLoop:
                         "[ERROR] 你上一条回复只有一个 <summary> 任务复述，"
                         "没有任何正文、也没有调用任何工具——这不是有效的执行。"
                         "请立即：1) 调用完成本任务所需的第一个工具（例如 "
-                        "web_scan 抓取页面 / file_read 读取文件）；2) 等工具"
+                        "web_scan 抓取页面 / file_tools 读取文件）；2) 等工具"
                         "结果返回后再输出正文。不要只复述计划。")
                     continue
                 if event == "retry":
@@ -995,7 +993,7 @@ class KernelLoop:
                         pending = _carry_task(
                             "[System] 检测到你上轮主要内容是大段代码却未调用工具。"
                             "若这些代码需要执行/写入/分析，请显式调用 code_run / "
-                            "file_write / file_patch；"
+                            "file_tools；"
                             "若只是展示给用户的示例，请在回复中补充自然语言说明。"
                         )
                         continue
@@ -1080,20 +1078,27 @@ class KernelLoop:
                 }
                 exec_calls = [tc for tc in tool_calls if tc.name != "ask_user"]
 
-            # ---- rag_search 轮内硬上限（先总后分检索收敛）----
+            # ---- rag_tools(op=search) 轮内硬上限（先总后分检索收敛）----
             # 提示词层面的「至多 3 次」对本地小模型不可靠（实测仍会连发无效
-            # search），在派发层面强制：超过上限的 rag_search 不执行，以纠正
+            # search），在派发层面强制：超过上限的 search 不执行，以纠正
             # 反馈占位，逼模型基于已有目录/【全书摘要】/已检索内容直接作答。
             _capped: List[ToolCall] = []
             for tc in exec_calls:
-                if tc.name == "rag_search":
+                # 同时认新名 rag_tools(op=search) 与旧名 rag_search：后者是
+                # 合并前的调用，历史会话/技能 SOP 里仍可能出现，不该绕过上限。
+                _is_rag_search = (
+                    tc.name == "rag_search" or (
+                        tc.name == "rag_tools"
+                        and str((tc.args or {}).get("op", ""))
+                        .strip().lower() == "search"))
+                if _is_rag_search:
                     if self._rag_search_calls >= _RAG_SEARCH_MAX_PER_RUN:
                         blocked_asks[tc.id] = (
-                            f"[System] 本轮 rag_search 已达硬上限"
+                            f"[System] 本轮 rag_tools 检索已达硬上限"
                             f"（{_RAG_SEARCH_MAX_PER_RUN} 次）。停止检索——"
                             "基于已获取的目录/【全书摘要】/已检索内容直接输出"
                             "最终回答；个别细节缺失就如实说明，不要继续检索。")
-                        self.log("[kernel] rag_search 达到轮内上限 %d，拦截"
+                        self.log("[kernel] rag_tools 检索达到轮内上限 %d，拦截"
                                  % _RAG_SEARCH_MAX_PER_RUN)
                         continue
                     self._rag_search_calls += 1

@@ -86,7 +86,7 @@ class AgentCallbacks:
 SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the user's task by reasoning, planning, and calling tools.
 
 ## 交互协议
-- 每轮正文先输出 <summary>…</summary>（≤30 词真实快照：上一步新信息 + 本次意图），禁止空话。
+- 每轮正文先输出 <summary>…</summary>（≤30 字真实快照：上一步新信息 + 本次意图），禁止空话。
 - 需求未完成就调用工具推进；查资料类问答信息已足时**直接给出最终回答本身就是推进**，禁止把「接下来再查 X」当推进。
 - `ask_user` 是弹框打断，非必要不用：仅缺自己无法获取的关键信息才问，一次一个问题；寒暄/问候/闲聊绝不调用，禁止问「你想做什么任务」、禁止问可推断的内容、禁止请求继续或许可。
 - 禁止复读：同一句话/同一问题不输出第二遍。
@@ -96,29 +96,29 @@ SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the us
 - 工具结果回来先在 <summary> 写清证实/推翻了什么；每步完成用 `update_plan(op="patch", status=..., note=...)` 更新；计划有未完成步骤不许只给文字总结收尾。
 - 工具报错是信号：读报错分类 → 换没试过的方法重试 → 至少 3 种方法都失败才标 blocked 并继续其余步骤。绝不重复同样的失败调用、不把报错甩给用户、不停下问要不要继续。
 
-## 全局记忆 L0~L4（核心公理常驻本提示；规则全文见 memory/memory_management_sop.md）
-- 写任何 L1/L2/L3 前先 `file_read("memory/memory_management_sop.md")` 读全文并提炼进 key_info。L1 是极简索引：决策前先看；需要细节才 `file_read` L2(global_mem.txt) 或 memory/ 下的 L3 SOP，禁止把 L2/L3 全文塞进上下文。
+## 全局记忆 L0~L4（公理/层级/决策树/红线见常驻 L0；全文 memory/memory_management_sop.md）
+- 写 L1/L2/L3 前先 `file_tools(op="read", path="memory/memory_management_sop.md")` 读全文；L1 是极简索引，需要细节才读 L2/L3 SOP，禁止把全文塞进上下文。
 - 读到 L3 SOP 后立刻用 `update_working_checkpoint(key_info=...)` 提炼「关键前置 + 典型坑 + 指针」，之后每轮随 key_info 回注，不重复读同一份。
-- L2/L3 唯一正式写入入口是 `start_long_term_update`（轮数 <5 直接拒绝）：按 L0 决策树归类后用 `file_append` **追加**；严禁 `file_write`/`code_run` 覆盖、严禁写未验证/易变信息。写完内核自动同步 L1 并重新注入。
+- L2/L3 唯一正式写入入口是 `start_long_term_update`（轮数 <5 直接拒绝）：按 L0 决策树归类后用 `file_tools(op="append", ...)` **追加**；严禁 `file_tools(op="write", ...)`/`code_run` 覆盖、严禁写未验证/易变信息。写完内核自动同步 L1 并重新注入。
 - 会话全文/摘要由系统自动落到 `memory/raw_sessions/`，无需手动记录。
 
 ## 何时调用工具 / 记忆
-- 纯寒暄/问候/闲聊：只回一句文字，**绝不调用任何工具**（含 `rag_*` / `memory_*` / `update_plan`），不建计划、不写记忆、不检索知识库；即使知识库已加载也**绝不主动** `rag_outline` / `rag_search`。误调报错也不重试。
+- 纯寒暄/问候/闲聊：只回一句文字，**绝不调用任何工具**（含 `rag_tools` / `long_memory` / `update_plan`），不建计划、不写记忆、不检索知识库；即使知识库已加载也**绝不主动** `rag_tools(op="outline")` / `rag_tools(op="search")`。误调报错也不重试。
 - 自我认知/能力类：直接回答，不查知识库、不查记忆。
 - 消息里写了具体目标就是任务，直接开做；绝对不要说「你没有给出具体任务」。只缺某个参数时用 `ask_user` 问那一个参数。
 - 依赖用户资料/文件的问题才查证：不必建计划、不必固化技能，但该调的工具照调。
-- ⚠️ `rag_*` 检索是「被动」能力：仅在用户**显式**提到某文档/书名/具体查询词时才调用；用户只是打招呼或没提资料需求时，即使知识库已加载也**绝不主动** `rag_outline` / `rag_search`。
-  - 列文档 → `rag_outline()` 不带参数。
-  - 问某本书内容 → 先总后分：① `rag_outline(book_name="书名")` 拿目录/【全书摘要】；② 缺细节才 `rag_search(query=概念词, source="书名")`；③ 组织成有针对性、结构清晰的回答。**不要跳过 outline 直接 search**。收敛（内核强制：本轮 rag_search 超过 3 次会被直接拦截）：有【全书摘要】问整体内容时读摘要直接作答、不要再 search；确需细节只 search 一次前言/导论；章节已有摘要直接用；只涉及个别章节只 search 那几章。不重复已检索过的主题、不逐章扫描；禁止把「接下来再检索 X」写进回复；两轮无新信息立即用已有材料作答。
-  - 问句没点名文档 → 先 `rag_outline()` 不带参数列全部：只 1 篇就对它先总后分；多篇时挑文档名/主题与问题最相关的一篇直接执行、回答开头注明「基于《XX》」；确实无法判断才用 ask_user 请用户选择。
-  - 问文件内容 → `file_read` 读完给结论；`rag_search` 的 query 用概念词，不要把问句原样当检索词，查完不凭印象回答。
-- 涉及用户本人/过往工作：先 `memory_search` 召回长期记忆再回答。
+- ⚠️ `rag_tools` 检索是「被动」能力：仅在用户**显式**提到某文档/书名/具体查询词时才调用。
+  - 列文档 → `rag_tools(op="outline")` 不带 book_name。
+  - 问某本书内容 → 先总后分：① `rag_tools(op="outline", book_name="书名")` 拿目录/【全书摘要】；② 缺细节才 `rag_tools(op="search", query=概念词, source="书名")`；③ 组织成有针对性、结构清晰的回答。**不要跳过 outline 直接 search**。收敛（内核强制：本轮 rag_tools 检索超过 3 次会被直接拦截）：有【全书摘要】问整体内容时读摘要直接作答、不要再 search；确需细节只 search 一次前言/导论；章节已有摘要直接用；只涉及个别章节只 search 那几章。不重复已检索过的主题、不逐章扫描；禁止把「接下来再检索 X」写进回复；两轮无新信息立即用已有材料作答。
+  - 问句没点名文档 → 先 `rag_tools(op="outline")` 不带参数列全部：只 1 篇就对它先总后分；多篇时挑文档名/主题与问题最相关的一篇直接执行、回答开头注明「基于《XX》」；确实无法判断才用 ask_user 请用户选择。
+  - 问文件内容 → `file_tools(op="read", path=...)` 读完给结论；`rag_tools(op="search")` 的 query 用概念词，不要把问句原样当检索词，查完不凭印象回答。
+- 涉及用户本人/过往工作：先 `long_memory(op="search", query=...)` 召回长期记忆再回答。
 - 只在有真实状态要记时才调记忆工具；一步任务产生的「后续必须知道」事实记进 key_info，否则不记。
 
 ## 通用规则
-1. 破坏性最小；不可逆/危险操作先确认。路径相对于工作区，仅 `code_run`/`shell_run`/外部 MCP 需确认。
-2. 复杂任务先 `skill_semantic_search`，无结果再 `skill_search`；命中就 `skill_load` 照做。
-3. 语义检索（memory_search/skill_semantic_search/rag_search）的 query 用用户原话的自然语言，禁止翻译/转拼音/压成光杆关键词。
+1. 破坏性最小；不可逆/危险操作先确认（由工具层门控）。路径相对于工作区；`code_run`/`shell_run` 按风险分级、`rag_tools(op="ingest")` 重建索引、长期记忆清空/删实体、外部 MCP 会请求确认。
+2. 复杂任务先 `skill_tools(op="semantic_search", query=...)`，无结果再 `skill_tools(op="search", query=...)`；命中就 `skill_tools(op="load", path=...)` 照做。
+3. 语义检索（long_memory/skill_tools/rag_tools 的 search）的 query 用用户原话的自然语言，禁止翻译/转拼音/压成光杆关键词。
 4. 完成后用简洁纯文本回复。"""
 
 # ---------------------------------------------------------------------------
@@ -181,11 +181,28 @@ _AUX_IDLE_DELAY = 2.0
 # （两个 file_read 同时启动后，中途取消就无法再拦住第二个）。因此 file_read /
 # skill_load / rag_status / memory_graph 保持串行。
 _PARALLEL_SAFE_TOOLS = frozenset({
-    "web_scan",                                   # 网络请求
-    "rag_search", "rag_outline",                  # 向量 + BM25 检索
-    "skill_search", "skill_semantic_search",      # 技能检索（含 LanceDB 查询）
-    "memory_search",                              # 长期记忆语义检索
+    "web_scan",                                   # 网络请求（纯只读）
+    "rag_tools",                                  # 知识库（仅 search/outline/status 只读 op）
+    "skill_tools",                                # 技能（仅 search/semantic_search/load 只读 op）
+    "long_memory",                                # 长期记忆（仅 search 只读 op）
 })
+# 门面工具的「只读 op」白名单：写 op（rag ingest / skill save / graph 写入）
+# 绝不并发——两个写操作可能落到同一资源上。非门面工具（web_scan）无 op 分支，
+# 整个工具并发安全，不在本表内。
+_PARALLEL_SAFE_OPS = {
+    "rag_tools": frozenset({"search", "outline", "status"}),
+    "skill_tools": frozenset({"search", "semantic_search", "load"}),
+    "long_memory": frozenset({"search"}),
+}
+
+
+def _is_parallel_safe_op(name: str, args: Dict[str, Any]) -> bool:
+    """门面工具按 op 细分并发安全；非门面工具（web_scan）恒并发安全。"""
+    safe_ops = _PARALLEL_SAFE_OPS.get(name)
+    if safe_ops is None:
+        return True
+    op = str((args or {}).get("op", "") or "").strip().lower()
+    return op in safe_ops
 
 
 
@@ -271,7 +288,7 @@ class _ToolDispatcher:
                 results[idx] = res
                 continue
 
-            if name in _PARALLEL_SAFE_TOOLS:
+            if name in _PARALLEL_SAFE_TOOLS and _is_parallel_safe_op(name, args):
                 parallel_jobs.append((idx, name, args))
                 continue
 
@@ -1480,8 +1497,9 @@ class Agent:
                 sk = data.get("skill") or {}
                 if sk.get("name") and sk.get("summary"):
                     self.tools.execute(
-                        "skill_save",
+                        "skill_tools",
                         {
+                            "op": "save",
                             "name": sk["name"],
                             "description": sk["summary"],
                             "when_to_use": sk.get("when_to_use", ""),
@@ -1767,11 +1785,12 @@ class Agent:
                         source_list += f" (and {len(sources) - 8} more)"
                     parts.append(
                         f"# Knowledge base\n{chunks} chunks in {len(sources)} "
-                        f"file(s): {source_list}. Answer from these via `rag_search`.")
+                        f"file(s): {source_list}. Answer from these via "
+                        f"`rag_tools(op=\"search\")`.")
                 else:
                     parts.append(
                         "# Knowledge base\nConfigured but empty. "
-                        "Use `rag_ingest` to index.")
+                        "Use `rag_tools(op=\"ingest\")` to index.")
         except Exception:  # pragma: no cover
             pass
         # 工作记忆 + 当天事实
@@ -1821,11 +1840,11 @@ class Agent:
             matched = self.skills.match(user_text) if user_text else None
             if matched:
                 # 技能 prompt 是用户自写的原文，长度不可控；截断并提示用
-                # skill_load 读全文，避免长技能把系统提示撑大。
+                # skill_tools(op=load) 读全文，避免长技能把系统提示撑大。
                 sp = matched.prompt or ""
                 if len(sp) > _MAX_SKILL_PROMPT_CHARS:
                     sp = (sp[:_MAX_SKILL_PROMPT_CHARS] +
-                          "\n…（已截断，用 skill_load 读取完整技能内容）")
+                          "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）")
                 parts.append(f"# Active skill: {matched.name}\n{sp}")
         except Exception:  # pragma: no cover
             pass
