@@ -1185,7 +1185,7 @@ python -m agent.tools.rag_mcp_server --transport http --port 8080 --scope lan
 
 | 工具名 | 能力 |
 |--------|------|
-| `parse_and_ingest_document` | 复杂文档解析入库（PDF / Office / Markdown 等） |
+| `ingest_document` | 复杂文档解析入库（PDF / Office / Markdown 等） |
 | `delete_document` / `forget_context` | 知识遗忘 / 删除文档（向量 + 元数据 + 原文缓存） |
 | `list_document` | 已入库文件列表 |
 | `extract_metadata` | 智能元数据提取（章节目录 + 摘要） |

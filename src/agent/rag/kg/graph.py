@@ -142,6 +142,90 @@ class KnowledgeGraph:
         edges.sort(key=lambda e: e.get("weight", 1), reverse=True)
         return edges
 
+    # ------------------------------------------------------------------
+    # 图查询（MCP 工具：get_path / get_subgraph）
+    # ------------------------------------------------------------------
+
+    def find_path(self, src_key: str, dst_key: str,
+                  algorithm: str = "bfs") -> Optional[Dict[str, Any]]:
+        """两实体间寻路，返回沿途全部节点与边的信息。
+
+        算法：
+        * ``bfs``      —— 广度优先，最少跳数（networkx 无权最短路）；
+        * ``dfs``      —— 深度优先：从 source 构造 DFS 树，树内到 target 的路径
+          （同一对节点 DFS 路径可能比 BFS 长，体现"一条走到底"的语义）；
+        * ``dijkstra`` —— 加权最短路：weight 越大关系越强，距离取 1/weight，
+          即优先走"证据最强"的边。
+
+        无路径 / 节点不存在返回 None。边字典附 ``from_key`` / ``to_key``。
+        """
+        algo = str(algorithm or "bfs").lower()
+        with self._lock:
+            if src_key not in self._g or dst_key not in self._g:
+                return None
+            try:
+                if algo == "dijkstra":
+                    def _dist(_u, _v, d):
+                        return 1.0 / max(float(d.get("weight", 1)), 1e-6)
+                    path = nx.shortest_path(self._g, src_key, dst_key, weight=_dist)
+                elif algo == "dfs":
+                    tree = nx.dfs_tree(self._g, src_key)
+                    path = nx.shortest_path(tree, src_key, dst_key)
+                else:
+                    path = nx.shortest_path(self._g, src_key, dst_key)
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                return None
+            nodes = [dict(self._g.nodes[k], name_key=k) for k in path]
+            edges: List[Dict[str, Any]] = []
+            for u, v in zip(path, path[1:]):
+                d = self._g.get_edge_data(u, v) or {}
+                d = dict(d)
+                d["from_key"], d["to_key"] = u, v
+                edges.append(d)
+        return {"algorithm": algo or "bfs", "length": len(path) - 1,
+                "nodes": nodes, "edges": edges}
+
+    def extract_subgraph(self, root_key: str, depth: int = 1,
+                         edge_types: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """从 root 出发 BFS depth 跳的子图（节点 + 边，附各节点跳数）。
+
+        edge_types 非空时按边的 relation_type / keywords 子串过滤
+        （大小写不敏感，任一命中即保留边；孤立节点随之被剪掉）。
+        """
+        depth = max(int(depth or 1), 1)
+        type_lows = [t.strip().lower() for t in (edge_types or []) if t and t.strip()]
+        with self._lock:
+            if root_key not in self._g:
+                return None
+            visited = {root_key: 0}
+            order = [root_key]
+            frontier = [root_key]
+            for d in range(depth):
+                nxt = []
+                for k in frontier:
+                    for nb in self._g.neighbors(k):
+                        if nb not in visited:
+                            visited[nb] = d + 1
+                            nxt.append(nb)
+                            order.append(nb)
+                frontier = nxt
+            edges = []
+            for u, v, d in self._g.edges(order, data=True):
+                if u not in visited or v not in visited:
+                    continue
+                dd = dict(d)
+                if type_lows:
+                    hay = f"{dd.get('relation_type', '')} {dd.get('keywords', '')}".lower()
+                    if not any(t in hay for t in type_lows):
+                        continue
+                dd["from_key"], dd["to_key"] = u, v
+                edges.append(dd)
+            nodes = [dict(self._g.nodes[k], name_key=k, depth=visited[k])
+                     for k in order if k == root_key or not type_lows
+                     or any(e.get("from_key") == k or e.get("to_key") == k
+                            for e in edges)]
+        return {"root": root_key, "depth": depth, "nodes": nodes, "edges": edges}
+
     def sorted_edges(self) -> List[Dict[str, Any]]:
         """全部边，按 weight 降序（global 策略召回用）。"""
         with self._lock:

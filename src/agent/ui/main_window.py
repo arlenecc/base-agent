@@ -915,6 +915,81 @@ class BuildKGWorker(QThread):
                 self.kg_finished.emit(emit_stats)
 
 
+class ConsolidateKGWorker(QThread):
+    """后台语义向量消歧：对库内现有实体做对齐与合并（构建期规则消歧的补位）。
+
+    不依赖 LLM/辅助模型——直接复用构建期算好的实体向量（kg_vectors，
+    name+description 文本向量），余弦相似度找出「写法不同但语义同一」的
+    实体对齐合并，完成后重建图快照。信号与 BuildKGWorker 同一套（kg_ 前缀，
+    避免遮蔽 QThread.finished），UI 槽函数完全复用。
+    """
+
+    kg_finished = pyqtSignal(dict)     # stats dict: scanned/merged/threshold
+    kg_failed = pyqtSignal(str)        # error message
+    kg_progress = pyqtSignal(int, int, str)  # done, total, message
+
+    kind = "consolidate"  # _on_kg_progress/_on_kg_failed 据此区分状态文案
+
+    def __init__(self, workspace: str, knowledge_base: str, config=None):
+        super().__init__()
+        self._workspace = workspace
+        self._knowledge_base = knowledge_base
+        self._config = config
+        self._engine: Optional[RAGEngine] = None
+        self._cancel = threading.Event()
+        self._log_buffer: list = []
+        self._log_buffer_lock = threading.Lock()
+
+    def _emit_log(self, msg: str) -> None:
+        with self._log_buffer_lock:
+            self._log_buffer.append(msg)
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:  # type: ignore[override]
+        emit_stats = None
+        emit_error = None
+        try:
+            from ..rag.kg import KGCancellation
+            self._emit_log("[kg] 语义消歧开始：先补齐缺失实体向量 …")
+            self._engine = RAGEngine(
+                workspace=self._workspace,
+                knowledge_base=self._knowledge_base,
+                embedding_model="",
+                rerank_model=getattr(self._config, "rag_rerank_model",
+                                     DEFAULT_RERANK_MODEL),
+                rerank_enabled=False,
+                chunk_size=getattr(self._config, "rag_chunk_size", 800),
+                chunk_overlap=getattr(self._config, "rag_chunk_overlap", 50),
+                overlap_percent=getattr(self._config, "rag_chunk_overlap_percent", 0.10),
+                use_semantic=getattr(self._config, "rag_chunk_semantic", True),
+                clamp_model=effective_embedding_model(self._config),
+            )
+            stats = self._engine.kg_semantic_consolidate(
+                progress_callback=lambda d, t, m: self.kg_progress.emit(d, t, m),
+                cancel_event=self._cancel,
+            )
+            emit_stats = stats
+        except KGCancellation:
+            self._emit_log("[kg] 消歧已取消")
+            emit_error = "消歧已取消"
+        except Exception as e:
+            self._emit_log(f"[kg] ❌ 消歧失败: {e}")
+            logger.error("ConsolidateKGWorker failed: %s", e, exc_info=True)
+            emit_error = f"{type(e).__name__}: {e}"
+        finally:
+            if self._engine is not None:
+                try:
+                    self._engine.close()
+                except Exception as e:
+                    logger.warning("ConsolidateKGWorker: engine close failed: %s", e)
+            if emit_error is not None:
+                self.kg_failed.emit(emit_error)
+            elif emit_stats is not None:
+                self.kg_finished.emit(emit_stats)
+
+
 class SyncKnowledgeWorker(QThread):
     """Background worker for RAG knowledge base ingestion.
 
@@ -2435,6 +2510,16 @@ class MainWindow(QMainWindow):
             "GLiNER 方案不依赖辅助模型。")
         self.kg_build_btn.clicked.connect(self._on_build_kg)
         kg_row.addWidget(self.kg_build_btn)
+        # 实体消歧：后期手动触发，对库内现有实体做语义向量消歧（对齐/合并）。
+        self.kg_dedup_btn = QPushButton("实体消歧")
+        self.kg_dedup_btn.setToolTip(
+            "对库内现有实体做语义向量消歧（构建期只做规则消歧，这里补做深层对齐）：\n"
+            "复用构建期算好的实体向量（实体名+描述），余弦相似度找出\n"
+            "「写法不同但语义同一」的实体（如中英文/全称简称），自动合并实体、\n"
+            "改写关系端点并重建图快照。不依赖 LLM/辅助模型。\n"
+            "建议「构建知识图谱」完成后运行；可重复执行（幂等续跑）。")
+        self.kg_dedup_btn.clicked.connect(self._on_consolidate_kg)
+        kg_row.addWidget(self.kg_dedup_btn)
         self.kg_status_label = QLabel("状态: 未构建")
         kg_row.addWidget(self.kg_status_label)
         kg_row.addStretch(1)
@@ -3796,32 +3881,86 @@ class MainWindow(QMainWindow):
         self._log_poll_timer.start()
         self._kg_worker.start()
 
+    def _on_consolidate_kg(self) -> None:
+        """「实体消歧」按钮：对库内现有实体做语义向量消歧（无需辅助模型）。"""
+        if getattr(self, "_kg_worker", None) is not None and self._kg_worker.isRunning():
+            QMessageBox.information(self, "操作进行中", "知识图谱操作正在进行中，请等待完成或取消。")
+            return
+        if getattr(self, "_sync_active", False):
+            QMessageBox.warning(self, "同步进行中", "知识库同步进行中，请等同步完成后再执行实体消歧。")
+            return
+        if getattr(self, "_busy", False):
+            QMessageBox.warning(
+                self, "Agent 运行中",
+                "Agent 正在执行（可能正在检索知识库）。请先「终止对话」后再消歧。")
+            return
+        kb = self.knowledge_base_edit.text().strip()
+        ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
+        if not kb:
+            QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
+            return
+        try:
+            self._gather_config_from_widgets()
+            from ..local.factory import configure_local_models
+            configure_local_models(self.config)
+        except Exception as e:
+            logger.warning("消歧前应用配置失败: %s", e)
+        self._append_log("[kg] ────────── 开始实体语义消歧 ──────────")
+        self.kg_build_btn.setEnabled(False)
+        self.kg_dedup_btn.setEnabled(False)
+        self.kg_status_label.setText("状态: 消歧中…")
+        # 与构建共用 _kg_worker 槽位 + 同一组信号槽（_poll_sync_logs 也读它）。
+        self._kg_worker = ConsolidateKGWorker(ws, kb, config=self.config)
+        self._kg_worker.kg_progress.connect(self._on_kg_progress)
+        self._kg_worker.kg_finished.connect(self._on_kg_finished)
+        self._kg_worker.kg_failed.connect(self._on_kg_failed)
+        self._kg_worker.finished.connect(self._kg_worker.deleteLater)
+        self._kg_worker.finished.connect(self._on_kg_thread_finished)
+        self._log_poll_timer.start()
+        self._kg_worker.start()
+
     def _on_kg_thread_finished(self) -> None:
         self._kg_worker = None
 
     def _on_kg_progress(self, done: int, total: int, msg: str) -> None:
         if done == 0 or done >= total:
             self._append_log(f"[kg] {msg}")
+        kind = getattr(self._kg_worker, "kind", "build") if self._kg_worker else "build"
+        verb = "消歧中" if kind == "consolidate" else "构建中"
         if total > 0 and done > 0:
             pct = done * 100 // total
-            self.kg_status_label.setText(f"状态: 构建中 {done}/{total} ({pct}%)")
+            self.kg_status_label.setText(f"状态: {verb} {done}/{total} ({pct}%)")
         else:
             self.kg_status_label.setText(f"状态: {msg}")
 
     def _on_kg_finished(self, stats: dict) -> None:
         self.kg_build_btn.setEnabled(True)
-        g = stats.get("graph") or {}
-        self.kg_status_label.setText(
-            f"状态: 已构建（实体 {g.get('nodes', 0)} / 关系 {g.get('edges', 0)}）")
-        self._append_log(
-            f"[kg] ✅ 完成：切片 {stats.get('chunks', 0)}，实体 {g.get('nodes', 0)}，"
-            f"关系 {g.get('edges', 0)}，向量 {stats.get('vectors', 0)}，"
-            f"耗时 {stats.get('elapsed', 0)}s")
+        self.kg_dedup_btn.setEnabled(True)
+        if "graph" not in stats and "scanned" in stats:
+            # 语义消歧（ConsolidateKGWorker）结果：无 graph/chunks 键。
+            self.kg_status_label.setText(
+                f"状态: 消歧完成（扫描 {stats.get('scanned', 0)} / "
+                f"合并 {stats.get('merged', 0)}）")
+            self._append_log(
+                f"[kg] ✅ 消歧完成：扫描 {stats.get('scanned', 0)} 个实体，"
+                f"合并 {stats.get('merged', 0)} 次"
+                f"（相似度阈值 {stats.get('threshold', 0)}），图快照已重建")
+        else:
+            g = stats.get("graph") or {}
+            self.kg_status_label.setText(
+                f"状态: 已构建（实体 {g.get('nodes', 0)} / 关系 {g.get('edges', 0)}）")
+            merged = stats.get("merged_entities", 0)
+            self._append_log(
+                f"[kg] ✅ 完成：切片 {stats.get('chunks', 0)}，实体 {g.get('nodes', 0)}，"
+                f"关系 {g.get('edges', 0)}，向量 {stats.get('vectors', 0)}，"
+                f"消歧合并 {merged} 次，耗时 {stats.get('elapsed', 0)}s")
         self._refresh_kg_status()
 
     def _on_kg_failed(self, error: str) -> None:
         self.kg_build_btn.setEnabled(True)
-        self.kg_status_label.setText("状态: 构建失败")
+        self.kg_dedup_btn.setEnabled(True)
+        kind = getattr(self._kg_worker, "kind", "build") if self._kg_worker else "build"
+        self.kg_status_label.setText("状态: 消歧失败" if kind == "consolidate" else "状态: 构建失败")
         self._append_log(f"[kg] ❌ {error}")
         self._refresh_kg_status()
 

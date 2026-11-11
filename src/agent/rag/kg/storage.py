@@ -5,7 +5,9 @@
 * ``relationships``   —— id/src/dst/relation_type/description/weight/properties/
                          source_ids（无向边按 pair_key 合并，一行 = 一对实体的
                          全部证据聚合）；
-* ``kg_vectors``      —— vector_id/target_type/target_id/embedding(int8 blob)。
+* ``kg_vectors``      —— vector_id/target_type/target_id/embedding(int8 blob)；
+* ``entity_aliases``  —— 实体消歧别名索引：别名键 → 实体 id（同一实体的
+                         不同写法/简称统一命中同一行，避免重复入库）。
 
 关键设计：
 * DB 行是「证据聚合行」：同一对实体的多条抽取按无向 pair_key 合并进一行，
@@ -60,9 +62,15 @@ CREATE TABLE IF NOT EXISTS kg_vectors (
     content_hash TEXT NOT NULL DEFAULT '',
     embedding    BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    alias_key  TEXT PRIMARY KEY,
+    alias      TEXT NOT NULL,
+    entity_id  TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_rel_src ON relationships(src_entity);
 CREATE INDEX IF NOT EXISTS idx_rel_dst ON relationships(dst_entity);
 CREATE INDEX IF NOT EXISTS idx_vec_target ON kg_vectors(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_alias_entity ON entity_aliases(entity_id);
 """
 
 
@@ -184,6 +192,205 @@ class KGStore:
             "properties": _json_loads(row[5], {}),
             "source_ids": _json_loads(row[6], []),
         }
+
+    # ------------------------------------------------------------------
+    # 实体消歧：别名索引 + 合并
+    # ------------------------------------------------------------------
+
+    def find_entity_by_alias(self, alias_key: str) -> Optional[Dict[str, Any]]:
+        """按别名键查实体（消歧用：同一实体的不同写法命中同一行）。"""
+        key = (alias_key or "").strip()
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT entity_id FROM entity_aliases WHERE alias_key=?",
+                (key,)).fetchone()
+            if row is None:
+                return None
+            ent = self._conn.execute(
+                "SELECT id, name, name_key, type, description, properties, source_ids"
+                " FROM entities WHERE id=?", (row[0],)).fetchone()
+        return self._entity_row(ent) if ent else None
+
+    def add_alias(self, alias_key: str, alias: str, entity_id: str) -> bool:
+        """注册别名键 → 实体。
+
+        已存在且指向同一实体返回 True；指向其他实体返回 False（不覆盖，
+        交由消歧合并流程处理）；新写入返回 True。
+        """
+        key = (alias_key or "").strip()
+        if not key or not entity_id:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT entity_id FROM entity_aliases WHERE alias_key=?",
+                (key,)).fetchone()
+            if row is not None:
+                return row[0] == entity_id
+            self._conn.execute(
+                "INSERT OR REPLACE INTO entity_aliases (alias_key, alias, entity_id)"
+                " VALUES (?,?,?)", (key, alias or key, entity_id))
+            self._conn.commit()
+            return True
+
+    def add_aliases(self, items: Iterable[Tuple[str, str, str]]) -> int:
+        """批量注册别名（单事务）：``(alias_key, alias, entity_id)``。
+
+        已存在的键不覆盖（``INSERT OR IGNORE``），返回新写入行数。构建期
+        实体量大，逐条 commit 会成为瓶颈，故合并为一次事务。
+        """
+        rows = []
+        for alias_key, alias, entity_id in items:
+            key = (alias_key or "").strip()
+            if key and entity_id:
+                rows.append((key, alias or key, entity_id))
+        if not rows:
+            return 0
+        with self._lock:
+            before = self._conn.total_changes
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO entity_aliases"
+                " (alias_key, alias, entity_id) VALUES (?,?,?)", rows)
+            self._conn.commit()
+            return self._conn.total_changes - before
+
+    def aliases_of(self, entity_id: str) -> List[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT alias FROM entity_aliases WHERE entity_id=?",
+                (entity_id,)).fetchall()
+        return [r[0] for r in rows]
+
+    def merge_entities(self, source_id: str, target_id: str) -> Dict[str, int]:
+        """把 source 实体整体合并进 target（source 行删除）。
+
+        实体消歧的核心动作（**不新增实体行**）：
+        1. 证据聚合：source_ids / descriptions / properties.file_paths 并入 target，
+           type 以 target 的非 UNKNOWN 类型优先；
+        2. 别名转移：source 的别名键与其 name_key 全部改指 target；
+        3. 关系重写：以 source 为端点的关系换成 target 展示名并重算 pair_key；
+           与已有关系撞键时合并为一行（raw_weight 相加、证据并集），
+           合并后成为自环的关系直接删除；
+        4. 清理：source 实体行、被删关系的向量、source 实体向量。
+        """
+        stats = {"entities": 0, "relationships": 0, "vectors": 0, "rewritten": 0}
+        if not source_id or not target_id or source_id == target_id:
+            return stats
+        sel = ("SELECT id, name, name_key, type, description, properties,"
+               " source_ids, descriptions FROM entities WHERE id=?")
+        with self._lock:
+            src = self._conn.execute(sel, (source_id,)).fetchone()
+            tgt = self._conn.execute(sel, (target_id,)).fetchone()
+            if src is None or tgt is None:
+                return stats
+            src_name, src_key = src[1], src[2]
+            tgt_name, tgt_type = tgt[1], tgt[3]
+            # 1) 实体行证据聚合
+            srcs = list(dict.fromkeys(_json_loads(tgt[6], [])
+                                      + _json_loads(src[6], [])))
+            descs = list(dict.fromkeys(_json_loads(tgt[7], [])
+                                       + _json_loads(src[7], [])))
+            new_type = (tgt_type if tgt_type and tgt_type != "UNKNOWN"
+                        else (src[3] or "UNKNOWN"))
+            props = _json_loads(tgt[5], {}) or {}
+            for k, v in (_json_loads(src[5], {}) or {}).items():
+                if k == "file_paths" and isinstance(v, list):
+                    props[k] = list(dict.fromkeys(list(props.get(k) or []) + v))
+                else:
+                    props.setdefault(k, v)
+            self._conn.execute(
+                "UPDATE entities SET type=?, description=?, properties=?,"
+                " source_ids=?, descriptions=? WHERE id=?",
+                (new_type, " ".join(descs)[:8000], _json_dumps(props),
+                 _json_dumps(srcs), _json_dumps(descs), target_id))
+            # 2) 别名转移
+            self._conn.execute(
+                "UPDATE entity_aliases SET entity_id=? WHERE entity_id=?",
+                (target_id, source_id))
+            self._conn.execute(
+                "INSERT OR REPLACE INTO entity_aliases (alias_key, alias, entity_id)"
+                " VALUES (?,?,?)", (src_key, src_name, target_id))
+            # 3) 关系端点重写（display 名 + pair_key 双条件，兼容历史数据）
+            rows = self._conn.execute(
+                "SELECT id, src_entity, dst_entity, pair_key FROM relationships"
+                " WHERE src_entity=? OR dst_entity=? OR pair_key LIKE ? OR pair_key LIKE ?",
+                (src_name, src_name, f"{src_key}\x1f%", f"%\x1f{src_key}")).fetchall()
+            for rid, s_disp, d_disp, pk in rows:
+                s_is_src = normalize_name(s_disp) == src_key
+                d_is_src = normalize_name(d_disp) == src_key
+                if not (s_is_src or d_is_src):
+                    continue
+                new_s = tgt_name if s_is_src else s_disp
+                new_d = tgt_name if d_is_src else d_disp
+                if normalize_name(new_s) == normalize_name(new_d):
+                    # 两端合并为同一实体 → 自环无意义，删除
+                    stats["vectors"] += self._delete_relationship_locked(rid)
+                    stats["relationships"] += 1
+                    continue
+                new_pk = pair_key(new_s, new_d)
+                if new_pk == pk:
+                    self._conn.execute(
+                        "UPDATE relationships SET src_entity=?, dst_entity=? WHERE id=?",
+                        (new_s, new_d, rid))
+                    stats["rewritten"] += 1
+                    continue
+                dup = self._conn.execute(
+                    "SELECT id FROM relationships WHERE pair_key=? AND id<>?",
+                    (new_pk, rid)).fetchone()
+                if dup is not None:
+                    self._merge_relationship_locked(rid, dup[0])
+                    stats["vectors"] += self._delete_relationship_locked(rid)
+                    stats["relationships"] += 1
+                else:
+                    self._conn.execute(
+                        "UPDATE relationships SET src_entity=?, dst_entity=?,"
+                        " pair_key=? WHERE id=?", (new_s, new_d, new_pk, rid))
+                    stats["rewritten"] += 1
+            # 4) 删除 source 实体行与向量
+            self._conn.execute("DELETE FROM entities WHERE id=?", (source_id,))
+            stats["vectors"] += self._delete_vectors_locked("entity", source_id)
+            stats["entities"] = 1
+            self._conn.commit()
+        return stats
+
+    def _delete_relationship_locked(self, rid: str) -> int:
+        """删除一条关系及其向量（调用方已持锁）。返回删除的向量数。"""
+        self._conn.execute("DELETE FROM relationships WHERE id=?", (rid,))
+        return self._delete_vectors_locked("relationship", rid)
+
+    def _delete_vectors_locked(self, target_type: str, target_id: str) -> int:
+        cur = self._conn.execute(
+            "DELETE FROM kg_vectors WHERE target_type=? AND target_id=?",
+            (target_type, target_id))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def _merge_relationship_locked(self, source_rid: str, target_rid: str) -> None:
+        """把 source 关系行合并进 target 行（调用方已持锁）。"""
+        sel = ("SELECT keywords, descriptions, raw_weight, source_ids, file_paths"
+               " FROM relationships WHERE id=?")
+        src = self._conn.execute(sel, (source_rid,)).fetchone()
+        tgt = self._conn.execute(sel, (target_rid,)).fetchone()
+        if src is None or tgt is None:
+            return
+        kws = [k.strip() for k in (tgt[0] or "").split(",") if k.strip()]
+        known = {k.lower() for k in kws}
+        for k in [k.strip() for k in (src[0] or "").split(",") if k.strip()]:
+            if k.lower() not in known:
+                kws.append(k)
+                known.add(k.lower())
+        descs = list(dict.fromkeys(_json_loads(tgt[1], [])
+                                   + _json_loads(src[1], [])))
+        srcs = list(dict.fromkeys(_json_loads(tgt[3], [])
+                                  + _json_loads(src[3], [])))
+        fps = list(dict.fromkeys(_json_loads(tgt[4], [])
+                                 + _json_loads(src[4], [])))
+        self._conn.execute(
+            "UPDATE relationships SET keywords=?, description=?, raw_weight=?,"
+            " source_ids=?, file_paths=?, descriptions=? WHERE id=?",
+            (",".join(kws), " ".join(descs)[:8000],
+             int(tgt[2] or 0) + int(src[2] or 0),
+             _json_dumps(srcs), _json_dumps(fps), _json_dumps(descs), target_rid))
 
     # ------------------------------------------------------------------
     # relationships（无向合并）
@@ -325,6 +532,39 @@ class KGStore:
                 (name_key, name_key)).fetchall()
         return [self._rel_row(r) for r in rows]
 
+    def delete_entity_cascade(self, entity_id: str) -> Dict[str, int]:
+        """删除实体及其全部关联边（MCP delete_entity 工具用）。
+
+        步骤：删该实体的全部关系行与关系向量 → 删别名 → 删实体向量 →
+        删实体行。返回 ``{"entities": 0|1, "relationships": n, "vectors": n}``；
+        实体不存在时返回全零。
+        """
+        stats = {"entities": 0, "relationships": 0, "vectors": 0}
+        if not entity_id:
+            return stats
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT name, name_key FROM entities WHERE id=?",
+                (entity_id,)).fetchone()
+            if row is None:
+                return stats
+            name, key = row
+            # 关联边：展示名 / name_key / pair_key 三种历史形态都要匹配
+            rel_ids = self._conn.execute(
+                "SELECT id FROM relationships WHERE src_entity=? OR dst_entity=?"
+                " OR pair_key LIKE ? OR pair_key LIKE ?",
+                (name, name, f"{key}\x1f%", f"%\x1f{key}")).fetchall()
+            for (rid,) in rel_ids:
+                stats["vectors"] += self._delete_relationship_locked(rid)
+                stats["relationships"] += 1
+            stats["vectors"] += self._delete_vectors_locked("entity", entity_id)
+            self._conn.execute(
+                "DELETE FROM entity_aliases WHERE entity_id=?", (entity_id,))
+            self._conn.execute("DELETE FROM entities WHERE id=?", (entity_id,))
+            stats["entities"] = 1
+            self._conn.commit()
+        return stats
+
     # ------------------------------------------------------------------
     # 向量虚拟表
     # ------------------------------------------------------------------
@@ -401,6 +641,8 @@ class KGStore:
                         (_json_dumps(kept), eid))
                 else:
                     self._conn.execute("DELETE FROM entities WHERE id=?", (eid,))
+                    self._conn.execute(
+                        "DELETE FROM entity_aliases WHERE entity_id=?", (eid,))
                     stats["entities"] += 1
             # --- relationships ---
             rows = self._conn.execute(
@@ -442,7 +684,8 @@ class KGStore:
         """清空三张表（强制重建知识图谱用）。"""
         with self._lock:
             self._conn.executescript(
-                "DELETE FROM kg_vectors; DELETE FROM relationships; DELETE FROM entities;")
+                "DELETE FROM kg_vectors; DELETE FROM relationships;"
+                " DELETE FROM entities; DELETE FROM entity_aliases;")
             self._conn.commit()
 
     def counts(self) -> Dict[str, int]:

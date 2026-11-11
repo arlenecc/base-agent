@@ -4,7 +4,9 @@
 1. 遍历向量库全部切片（VectorStore 新增 ``iter_all_chunks``）；
 2. 每片用辅助模型抽取实体/关系，写入 entities/relationships 表
    （同名实体/无向同对关系聚合，多描述交给 LLM 用
-   ``summarize_entity_descriptions`` prompt 归纳）；
+   ``summarize_entity_descriptions`` prompt 归纳）；**入库前先做实体消歧**：
+   同一实体的不同写法（简称/全称/括号注释/机构后缀/全半角）解析到已有实体，
+   证据并入已有行而不新增实体，关系端点改写为规范名（entity_resolver.py）；
 3. 全部抽取完成后做向量化（entity/relationship 文本 → 128 维截断 →
    L2 重归一化 → int8 入 kg_vectors；无向关系正反序两个 vector_id）；
 4. 从库重建内存图并保存 JSON 快照（构建中途每 ``SNAPSHOT_EVERY`` 片
@@ -19,9 +21,8 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-import numpy as np
-
 from .embedding import KGEmbedder
+from .entity_resolver import EntityResolver
 from .extractor import KGExtractor
 from .graph import KnowledgeGraph
 from .storage import KGStore, normalize_name, pair_key
@@ -57,6 +58,7 @@ class KGBuilder:
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         cancel_event=None,
         log_callback: Optional[Callable[[str], None]] = None,
+        resolver: Optional[EntityResolver] = None,
     ):
         self._rag_dir = rag_dir
         self._store = store
@@ -66,19 +68,33 @@ class KGBuilder:
         self._log = log_callback or (lambda m: None)
         self._kg_store = KGStore(kg_dir_for(rag_dir))
         self._embedder = KGEmbedder(store.embedding_function)
+        # 实体消歧（入库前解析到已有实体，不重复建行）。
+        self._resolver = resolver or EntityResolver(self._kg_store)
 
     def close(self) -> None:
         self._kg_store.close()
 
     # ------------------------------------------------------------------
 
-    def build(self, limit: Optional[int] = None) -> Dict[str, Any]:
-        """执行完整构建。返回统计 dict。"""
+    def build(self, limit: Optional[int] = None,
+              doc_filter: Optional[str] = None) -> Dict[str, Any]:
+        """执行完整构建。返回统计 dict。
+
+        doc_filter 非空时只抽取 source 路径包含该子串的文档切片（增量并入
+        已有图谱；MCP ``ingest_knowledge`` 工具按文档建图即走此路径）。
+        """
         t0 = time.monotonic()
         chunks = list(self._store.iter_all_chunks())
+        if doc_filter:
+            chunks = [c for c in chunks
+                      if doc_filter in (c.get("source") or "")]
         if limit:
             chunks = chunks[:limit]
         total = len(chunks)
+        if doc_filter and total == 0:
+            raise ValueError(
+                f"知识库中未找到匹配 {doc_filter!r} 的文档切片"
+                "（请确认文档已同步入库）")
         self._log(f"[kg] 开始构建知识图谱: {total} 个切片, "
                   f"实体/关系抽取模型={'辅助模型' if self._extractor.available else '（未配置，跳过抽取）'}")
         self._progress(0, total, "知识图谱构建开始")
@@ -86,10 +102,19 @@ class KGBuilder:
             reason = getattr(self._extractor, "unavailable_reason", "") or ""
             raise RuntimeError(reason or "抽取器不可用：知识图谱构建无法继续")
 
-        stats = {"chunks": 0, "entities": 0, "relationships": 0, "errors": 0}
+        stats = {"chunks": 0, "entities": 0, "relationships": 0, "errors": 0,
+                 "merged_entities": 0}
         snapshot_path = snapshot_path_for(self._rag_dir)
         graph = KnowledgeGraph()
         graph.load_snapshot(snapshot_path)  # 增量续建：已有快照则热身内存图
+
+        # 存量整理：入库前把历史遗留的重复实体合并掉（不新增实体），
+        # 并补全别名索引，保证后续 resolve 全部走 O(1) 索引。
+        self._log("[kg] 实体消歧：扫描已有实体，合并同义重复项...")
+        cons = self._resolver.consolidate()
+        if cons.get("merged"):
+            self._log(f"[kg] 实体消歧完成：扫描 {cons['scanned']} 个实体，"
+                      f"合并 {cons['merged']} 个重复实体")
 
         for done, chunk in enumerate(chunks, 1):
             if self._cancel_event is not None and self._cancel_event.is_set():
@@ -104,8 +129,10 @@ class KGBuilder:
             try:
                 entities, relations = self._extractor.extract_entities_relations(
                     text, section_context=f"来源文档: {source}")
-                self._commit_extraction(entities, relations, chunk_id, source)
-                stats["entities"] += len(entities)
+                created, merged = self._commit_extraction(
+                    entities, relations, chunk_id, source)
+                stats["entities"] += created
+                stats["merged_entities"] += merged
                 stats["relationships"] += len(relations)
                 stats["chunks"] += 1
             except KGCancellation:
@@ -136,30 +163,52 @@ class KGBuilder:
     # ------------------------------------------------------------------
 
     def _commit_extraction(self, entities, relations, chunk_id: str,
-                           source: str) -> None:
-        """单片抽取结果入库（聚合 + 描述归纳）。"""
-        # 先实体：upsert 返回 (id, created)；多条描述时触发 LLM 归纳。
-        entity_names = []
+                           source: str) -> tuple:
+        """单片抽取结果入库（实体消歧合并 + 聚合 + 描述归纳）。
+
+        返回 ``(新建实体数, 合并到已有实体的次数)``。实体写入前一律先经
+        消歧器解析：同义写法命中已有实体则合并入库，关系端点统一用规范名，
+        因此同一实体在库中只会有一行。
+        """
+        name_map: Dict[str, str] = {}
+        created = 0
+        merged = 0
         for ent in entities:
-            name = ent.name.strip()
+            name = (ent.name or "").strip()
             if not name:
                 continue
-            entity_names.append(name)
-            eid, _created = self._kg_store.upsert_entity(
-                name, ent.type, ent.description, chunk_id, file_path=source)
-            self._maybe_summarize_entity(name)
-        # 关系：引用了不存在的实体 → 现场建 UNKNOWN 节点（spec 第六步）。
+            canonical, is_new, was_merged = self._resolver.merge_or_create(
+                name, ent.type, ent.description, chunk_id, source)
+            name_map[name] = canonical
+            created += 1 if is_new else 0
+            merged += 1 if was_merged else 0
+            self._maybe_summarize_entity(canonical)
+        # 关系：引用了未抽取的实体 → 同样先消歧（命中则复用已有实体），
+        # 未命中才现场建 UNKNOWN 节点（spec 第六步）。
         for rel in relations:
-            src, dst = rel.src.strip(), rel.dst.strip()
+            src, dst = (rel.src or "").strip(), (rel.dst or "").strip()
             if not src or not dst:
                 continue
-            for name, known in ((src, src in entity_names), (dst, dst in entity_names)):
-                if not known:
-                    self._kg_store.upsert_entity(
-                        name, "UNKNOWN", "", chunk_id, file_path=source)
+            src_c = self._canonical_endpoint(name_map, src, chunk_id, source)
+            dst_c = self._canonical_endpoint(name_map, dst, chunk_id, source)
+            if normalize_name(src_c) == normalize_name(dst_c):
+                # 消歧合并后两端归一为同一实体，自环关系无意义。
+                continue
             self._kg_store.upsert_relationship(
-                src, dst, rel.keywords, rel.description, chunk_id, file_path=source)
-            self._maybe_summarize_relationship(src, dst)
+                src_c, dst_c, rel.keywords, rel.description, chunk_id,
+                file_path=source)
+            self._maybe_summarize_relationship(src_c, dst_c)
+        return created, merged
+
+    def _canonical_endpoint(self, name_map: Dict[str, str], name: str,
+                            chunk_id: str, source: str) -> str:
+        """关系端点的规范名（同片内已解析过的直接复用，避免重复消歧）。"""
+        if name in name_map:
+            return name_map[name]
+        canonical, _is_new, _merged = self._resolver.merge_or_create(
+            name, "UNKNOWN", "", chunk_id, source)
+        name_map[name] = canonical
+        return canonical
 
     def _maybe_summarize_entity(self, name: str) -> None:
         row = self._kg_store.get_entity_by_key(normalize_name(name))
@@ -202,43 +251,53 @@ class KGBuilder:
 
     def _vectorize(self) -> int:
         """全部待向量化行 → int8 向量入库（增量：content_hash 未变则跳过）。"""
-        kg = self._kg_store
-        count = 0
-        # 实体
-        ent_texts, ent_keys = [], []
-        for e in kg.iter_entities():
-            text = KGEmbedder.entity_text(e["name"], e["description"])
-            vid = f"ent:{e['id']}"
-            h = KGEmbedder.content_hash(text)
-            if kg.get_vector_hash(vid) == h:
-                continue
-            ent_texts.append(text)
-            ent_keys.append((vid, "entity", e["id"], h))
-        # 关系（正反序两个 id）
-        rel_texts, rel_keys = [], []
-        for r in kg.iter_relationships():
-            for reverse in (False, True):
-                text = KGEmbedder.relationship_text(
-                    r["src_entity"], r["dst_entity"], r["keywords"],
-                    r["description"], reverse=reverse)
-                vid = f"rel:{r['id']}:{'rev' if reverse else 'fwd'}"
-                h = KGEmbedder.content_hash(text)
-                if kg.get_vector_hash(vid) == h:
-                    continue
-                rel_texts.append(text)
-                rel_keys.append((vid, "relationship", r["id"], h))
-        for texts, keys in ((ent_texts, ent_keys), (rel_texts, rel_keys)):
-            if not texts:
-                continue
-            vecs = self._embedder.embed_for_index(texts)
-            for (vid, ttype, tid, h), vec in zip(keys, vecs):
-                kg.put_vector(vid, ttype, tid, h,
-                              np.asarray(vec, dtype=np.int8).tobytes())
-                count += 1
-        return count
+        return vectorize_pending_rows(self._kg_store, self._embedder)
 
     def _refresh_graph(self, graph: KnowledgeGraph) -> None:
         graph.rebuild_from_store(self._kg_store)
+
+
+def vectorize_pending_rows(kg_store: "KGStore", embedder: "KGEmbedder") -> int:
+    """增量向量化 KGStore 中未向量化/内容变化的实体与关系行。
+
+    独立成模块级函数：构建流程与 MCP 手工增删实体/关系后的补向量化共用。
+    """
+    import numpy as np
+
+    kg = kg_store
+    count = 0
+    # 实体
+    ent_texts, ent_keys = [], []
+    for e in kg.iter_entities():
+        text = KGEmbedder.entity_text(e["name"], e["description"])
+        vid = f"ent:{e['id']}"
+        h = KGEmbedder.content_hash(text)
+        if kg.get_vector_hash(vid) == h:
+            continue
+        ent_texts.append(text)
+        ent_keys.append((vid, "entity", e["id"], h))
+    # 关系（正反序两个 id）
+    rel_texts, rel_keys = [], []
+    for r in kg.iter_relationships():
+        for reverse in (False, True):
+            text = KGEmbedder.relationship_text(
+                r["src_entity"], r["dst_entity"], r["keywords"],
+                r["description"], reverse=reverse)
+            vid = f"rel:{r['id']}:{'rev' if reverse else 'fwd'}"
+            h = KGEmbedder.content_hash(text)
+            if kg.get_vector_hash(vid) == h:
+                continue
+            rel_texts.append(text)
+            rel_keys.append((vid, "relationship", r["id"], h))
+    for texts, keys in ((ent_texts, ent_keys), (rel_texts, rel_keys)):
+        if not texts:
+            continue
+        vecs = embedder.embed_for_index(texts)
+        for (vid, ttype, tid, h), vec in zip(keys, vecs):
+            kg.put_vector(vid, ttype, tid, h,
+                          np.asarray(vec, dtype=np.int8).tobytes())
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------

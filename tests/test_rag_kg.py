@@ -73,6 +73,13 @@ class FakeEF:
         return out
 
 
+class CallableEF(FakeEF):
+    """可调用版 FakeEF：VectorStore.add 直接 ``ef(texts)``，需 ``__call__``。"""
+
+    def __call__(self, texts):
+        return self.embed_task(list(texts), "doc")
+
+
 class FakeLLM:
     """假辅助模型：按 prompt 特征返回固定输出，记录调用。"""
 
@@ -741,6 +748,146 @@ class TestGraphNetworkx:
         assert g._g.edges["a", "b"]["weight"] == 3  # max(3, 2 chunks)
 
 
+class TestEngineKgTools:
+    """MCP 工具路径（engine.kg_*）真实引擎测试：入库 → 查询 → 增删 → 检索。"""
+
+    EXTRACT_A = (
+        "entity<|#|>苹果公司<|#|>Organization<|#|>科技公司\n"
+        "entity<|#|>乔布斯<|#|>Person<|#|>创始人\n"
+        "relation<|#|>苹果公司<|#|>乔布斯<|#|>创始人<|#|>乔布斯创办苹果\n"
+        "relation<|#|>苹果公司<|#|>沃兹尼亚克<|#|>联合创始人<|#|>沃兹共同创办\n"
+        "entity<|#|>沃兹尼亚克<|#|>Person<|#|>联合创始人\n")
+
+    def _make_engine(self, tmp_path):
+        from agent.rag.engine import RAGEngine
+        eng = RAGEngine(workspace=str(tmp_path / "ws"),
+                        knowledge_base=str(tmp_path / "kb"),
+                        embedding_function=CallableEF())
+        eng.set_aux_llm(FakeLLM(extract_output=self.EXTRACT_A))
+        return eng
+
+    @staticmethod
+    def _seed(eng, docs=(("a.md", "苹果公司由乔布斯创立。"),
+                         ("b.md", "苹果总部位于库比蒂诺。"))):
+        eng._get_store().add([
+            {"text": t, "source": s, "chunk_index": 0} for s, t in docs])
+
+    def test_ingest_all_and_query_tools(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            stats = eng.kg_ingest()
+            assert stats["chunks"] == 2 and stats["graph"]["nodes"] >= 2
+            # get_entity：属性 + 关联边 + 方向
+            ent = eng.kg_get_entity("苹果公司")
+            assert ent["type"] == "Organization"
+            assert any(r["relation_type"] == "创始人"
+                       for r in ent["relationships"])
+            # 邻居
+            nb = eng.kg_get_neighbors("乔布斯")
+            assert nb["degree"] == 1
+            assert nb["neighbors"][0]["name"] == "苹果公司"
+            # 寻路：三种算法
+            for algo in ("bfs", "dfs", "dijkstra"):
+                p = eng.kg_get_path("乔布斯", "沃兹尼亚克", algo)
+                assert p["found"] is True
+                assert {n["name"] for n in p["nodes"]} >= {"乔布斯", "沃兹尼亚克"}
+            # 子图：depth=1 + edge_types 过滤
+            sub = eng.kg_get_subgraph("苹果公司", depth=1, edge_types=["创始人"])
+            assert sub["nodes"][0]["name"] == "苹果公司"
+            assert all("创始人" in (e["relation_type"] + e["keywords"]).lower()
+                       for e in sub["edges"])
+            # search_graph：非法模式报错；合法模式返回列表
+            with pytest.raises(ValueError):
+                eng.kg_search_graph("q", mode="naive")
+            results = eng.kg_search_graph("苹果公司 创始人", mode="mix")
+            assert isinstance(results, list)
+        finally:
+            eng.close()
+
+    def test_ingest_doc_filter(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            stats = eng.kg_ingest(doc_name="a.md")
+            assert stats["chunks"] == 1
+            with pytest.raises(ValueError):
+                eng.kg_ingest(doc_name="不存在的文档")
+        finally:
+            eng.close()
+
+    def test_ingest_requires_available_extractor(self, tmp_path):
+        from agent.rag.engine import RAGEngine
+        eng = RAGEngine(workspace=str(tmp_path / "ws"),
+                        knowledge_base=str(tmp_path / "kb"),
+                        embedding_function=CallableEF())
+        try:
+            self._seed(eng)
+            with pytest.raises(RuntimeError):
+                eng.kg_ingest()  # 未注入辅助模型 → 抽取器不可用
+        finally:
+            eng.close()
+
+    def test_add_entity_merges_variant(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            eng.kg_ingest()
+            from agent.rag.kg.builder import kg_dir_for
+            from agent.rag.kg.storage import KGStore
+            before = KGStore(kg_dir_for(eng._rag_dir)).counts()["entities"]
+            out = eng.kg_add_entity("苹果", "Organization", "手工补充")
+            assert out["created"] is False  # 变体写法合并进已有实体
+            after = KGStore(kg_dir_for(eng._rag_dir)).counts()["entities"]
+            assert after == before  # 不新增实体行
+        finally:
+            eng.close()
+
+    def test_add_relationship_auto_creates_endpoints(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            eng.kg_ingest()
+            out = eng.kg_add_relationship("库比蒂诺", "苹果公司", "位于",
+                                          description="总部所在地")
+            assert out["created"] is True
+            ent = eng.kg_get_entity("库比蒂诺")  # 不存在 → 现场建 UNKNOWN
+            assert ent["type"] == "UNKNOWN"
+            nb = eng.kg_get_neighbors("苹果公司")
+            assert any(n["name"] == "库比蒂诺" for n in nb["neighbors"])
+        finally:
+            eng.close()
+
+    def test_delete_entity_cascades(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            eng.kg_ingest()
+            out = eng.kg_delete_entity("苹果公司")
+            assert out["deleted"] == "苹果公司"
+            with pytest.raises(KeyError):
+                eng.kg_get_entity("苹果公司")
+            # 关联边一并删除：乔布斯度数归零
+            nb = eng.kg_get_neighbors("乔布斯")
+            assert nb["degree"] == 0
+        finally:
+            eng.close()
+
+    def test_path_and_entity_errors(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            eng.kg_ingest()
+            with pytest.raises(KeyError):
+                eng.kg_get_path("苹果公司", "不存在实体")
+            with pytest.raises(ValueError):
+                eng.kg_get_path("苹果公司", "乔布斯", algorithm="astar")
+            with pytest.raises(KeyError):
+                eng.kg_get_entity("幽灵")
+        finally:
+            eng.close()
+
+
 class TestEngineExtractorScheme:
     def test_status_and_retriever_scheme(self, tmp_path):
         from agent.rag.engine import RAGEngine
@@ -767,5 +914,383 @@ class TestEngineExtractorScheme:
                         embedding_function=FakeEF())
         try:
             assert eng.status()["kg_extractor"] == "llm_raw"
+        finally:
+            eng.close()
+
+
+# ---------------------------------------------------------------------------
+# 实体消歧与合并（入库阶段）
+# ---------------------------------------------------------------------------
+
+from agent.rag.kg.entity_resolver import (  # noqa: E402
+    EntityResolver, canonical_forms, types_compatible,
+    semantic_consolidate,
+)
+
+
+class TestCanonicalForms:
+    def test_case_and_space(self):
+        assert normalize_name("  Apple   Inc ") in canonical_forms("  Apple   Inc ")
+
+    def test_org_suffix_stripped(self):
+        forms = canonical_forms("苹果公司")
+        assert "苹果" in forms
+
+    def test_english_suffix_stripped(self):
+        assert "apple" in canonical_forms("Apple Inc.")
+        assert "apple" in canonical_forms("apple corporation")
+
+    def test_parenthetical_both_sides(self):
+        forms = canonical_forms("苹果（Apple）")
+        assert "苹果（apple）" in forms
+        assert "苹果" in forms and "apple" in forms
+
+    def test_fullwidth_normalized(self):
+        # 全角字母数字 → NFKC 半角
+        assert "iphone15" in canonical_forms("ｉＰｈｏｎｅ　１５")
+
+    def test_types_compatible(self):
+        assert types_compatible("Person", "Person")
+        assert types_compatible("UNKNOWN", "Organization")
+        assert types_compatible("", "Concept")
+        assert not types_compatible("Person", "Organization")
+
+
+class TestMergeEntities:
+    def test_merge_aggregates_evidence(self, kg_store):
+        a, _ = kg_store.upsert_entity("苹果", "Organization", "科技公司", "c1")
+        b, _ = kg_store.upsert_entity("苹果公司", "Organization", "消费电子巨头", "c2")
+        kg_store.upsert_entity("苹果", "Organization", "补充描述", "c3")
+        stats = kg_store.merge_entities(b, a)
+        assert stats["entities"] == 1
+        row = kg_store.get_entity_by_key(normalize_name("苹果"))
+        assert set(row["source_ids"]) == {"c1", "c2", "c3"}
+        assert kg_store.get_entity_by_key(normalize_name("苹果公司")) is None
+        # 被合并实体名成为别名
+        assert kg_store.find_entity_by_alias("苹果公司")["id"] == a
+
+    def test_merge_rewrites_relationship_endpoints(self, kg_store):
+        a, _ = kg_store.upsert_entity("苹果", "Organization", "", "c1")
+        b, _ = kg_store.upsert_entity("苹果公司", "Organization", "", "c2")
+        kg_store.upsert_entity("乔布斯", "Person", "", "c1")
+        rid, _ = kg_store.upsert_relationship("苹果公司", "乔布斯", "创始人", "创办", "c2")
+        kg_store.merge_entities(b, a)
+        rel = kg_store.get_relationship(rid)
+        assert rel is not None
+        # 端点改写为规范名（db 行按 pair_key 排序存两端展示名）
+        assert {rel["src_entity"], rel["dst_entity"]} == {"苹果", "乔布斯"}
+        assert rel["pair_key"] == pair_key("苹果", "乔布斯")
+
+    def test_merge_collides_into_single_relationship(self, kg_store):
+        a, _ = kg_store.upsert_entity("苹果", "Organization", "", "c1")
+        b, _ = kg_store.upsert_entity("苹果公司", "Organization", "", "c2")
+        kg_store.upsert_entity("乔布斯", "Person", "", "c1")
+        r1, _ = kg_store.upsert_relationship("苹果", "乔布斯", "创始人", "创办", "c1")
+        r2, _ = kg_store.upsert_relationship("苹果公司", "乔布斯", "领导", "领导苹果", "c2")
+        stats = kg_store.merge_entities(b, a)
+        assert stats["relationships"] == 1
+        rel = kg_store.get_relationship_by_pair(pair_key("苹果", "乔布斯"))
+        assert rel["id"] == r1  # 保留已有行
+        assert rel["raw_weight"] == 2  # 两条证据相加
+        assert "创始人" in rel["keywords"] and "领导" in rel["keywords"]
+        assert set(rel["source_ids"]) == {"c1", "c2"}
+        assert kg_store.get_relationship(r2) is None
+
+    def test_merge_drops_self_loop(self, kg_store):
+        a, _ = kg_store.upsert_entity("苹果", "Organization", "", "c1")
+        b, _ = kg_store.upsert_entity("苹果公司", "Organization", "", "c2")
+        rid, _ = kg_store.upsert_relationship("苹果公司", "苹果", "同义", "同一实体", "c2")
+        stats = kg_store.merge_entities(b, a)
+        assert stats["relationships"] == 1
+        assert kg_store.get_relationship(rid) is None
+
+    def test_merge_deletes_orphan_vectors(self, kg_store):
+        a, _ = kg_store.upsert_entity("苹果", "Organization", "", "c1")
+        b, _ = kg_store.upsert_entity("苹果公司", "Organization", "", "c2")
+        kg_store.put_vector(f"ent:{b}", "entity", b, "h", b"\x01")
+        kg_store.merge_entities(b, a)
+        assert kg_store.get_vector(f"ent:{b}") is None
+        assert kg_store.counts()["vectors"] == 0
+
+    def test_purge_cleans_aliases(self, kg_store):
+        a, _ = kg_store.upsert_entity("苹果", "Organization", "", "doc1_0")
+        kg_store.add_alias("apple", "Apple", a)
+        kg_store.purge_document(["doc1_"])
+        assert kg_store.find_entity_by_alias("apple") is None
+
+
+class TestEntityResolver:
+    def test_variant_resolves_and_does_not_insert(self, kg_store):
+        resolver = EntityResolver(kg_store)
+        name1, new1, _ = resolver.merge_or_create("苹果公司", "Organization", "科技公司", "c1")
+        name2, new2, merged = resolver.merge_or_create("苹果", "Organization", "消费电子", "c2")
+        assert new1 and not new2 and merged
+        assert name1 == name2 == "苹果公司"  # 不新增实体行，统一到已有实体
+        assert kg_store.counts()["entities"] == 1
+        row = kg_store.get_entity_by_key(normalize_name("苹果公司"))
+        assert set(row["source_ids"]) == {"c1", "c2"}
+
+    def test_alias_hit_for_later_variant(self, kg_store):
+        resolver = EntityResolver(kg_store)
+        resolver.merge_or_create("苹果公司", "Organization", "", "c1")
+        # 括号注释写法也能命中
+        name, is_new, merged = resolver.merge_or_create(
+            "苹果（Apple）", "Organization", "", "c2")
+        assert not is_new and merged and name == "苹果公司"
+
+    def test_type_guard_prevents_wrong_merge(self, kg_store):
+        resolver = EntityResolver(kg_store)
+        resolver.merge_or_create("苹果", "Organization", "", "c1")
+        # 变体名相同但类型冲突（如「苹果」水果 vs 「苹果公司」）→ 独立实体
+        name, is_new, _merged = resolver.merge_or_create("苹果公司", "Person", "", "c2")
+        assert is_new
+        assert kg_store.counts()["entities"] == 2
+        assert name == "苹果公司"
+
+    def test_resolve_returns_none_when_disabled(self, kg_store):
+        store_resolver = EntityResolver(kg_store, enabled=False)
+        store_resolver.merge_or_create("苹果", "Organization", "", "c1")
+        store_resolver.merge_or_create("苹果公司", "Organization", "", "c2")
+        assert kg_store.counts()["entities"] == 2
+
+    def test_consolidate_merges_existing_duplicates(self, kg_store):
+        # 模拟历史数据：同名变体已分别入库（未经消歧）
+        kg_store.upsert_entity("苹果", "Organization", "描述A", "c1")
+        kg_store.upsert_entity("苹果公司", "Organization", "描述B", "c2")
+        kg_store.upsert_entity("乔布斯", "Person", "", "c1")
+        kg_store.upsert_relationship("苹果", "乔布斯", "创始人", "创办", "c1")
+        kg_store.upsert_relationship("苹果公司", "乔布斯", "领导", "领导", "c2")
+        stats = EntityResolver(kg_store).consolidate()
+        assert stats["merged"] == 1
+        assert kg_store.counts()["entities"] == 2  # 苹果 + 乔布斯
+        # 归并后两个写法都能解析到同一实体
+        kept = kg_store.find_entity_by_alias("苹果")
+        assert kept is not None and kept["id"] == kg_store.find_entity_by_alias("苹果公司")["id"]
+        # 关系只剩一条且证据合并
+        rels = kg_store.iter_relationships()
+        assert len(rels) == 1 and rels[0]["raw_weight"] == 2
+
+    def test_consolidate_registers_aliases(self, kg_store):
+        kg_store.upsert_entity("苹果公司", "Organization", "", "c1")
+        EntityResolver(kg_store).consolidate()
+        assert kg_store.find_entity_by_alias("苹果") is not None
+
+
+class TestBuilderDisambiguation:
+    def test_build_merges_variant_entities(self, rag_dir):
+        extract_output = (
+            "entity<|#|>苹果公司<|#|>Organization<|#|>科技公司\n"
+            "entity<|#|>乔布斯<|#|>Person<|#|>创始人\n"
+            "relation<|#|>苹果公司<|#|>乔布斯<|#|>创始人<|#|>乔布斯创办苹果\n")
+        store = FakeStore([
+            {"id": "c1_0", "text": "苹果公司由乔布斯创立。", "source": "a.md", "chunk_index": 0},
+        ])
+        builder = KGBuilder(rag_dir, store, KGExtractor(FakeLLM(extract_output=extract_output)))
+        try:
+            stats = builder.build()
+        finally:
+            builder.close()
+        assert stats["entities"] == 2
+        kg = KGStore(kg_dir_for(rag_dir))
+        try:
+            # 两个实体入库、关系端点写成规范名（后续片段的变体写法会命中同一行）
+            assert kg.counts()["entities"] == 2
+            assert kg.get_relationship_by_pair(pair_key("苹果公司", "乔布斯")) is not None
+        finally:
+            kg.close()
+
+    def test_build_reuses_entity_across_chunks(self, rag_dir):
+        store = FakeStore([
+            {"id": "c1_0", "text": "苹果公司由乔布斯创立。", "source": "a.md", "chunk_index": 0},
+            {"id": "c2_0", "text": "苹果总部位于库比蒂诺。", "source": "b.md", "chunk_index": 0},
+        ])
+        # 第一片抽到全称、第二片抽到简称
+        outputs = [
+            "entity<|#|>苹果公司<|#|>Organization<|#|>科技公司\n"
+            "entity<|#|>乔布斯<|#|>Person<|#|>创始人\n"
+            "relation<|#|>苹果公司<|#|>乔布斯<|#|>创始人<|#|>创办\n",
+            "entity<|#|>苹果<|#|>Organization<|#|>总部\n",
+        ]
+
+        class SeqLLM(FakeLLM):
+            def __init__(self):
+                super().__init__()
+                self._i = 0
+
+            def batch_chat(self, messages_list, *args, **kwargs):
+                text = messages_list[0][-1]["content"] if messages_list else ""
+                if "high_level_keywords" in text:
+                    return [self.keywords]
+                self._i += 1
+                return [outputs[min(self._i - 1, len(outputs) - 1)]]
+
+        builder = KGBuilder(rag_dir, store, KGExtractor(SeqLLM()))
+        try:
+            stats = builder.build()
+        finally:
+            builder.close()
+        assert stats["merged_entities"] == 1
+        kg = KGStore(kg_dir_for(rag_dir))
+        try:
+            assert kg.counts()["entities"] == 2  # 苹果（含苹果公司） + 乔布斯
+            ent = kg.get_entity_by_key(normalize_name("苹果公司"))
+            assert set(ent["source_ids"]) == {"c1_0", "c2_0"}
+        finally:
+            kg.close()
+
+
+# ---------------------------------------------------------------------------
+# 语义向量消歧（后期手动触发：对库内现有实体做向量对齐与合并）
+# ---------------------------------------------------------------------------
+
+class TestSemanticConsolidate:
+    """semantic_consolidate：实体向量余弦 ≥ 阈值 → 并查集聚类 → merge_entities。
+
+    FakeEF 关键词向量：苹果(0)/乔布斯(1)/公司(3)/创始(4)/科技(5)。
+    「苹果公司\n苹果 科技」与「苹果科技公司\n苹果 公司」关键词集合相同
+    → 余弦 1.0 ≥ 0.92 必合并；「苹果公司饮品」与「苹果公司」仅部分重叠
+    （2/√6 ≈ 0.816 < 0.92）不合并。
+    """
+
+    @staticmethod
+    def _vectorize(store):
+        from agent.rag.kg.builder import vectorize_pending_rows
+        vectorize_pending_rows(store, KGEmbedder(CallableEF()))
+
+    def test_semantic_merge_rewrites_relationships(self, kg_store):
+        a, _ = kg_store.upsert_entity("苹果公司", "Organization", "苹果 科技", "c1")
+        b, _ = kg_store.upsert_entity("苹果科技公司", "Organization", "苹果 公司", "c2")
+        kg_store.upsert_entity("乔布斯", "Person", "创始", "c1")
+        kg_store.upsert_relationship("苹果公司", "乔布斯", "创始人", "创办", "c1")
+        kg_store.upsert_relationship("苹果科技公司", "乔布斯", "领导", "执掌", "c2")
+        self._vectorize(kg_store)
+        stats = semantic_consolidate(kg_store, CallableEF())
+        assert stats["scanned"] == 3
+        assert stats["merged"] == 1
+        assert stats["threshold"] == pytest.approx(0.92)
+        assert kg_store.counts()["entities"] == 2
+        # 两个写法都解析到同一实体（保留方按主名查、被合并方按别名查）
+        kept_a = kg_store.get_entity_by_key(normalize_name("苹果公司"))
+        kept_b = kg_store.find_entity_by_alias("苹果科技公司")
+        assert kept_a is not None and kept_b is not None
+        assert kept_a["id"] == kept_b["id"]
+        # 关系端点改写并聚合为一条（raw_weight = 2 条证据）
+        rels = kg_store.iter_relationships()
+        assert len(rels) == 1 and rels[0]["raw_weight"] == 2
+
+    def test_type_guard_prevents_semantic_merge(self, kg_store):
+        # 向量几乎相同但类型冲突 → 与规则消歧同一守卫，不合并
+        kg_store.upsert_entity("苹果公司", "Organization", "苹果 科技", "c1")
+        kg_store.upsert_entity("苹果科技公司", "Product", "苹果 公司", "c2")
+        self._vectorize(kg_store)
+        stats = semantic_consolidate(kg_store, CallableEF())
+        assert stats["merged"] == 0
+        assert kg_store.counts()["entities"] == 2
+
+    def test_below_threshold_not_merged(self, kg_store):
+        # 部分关键词重叠（cos ≈ 0.816 < 0.92）：宁漏合不误合
+        kg_store.upsert_entity("苹果公司", "Organization", "科技", "c1")
+        kg_store.upsert_entity("苹果公司饮品", "Organization", "", "c2")
+        self._vectorize(kg_store)
+        stats = semantic_consolidate(kg_store, CallableEF())
+        assert stats["merged"] == 0
+        assert kg_store.counts()["entities"] == 2
+
+    def test_custom_threshold(self, kg_store):
+        # 阈值降到 0.8 → 部分重叠对也被合并
+        kg_store.upsert_entity("苹果公司", "Organization", "科技", "c1")
+        kg_store.upsert_entity("苹果公司饮品", "Organization", "", "c2")
+        self._vectorize(kg_store)
+        stats = semantic_consolidate(kg_store, CallableEF(), threshold=0.8)
+        assert stats["merged"] == 1
+
+    def test_missing_vectors_skipped(self, kg_store):
+        # 无向量（embedding_function=None 且未预置）：只扫描不比对
+        kg_store.upsert_entity("苹果公司", "Organization", "科技", "c1")
+        kg_store.upsert_entity("苹果科技公司", "Organization", "苹果", "c2")
+        stats = semantic_consolidate(kg_store, None)
+        assert stats["scanned"] == 2 and stats["merged"] == 0
+
+    def test_fewer_than_two_entities_returns_early(self, kg_store):
+        kg_store.upsert_entity("苹果公司", "Organization", "科技", "c1")
+        self._vectorize(kg_store)
+        stats = semantic_consolidate(kg_store, CallableEF())
+        assert stats == {"scanned": 1, "merged": 0, "threshold": 0.92}
+
+    def test_cancellation(self, kg_store):
+        from agent.rag.kg.builder import KGCancellation
+        kg_store.upsert_entity("苹果公司", "Organization", "苹果 科技", "c1")
+        kg_store.upsert_entity("苹果科技公司", "Organization", "苹果 公司", "c2")
+        self._vectorize(kg_store)
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(KGCancellation):
+            semantic_consolidate(kg_store, CallableEF(), cancel_event=cancel)
+
+    def test_idempotent_rerun(self, kg_store):
+        kg_store.upsert_entity("苹果公司", "Organization", "苹果 科技", "c1")
+        kg_store.upsert_entity("苹果科技公司", "Organization", "苹果 公司", "c2")
+        self._vectorize(kg_store)
+        first = semantic_consolidate(kg_store, CallableEF())
+        assert first["merged"] == 1
+        # 重跑：已合并实体只剩一行，幂等
+        second = semantic_consolidate(kg_store, CallableEF())
+        assert second["merged"] == 0
+        assert kg_store.counts()["entities"] == 1
+
+
+class TestEngineSemanticConsolidate:
+    """engine.kg_semantic_consolidate 集成：构建后消歧入口 + 图快照重建。"""
+
+    def _make_engine(self, tmp_path):
+        from agent.rag.engine import RAGEngine
+        eng = RAGEngine(workspace=str(tmp_path / "ws"),
+                        knowledge_base=str(tmp_path / "kb"),
+                        embedding_function=CallableEF())
+        eng.set_aux_llm(FakeLLM(extract_output=TestEngineKgTools.EXTRACT_A))
+        return eng
+
+    _seed = staticmethod(TestEngineKgTools._seed)
+
+    def test_consolidate_after_ingest(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            ingested = eng.kg_ingest()
+            assert ingested["entities"] == 3
+            stats = eng.kg_semantic_consolidate()
+            assert set(stats) == {"scanned", "merged", "threshold"}
+            assert stats["scanned"] == 3
+            # 现有实体向量互不相似（均 < 0.92）→ 不误合并
+            assert stats["merged"] == 0
+            # 幂等：重复执行结果一致
+            assert eng.kg_semantic_consolidate() == stats
+        finally:
+            eng.close()
+
+    def test_consolidate_merges_manual_variant(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            eng.kg_ingest()
+            # 手工加一个与「苹果公司」向量相同（关键词集合一致）的变体实体
+            # ——规则消歧覆盖不到的深层语义对齐场景
+            eng._kg_store_open()  # 确保目录存在
+            from agent.rag.kg.builder import kg_dir_for
+            from agent.rag.kg.storage import KGStore
+            kg = KGStore(kg_dir_for(eng._rag_dir))
+            try:
+                kg.upsert_entity("苹果科技公司", "Organization", "苹果 科技 公司", "manual_0")
+            finally:
+                kg.close()
+            stats = eng.kg_semantic_consolidate()
+            assert stats["merged"] == 1
+            kg = KGStore(kg_dir_for(eng._rag_dir))
+            try:
+                ids = {kg.get_entity_by_key(normalize_name("苹果公司"))["id"],
+                       kg.find_entity_by_alias("苹果科技公司")["id"]}
+                assert len(ids) == 1
+            finally:
+                kg.close()
         finally:
             eng.close()

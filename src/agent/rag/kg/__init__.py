@@ -2,6 +2,7 @@
 from .storage import KGStore, normalize_name, pair_key
 from .graph import KnowledgeGraph
 from .embedding import KGEmbedder
+from .entity_resolver import EntityResolver, canonical_forms
 from .extractor import (
     BaseKGExtractor, KGExtractor, PydanticLLMExtractor, GLiNERExtractor,
     create_extractor, EXTRACTOR_SCHEMES,
@@ -11,6 +12,7 @@ from .retriever import KGRetriever, VALID_STRATEGIES
 
 __all__ = [
     "KGStore", "KnowledgeGraph", "KGEmbedder",
+    "EntityResolver", "canonical_forms",
     "BaseKGExtractor", "KGExtractor", "PydanticLLMExtractor", "GLiNERExtractor",
     "create_extractor", "EXTRACTOR_SCHEMES",
     "KGBuilder", "KGRetriever", "VALID_STRATEGIES",

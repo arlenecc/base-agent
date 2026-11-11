@@ -816,8 +816,9 @@ class RAGEngine:
                     q, top_k=k, min_similarity=self._min_similarity,
                     use_reranker=self._rerank_enabled)
 
-            def _rerank(q: str, cands: List[Dict[str, Any]], k: int):
-                return store.rerank(q, cands, top_k=k,
+            def _rerank(q: str, cands: List[Dict[str, Any]], top_k: int = 10):
+                # retriever 以 rerank(q, cands, top_k=n) 关键字形式回调。
+                return store.rerank(q, cands, top_k=top_k,
                                     min_similarity=self._min_similarity)
 
             results = retriever.search(query, strategy,
@@ -830,6 +831,282 @@ class RAGEngine:
         except Exception as e:
             logger.warning("KG: 图谱检索失败，回退 naive: %s", e, exc_info=True)
             return None
+
+    # ------------------------------------------------------------------
+    # 知识图谱 MCP 工具路径（rag_mcp_server 的 9 个 kg 工具薄封装调用）
+    # ------------------------------------------------------------------
+
+    def _kg_store_open(self):
+        from .kg.builder import kg_dir_for
+        from .kg.storage import KGStore
+        return KGStore(kg_dir_for(self._rag_dir))
+
+    def _kg_refresh_snapshot(self) -> None:
+        """实体/关系变更后：增量向量化 → 重建内存图 → 落快照 → 失效检索器。"""
+        from .kg.builder import snapshot_path_for, vectorize_pending_rows
+        from .kg.embedding import KGEmbedder
+        from .kg.graph import KnowledgeGraph
+        kg = self._kg_store_open()
+        try:
+            store = self._get_store()
+            if store.embedding_function is not None:
+                n = vectorize_pending_rows(kg, KGEmbedder(store.embedding_function))
+                if n:
+                    logger.info("KG: MCP 变更后增量向量化 %d 条", n)
+            graph = KnowledgeGraph()
+            graph.rebuild_from_store(kg)
+            graph.save_snapshot(snapshot_path_for(self._rag_dir))
+        finally:
+            kg.close()
+        if self._kg_retriever is not None:
+            self._kg_retriever.close()
+            self._kg_retriever = None
+
+    def _resolve_kg_entity(self, kg, entity: str) -> Optional[Dict[str, Any]]:
+        """实体标识解析：id → 精确名 → 别名（MCP 用户可能传任意一种写法）。"""
+        from .kg.storage import normalize_name
+        ent = kg.get_entity(entity)
+        if ent is not None:
+            return ent
+        ent = kg.get_entity_by_key(normalize_name(entity))
+        if ent is not None:
+            return ent
+        from .kg.entity_resolver import canonical_forms
+        for form in canonical_forms(entity):
+            ent = kg.find_entity_by_alias(form)
+            if ent is not None:
+                return ent
+            ent = kg.get_entity_by_key(form)
+            if ent is not None:
+                return ent
+        return None
+
+    def kg_ingest(self, doc_name: str = "") -> Dict[str, Any]:
+        """构建知识图谱（MCP ``ingest_knowledge``）。
+
+        doc_name 非空时只抽取 source 路径包含该子串的文档切片（增量并入已有
+        图谱）；为空则对知识库全部切片构建。抽取方案沿用 ``rag_kg_extractor``
+        配置；LLM 方案需要辅助模型已加载（set_aux_llm）。
+        """
+        from .kg.builder import KGBuilder
+        from .kg.extractor import create_extractor
+        store = self._get_store()
+        if store.count() == 0:
+            raise RuntimeError("知识库为空：请先入库文档再构建知识图谱")
+        extractor = create_extractor(self._kg_extractor_scheme, self._aux_llm)
+        if not extractor.available:
+            raise RuntimeError(getattr(extractor, "unavailable_reason", "")
+                               or "抽取器不可用")
+        builder = KGBuilder(self._rag_dir, store, extractor)
+        try:
+            stats = builder.build(doc_filter=doc_name or None)
+        finally:
+            builder.close()
+        self._kg_refresh_snapshot()
+        return stats
+
+    def kg_add_entity(self, name: str, etype: str = "UNKNOWN",
+                      description: str = "") -> Dict[str, Any]:
+        """手工加实体（MCP ``add_entity``）：经消歧器合并，重复写法不新增行。"""
+        from .kg.entity_resolver import EntityResolver
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("实体名不能为空")
+        kg = self._kg_store_open()
+        try:
+            resolver = EntityResolver(kg)
+            canonical, created, _merged = resolver.merge_or_create(
+                name, etype or "UNKNOWN", description or "", "mcp", source="mcp")
+        finally:
+            kg.close()
+        self._kg_refresh_snapshot()
+        return {"name": canonical, "created": created}
+
+    def kg_add_relationship(self, source: str, target: str,
+                            relation: str, description: str = "") -> Dict[str, Any]:
+        """手工加关系（MCP ``add_relationship``）：端点实体缺失时自动建
+        UNKNOWN 实体；同对关系重复调用会聚合进同一行（weight 累加）。"""
+        source, target = (source or "").strip(), (target or "").strip()
+        relation = (relation or "").strip()
+        if not source or not target:
+            raise ValueError("关系的两端实体名不能为空")
+        if not relation:
+            raise ValueError("关系类型（relation）不能为空")
+        kg = self._kg_store_open()
+        try:
+            from .kg.entity_resolver import EntityResolver
+            resolver = EntityResolver(kg)
+            src_c, _, _ = resolver.merge_or_create(
+                source, "UNKNOWN", "", "mcp", source="mcp")
+            dst_c, _, _ = resolver.merge_or_create(
+                target, "UNKNOWN", "", "mcp", source="mcp")
+            rid, created = kg.upsert_relationship(
+                src_c, dst_c, relation, description or "", "mcp", file_path="mcp")
+        finally:
+            kg.close()
+        self._kg_refresh_snapshot()
+        return {"id": rid, "source": src_c, "target": dst_c,
+                "relation": relation, "created": created}
+
+    def kg_get_entity(self, entity: str) -> Dict[str, Any]:
+        """实体详情（MCP ``get_entity``）：属性 + 关联边 + 别名。"""
+        kg = self._kg_store_open()
+        try:
+            ent = self._resolve_kg_entity(kg, entity)
+            if ent is None:
+                raise KeyError(f"实体不存在: {entity}")
+            rels = kg.relationships_of_entity(ent["name_key"])
+            for r in rels:
+                r["direction"] = ("out" if r["src_entity"] == ent["name"]
+                                  else "in" if r["dst_entity"] == ent["name"]
+                                  else "self")
+            ent = dict(ent)
+            ent["relationships"] = rels
+            ent["aliases"] = kg.aliases_of(ent["id"])
+        finally:
+            kg.close()
+        return ent
+
+    def kg_delete_entity(self, entity: str) -> Dict[str, Any]:
+        """删除实体及其全部关联边（MCP ``delete_entity``），并重建快照。"""
+        kg = self._kg_store_open()
+        try:
+            ent = self._resolve_kg_entity(kg, entity)
+            if ent is None:
+                raise KeyError(f"实体不存在: {entity}")
+            stats = kg.delete_entity_cascade(ent["id"])
+        finally:
+            kg.close()
+        self._kg_refresh_snapshot()
+        return {"deleted": ent["name"], **stats}
+
+    def kg_get_path(self, entity_a: str, entity_b: str,
+                    algorithm: str = "bfs") -> Dict[str, Any]:
+        """两实体间寻路（MCP ``get_path``）：bfs / dfs / dijkstra（weight 越大
+        关系越强，dijkstra 距离取 1/weight 优先走强边）。"""
+        algo = str(algorithm or "bfs").lower()
+        if algo not in ("bfs", "dfs", "dijkstra"):
+            raise ValueError(f"不支持的寻路算法: {algorithm}（可选 bfs/dfs/dijkstra）")
+        from .kg.builder import load_or_rebuild_graph
+        graph = load_or_rebuild_graph(self._rag_dir, self._get_store())
+        if graph is None:
+            raise RuntimeError("知识图谱尚未构建（先调用 ingest_knowledge）")
+        kg = self._kg_store_open()
+        try:
+            a = self._resolve_kg_entity(kg, entity_a)
+            b = self._resolve_kg_entity(kg, entity_b)
+        finally:
+            kg.close()
+        if a is None:
+            raise KeyError(f"实体不存在: {entity_a}")
+        if b is None:
+            raise KeyError(f"实体不存在: {entity_b}")
+        result = graph.find_path(a["name_key"], b["name_key"], algo)
+        if result is None:
+            return {"found": False, "algorithm": algo,
+                    "message": f"「{a['name']}」与「{b['name']}」之间无可达路径"}
+        result["found"] = True
+        return result
+
+    def kg_get_neighbors(self, entity: str) -> Dict[str, Any]:
+        """一跳邻居（MCP ``get_neighbors``）：邻边 + 相邻实体详情。"""
+        from .kg.builder import load_or_rebuild_graph
+        graph = load_or_rebuild_graph(self._rag_dir, self._get_store())
+        if graph is None:
+            raise RuntimeError("知识图谱尚未构建（先调用 ingest_knowledge）")
+        kg = self._kg_store_open()
+        try:
+            ent = self._resolve_kg_entity(kg, entity)
+        finally:
+            kg.close()
+        if ent is None:
+            raise KeyError(f"实体不存在: {entity}")
+        key = ent["name_key"]
+        edges = graph.neighbor_edges(key)
+        neighbors = []
+        for e in edges:
+            other = e["dst"] if e["src"] == key else e["src"]
+            node = graph.get_node(other)
+            neighbors.append({
+                "name_key": other,
+                "name": (node or {}).get("name", other),
+                "type": (node or {}).get("type", "UNKNOWN"),
+                "description": (node or {}).get("description", ""),
+                "via": {"relation_type": e.get("relation_type", ""),
+                        "keywords": e.get("keywords", ""),
+                        "weight": e.get("weight", 1)},
+            })
+        return {"entity": ent["name"], "name_key": key, "degree": len(edges),
+                "neighbors": neighbors}
+
+    def kg_get_subgraph(self, root: str, depth: int = 1,
+                        edge_types: Optional[List[str]] = None) -> Dict[str, Any]:
+        """子图提取（MCP ``get_subgraph``）：root 出发 BFS depth 跳，可按
+        edge_types（关系类型/关键词子串列表）过滤边。"""
+        from .kg.builder import load_or_rebuild_graph
+        graph = load_or_rebuild_graph(self._rag_dir, self._get_store())
+        if graph is None:
+            raise RuntimeError("知识图谱尚未构建（先调用 ingest_knowledge）")
+        kg = self._kg_store_open()
+        try:
+            ent = self._resolve_kg_entity(kg, root)
+        finally:
+            kg.close()
+        if ent is None:
+            raise KeyError(f"实体不存在: {root}")
+        result = graph.extract_subgraph(ent["name_key"], depth, edge_types)
+        if result is None:  # pragma: no cover - 实体已确认存在
+            raise KeyError(f"实体不在图中: {root}")
+        return result
+
+    def kg_semantic_consolidate(self, progress_callback=None,
+                                cancel_event=None) -> Dict[str, Any]:
+        """存量语义向量消歧（MCP/配置面板「实体消歧」按钮）。
+
+        对库内现有实体按向量相似度做对齐与合并（不新增实体），合并后重建
+        图快照。规则消歧（构建期）之外的深层语义对齐入口。
+        """
+        from .kg.entity_resolver import semantic_consolidate
+        store = self._get_store()
+        kg = self._kg_store_open()
+        try:
+            stats = semantic_consolidate(
+                kg, store.embedding_function,
+                progress_callback=progress_callback, cancel_event=cancel_event)
+        finally:
+            kg.close()
+        self._kg_refresh_snapshot()
+        return stats
+
+    def kg_search_graph(self, query: str, mode: str = "hybrid") -> List[Dict[str, Any]]:
+        """图谱语义检索（MCP ``search_graph``）：mode ∈ local/global/hybrid/mix。
+
+        local：命中实体拉邻边与关联实体，适合问具体细节；global：命中关系
+        反查两端实体与度数，适合跨文档宏观主题/总结；hybrid：实体+关系两路
+        交织合并；mix：实体+关系+原文 chunk 全做（原始片段兜底）。
+        """
+        mode = str(mode or "hybrid").lower()
+        valid = {"local", "global", "hybrid", "mix"}
+        if mode not in valid:
+            raise ValueError(f"不支持的检索模式: {mode}（可选 {'/'.join(sorted(valid))}）")
+        retriever = self._get_kg_retriever()
+        if not retriever.graph_ready():
+            raise RuntimeError("知识图谱尚未构建（先调用 ingest_knowledge）")
+        store = self._get_store()
+
+        def _chunk_recall(q: str, k: int) -> List[Dict[str, Any]]:
+            return store.search_with_rerank(
+                q, top_k=k, min_similarity=self._min_similarity,
+                use_reranker=self._rerank_enabled)
+
+        def _rerank(q: str, cands, top_k: int = 10):
+            # retriever 以 rerank(q, cands, top_k=n) 关键字形式回调。
+            return store.rerank(q, cands, top_k=top_k,
+                                min_similarity=self._min_similarity)
+
+        results = retriever.search(query, mode,
+                                   chunk_recall=_chunk_recall, rerank=_rerank)
+        return results or []
 
     # ------------------------------------------------------------------
     # ingestion pipeline (流式：worker 并行解析+chunk，主线程增量 embed+store)

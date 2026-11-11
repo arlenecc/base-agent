@@ -4,6 +4,15 @@
 对接使用。复用应用内已加载的 ``RAGEngine``（与桌面端知识库同一份索引/模型，
 避免双份 ~600MB 向量/模型内存）。
 
+工具清单：
+  * RAG 检索/文档管理（7）：ingest_document / delete_document /
+    forget_context / list_document / extract_metadata /
+    hybrid_search_with_rerank / get_document；
+  * 知识图谱（9，rag/kg/）：ingest_knowledge（按文档建图）/ add_entity /
+    add_relationship / get_entity / delete_entity / get_path（bfs/dfs/
+    dijkstra 寻路）/ get_neighbors / get_subgraph（BFS 深度 + 关系类型过滤）/
+    search_graph（local/global/hybrid/mix 四种检索策略）。
+
 设计要点：
   * 工具只做「薄封装」——直接转发到 ``RAGEngine`` 的对应方法，不做额外的 RAG 逻辑，
     保证与原 RAG 流程完全一致（原流程不受影响）。
@@ -87,7 +96,7 @@ def build_mcp_server() -> "FastMCP":
         mcp = FastMCP("base-agent-rag")
 
         @mcp.tool()
-        def parse_and_ingest_document(doc_path: str) -> str:
+        def ingest_document(doc_path: str) -> str:
             """复杂文档解析入库：将传入文档解析、提取、清洗、切片、计算向量、入库，以备查询。
 
             参数 doc_path: 待入库文档的本地路径（支持 PDF/Office/Markdown/纯文本 等）。
@@ -194,6 +203,172 @@ def build_mcp_server() -> "FastMCP":
             except Exception as e:  # noqa: BLE001
                 return _err(f"读取失败: {e}")
 
+        # ------------------------------------------------------------------
+        # 知识图谱工具（rag/kg/）：构建、手工增删、图查询、语义检索
+        # ------------------------------------------------------------------
+
+        @mcp.tool()
+        def ingest_knowledge(doc_name: str = "") -> str:
+            """知识图谱构建：对指定文档（或知识库全部文档）做实体/关系抽取并建图。
+
+            参数 doc_name: 文档名或路径子串；为空则对知识库全部切片构建。
+            返回: JSON 统计（切片/实体/关系/向量数、图规模、耗时）。
+            说明: 抽取方案由应用配置 rag_kg_extractor 决定（llm_raw/llm_pydantic
+            需要 LLM 辅助模型已加载；gliner 为本地 NER）。
+            """
+            engine = _get_engine()
+            if engine is None:
+                return _err("RAG 引擎未就绪（请先在应用内启用知识库）")
+            try:
+                stats = engine.kg_ingest(doc_name=doc_name)
+                return _ok({"ingest": stats})
+            except Exception as e:  # noqa: BLE001
+                return _err(f"知识图谱构建失败: {e}")
+
+        @mcp.tool()
+        def add_entity(name: str, type: str = "UNKNOWN",
+                       description: str = "") -> str:
+            """图谱加实体：写入实体节点（同名/同义写法自动合并到已有实体）。
+
+            参数 name: 实体名；type: 实体类型（Person/Organization/Location/
+            Event/Concept/Method/Content/Data/Artifact/NaturalObject/UNKNOWN）；
+            description: 实体描述。
+            """
+            engine = _get_engine()
+            if engine is None:
+                return _err("RAG 引擎未就绪")
+            try:
+                result = engine.kg_add_entity(name, etype=type, description=description)
+                return _ok(result)
+            except Exception as e:  # noqa: BLE001
+                return _err(f"添加实体失败: {e}")
+
+        @mcp.tool()
+        def add_relationship(source: str, target: str, relation: str,
+                             description: str = "") -> str:
+            """图谱加关系：在两个实体间建立（或聚合到已有）无向关系。
+
+            参数 source/target: 两端实体名（不存在会自动建 UNKNOWN 实体）；
+            relation: 关系类型/关键词；description: 关系描述。
+            """
+            engine = _get_engine()
+            if engine is None:
+                return _err("RAG 引擎未就绪")
+            try:
+                result = engine.kg_add_relationship(
+                    source, target, relation, description=description)
+                return _ok(result)
+            except Exception as e:  # noqa: BLE001
+                return _err(f"添加关系失败: {e}")
+
+        @mcp.tool()
+        def get_entity(entity: str) -> str:
+            """实体详情：返回单个节点的属性、全部关联边（含方向）与别名。
+
+            参数 entity: 实体 id / 名称 / 别名（任意一种写法）。
+            """
+            engine = _get_engine()
+            if engine is None:
+                return _err("RAG 引擎未就绪")
+            try:
+                return _ok(engine.kg_get_entity(entity))
+            except KeyError as e:
+                return _err(str(e).strip("'\""))
+            except Exception as e:  # noqa: BLE001
+                return _err(f"查询实体失败: {e}")
+
+        @mcp.tool()
+        def delete_entity(entity: str) -> str:
+            """图谱删实体：删除节点及其全部关联边，并重建图快照。
+
+            参数 entity: 实体 id / 名称 / 别名。
+            """
+            engine = _get_engine()
+            if engine is None:
+                return _err("RAG 引擎未就绪")
+            try:
+                return _ok(engine.kg_delete_entity(entity))
+            except KeyError as e:
+                return _err(str(e).strip("'\""))
+            except Exception as e:  # noqa: BLE001
+                return _err(f"删除实体失败: {e}")
+
+        @mcp.tool()
+        def get_path(entity_a: str, entity_b: str, algorithm: str = "bfs") -> str:
+            """图谱寻路：返回两实体间路径上的全部中间节点与边的信息。
+
+            参数 entity_a/entity_b: 两端实体；algorithm: 寻路算法，可选
+            bfs（最少跳数，默认）/ dfs（深度优先）/ dijkstra（加权最短路，
+            优先走关系证据最强的边）。
+            """
+            engine = _get_engine()
+            if engine is None:
+                return _err("RAG 引擎未就绪")
+            try:
+                return _ok(engine.kg_get_path(entity_a, entity_b, algorithm))
+            except KeyError as e:
+                return _err(str(e).strip("'\""))
+            except Exception as e:  # noqa: BLE001
+                return _err(f"寻路失败: {e}")
+
+        @mcp.tool()
+        def get_neighbors(entity: str) -> str:
+            """一跳邻居：返回实体的全部邻边与相邻实体（含经由关系与权重）。
+
+            参数 entity: 实体 id / 名称 / 别名。
+            """
+            engine = _get_engine()
+            if engine is None:
+                return _err("RAG 引擎未就绪")
+            try:
+                return _ok(engine.kg_get_neighbors(entity))
+            except KeyError as e:
+                return _err(str(e).strip("'\""))
+            except Exception as e:  # noqa: BLE001
+                return _err(f"查询邻居失败: {e}")
+
+        @mcp.tool()
+        def get_subgraph(root: str, depth: int = 1, edge_types: str = "") -> str:
+            """子图提取：从 root 出发按 BFS 深度提取局部子图。
+
+            参数 root: 根实体；depth: BFS 深度（默认 1 跳）；
+            edge_types: 逗号分隔的关系类型/关键词子串过滤（如
+            "创始人,领导"），为空不过滤。
+            返回: JSON，含 nodes（附 depth 跳数）与 edges 列表。
+            """
+            engine = _get_engine()
+            if engine is None:
+                return _err("RAG 引擎未就绪")
+            try:
+                types = [t.strip() for t in edge_types.split(",") if t.strip()] \
+                    if edge_types else None
+                return _ok(engine.kg_get_subgraph(root, depth=depth,
+                                                  edge_types=types))
+            except KeyError as e:
+                return _err(str(e).strip("'\""))
+            except Exception as e:  # noqa: BLE001
+                return _err(f"提取子图失败: {e}")
+
+        @mcp.tool()
+        def search_graph(query: str, mode: str = "hybrid") -> str:
+            """图谱语义检索：按指定策略在知识图谱上检索。
+
+            参数 query: 查询语句；mode: 检索策略——
+            local（命中实体拉邻边与关联实体，适合问具体细节）/
+            global（命中关系反查两端实体与度数，适合跨文档宏观主题/总结）/
+            hybrid（实体+关系两路交织合并，细节与全貌兼顾）/ mix（实体+关系+
+            原文 chunk 全做，原始片段兜底）。
+            """
+            engine = _get_engine()
+            if engine is None:
+                return _err("RAG 引擎未就绪")
+            try:
+                results = engine.kg_search_graph(query, mode=mode)
+                return _ok({"mode": mode, "results": results,
+                            "count": len(results)})
+            except Exception as e:  # noqa: BLE001
+                return _err(f"图谱检索失败: {e}")
+
         _mcp = mcp
         return _mcp
 
@@ -228,6 +403,95 @@ def _make_monkey_engine():
 
         def get_document(self, name):
             return "# monkey markdown\n\n（测试桩内容）"
+
+        # -- 知识图谱桩（monkey 图谱：苹果-乔布斯-沃兹 三角） ------------
+
+        _MONKEY_NODES = {
+            "苹果": {"name_key": "苹果", "name": "苹果", "type": "Organization",
+                     "description": "科技公司", "degree": 2},
+            "乔布斯": {"name_key": "乔布斯", "name": "乔布斯", "type": "Person",
+                       "description": "创始人", "degree": 2},
+            "沃兹尼亚克": {"name_key": "沃兹尼亚克", "name": "沃兹尼亚克",
+                           "type": "Person", "description": "联合创始人", "degree": 2},
+        }
+        _MONKEY_EDGES = [
+            {"pair_key": "乔布斯\x1f苹果", "src": "苹果", "dst": "乔布斯",
+             "src_name": "苹果", "dst_name": "乔布斯", "relation_type": "创始人",
+             "keywords": "创始人", "description": "乔布斯创办苹果",
+             "weight": 2, "from_key": "苹果", "to_key": "乔布斯"},
+            {"pair_key": "乔布斯\x1f苹果", "src": "苹果", "dst": "乔布斯",
+             "src_name": "苹果", "dst_name": "乔布斯", "relation_type": "创始人",
+             "keywords": "创始人", "description": "乔布斯创办苹果",
+             "weight": 2, "from_key": "乔布斯", "to_key": "苹果"},
+            {"pair_key": "沃兹尼亚克\x1f苹果", "src": "苹果", "dst": "沃兹尼亚克",
+             "src_name": "苹果", "dst_name": "沃兹尼亚克", "relation_type": "联合创始人",
+             "keywords": "联合创始人", "description": "沃兹共同创办苹果",
+             "weight": 1, "from_key": "苹果", "to_key": "沃兹尼亚克"},
+            {"pair_key": "沃兹尼亚克\x1f苹果", "src": "苹果", "dst": "沃兹尼亚克",
+             "src_name": "苹果", "dst_name": "沃兹尼亚克", "relation_type": "联合创始人",
+             "keywords": "联合创始人", "description": "沃兹共同创办苹果",
+             "weight": 1, "from_key": "沃兹尼亚克", "to_key": "苹果"},
+        ]
+
+        def kg_ingest(self, doc_name=""):
+            return {"chunks": 2, "entities": 3, "relationships": 2, "vectors": 8,
+                    "graph": {"nodes": 3, "edges": 2}, "monkey": True}
+
+        def kg_add_entity(self, name, etype="UNKNOWN", description=""):
+            return {"name": name, "created": True}
+
+        def kg_add_relationship(self, source, target, relation, description=""):
+            return {"id": "mcp-rid", "source": source, "target": target,
+                    "relation": relation, "created": True}
+
+        def kg_get_entity(self, entity):
+            node = self._MONKEY_NODES.get(entity)
+            if node is None:
+                raise KeyError(f"实体不存在: {entity}")
+            return {**node, "relationships": self._MONKEY_EDGES[:2],
+                    "aliases": ["Apple"], "monkey": True}
+
+        def kg_delete_entity(self, entity):
+            if entity not in self._MONKEY_NODES:
+                raise KeyError(f"实体不存在: {entity}")
+            return {"deleted": entity, "entities": 1, "relationships": 2,
+                    "vectors": 5}
+
+        def kg_get_path(self, entity_a, entity_b, algorithm="bfs"):
+            for e in (entity_a, entity_b):
+                if e not in self._MONKEY_NODES:
+                    raise KeyError(f"实体不存在: {e}")
+            return {"found": True, "algorithm": algorithm, "length": 1,
+                    "nodes": [self._MONKEY_NODES[entity_a],
+                              self._MONKEY_NODES[entity_b]],
+                    "edges": [self._MONKEY_EDGES[0]]}
+
+        def kg_get_neighbors(self, entity):
+            node = self._MONKEY_NODES.get(entity)
+            if node is None:
+                raise KeyError(f"实体不存在: {entity}")
+            others = [n for n in self._MONKEY_NODES.values() if n["name"] != entity]
+            return {"entity": entity, "name_key": node["name_key"], "degree": 2,
+                    "neighbors": [{"name_key": n["name_key"], "name": n["name"],
+                                   "type": n["type"], "description": n["description"],
+                                   "via": {"relation_type": "关联",
+                                           "keywords": "关联", "weight": 1}}
+                                  for n in others]}
+
+        def kg_get_subgraph(self, root, depth=1, edge_types=None):
+            node = self._MONKEY_NODES.get(root)
+            if node is None:
+                raise KeyError(f"实体不存在: {root}")
+            return {"root": node["name_key"], "depth": depth,
+                    "nodes": [{**n, "depth": 0 if n["name"] == root else 1}
+                              for n in self._MONKEY_NODES.values()],
+                    "edges": self._MONKEY_EDGES}
+
+        def kg_search_graph(self, query, mode="hybrid"):
+            if mode not in ("local", "global", "hybrid", "mix"):
+                raise ValueError(f"不支持的检索模式: {mode}")
+            return [{"kind": "entity", "name": "苹果", "monkey": True},
+                    {"kind": "relationship", "keywords": "创始人", "monkey": True}]
 
     return _MonkeyEngine()
 

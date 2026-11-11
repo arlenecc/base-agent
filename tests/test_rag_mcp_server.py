@@ -53,6 +53,52 @@ class StubEngine:
     def get_document(self, name: str):
         return "# 完整文档 markdown\n正文……"
 
+    # -- 知识图谱工具桩（仅验证 MCP 封装层接线） -------------------------
+
+    def kg_ingest(self, doc_name=""):
+        return {"chunks": 3, "entities": 2, "relationships": 1,
+                "vectors": 4, "graph": {"nodes": 2, "edges": 1}}
+
+    def kg_add_entity(self, name, etype="UNKNOWN", description=""):
+        return {"name": name, "created": True}
+
+    def kg_add_relationship(self, source, target, relation, description=""):
+        return {"id": "rid", "source": source, "target": target,
+                "relation": relation, "created": True}
+
+    def kg_get_entity(self, entity):
+        if entity == "不存在":
+            raise KeyError(f"实体不存在: {entity}")
+        return {"name": entity, "type": "Person", "relationships": [],
+                "aliases": []}
+
+    def kg_delete_entity(self, entity):
+        return {"deleted": entity, "entities": 1, "relationships": 2,
+                "vectors": 3}
+
+    def kg_get_path(self, entity_a, entity_b, algorithm="bfs"):
+        if algorithm not in ("bfs", "dfs", "dijkstra"):
+            raise ValueError(f"不支持的寻路算法: {algorithm}")
+        return {"found": True, "algorithm": algorithm, "length": 1,
+                "nodes": [{"name_key": entity_a}, {"name_key": entity_b}],
+                "edges": [{"keywords": "相关"}]}
+
+    def kg_get_neighbors(self, entity):
+        return {"entity": entity, "name_key": entity, "degree": 1,
+                "neighbors": [{"name_key": "苹果", "name": "苹果",
+                               "type": "Organization", "description": "",
+                               "via": {"relation_type": "关联",
+                                       "keywords": "关联", "weight": 1}}]}
+
+    def kg_get_subgraph(self, root, depth=1, edge_types=None):
+        return {"root": root, "depth": depth,
+                "nodes": [{"name_key": root, "depth": 0}], "edges": []}
+
+    def kg_search_graph(self, query, mode="hybrid"):
+        if mode not in ("local", "global", "hybrid", "mix"):
+            raise ValueError(f"不支持的检索模式: {mode}")
+        return [{"kind": "entity", "name": "苹果", "score": 0.9}]
+
 
 @pytest.fixture
 def stub_engine():
@@ -90,9 +136,9 @@ def test_mcp_tools_inmemory(stub_engine):
             assert d["status"] == "ok"
             assert d["data"]["count"] == 2
 
-            # 2. parse_and_ingest_document
+            # 2. ingest_document
             d = _parse(await client.call_tool(
-                "parse_and_ingest_document", {"doc_path": "/tmp/x.pdf"}))
+                "ingest_document", {"doc_path": "/tmp/x.pdf"}))
             assert d["status"] == "ok"
             assert d["data"]["ingested"]["upserted"] == 1
 
@@ -124,6 +170,47 @@ def test_mcp_tools_inmemory(stub_engine):
                 "get_document", {"doc_name": "book"}))
             assert d["status"] == "ok"
             assert d["data"]["markdown"].startswith("# 完整文档")
+
+            # 8-16. 知识图谱 9 工具
+            d = _parse(await client.call_tool("ingest_knowledge", {}))
+            assert d["status"] == "ok"
+            assert d["data"]["ingest"]["entities"] == 2
+            d = _parse(await client.call_tool(
+                "ingest_knowledge", {"doc_name": "book.md"}))
+            assert d["status"] == "ok"
+            d = _parse(await client.call_tool(
+                "add_entity", {"name": "苹果", "type": "Organization"}))
+            assert d["status"] == "ok" and d["data"]["created"] is True
+            d = _parse(await client.call_tool(
+                "add_relationship",
+                {"source": "苹果", "target": "乔布斯", "relation": "创始人"}))
+            assert d["status"] == "ok" and d["data"]["relation"] == "创始人"
+            d = _parse(await client.call_tool("get_entity", {"entity": "苹果"}))
+            assert d["status"] == "ok" and d["data"]["type"] == "Person"
+            d = _parse(await client.call_tool("get_entity", {"entity": "不存在"}))
+            assert d["status"] == "error"
+            d = _parse(await client.call_tool(
+                "get_path", {"entity_a": "苹果", "entity_b": "乔布斯",
+                             "algorithm": "dijkstra"}))
+            assert d["status"] == "ok" and d["data"]["found"] is True
+            d = _parse(await client.call_tool(
+                "get_path", {"entity_a": "苹果", "entity_b": "乔布斯",
+                             "algorithm": "bogus"}))
+            assert d["status"] == "error"
+            d = _parse(await client.call_tool("get_neighbors", {"entity": "乔布斯"}))
+            assert d["status"] == "ok" and d["data"]["degree"] == 1
+            d = _parse(await client.call_tool(
+                "get_subgraph", {"root": "苹果", "depth": 2,
+                                 "edge_types": "创始人,领导"}))
+            assert d["status"] == "ok" and d["data"]["root"] == "苹果"
+            d = _parse(await client.call_tool("delete_entity", {"entity": "苹果"}))
+            assert d["status"] == "ok" and d["data"]["entities"] == 1
+            d = _parse(await client.call_tool(
+                "search_graph", {"query": "创始人是谁", "mode": "mix"}))
+            assert d["status"] == "ok" and d["data"]["count"] == 1
+            d = _parse(await client.call_tool(
+                "search_graph", {"query": "x", "mode": "bogus"}))
+            assert d["status"] == "error"
 
     asyncio.run(run())
 
@@ -174,10 +261,16 @@ def test_mcp_service_stdio():
     try:
         # 显式把当前环境（含 MONKEY_RAG_ENGINE）传给子进程：StdioTransport 不自动
         # 继承父进程 os.environ，需显式 env 才能让 stdio 子进程走内置桩引擎。
+        # src 布局：子进程需要 PYTHONPATH 找到 agent 包（pytest 里由 conftest
+        # 或 rootdir 配置注入，裸子进程没有）。
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src_dir = os.path.join(repo_root, "src")
+        env = {**os.environ}
+        env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
         transport = StdioTransport(
             command=sys.executable,
             args=["-m", "agent.tools.rag_mcp_server", "--transport", "stdio"],
-            env={**os.environ},
+            env=env,
         )
 
         async def run():
@@ -185,11 +278,15 @@ def test_mcp_service_stdio():
             async with client:
                 tools = await client.list_tools()
                 names = {t.name for t in tools}
-                # 6 项能力 → 7 个工具名（delete_document 与 forget_context 同义）
+                # 6 项 RAG 能力（7 工具，delete_document/forget_context 同义）
+                # + 9 个知识图谱工具
                 expected = {
-                    "parse_and_ingest_document", "delete_document", "forget_context",
+                    "ingest_document", "delete_document", "forget_context",
                     "list_document", "extract_metadata",
                     "hybrid_search_with_rerank", "get_document",
+                    "ingest_knowledge", "add_entity", "add_relationship",
+                    "get_entity", "delete_entity", "get_path", "get_neighbors",
+                    "get_subgraph", "search_graph",
                 }
                 assert names == expected, names
                 # 调用若干工具走通（monkey 桩）
@@ -203,6 +300,20 @@ def test_mcp_service_stdio():
                 d = _parse(await client.call_tool("get_document", {"doc_name": "x"}))
                 assert d["status"] == "ok"
                 assert "monkey" in d["data"]["markdown"]
+                # monkey 图谱桩走通：详情 / 邻居 / 寻路 / 子图 / 检索
+                d = _parse(await client.call_tool("get_entity", {"entity": "苹果"}))
+                assert d["status"] == "ok" and d["data"]["monkey"] is True
+                d = _parse(await client.call_tool("get_neighbors", {"entity": "苹果"}))
+                assert d["status"] == "ok" and d["data"]["degree"] == 2
+                d = _parse(await client.call_tool(
+                    "get_path", {"entity_a": "苹果", "entity_b": "乔布斯",
+                                 "algorithm": "dfs"}))
+                assert d["status"] == "ok" and d["data"]["found"] is True
+                d = _parse(await client.call_tool("get_subgraph", {"root": "苹果"}))
+                assert d["status"] == "ok" and len(d["data"]["nodes"]) == 3
+                d = _parse(await client.call_tool(
+                    "search_graph", {"query": "创始人", "mode": "local"}))
+                assert d["status"] == "ok" and d["data"]["count"] == 2
 
         asyncio.run(run())
     finally:
