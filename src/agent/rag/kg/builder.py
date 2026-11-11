@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 SNAPSHOT_EVERY = 50          # 每 N 片落一次快照
 _SUMMARY_MIN_DESCS = 2       # 描述数达到该值才触发 LLM 归纳
+# 单片抽取硬上限（与 prompts.py 的约束一致）：模型不守约时在此兜底，
+# 描述超长按 100 字截断，避免单条描述把后续上下文挤爆。
+MAX_ENTITIES_PER_CHUNK = 20
+MAX_RELATIONS_PER_CHUNK = 50
+MAX_DESCRIPTION_CHARS = 100
 
 
 def kg_dir_for(rag_dir: str) -> str:
@@ -65,7 +70,15 @@ class KGBuilder:
         self._extractor = extractor
         self._progress = progress_callback or (lambda d, t, m: None)
         self._cancel_event = cancel_event
-        self._log = log_callback or (lambda m: None)
+
+        def _emit_log(msg: str) -> None:
+            # 终端也打一份：UI 日志窗口可能没打开，用户从终端启动时只能靠
+            # logger 看到进度（否则构建期间表现为「完全没有任何信息」）。
+            logger.info("%s", msg)
+            if log_callback is not None:
+                log_callback(msg)
+
+        self._log = _emit_log
         self._kg_store = KGStore(kg_dir_for(rag_dir))
         self._embedder = KGEmbedder(store.embedding_function)
         # 实体消歧（入库前解析到已有实体，不重复建行）。
@@ -161,6 +174,10 @@ class KGBuilder:
                 logger.warning("KG: 切片 %s 抽取失败: %s", chunk_id, e)
                 self._log(f"[kg] ⚠ 切片 {chunk_id} 抽取失败: {e}")
             self._progress(done, total, f"知识图谱抽取 {done}/{total}")
+            if done % 20 == 0 or done == total:
+                self._log(f"[kg] 抽取进度 {done}/{total}"
+                          f"（新增实体 {stats['entities']}，"
+                          f"关系 {stats['relationships']}）")
             if done % SNAPSHOT_EVERY == 0:
                 self._refresh_graph(graph)
                 graph.save_snapshot(snapshot_path)
@@ -192,12 +209,23 @@ class KGBuilder:
         name_map: Dict[str, str] = {}
         created = 0
         merged = 0
+        # 兜底执行 prompt 的数量/长度约束（模型不守约时防止洪泛）：
+        # 上限取自抽取器（配置项 rag_kg_max_*），与 prompt 渲染用的是同一份值。
+        max_ent = int(getattr(self._extractor, "max_entities",
+                              MAX_ENTITIES_PER_CHUNK))
+        max_rel = int(getattr(self._extractor, "max_relations",
+                              MAX_RELATIONS_PER_CHUNK))
+        max_desc = int(getattr(self._extractor, "max_desc_chars",
+                               MAX_DESCRIPTION_CHARS))
+        entities = list(entities)[:max_ent]
+        relations = list(relations)[:max_rel]
         for ent in entities:
             name = (ent.name or "").strip()
             if not name:
                 continue
             canonical, is_new, was_merged = self._resolver.merge_or_create(
-                name, ent.type, ent.description, chunk_id, source)
+                name, ent.type, (ent.description or "")[:max_desc],
+                chunk_id, source)
             name_map[name] = canonical
             created += 1 if is_new else 0
             merged += 1 if was_merged else 0
@@ -214,7 +242,8 @@ class KGBuilder:
                 # 消歧合并后两端归一为同一实体，自环关系无意义。
                 continue
             self._kg_store.upsert_relationship(
-                src_c, dst_c, rel.keywords, rel.description, chunk_id,
+                src_c, dst_c, rel.keywords,
+                (rel.description or "")[:max_desc], chunk_id,
                 file_path=source)
             self._maybe_summarize_relationship(src_c, dst_c)
         return created, merged

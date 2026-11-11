@@ -585,7 +585,10 @@ class LocalLLMClient:
         # 串行化同实例的生成调用：MLX/GGUF 模型对同一实例并发 generate 不安全。
         # 主模型与辅助模型是各自独立的 LocalLLMClient 实例，因此这把锁互不阻塞
         # 二者，只防止辅助模型被「RAG 精简线程」与「事实抽取线程」等并发调用。
-        self._gen_lock = threading.Lock()
+        # 必须是 RLock：非 MLX 后端的 batch_chat 兜底路径会先持锁、再逐条调用
+        # chat_stream（chat_stream 内部还要再取同一把锁）——普通 Lock 会让同一
+        # 线程二次加锁永久自死锁（GGUF 辅助模型上表现为构建/逐章摘要全卡住）。
+        self._gen_lock = threading.RLock()
         # 跨轮 KV 缓存（仅 MLX 路径）：多轮对话复用 system+历史 的 KV 状态，
         # 每轮只预填充本轮新增 token（对齐 Ollama 的 prompt cache 行为）。
         self._mlx_cache = None

@@ -887,3 +887,43 @@ def test_resolve_model_path_falls_back_to_home_models(tmp_path, monkeypatch):
     abs_dir = tmp_path / "abs-model"
     abs_dir.mkdir()
     assert registry.resolve_model_path("embedding", str(abs_dir)) == str(abs_dir)
+
+
+# ---------------------------------------------------------------------------
+# 非 MLX 后端 batch_chat 兜底路径：不能与 chat_stream 自死锁
+# ---------------------------------------------------------------------------
+
+def test_batch_chat_gguf_fallback_no_self_deadlock():
+    """GGUF/ONNX 的 batch_chat 兜底先持 _gen_lock 再调 chat_stream。
+
+    chat_stream 内部还会再取同一把锁——若 _gen_lock 是普通 Lock，同一线程
+    二次加锁会永久死锁（表现为：知识图谱构建/逐章摘要在 GGUF 辅助模型上
+    完全无进度、CPU 0%，且同实例的其它调用全部排队卡死）。
+    """
+    import threading
+    from types import SimpleNamespace
+    from agent.local.llm import LocalLLMClient
+
+    client = LocalLLMClient(path="/tmp/fake-nonexistent.gguf", backend="gguf")
+    # 绕过真实权重加载，只验证加锁结构
+    client._loaded = True
+    client._ensure_model = lambda: None
+
+    def fake_stream(messages, tools=None, temperature=0.7, kv_group="main",
+                    enable_thinking=None, max_tokens=None):
+        yield SimpleNamespace(type="content", content="ok")
+        yield SimpleNamespace(type="done", content="")
+
+    client._stream_gguf = fake_stream  # type: ignore[method-assign]
+
+    result = {}
+
+    def run():
+        result["v"] = client.batch_chat(
+            [{"role": "user", "content": "hi"}], max_tokens=4)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(5)
+    assert not t.is_alive(), "batch_chat 在非 MLX 后端自死锁（_gen_lock 不可重入）"
+    assert result["v"] == ["ok"]

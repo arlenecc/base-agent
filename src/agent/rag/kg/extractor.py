@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 _ROW_DELIM = "<|#|>"
 _COMPLETE_TAG = "<|COMPLETE|>"
+# 行首标记切分：模型常把多行 entity/relation 连着写（无换行），按 ``^``
+# 切分会漏行；这里用零宽前瞻在任意位置的 "entity<|#|>" 前断开。
+_ROW_START_RE = re.compile(
+    r"(?i)(?=(?:entity|relation)\s*" + re.escape(_ROW_DELIM) + ")")
 _MAX_DESCRIPTIONS_FOR_SUMMARY = 12
 
 _ENTITY_TYPES = {
@@ -96,9 +100,15 @@ class BaseKGExtractor:
 
     scheme = "base"
 
-    def __init__(self, language: str = "中文"):
+    def __init__(self, language: str = "中文", *,
+                 max_entities: int = 20, max_relations: int = 50,
+                 max_desc_chars: int = 100):
         self._language = language or "中文"
         self._unavailable_reason = "抽取器未初始化"
+        # 单片抽取上限：既用于渲染 prompt，也供构建器入库兜底截断（同一份值）。
+        self.max_entities = max(1, int(max_entities))
+        self.max_relations = max(0, int(max_relations))
+        self.max_desc_chars = max(1, int(max_desc_chars))
 
     @property
     def available(self) -> bool:
@@ -148,9 +158,22 @@ class KGExtractor(BaseKGExtractor):
 
     scheme = "llm_raw"
 
-    def __init__(self, llm_client: Any = None, language: str = "中文"):
-        super().__init__(language)
+    def __init__(self, llm_client: Any = None, language: str = "中文", *,
+                 max_entities: int = 20, max_relations: int = 50,
+                 max_desc_chars: int = 100):
+        super().__init__(language, max_entities=max_entities,
+                         max_relations=max_relations,
+                         max_desc_chars=max_desc_chars)
         self._llm = llm_client
+        # 上限在构造期渲染进 prompt（每片都复用，避免重复替换）。
+        self._system_prompt = prompts.with_limits(
+            prompts.EXTRACT_SYSTEM, max_entities=self.max_entities,
+            max_relations=self.max_relations,
+            max_desc_chars=self.max_desc_chars)
+        self._task_template = prompts.with_limits(
+            prompts.EXTRACT_TASK, max_entities=self.max_entities,
+            max_relations=self.max_relations,
+            max_desc_chars=self.max_desc_chars)
 
     @property
     def available(self) -> bool:
@@ -205,12 +228,12 @@ class KGExtractor(BaseKGExtractor):
 
         解析失败/无输出返回空列表，不影响整体构建。
         """
-        user = prompts.EXTRACT_TASK.format(
+        user = self._task_template.format(
             language=self._language,
             section_context=section_context or "（无）",
             input_text=chunk_text,
         )
-        raw = self._chat(prompts.EXTRACT_SYSTEM, user, max_tokens=4096)
+        raw = self._chat(self._system_prompt, user, max_tokens=4096)
         return parse_extraction_output(raw)
 
     # ------------------------------------------------------------------
@@ -308,8 +331,22 @@ class PydanticLLMExtractor(KGExtractor):
 
     scheme = "llm_pydantic"
 
-    def __init__(self, llm_client: Any = None, language: str = "中文"):
-        super().__init__(llm_client, language)
+    def __init__(self, llm_client: Any = None, language: str = "中文", *,
+                 max_entities: int = 20, max_relations: int = 50,
+                 max_desc_chars: int = 100):
+        super().__init__(llm_client, language,
+                         max_entities=max_entities,
+                         max_relations=max_relations,
+                         max_desc_chars=max_desc_chars)
+        # 覆盖父类渲染的 llm_raw 模板（本方案用 JSON 版 prompt）。
+        self._system_prompt = prompts.with_limits(
+            prompts.PYDANTIC_EXTRACT_SYSTEM, max_entities=self.max_entities,
+            max_relations=self.max_relations,
+            max_desc_chars=self.max_desc_chars)
+        self._task_template = prompts.with_limits(
+            prompts.PYDANTIC_EXTRACT_TASK, max_entities=self.max_entities,
+            max_relations=self.max_relations,
+            max_desc_chars=self.max_desc_chars)
         self._models = _build_pydantic_models()
         if self._models is None:
             logger.warning("KG: pydantic 未安装，llm_pydantic 方案不可用")
@@ -328,12 +365,12 @@ class PydanticLLMExtractor(KGExtractor):
     ) -> tuple:
         if self._models is None:
             return [], []
-        user = prompts.PYDANTIC_EXTRACT_TASK.format(
+        user = self._task_template.format(
             language=self._language,
             section_context=section_context or "（无）",
             input_text=chunk_text,
         )
-        raw = self._chat(prompts.PYDANTIC_EXTRACT_SYSTEM, user, max_tokens=4096)
+        raw = self._chat(self._system_prompt, user, max_tokens=4096)
         data = _parse_json_object(raw)
         if not isinstance(data, dict):
             logger.debug("KG: pydantic 方案输出不是 JSON 对象，本片返回空结果")
@@ -378,8 +415,12 @@ class GLiNERExtractor(BaseKGExtractor):
     scheme = "gliner"
 
     def __init__(self, model_name: str = GLINER_DEFAULT_MODEL,
-                 language: str = "中文", threshold: float = 0.4):
-        super().__init__(language)
+                 language: str = "中文", threshold: float = 0.4, *,
+                 max_entities: int = 20, max_relations: int = 50,
+                 max_desc_chars: int = 100):
+        super().__init__(language, max_entities=max_entities,
+                         max_relations=max_relations,
+                         max_desc_chars=max_desc_chars)
         self._model_name = model_name or GLINER_DEFAULT_MODEL
         self._threshold = float(threshold)
         self._model: Any = None
@@ -501,19 +542,24 @@ class GLiNERExtractor(BaseKGExtractor):
 # ---------------------------------------------------------------------------
 
 def create_extractor(scheme: str, llm_client: Any = None,
-                     language: str = "中文") -> BaseKGExtractor:
+                     language: str = "中文", *,
+                     max_entities: int = 20, max_relations: int = 50,
+                     max_desc_chars: int = 100) -> BaseKGExtractor:
     """按配置字符串构造抽取方案。
 
     scheme ∈ {llm_raw, llm_pydantic, gliner}；未知值回退 llm_raw 并告警。
+    max_* 为单片抽取上限（配置项 rag_kg_max_*），同时用于 prompt 与入库兜底。
     """
     scheme = str(scheme or "llm_raw").lower()
+    limits = dict(max_entities=max_entities, max_relations=max_relations,
+                  max_desc_chars=max_desc_chars)
     if scheme == "llm_pydantic":
-        return PydanticLLMExtractor(llm_client, language)
+        return PydanticLLMExtractor(llm_client, language, **limits)
     if scheme == "gliner":
-        return GLiNERExtractor(language=language)
+        return GLiNERExtractor(language=language, **limits)
     if scheme != "llm_raw":
         logger.warning("KG: 未知抽取方案 %r，回退 llm_raw", scheme)
-    return KGExtractor(llm_client, language)
+    return KGExtractor(llm_client, language, **limits)
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +567,12 @@ def create_extractor(scheme: str, llm_client: Any = None,
 # ---------------------------------------------------------------------------
 
 def parse_extraction_output(raw: str) -> tuple:
-    """解析 ``entity<|#|>...`` / ``relation<|#|>...`` 行输出。"""
+    """解析 ``entity<|#|>...`` / ``relation<|#|>...`` 行输出。
+
+    容错要点：模型不一定逐行输出（常见把多行连着写、或字段里夹换行），
+    因此**按行首标记切分**而不是按 ``splitlines``——否则一行里的第 2 条
+    及之后的行会被整段丢弃（表现为「抽到了实体但入库只有 1 个」）。
+    """
     entities: List[ExtractedEntity] = []
     relations: List[ExtractedRelation] = []
     if not raw:
@@ -530,10 +581,12 @@ def parse_extraction_output(raw: str) -> tuple:
     if _COMPLETE_TAG in raw:
         raw = raw.split(_COMPLETE_TAG, 1)[0]
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S)
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or _ROW_DELIM not in line:
+    for seg in _ROW_START_RE.split(raw):
+        seg = seg.strip()
+        if not seg or _ROW_DELIM not in seg:
             continue
+        # 一行一条：描述自身若含换行，只取首行（与格式约定一致）。
+        line = seg.splitlines()[0].strip()
         parts = [p.strip() for p in line.split(_ROW_DELIM)]
         tag = parts[0].lower()
         try:

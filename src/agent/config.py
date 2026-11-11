@@ -143,6 +143,11 @@ class AgentConfig:
     #   - "gliner"：不基于 LLM，本地 GLiNER NER 模型抽实体 + 同句共现启发式
     #     连边（需 pip install gliner，首次使用下载模型权重；无需启用辅助模型）。
     rag_kg_extractor: str = "llm_raw"
+    # 知识图谱单片抽取上限（构建期）：既渲染进抽取 prompt 的约束，也在入库时
+    # 兜底截断（模型不守约时防止洪泛）。描述字数同时是「一条描述的最大长度」。
+    rag_kg_max_entities: int = 20
+    rag_kg_max_relations: int = 50
+    rag_kg_max_description_chars: int = 100
     # PDF 统一解析引擎切换（仅影响「有文本层的常规 PDF/office 文档」首选谁，
     # 扫描件/图片重 PDF 始终走 parsers 的 RapidOCR 路径）：
     #   - "docling"（默认，现状）：docling 统一解析，不可用回退按格式解析器
@@ -376,7 +381,9 @@ class AgentConfig:
                    "rag_binary_prefilter_top",
                    "aux_max_tokens", "aux_top_k",
                    "local_llm_num_draft_tokens", "local_llm_prefill_step_size",
-                   "rag_mcp_port")
+                   "rag_mcp_port",
+                   "rag_kg_max_entities", "rag_kg_max_relations",
+                   "rag_kg_max_description_chars")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
                      "rag_rerank_min_similarity",

@@ -1427,3 +1427,120 @@ class TestStoragePathLock:
             assert v == 5000
         finally:
             kg.close()
+
+
+# ---------------------------------------------------------------------------
+# 抽取输出解析：模型不换行 / 多行连写时的容错
+# ---------------------------------------------------------------------------
+
+class TestParseExtractionOutput:
+    def test_rows_without_newlines_are_all_parsed(self):
+        """模型把多行连成一整行输出时，不能只解析第一条。"""
+        from agent.rag.kg.extractor import parse_extraction_output
+        raw = ("entity<|#|>苹果公司<|#|>Organization<|#|>科技公司。"
+               "entity<|#|>史蒂夫·沃兹尼亚克<|#|>Person<|#|>联合创始人。"
+               "relation<|#|>史蒂夫·沃兹尼亚克<|#|>苹果公司<|#|>创立<|#|>共同创办。"
+               "<|COMPLETE|>")
+        ents, rels = parse_extraction_output(raw)
+        assert [e.name for e in ents] == ["苹果公司", "史蒂夫·沃兹尼亚克"]
+        assert len(rels) == 1 and rels[0].src == "史蒂夫·沃兹尼亚克"
+
+    def test_standard_line_format_still_works(self):
+        from agent.rag.kg.extractor import parse_extraction_output
+        raw = ("entity<|#|>苹果公司<|#|>Organization<|#|>科技公司。\n"
+               "entity<|#|>乔布斯<|#|>Person<|#|>创始人。\n"
+               "relation<|#||>x<|#|>y<|#|>z<|#|>w\n"
+               "<|COMPLETE|>")
+        ents, rels = parse_extraction_output(raw)
+        assert len(ents) == 2
+        assert rels == []   # 畸形行（分隔符写错）被忽略，不影响实体
+
+
+# ---------------------------------------------------------------------------
+# 抽取数量/长度约束：prompt 约束 + 入库兜底
+# ---------------------------------------------------------------------------
+
+class TestExtractionLimits:
+    def test_prompts_render_configured_limits(self):
+        """上限是配置项：渲染后 prompt 里应是实际数值，而非占位符。"""
+        from agent.rag.kg import prompts
+        sys_raw = prompts.with_limits(
+            prompts.EXTRACT_SYSTEM, max_entities=7, max_relations=9,
+            max_desc_chars=40)
+        assert "within 40 Chinese characters" in sys_raw
+        assert "at most 7 entity rows and at most 9 relationship rows" in sys_raw
+        assert prompts.MAX_ENTITIES_TOKEN not in sys_raw
+        pyd = prompts.with_limits(
+            prompts.PYDANTIC_EXTRACT_SYSTEM, max_entities=7, max_relations=9,
+            max_desc_chars=40)
+        assert "within 40 Chinese characters" in pyd
+        assert "at most 7 entities and 9 relations" in pyd
+        assert prompts.MAX_DESC_CHARS_TOKEN not in pyd
+
+    def test_extractor_carries_limits(self):
+        from agent.rag.kg.extractor import create_extractor
+        ex = create_extractor("llm_raw", None, max_entities=3,
+                              max_relations=4, max_desc_chars=50)
+        assert (ex.max_entities, ex.max_relations, ex.max_desc_chars) == (3, 4, 50)
+        # prompt 里已是实际值
+        assert "within 50 Chinese characters" in ex._system_prompt
+
+    def test_builder_clamps_entities_relations_and_descriptions(self, rag_dir):
+        """模型超量输出时：实体截 20、关系截 50、描述截 100 字。"""
+        from agent.rag.kg.builder import (
+            MAX_DESCRIPTION_CHARS, MAX_ENTITIES_PER_CHUNK,
+            MAX_RELATIONS_PER_CHUNK)
+        import itertools
+        long_desc = "描" * 500
+        ents = [f"entity<|#|>实体{i}<|#|>Concept<|#|>{long_desc}"
+                for i in range(30)]
+        pairs = list(itertools.combinations(range(20), 2))[:60]
+        rels = [f"relation<|#|>实体{a}<|#|>实体{b}<|#|>相关<|#|>{long_desc}"
+                for a, b in pairs]
+        store = FakeStore([
+            {"id": "c1_0", "text": "测试", "source": "a.md", "chunk_index": 0},
+        ])
+        builder = KGBuilder(
+            rag_dir, store,
+            KGExtractor(FakeLLM(extract_output="\n".join(ents + rels))))
+        try:
+            builder.build()
+        finally:
+            builder.close()
+        kg = KGStore(kg_dir_for(rag_dir))
+        try:
+            counts = kg.counts()
+            assert counts["entities"] == MAX_ENTITIES_PER_CHUNK == 20
+            assert counts["relationships"] == MAX_RELATIONS_PER_CHUNK == 50
+            e = kg.get_entity_by_key(normalize_name("实体0"))
+            assert len(e["description"]) <= MAX_DESCRIPTION_CHARS == 100
+        finally:
+            kg.close()
+
+    def test_builder_honors_custom_limits(self, rag_dir):
+        """自定义上限（配置项）必须生效：3 实体 / 2 关系 / 30 字描述。"""
+        ents = [f"entity<|#|>实体{i}<|#|>Concept<|#|>{'描' * 200}"
+                for i in range(6)]
+        rels = [f"relation<|#|>实体0<|#|>实体1<|#|>相关<|#|>{'描' * 200}",
+                f"relation<|#|>实体0<|#|>实体2<|#|>相关<|#|>{'描' * 200}",
+                f"relation<|#|>实体1<|#|>实体2<|#|>相关<|#|>{'描' * 200}"]
+        store = FakeStore([
+            {"id": "c1_0", "text": "测试", "source": "a.md", "chunk_index": 0},
+        ])
+        builder = KGBuilder(
+            rag_dir, store,
+            KGExtractor(FakeLLM(extract_output="\n".join(ents + rels)),
+                        max_entities=3, max_relations=2, max_desc_chars=30))
+        try:
+            builder.build()
+        finally:
+            builder.close()
+        kg = KGStore(kg_dir_for(rag_dir))
+        try:
+            counts = kg.counts()
+            assert counts["entities"] == 3
+            assert counts["relationships"] == 2
+            e = kg.get_entity_by_key(normalize_name("实体0"))
+            assert len(e["description"]) <= 30
+        finally:
+            kg.close()

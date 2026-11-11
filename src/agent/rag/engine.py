@@ -664,6 +664,9 @@ class RAGEngine:
         min_similarity: Optional[float] = None,
         kg_strategy: str = "naive",
         kg_extractor: str = "llm_raw",
+        kg_max_entities: int = 20,
+        kg_max_relations: int = 50,
+        kg_max_description_chars: int = 100,
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -724,6 +727,10 @@ class RAGEngine:
         # 三元组抽取方案（llm_raw / llm_pydantic / gliner，与构建期共用配置）：
         # 决定查询期 extract_keywords 用辅助模型还是 GLiNER。
         self._kg_extractor_scheme = str(kg_extractor or "llm_raw").lower()
+        # 单片抽取上限（配置项 rag_kg_max_*）：渲染 prompt 与入库兜底共用。
+        self._kg_max_entities = max(1, int(kg_max_entities))
+        self._kg_max_relations = max(0, int(kg_max_relations))
+        self._kg_max_description_chars = max(1, int(kg_max_description_chars))
         self._aux_llm: Any = None
         self._kg_retriever: Optional[Any] = None
 
@@ -795,7 +802,11 @@ class RAGEngine:
             from .kg.extractor import create_extractor
             from .kg.retriever import KGRetriever
             from .chunker import estimate_tokens
-            extractor = create_extractor(self._kg_extractor_scheme, self._aux_llm)
+            extractor = create_extractor(
+                self._kg_extractor_scheme, self._aux_llm,
+                max_entities=self._kg_max_entities,
+                max_relations=self._kg_max_relations,
+                max_desc_chars=self._kg_max_description_chars)
             self._kg_retriever = KGRetriever(
                 self._rag_dir, self._get_store(), extractor,
                 estimate_tokens=estimate_tokens)
@@ -896,7 +907,11 @@ class RAGEngine:
         store = self._get_store()
         if store.count() == 0:
             raise RuntimeError("知识库为空：请先入库文档再构建知识图谱")
-        extractor = create_extractor(self._kg_extractor_scheme, self._aux_llm)
+        extractor = create_extractor(
+            self._kg_extractor_scheme, self._aux_llm,
+            max_entities=self._kg_max_entities,
+            max_relations=self._kg_max_relations,
+            max_desc_chars=self._kg_max_description_chars)
         if not extractor.available:
             raise RuntimeError(getattr(extractor, "unavailable_reason", "")
                                or "抽取器不可用")

@@ -600,6 +600,11 @@ class ToolRegistry:
                 kg_strategy=getattr(self.config, "rag_kg_strategy", "naive"),
                 # 三元组抽取方案（llm_raw/llm_pydantic/gliner，构建+检索共用）。
                 kg_extractor=getattr(self.config, "rag_kg_extractor", "llm_raw"),
+                # 单片抽取上限（prompt 约束 + 入库兜底）。
+                kg_max_entities=getattr(self.config, "rag_kg_max_entities", 20),
+                kg_max_relations=getattr(self.config, "rag_kg_max_relations", 50),
+                kg_max_description_chars=getattr(
+                    self.config, "rag_kg_max_description_chars", 100),
             )
             self._rag_engine = engine
             # KG 查询期关键词抽取用辅助模型：工具注册时已持有 aux_llm_getter，

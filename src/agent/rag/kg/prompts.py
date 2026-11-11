@@ -6,6 +6,21 @@
 * SUMMARIZE_DESCRIPTIONS —— 实体/关系多描述的 LLM 归纳合并。
 """
 
+# 单片抽取上限占位符：数值由配置项
+# rag_kg_max_entities / rag_kg_max_relations / rag_kg_max_description_chars
+# 在运行期经 ``with_limits`` 渲染（同一份值也用于入库兜底截断）。
+MAX_ENTITIES_TOKEN = "<<MAX_ENTITIES>>"
+MAX_RELATIONS_TOKEN = "<<MAX_RELATIONS>>"
+MAX_DESC_CHARS_TOKEN = "<<MAX_DESC_CHARS>>"
+
+
+def with_limits(text: str, *, max_entities: int, max_relations: int,
+                max_desc_chars: int) -> str:
+    """把上限占位符替换为实际配置值（prompt 渲染入口）。"""
+    return (text.replace(MAX_ENTITIES_TOKEN, str(int(max_entities)))
+                .replace(MAX_RELATIONS_TOKEN, str(int(max_relations)))
+                .replace(MAX_DESC_CHARS_TOKEN, str(int(max_desc_chars))))
+
 # ---------------------------------------------------------------------------
 # 实体与关系抽取（构建期，辅助模型）
 # ---------------------------------------------------------------------------
@@ -19,7 +34,7 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
   - For each entity, extract:
     - `entity_name`: The name of the entity. If the entity name is case-insensitive, capitalize the first letter of each significant word (title case). Ensure **consistent naming** across the entire extraction process.
     - `entity_type`: Categorize the entity using the type guidance provided in the `---Entity Types---` section below. If none of the provided entity types apply, classify it as `Other`.
-    - `entity_description`: Provide a concise yet comprehensive description of the entity's attributes and activities, based *solely* on the information present in the input text.
+    - `entity_description`: Provide a concise yet comprehensive description of the entity's attributes and activities, based *solely* on the information present in the input text. **Keep it within <<MAX_DESC_CHARS>> Chinese characters.**
 
 2. **Relationship Extraction:**
   - Identify direct, clearly stated, and meaningful relationships between previously extracted entities.
@@ -28,7 +43,7 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
     - `source_entity`: The name of the source entity. Ensure **consistent naming** with entity extraction. Capitalize the first letter of each significant word (title case) if the name is case-insensitive.
     - `target_entity`: The name of the target entity. Ensure **consistent naming** with entity extraction. Capitalize the first letter of each significant word (title case) if the name is case-insensitive.
     - `relationship_keywords`: One or more high-level keywords summarizing the relationship. Multiple keywords within this field must be separated by a comma `,`. **DO NOT use `<|#|>` for separating multiple keywords within this field.**
-    - `relationship_description`: A concise explanation of the nature of the relationship between the source and target entities.
+    - `relationship_description`: A concise explanation of the nature of the relationship between the source and target entities. **Keep it within <<MAX_DESC_CHARS>> Chinese characters.**
 
 3. **Record Types:**
   - `entity` is used only for entity rows and those rows always contain exactly 4 tuple parts total.
@@ -49,8 +64,7 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
 
 6. **Output Order & Deduplication:**
   - Output all extracted entities first, followed by all extracted relationships.
-  - Output at most 100 total rows across entities and relationships in this response.
-  - Output at most 40 entity rows in this response.
+  - Output at most <<MAX_ENTITIES>> entity rows and at most <<MAX_RELATIONS>> relationship rows in this response.
   - Output fewer rows if fewer high-value items are present. Do not try to fill the limit.
   - Only output relationship rows whose source and target entities are both included in the selected entity rows for this response.
   - If the limit is reached, stop adding new rows immediately and output `<|COMPLETE|>`.
@@ -101,7 +115,7 @@ Extract entities and relationships from the `---Input Text---` section below.
 
 ---Instructions---
 1. **Strict Adherence to Format:** Strictly adhere to all format requirements for entity and relationship lists, including output order, field delimiters, and proper noun handling, as specified in the system prompt.
-2. **Quantity Limits:** In this response, output at most 100 total rows and at most 40 entity rows. Output fewer rows if fewer high-value items are present. Only output relationship rows whose source and target entities are both included in this response.
+2. **Quantity Limits:** In this response, output at most <<MAX_ENTITIES>> entity rows and at most <<MAX_RELATIONS>> relationship rows. Output fewer rows if fewer high-value items are present. Only output relationship rows whose source and target entities are both included in this response. Keep every description within <<MAX_DESC_CHARS>> Chinese characters.
 3. **Output Content Only:** Output *only* the extracted list of entities and relationships. Do not include any introductory or concluding remarks, explanations, or additional text before or after the list.
 4. **Completion Signal:** Output `<|COMPLETE|>` as the final line after all relevant entities and relationships have been extracted and presented. If the row limit is reached, output `<|COMPLETE|>` immediately after the last allowed row.
 5. **Output Language:** Ensure the output language is {language}. Proper nouns (e.g., personal names, place names, organization names) must be kept in their original language and not translated.
@@ -121,15 +135,15 @@ PYDANTIC_EXTRACT_SYSTEM = """---Role---
 You are a Knowledge Graph Specialist responsible for extracting entities and relationships from the `---Input Text---` section of user prompt. Your output will be parsed by a strict JSON schema validator.
 
 ---Instructions---
-1. **Entity Extraction:** Identify clearly defined and meaningful entities only in the fenced `---Input Text---` section. For each entity extract `name` (consistent naming, title case for case-insensitive names), `type` (one of: Person, Creature, Organization, Location, Event, Concept, Method, Content, Data, Artifact, NaturalObject; use `Other` if none fits), and `description` (concise, based solely on the input text, third person, no pronouns).
+1. **Entity Extraction:** Identify clearly defined and meaningful entities only in the fenced `---Input Text---` section. For each entity extract `name` (consistent naming, title case for case-insensitive names), `type` (one of: Person, Creature, Organization, Location, Event, Concept, Method, Content, Data, Artifact, NaturalObject; use `Other` if none fits), and `description` (concise, based solely on the input text, third person, no pronouns, **within <<MAX_DESC_CHARS>> Chinese characters**).
 
-2. **Relationship Extraction:** Identify direct, clearly stated, meaningful relationships between the extracted entities. Decompose n-ary statements into binary relations. Each relation has `src`, `dst` (both must match an extracted entity `name` exactly), `keywords` (comma-separated high-level keywords), and `description` (concise explanation). Treat all relationships as **undirected**; avoid duplicates.
+2. **Relationship Extraction:** Identify direct, clearly stated, meaningful relationships between the extracted entities. Decompose n-ary statements into binary relations. Each relation has `src`, `dst` (both must match an extracted entity `name` exactly), `keywords` (comma-separated high-level keywords), and `description` (concise explanation, **within <<MAX_DESC_CHARS>> Chinese characters**). Treat all relationships as **undirected**; avoid duplicates.
 
 3. **Output Format:** Output *only* one valid JSON object — no markdown fences, no comments, no text before or after. The first character must be `{` and the last must be `}`. Shape:
 
    {"entities": [{"name": "...", "type": "...", "description": "..."}], "relations": [{"src": "...", "dst": "...", "keywords": "...", "description": "..."}]}
 
-   Both keys are required (use empty arrays if nothing extracted). Output at most 40 entities and 100 total rows. Output fewer rows if fewer high-value items are present.
+   Both keys are required (use empty arrays if nothing extracted). Output at most <<MAX_ENTITIES>> entities and <<MAX_RELATIONS>> relations. Output fewer rows if fewer high-value items are present.
 
 4. **Context & Language:** If a `---Section Context---` section is present, use it only as background to disambiguate references — never extract from the headings themselves. All names and descriptions must be written in `中文`. Proper nouns should be retained in their original language if a widely accepted translation is unavailable.
 
@@ -144,7 +158,7 @@ Extract entities and relationships from the `---Input Text---` section below.
 
 ---Instructions---
 1. Output *only* the JSON object as specified in the system prompt (no fences, no extra text). Both `entities` and `relations` keys are required.
-2. Only output relations whose `src` and `dst` exactly match an extracted entity `name`.
+2. Only output relations whose `src` and `dst` exactly match an extracted entity `name`. At most <<MAX_ENTITIES>> entities and <<MAX_RELATIONS>> relations in this response.
 3. Output language: {language}. Proper nouns must be kept in their original language.
 
 ---Section Context---

@@ -839,23 +839,40 @@ class BuildKGWorker(QThread):
     def cancel(self) -> None:
         self._cancel.set()
 
+    def _extraction_client(self):
+        """KG 抽取用的 LLM 客户端，返回 (client, 人类可读标签)。
+
+        **默认（且只）用辅助模型**：构建动辄数小时，绝不能占用主模型——否则
+        对话/工具调用全部排队（用户明确要求「不影响使用」）。这里单独构建一份
+        辅助模型实例，构建结束在 finally 里 close 释放，不碰 UI 的共享实例。
+
+        实测（同一 786 字正文切片，llm_raw，enable_thinking=False）：
+          * 0.8B：2.4s，只输出 ``<|COMPLETE|>`` → 0 实体 0 关系（不可用）；
+          * 2B / 2B-Agent：113s / 126s，7k-13k 字、136-144 实体（无视 20 上限），
+            token 预算耗尽 → 关系恒为 0；
+          * Spark-X2.6 1.7B：15.8s，3 实体 2 关系（关系字段只有 4 段，错位）；
+          * 4B（Qwen3.5 / Spark-X2.6）：约 24-30s，4-5 实体 + 4-5 关系，结构正确。
+        结论：辅助模型建议 ≥4B。
+        """
+        from ..local.factory import build_aux_llm_client
+        if bool(getattr(self._config, "aux_llm_enabled", False)):
+            return build_aux_llm_client(self._config), "辅助模型"
+        raise RuntimeError(
+            "知识图谱抽取需要辅助模型：请在「辅助模型」区域启用并加载"
+            "（建议 ≥4B，0.8B/2B 实测不可用），或把抽取方案切换为 GLiNER")
+
     def run(self) -> None:  # type: ignore[override]
         emit_stats = None
         emit_error = None
         aux_client = None
         try:
             from ..rag.kg import KGBuilder, KGCancellation, create_extractor
-            # 抽取方案：LLM 两种方案构建期必须有辅助模型；GLiNER 不依赖 LLM。
+            # 抽取方案：LLM 两种方案构建期必须有 LLM；GLiNER 不依赖。
             scheme = str(getattr(self._config, "rag_kg_extractor", "llm_raw")
                          or "llm_raw").lower()
             if scheme != "gliner":
-                if not bool(getattr(self._config, "aux_llm_enabled", False)):
-                    raise RuntimeError(
-                        "辅助模型未启用：请先在「辅助模型」区域启用并加载辅助模型，"
-                        "再构建知识图谱（或把抽取方案切换为 GLiNER）")
-                from ..local.factory import build_aux_llm_client
-                self._emit_log("[kg] 正在加载辅助模型（首次可能需要编译/下载）...")
-                aux_client = build_aux_llm_client(self._config)
+                aux_client, label = self._extraction_client()
+                self._emit_log(f"[kg] 抽取使用{label}（首次加载可能需要编译/下载）...")
             else:
                 self._emit_log("[kg] GLiNER 方案：不依赖辅助模型，加载本地 NER 模型...")
             self._engine = RAGEngine(
@@ -874,7 +891,12 @@ class BuildKGWorker(QThread):
             store = self._engine._get_store()
             if store.count() == 0:
                 raise RuntimeError("知识库为空：请先同步知识库（有切片才能抽取实体/关系）")
-            extractor = create_extractor(scheme, aux_client)
+            extractor = create_extractor(
+                scheme, aux_client,
+                max_entities=int(getattr(self._config, "rag_kg_max_entities", 20)),
+                max_relations=int(getattr(self._config, "rag_kg_max_relations", 50)),
+                max_desc_chars=int(getattr(
+                    self._config, "rag_kg_max_description_chars", 100)))
             if not extractor.available:
                 raise RuntimeError(getattr(extractor, "unavailable_reason", "")
                                    or "抽取器不可用")
@@ -906,9 +928,14 @@ class BuildKGWorker(QThread):
                     logger.warning("BuildKGWorker: engine close failed: %s", e)
             try:
                 if aux_client is not None:
-                    unload = getattr(aux_client, "unload", None)
-                    if callable(unload):
-                        unload()
+                    # 构建结束后立刻释放权重（4B 级模型占 2-3GB）：close() 会
+                    # 清引用并回收统一内存；旧实现只找 unload()，而
+                    # LocalLLMClient 没有该方法 → 内存要等 GC 才释放。
+                    for name in ("unload", "close"):
+                        fn = getattr(aux_client, name, None)
+                        if callable(fn):
+                            fn()
+                            break
             except Exception:
                 pass
             if emit_error is not None:
@@ -1626,6 +1653,9 @@ class MainWindow(QMainWindow):
                 and not self._is_worker_running(getattr(self, "_deps_worker", None))
                 and not self._is_worker_running(getattr(self, "_dedup_worker", None))
                 and not self._is_worker_running(getattr(self, "_fetch_worker", None))
+                # 知识图谱构建/消歧正在跑时不让摘要抢辅助模型：两者都用同一份
+                # 本地权重，并发只会互相拖慢，且构建期需要稳定的抽取吞吐。
+                and not self._is_worker_running(getattr(self, "_kg_worker", None))
             ),
         )
         self._summary_scheduler.start()
@@ -2508,8 +2538,9 @@ class MainWindow(QMainWindow):
         self.kg_build_btn.setToolTip(
             "按当前「抽取方案」**清空重建**知识图谱（实体表 + 关系表 + 向量 +\n"
             "内存图快照）：旧图谱数据先清空，可修复切换方案后的残留数据。\n"
-            "需要先：① 同步知识库；② LLM 方案还需启用辅助模型\n"
-            "（GLiNER 方案不依赖）。按文档增量构建走 MCP ingest_knowledge。")
+            "需要先：① 同步知识库；② LLM 方案需在「辅助模型」启用并加载\n"
+            "（不占用主模型；实测建议 ≥4B：0.8B 零产出、2B 超量且关系恒 0；\n"
+            "GLiNER 方案不依赖 LLM）。按文档增量构建走 MCP ingest_knowledge。")
         self.kg_build_btn.clicked.connect(self._on_build_kg)
         kg_row.addWidget(self.kg_build_btn)
         # 实体消歧：后期手动触发，对库内现有实体做语义向量消歧（对齐/合并）。
@@ -2526,6 +2557,36 @@ class MainWindow(QMainWindow):
         kg_row.addWidget(self.kg_status_label)
         kg_row.addStretch(1)
         adv_lay.addLayout(kg_row)
+
+        # 单片抽取上限（rag_kg_max_*）：既写入抽取 prompt 的约束，也在入库时
+        # 兜底截断。默认 20 实体 / 50 关系 / 描述 100 字。
+        kg_limits_row = QHBoxLayout()
+        kg_limits_row.addWidget(QLabel("单片上限"))
+        kg_limits_row.addSpacing(8)
+        self.kg_max_entities_edit = _num(
+            str(getattr(self.config, "rag_kg_max_entities", 20)), 48)
+        self.kg_max_entities_edit.setToolTip(
+            "单个切片最多抽取的实体数（写入 prompt 约束 + 入库兜底截断）。\n"
+            "调大可能抽出更多实体，但生成 token 更多、构建更慢。")
+        kg_limits_row.addWidget(QLabel("实体"))
+        kg_limits_row.addWidget(self.kg_max_entities_edit)
+        kg_limits_row.addSpacing(8)
+        self.kg_max_relations_edit = _num(
+            str(getattr(self.config, "rag_kg_max_relations", 50)), 48)
+        self.kg_max_relations_edit.setToolTip(
+            "单个切片最多抽取的关系数（写入 prompt 约束 + 入库兜底截断）。")
+        kg_limits_row.addWidget(QLabel("关系"))
+        kg_limits_row.addWidget(self.kg_max_relations_edit)
+        kg_limits_row.addSpacing(8)
+        self.kg_max_desc_edit = _num(
+            str(getattr(self.config, "rag_kg_max_description_chars", 100)), 56)
+        self.kg_max_desc_edit.setToolTip(
+            "单条实体/关系描述的最大字数（写入 prompt 约束 + 入库截断）。\n"
+            "描述越长信息越全，但每个切片生成的 token 越多、构建越慢。")
+        kg_limits_row.addWidget(QLabel("描述字数"))
+        kg_limits_row.addWidget(self.kg_max_desc_edit)
+        kg_limits_row.addStretch(1)
+        adv_lay.addLayout(kg_limits_row)
 
         lay.addWidget(adv_box)
         lay.addStretch(1)
@@ -3295,6 +3356,13 @@ class MainWindow(QMainWindow):
         _kg_ext_fwd = {k: i for i, k in enumerate(_KG_EXTRACTOR_DISPLAY)}
         self.kg_extractor_combo.setCurrentIndex(
             _kg_ext_fwd.get(str(getattr(self.config, "rag_kg_extractor", "llm_raw")), 0))
+        # 单片抽取上限（rag_kg_max_*）
+        self.kg_max_entities_edit.setText(
+            str(getattr(self.config, "rag_kg_max_entities", 20)))
+        self.kg_max_relations_edit.setText(
+            str(getattr(self.config, "rag_kg_max_relations", 50)))
+        self.kg_max_desc_edit.setText(
+            str(getattr(self.config, "rag_kg_max_description_chars", 100)))
         self._refresh_kg_status()
         _dims_load = str(getattr(self.config, "rag_embedding_dims", 256))
         if _dims_load not in ("128", "256", "512"):
@@ -3461,6 +3529,15 @@ class MainWindow(QMainWindow):
         self.config.rag_embedding_dims = (
             int(_dims_save) if _dims_save in ("128", "256", "512") else 256)
         self.config.rag_chunk_overlap_percent = 0.0
+        # 知识图谱单片抽取上限：夹紧到安全区间（实体 1-200、关系 0-500、描述 10-2000）。
+        _num(self.kg_max_entities_edit, "rag_kg_max_entities", 20, int, "单片实体上限")
+        self.config.rag_kg_max_entities = min(max(self.config.rag_kg_max_entities, 1), 200)
+        _num(self.kg_max_relations_edit, "rag_kg_max_relations", 50, int, "单片关系上限")
+        self.config.rag_kg_max_relations = min(max(self.config.rag_kg_max_relations, 0), 500)
+        _num(self.kg_max_desc_edit, "rag_kg_max_description_chars", 100, int,
+             "描述字数上限")
+        self.config.rag_kg_max_description_chars = min(
+            max(self.config.rag_kg_max_description_chars, 10), 2000)
         # PDF 解析引擎（docling | marker | ovis）：显示标签 → 内部值。
         self.config.rag_pdf_engine = _PDF_DISPLAY_TO_VALUE.get(
             self.pdf_engine_combo.currentText().strip(), "docling")
@@ -3855,15 +3932,18 @@ class MainWindow(QMainWindow):
         if not kb:
             QMessageBox.warning(self._front_dialog(), "缺少知识库", "请先选择知识库目录")
             return
-        # LLM 两种抽取方案必须有辅助模型；GLiNER 方案不依赖 LLM，跳过该校验。
+        # LLM 两种抽取方案必须有辅助模型；GLiNER 方案不依赖，跳过该校验。
+        # 不占用主模型：构建期长达数小时，主模型留给对话与工具。
         _kg_ext_rev = {i: k for i, k in enumerate(_KG_EXTRACTOR_DISPLAY)}
         _kg_scheme = _kg_ext_rev.get(self.kg_extractor_combo.currentIndex(), "llm_raw")
-        if _kg_scheme != "gliner" and not bool(getattr(self.config, "aux_llm_enabled", False)):
+        if (_kg_scheme != "gliner"
+                and not bool(getattr(self.config, "aux_llm_enabled", False))):
             QMessageBox.warning(
                 self._front_dialog(),
                 "需要辅助模型",
-                "知识图谱抽取需要辅助模型：请先在「辅助模型（本地专用）」区域\n"
-                "启用辅助模型并加载，再点击「构建知识图谱」。\n"
+                "知识图谱抽取使用辅助模型（不占用主模型）：请先在\n"
+                "「辅助模型（本地专用）」区域启用并加载（建议 ≥4B），\n"
+                "再点击「构建知识图谱」。\n"
                 "（或者把「抽取方案」切换为 GLiNER——不依赖 LLM）")
             return
         try:
