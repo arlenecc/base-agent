@@ -55,7 +55,7 @@ class StubEngine:
 
     # -- 知识图谱工具桩（仅验证 MCP 封装层接线） -------------------------
 
-    def kg_ingest(self, doc_name=""):
+    def kg_ingest(self, doc_name="", rebuild=False):
         return {"chunks": 3, "entities": 2, "relationships": 1,
                 "vectors": 4, "graph": {"nodes": 2, "edges": 1}}
 

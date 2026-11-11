@@ -885,7 +885,9 @@ class BuildKGWorker(QThread):
                 log_callback=self._emit_log,
             )
             try:
-                stats = builder.build()
+                # UI 按钮是「全量重建」语义：清空旧图谱数据后按当前抽取方案
+                # 重建（切换方案/修数据；按文档增量走 MCP ingest_knowledge）。
+                stats = builder.build(rebuild=True)
             finally:
                 builder.close()
             emit_stats = stats
@@ -2504,10 +2506,10 @@ class MainWindow(QMainWindow):
         kg_row.addSpacing(8)
         self.kg_build_btn = QPushButton("构建知识图谱")
         self.kg_build_btn.setToolTip(
-            "按当前「抽取方案」对知识库全部切片做实体/关系抽取，\n"
-            "构建知识图谱（实体表 + 关系表 + 向量 + 内存图快照）。\n"
-            "LLM 两种方案需要先：① 同步知识库；② 在「辅助模型」区域启用辅助模型；\n"
-            "GLiNER 方案不依赖辅助模型。")
+            "按当前「抽取方案」**清空重建**知识图谱（实体表 + 关系表 + 向量 +\n"
+            "内存图快照）：旧图谱数据先清空，可修复切换方案后的残留数据。\n"
+            "需要先：① 同步知识库；② LLM 方案还需启用辅助模型\n"
+            "（GLiNER 方案不依赖）。按文档增量构建走 MCP ingest_knowledge。")
         self.kg_build_btn.clicked.connect(self._on_build_kg)
         kg_row.addWidget(self.kg_build_btn)
         # 实体消歧：后期手动触发，对库内现有实体做语义向量消歧（对齐/合并）。
@@ -3837,27 +3839,29 @@ class MainWindow(QMainWindow):
     def _on_build_kg(self) -> None:
         """「构建知识图谱」按钮：后台 KGBuilder（辅助模型抽取实体/关系）。"""
         if getattr(self, "_kg_worker", None) is not None and self._kg_worker.isRunning():
-            QMessageBox.information(self, "构建中", "知识图谱正在构建中，请等待完成或取消。")
+            QMessageBox.information(self._front_dialog(), "构建中", "知识图谱正在构建中，请等待完成或取消。")
             return
         if getattr(self, "_sync_active", False):
-            QMessageBox.warning(self, "同步进行中", "知识库同步进行中，请等同步完成后再构建知识图谱。")
+            QMessageBox.warning(self._front_dialog(), "同步进行中", "知识库同步进行中，请等同步完成后再构建知识图谱。")
             return
         if getattr(self, "_busy", False):
             QMessageBox.warning(
-                self, "Agent 运行中",
+                self._front_dialog(),
+                "Agent 运行中",
                 "Agent 正在执行（可能正在检索知识库）。请先「终止对话」后再构建。")
             return
         kb = self.knowledge_base_edit.text().strip()
         ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
         if not kb:
-            QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
+            QMessageBox.warning(self._front_dialog(), "缺少知识库", "请先选择知识库目录")
             return
         # LLM 两种抽取方案必须有辅助模型；GLiNER 方案不依赖 LLM，跳过该校验。
         _kg_ext_rev = {i: k for i, k in enumerate(_KG_EXTRACTOR_DISPLAY)}
         _kg_scheme = _kg_ext_rev.get(self.kg_extractor_combo.currentIndex(), "llm_raw")
         if _kg_scheme != "gliner" and not bool(getattr(self.config, "aux_llm_enabled", False)):
             QMessageBox.warning(
-                self, "需要辅助模型",
+                self._front_dialog(),
+                "需要辅助模型",
                 "知识图谱抽取需要辅助模型：请先在「辅助模型（本地专用）」区域\n"
                 "启用辅助模型并加载，再点击「构建知识图谱」。\n"
                 "（或者把「抽取方案」切换为 GLiNER——不依赖 LLM）")
@@ -3884,20 +3888,21 @@ class MainWindow(QMainWindow):
     def _on_consolidate_kg(self) -> None:
         """「实体消歧」按钮：对库内现有实体做语义向量消歧（无需辅助模型）。"""
         if getattr(self, "_kg_worker", None) is not None and self._kg_worker.isRunning():
-            QMessageBox.information(self, "操作进行中", "知识图谱操作正在进行中，请等待完成或取消。")
+            QMessageBox.information(self._front_dialog(), "操作进行中", "知识图谱操作正在进行中，请等待完成或取消。")
             return
         if getattr(self, "_sync_active", False):
-            QMessageBox.warning(self, "同步进行中", "知识库同步进行中，请等同步完成后再执行实体消歧。")
+            QMessageBox.warning(self._front_dialog(), "同步进行中", "知识库同步进行中，请等同步完成后再执行实体消歧。")
             return
         if getattr(self, "_busy", False):
             QMessageBox.warning(
-                self, "Agent 运行中",
+                self._front_dialog(),
+                "Agent 运行中",
                 "Agent 正在执行（可能正在检索知识库）。请先「终止对话」后再消歧。")
             return
         kb = self.knowledge_base_edit.text().strip()
         ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
         if not kb:
-            QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
+            QMessageBox.warning(self._front_dialog(), "缺少知识库", "请先选择知识库目录")
             return
         try:
             self._gather_config_from_widgets()
@@ -3956,12 +3961,30 @@ class MainWindow(QMainWindow):
                 f"消歧合并 {merged} 次，耗时 {stats.get('elapsed', 0)}s")
         self._refresh_kg_status()
 
+    def _front_dialog(self) -> QWidget:
+        """KG 弹窗的父级：优先挂到当前可见的配置/日志窗口。
+
+        「构建知识图谱」「实体消歧」按钮都在配置面板（ConfigDialog）里，
+        若弹窗父级是主窗口而配置窗口又开着，macOS 上弹窗会被压在配置窗口
+        后面——用户视角就是「点了没反应」。挂到最前面的窗口保证可见。
+        """
+        for w in (getattr(self, "_config_dialog", None),
+                  getattr(self, "_log_window", None)):
+            if w is not None and w.isVisible():
+                return w
+        return self
+
     def _on_kg_failed(self, error: str) -> None:
         self.kg_build_btn.setEnabled(True)
         self.kg_dedup_btn.setEnabled(True)
         kind = getattr(self._kg_worker, "kind", "build") if self._kg_worker else "build"
         self.kg_status_label.setText("状态: 消歧失败" if kind == "consolidate" else "状态: 构建失败")
         self._append_log(f"[kg] ❌ {error}")
+        # 失败原因不能只写日志窗口（可能没打开）：弹窗明示，避免「没反应」的观感。
+        QMessageBox.critical(
+            self._front_dialog(),
+            "实体消歧失败" if kind == "consolidate" else "知识图谱构建失败",
+            error)
         self._refresh_kg_status()
 
     def _refresh_kg_status(self) -> None:

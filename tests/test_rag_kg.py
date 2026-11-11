@@ -1294,3 +1294,136 @@ class TestEngineSemanticConsolidate:
                 kg.close()
         finally:
             eng.close()
+
+
+# ---------------------------------------------------------------------------
+# 审查修复回归：向量模型指纹 / 重建与按文档 purge / 存储锁
+# ---------------------------------------------------------------------------
+
+class TestVectorModelFingerprint:
+    """content_hash 混入 embedding 模型名：换模型后旧向量自动失效重算。"""
+
+    def test_hash_varies_with_model_name(self):
+        class OtherEF(CallableEF):
+            def name(self):
+                return "other-model"
+
+        e1 = KGEmbedder(CallableEF())
+        e2 = KGEmbedder(OtherEF())
+        assert e1.model_name != e2.model_name
+        assert e1.content_hash("苹果 公司") == e1.content_hash("苹果 公司")
+        assert e1.content_hash("苹果 公司") != e2.content_hash("苹果 公司")
+
+    def test_model_change_invalidates_vectors(self, kg_store):
+        from agent.rag.kg.builder import vectorize_pending_rows
+        eid, _ = kg_store.upsert_entity("苹果公司", "Organization", "科技", "c1")
+        emb1 = KGEmbedder(CallableEF())
+        vectorize_pending_rows(kg_store, emb1)
+        h1 = kg_store.get_vector_hash(f"ent:{eid}")
+        assert h1  # 已向量化
+        # 同模型重跑：hash 命中，跳过
+        assert vectorize_pending_rows(kg_store, emb1) == 0
+        # 换模型：hash 不匹配 → 重算
+        class OtherEF(CallableEF):
+            def name(self):
+                return "other-model"
+
+        n = vectorize_pending_rows(kg_store, KGEmbedder(OtherEF()))
+        assert n == 1
+        assert kg_store.get_vector_hash(f"ent:{eid}") != h1
+
+
+class TestRebuildAndDocPurge:
+    """build(rebuild=True) 清空重建；doc_filter 按文档清旧证据再重抽。"""
+
+    def test_rebuild_wipes_manual_entities(self, tmp_path):
+        eng = TestEngineSemanticConsolidate()._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            eng.kg_ingest()
+            eng.kg_add_entity("手工实体", "Person", "测试")
+            from agent.rag.kg.builder import kg_dir_for
+            kg = KGStore(kg_dir_for(eng._rag_dir))
+            assert kg.counts()["entities"] == 4
+            kg.close()
+            # rebuild=True：清空后全量重建 → 手工实体消失，回到 3 个
+            eng.kg_ingest(rebuild=True)
+            kg = KGStore(kg_dir_for(eng._rag_dir))
+            try:
+                assert kg.counts()["entities"] == 3
+                assert kg.get_entity_by_key(normalize_name("手工实体")) is None
+            finally:
+                kg.close()
+        finally:
+            eng.close()
+
+    _seed = staticmethod(TestEngineKgTools._seed)
+
+    def _make_engine(self, tmp_path):
+        return TestEngineSemanticConsolidate()._make_engine(tmp_path)
+
+    def test_doc_filter_purges_stale_evidence(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            eng.kg_ingest()
+            # 模拟文档改版遗留的悬空证据：source 前缀与 a.md 的真实 chunk
+            # 前缀相同（同一路径 hash），但 chunk 本身已不存在。
+            chunk_id = next(c["id"] for c in eng._get_store().iter_all_chunks()
+                            if "a" in (c.get("source") or ""))
+            prefix = chunk_id.rsplit("_", 1)[0]
+            from agent.rag.kg.builder import kg_dir_for
+            kg = KGStore(kg_dir_for(eng._rag_dir))
+            kg.upsert_entity("陈旧实体", "Person", "旧内容", f"{prefix}_999")
+            kg.close()
+            # 按文档增量构建 a.md：先清该文档前缀全部旧证据（含悬空行）再重抽
+            eng.kg_ingest(doc_name="a")
+            kg = KGStore(kg_dir_for(eng._rag_dir))
+            try:
+                assert kg.get_entity_by_key(normalize_name("陈旧实体")) is None
+                # b.md 的证据不受影响；a.md 的实体重抽后仍在
+                assert kg.get_entity_by_key(normalize_name("沃兹尼亚克")) is not None
+                assert kg.get_entity_by_key(normalize_name("苹果公司")) is not None
+            finally:
+                kg.close()
+        finally:
+            eng.close()
+
+    def test_doc_filter_idempotent_rerun(self, tmp_path):
+        eng = self._make_engine(tmp_path)
+        try:
+            self._seed(eng)
+            first = eng.kg_ingest(doc_name="a")
+            second = eng.kg_ingest(doc_name="a")
+            # 同文档重复 ingest 不叠加（先清后抽，幂等）
+            assert second == first
+        finally:
+            eng.close()
+
+
+class TestStoragePathLock:
+    """按 db 路径键控的模块级锁 + busy_timeout。"""
+
+    def test_same_path_shares_lock(self, tmp_path):
+        kg1 = KGStore(str(tmp_path))
+        kg2 = KGStore(str(tmp_path))
+        try:
+            assert kg1._lock is kg2._lock
+            assert isinstance(kg1._lock, type(threading.RLock()))
+            # 不同路径不同锁
+            other = KGStore(str(tmp_path / "other"))
+            try:
+                assert other._lock is not kg1._lock
+            finally:
+                other.close()
+        finally:
+            kg1.close()
+            kg2.close()
+
+    def test_busy_timeout_pragma(self, tmp_path):
+        kg = KGStore(str(tmp_path))
+        try:
+            v = kg._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            assert v == 5000
+        finally:
+            kg.close()

@@ -16,7 +16,8 @@
   purge 后按剩余证据重算，不保留旧标量（spec 第四步）。
 * 实体向量按 ``ent:{id}``，关系向量按 ``rel:{id}:fwd`` / ``rel:{id}:rev``
   （无向边正反序两个 id，spec 第五步）。
-* ``content_hash`` 记录被嵌入文本的指纹，增量构建时跳过未变化的行。
+* ``content_hash`` 记录被嵌入文本 + embedding 模型名的指纹，增量构建时跳过
+  未变化的行；换 embedding 模型后旧向量自动失效重算。
 """
 from __future__ import annotations
 
@@ -29,6 +30,23 @@ import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# 按 db 路径键控的模块级锁：同进程多个 KGStore 实例（主 agent 引擎、UI 构建
+# worker、MCP 工具各自打开）操作同一个 kg.sqlite 时互斥串行。用 RLock——
+# 方法都是叶子级加锁，但防未来嵌套调用死锁。
+_PATH_LOCKS: Dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for_path(db_path: str) -> threading.RLock:
+    key = os.path.abspath(db_path)
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entities (
@@ -104,10 +122,12 @@ class KGStore:
         self._dir = kg_dir
         os.makedirs(kg_dir, exist_ok=True)
         self._db_path = os.path.join(kg_dir, "kg.sqlite")
-        self._lock = threading.Lock()
+        self._lock = _lock_for_path(self._db_path)
         with self._lock:
             self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
+            # 写冲突等待而非立即抛 database is locked（多实例/多线程并发写）。
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
 

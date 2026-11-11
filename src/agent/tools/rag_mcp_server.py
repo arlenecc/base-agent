@@ -208,10 +208,13 @@ def build_mcp_server() -> "FastMCP":
         # ------------------------------------------------------------------
 
         @mcp.tool()
-        def ingest_knowledge(doc_name: str = "") -> str:
+        def ingest_knowledge(doc_name: str = "", rebuild: bool = False) -> str:
             """知识图谱构建：对指定文档（或知识库全部文档）做实体/关系抽取并建图。
 
-            参数 doc_name: 文档名或路径子串；为空则对知识库全部切片构建。
+            参数 doc_name: 文档名或路径子串；非空时先清该文档旧图谱证据再重抽
+            （幂等，适合文档改版后刷新）；为空则对知识库全部切片构建。
+            参数 rebuild: 为 true 时先清空全部图谱数据再重建（切换抽取方案或
+            旧数据污染后的自愈）。
             返回: JSON 统计（切片/实体/关系/向量数、图规模、耗时）。
             说明: 抽取方案由应用配置 rag_kg_extractor 决定（llm_raw/llm_pydantic
             需要 LLM 辅助模型已加载；gliner 为本地 NER）。
@@ -220,7 +223,7 @@ def build_mcp_server() -> "FastMCP":
             if engine is None:
                 return _err("RAG 引擎未就绪（请先在应用内启用知识库）")
             try:
-                stats = engine.kg_ingest(doc_name=doc_name)
+                stats = engine.kg_ingest(doc_name=doc_name, rebuild=rebuild)
                 return _ok({"ingest": stats})
             except Exception as e:  # noqa: BLE001
                 return _err(f"知识图谱构建失败: {e}")

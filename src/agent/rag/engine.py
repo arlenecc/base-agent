@@ -881,12 +881,15 @@ class RAGEngine:
                 return ent
         return None
 
-    def kg_ingest(self, doc_name: str = "") -> Dict[str, Any]:
+    def kg_ingest(self, doc_name: str = "",
+                  rebuild: bool = False) -> Dict[str, Any]:
         """构建知识图谱（MCP ``ingest_knowledge``）。
 
-        doc_name 非空时只抽取 source 路径包含该子串的文档切片（增量并入已有
-        图谱）；为空则对知识库全部切片构建。抽取方案沿用 ``rag_kg_extractor``
-        配置；LLM 方案需要辅助模型已加载（set_aux_llm）。
+        doc_name 非空时只抽取 source 路径包含该子串的文档切片（先清该文档
+        旧证据再重抽，幂等）；为空则对知识库全部切片构建。rebuild=True 时
+        先清空全部图谱数据再重建（切换抽取方案/旧数据污染后的自愈）。
+        抽取方案沿用 ``rag_kg_extractor`` 配置；LLM 方案需要辅助模型已加载
+        （set_aux_llm）。
         """
         from .kg.builder import KGBuilder
         from .kg.extractor import create_extractor
@@ -899,7 +902,7 @@ class RAGEngine:
                                or "抽取器不可用")
         builder = KGBuilder(self._rag_dir, store, extractor)
         try:
-            stats = builder.build(doc_filter=doc_name or None)
+            stats = builder.build(doc_filter=doc_name or None, rebuild=rebuild)
         finally:
             builder.close()
         self._kg_refresh_snapshot()

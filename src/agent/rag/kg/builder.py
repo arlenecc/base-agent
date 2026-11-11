@@ -77,17 +77,33 @@ class KGBuilder:
     # ------------------------------------------------------------------
 
     def build(self, limit: Optional[int] = None,
-              doc_filter: Optional[str] = None) -> Dict[str, Any]:
+              doc_filter: Optional[str] = None,
+              rebuild: bool = False) -> Dict[str, Any]:
         """执行完整构建。返回统计 dict。
 
-        doc_filter 非空时只抽取 source 路径包含该子串的文档切片（增量并入
-        已有图谱；MCP ``ingest_knowledge`` 工具按文档建图即走此路径）。
+        doc_filter 非空时只抽取 source 路径包含该子串的文档切片；此时先
+        **清掉这些文档的旧图谱证据再重抽**（幂等：同文档重复 ingest 不叠加，
+        文档改版后旧 chunk 悬空的证据也随之清除）。
+        rebuild=True 时清空全部图谱数据（实体/关系/向量）后全量重建——
+        用于切换抽取方案后的重建，或旧数据被污染后的自愈。
         """
         t0 = time.monotonic()
+        if rebuild:
+            self._log("[kg] 重建模式：清空已有图谱数据（实体/关系/向量）...")
+            self._kg_store.clear()
         chunks = list(self._store.iter_all_chunks())
         if doc_filter:
             chunks = [c for c in chunks
                       if doc_filter in (c.get("source") or "")]
+            # 按文档重建：清掉这些文档的旧证据（前缀 = chunk_id 去掉 _idx，
+            # 同一路径 hash 的历史 chunk 全部覆盖，含文档改版后已消失的行）。
+            prefixes = sorted({(c.get("id") or "").rsplit("_", 1)[0]
+                               for c in chunks if c.get("id")})
+            if prefixes:
+                purged = self._kg_store.purge_document(prefixes)
+                if purged.get("entities") or purged.get("relationships"):
+                    self._log(f"[kg] 已清理该文档旧图谱证据: "
+                              f"实体 {purged['entities']} / 关系 {purged['relationships']}")
         if limit:
             chunks = chunks[:limit]
         total = len(chunks)
@@ -106,7 +122,10 @@ class KGBuilder:
                  "merged_entities": 0}
         snapshot_path = snapshot_path_for(self._rag_dir)
         graph = KnowledgeGraph()
-        graph.load_snapshot(snapshot_path)  # 增量续建：已有快照则热身内存图
+        if not rebuild:
+            # 增量续建：已有快照则热身内存图（rebuild 时库已清空，
+            # 热身旧快照会在取消时把旧图存回去，与空库不一致）。
+            graph.load_snapshot(snapshot_path)
 
         # 存量整理：入库前把历史遗留的重复实体合并掉（不新增实体），
         # 并补全别名索引，保证后续 resolve 全部走 O(1) 索引。
@@ -271,7 +290,7 @@ def vectorize_pending_rows(kg_store: "KGStore", embedder: "KGEmbedder") -> int:
     for e in kg.iter_entities():
         text = KGEmbedder.entity_text(e["name"], e["description"])
         vid = f"ent:{e['id']}"
-        h = KGEmbedder.content_hash(text)
+        h = embedder.content_hash(text)
         if kg.get_vector_hash(vid) == h:
             continue
         ent_texts.append(text)
@@ -284,7 +303,7 @@ def vectorize_pending_rows(kg_store: "KGStore", embedder: "KGEmbedder") -> int:
                 r["src_entity"], r["dst_entity"], r["keywords"],
                 r["description"], reverse=reverse)
             vid = f"rel:{r['id']}:{'rev' if reverse else 'fwd'}"
-            h = KGEmbedder.content_hash(text)
+            h = embedder.content_hash(text)
             if kg.get_vector_hash(vid) == h:
                 continue
             rel_texts.append(text)

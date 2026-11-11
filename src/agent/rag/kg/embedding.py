@@ -72,9 +72,15 @@ class KGEmbedder:
         a, b = (dst, src) if reverse else (src, dst)
         return f"{keywords or ''}\t{a or ''}\n{b or ''}\n{description or ''}"
 
-    @staticmethod
-    def content_hash(text: str) -> str:
-        return hashlib.md5(text.encode("utf-8")).hexdigest()
+    def content_hash(self, text: str) -> str:
+        """内容指纹（**混入 embedding 模型名**）。
+
+        只看文本的话，换 embedding 模型后旧向量会被当作「未变化」跳过重算，
+        导致跨模型向量互相比对（语义消歧/图检索结果错误且无告警）。
+        模型名进 hash → 换模型后全部向量自动失效重算。
+        """
+        return hashlib.md5(
+            f"{self.model_name}\x1f{text}".encode("utf-8")).hexdigest()
 
     # ------------------------------------------------------------------
     # 编码
