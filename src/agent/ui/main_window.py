@@ -59,6 +59,13 @@ _BACKEND_TO_LLM_TYPE = {"mlx": "MLX-LM", "onnx": "ONNX", "gguf": "GGUF"}
 _PDF_DISPLAY_TO_VALUE = {"docling": "docling", "marker": "marker", "OvisOCR": "ovis"}
 _PDF_VALUE_TO_DISPLAY = {"docling": "docling", "marker": "marker", "ovis": "OvisOCR"}
 
+# KG 三元组抽取方案下拉标签 ↔ 内部标识（rag_kg_extractor：llm_raw/llm_pydantic/gliner）。
+_KG_EXTRACTOR_DISPLAY = {
+    "llm_raw": "LLM 行解析（自实现）",
+    "llm_pydantic": "LLM 结构化（pydantic）",
+    "gliner": "GLiNER（本地 NER）",
+}
+
 # 本地模型加载成功后的按钮样式：文字改为「重新加载」+ 绿色背景，代表模型可用。
 _MODEL_READY_STYLE = "font-weight:600; background-color:#16a34a; color:#ffffff;"
 _MODEL_IDLE_STYLE = "font-weight:600;"
@@ -801,6 +808,111 @@ class VectorDedupWorker(QThread):
 
     def _on_progress(self, cur: int, total: int, msg: str) -> None:
         self.dedup_progress.emit(cur, total, msg)
+
+
+class BuildKGWorker(QThread):
+    """后台构建知识图谱（spec 第九步）。
+
+    流程：加载辅助模型（未启用则报错）→ RAGEngine → 遍历切片抽取
+    实体/关系 → 聚合入库 → 向量化 → 内存图 + JSON 快照。
+    信号前缀 ``kg_``（避免遮蔽 QThread 内建 finished，原因同 SyncKnowledgeWorker）。
+    """
+
+    kg_finished = pyqtSignal(dict)     # stats dict
+    kg_failed = pyqtSignal(str)        # error message
+    kg_progress = pyqtSignal(int, int, str)  # done, total, message
+
+    def __init__(self, workspace: str, knowledge_base: str, config=None):
+        super().__init__()
+        self._workspace = workspace
+        self._knowledge_base = knowledge_base
+        self._config = config
+        self._engine: Optional[RAGEngine] = None
+        self._cancel = threading.Event()
+        self._log_buffer: list = []
+        self._log_buffer_lock = threading.Lock()
+
+    def _emit_log(self, msg: str) -> None:
+        with self._log_buffer_lock:
+            self._log_buffer.append(msg)
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:  # type: ignore[override]
+        emit_stats = None
+        emit_error = None
+        aux_client = None
+        try:
+            from ..rag.kg import KGBuilder, KGCancellation, create_extractor
+            # 抽取方案：LLM 两种方案构建期必须有辅助模型；GLiNER 不依赖 LLM。
+            scheme = str(getattr(self._config, "rag_kg_extractor", "llm_raw")
+                         or "llm_raw").lower()
+            if scheme != "gliner":
+                if not bool(getattr(self._config, "aux_llm_enabled", False)):
+                    raise RuntimeError(
+                        "辅助模型未启用：请先在「辅助模型」区域启用并加载辅助模型，"
+                        "再构建知识图谱（或把抽取方案切换为 GLiNER）")
+                from ..local.factory import build_aux_llm_client
+                self._emit_log("[kg] 正在加载辅助模型（首次可能需要编译/下载）...")
+                aux_client = build_aux_llm_client(self._config)
+            else:
+                self._emit_log("[kg] GLiNER 方案：不依赖辅助模型，加载本地 NER 模型...")
+            self._engine = RAGEngine(
+                workspace=self._workspace,
+                knowledge_base=self._knowledge_base,
+                embedding_model="",
+                rerank_model=getattr(self._config, "rag_rerank_model",
+                                     DEFAULT_RERANK_MODEL),
+                rerank_enabled=False,
+                chunk_size=getattr(self._config, "rag_chunk_size", 800),
+                chunk_overlap=getattr(self._config, "rag_chunk_overlap", 50),
+                overlap_percent=getattr(self._config, "rag_chunk_overlap_percent", 0.10),
+                use_semantic=getattr(self._config, "rag_chunk_semantic", True),
+                clamp_model=effective_embedding_model(self._config),
+            )
+            store = self._engine._get_store()
+            if store.count() == 0:
+                raise RuntimeError("知识库为空：请先同步知识库（有切片才能抽取实体/关系）")
+            extractor = create_extractor(scheme, aux_client)
+            if not extractor.available:
+                raise RuntimeError(getattr(extractor, "unavailable_reason", "")
+                                   or "抽取器不可用")
+            builder = KGBuilder(
+                self._engine._rag_dir, store, extractor,
+                progress_callback=lambda d, t, m: self.kg_progress.emit(d, t, m),
+                cancel_event=self._cancel,
+                log_callback=self._emit_log,
+            )
+            try:
+                stats = builder.build()
+            finally:
+                builder.close()
+            emit_stats = stats
+        except KGCancellation:
+            self._emit_log("[kg] 构建已取消")
+            emit_error = "构建已取消"
+        except Exception as e:
+            self._emit_log(f"[kg] ❌ 构建失败: {e}")
+            logger.error("BuildKGWorker failed: %s", e, exc_info=True)
+            emit_error = f"{type(e).__name__}: {e}"
+        finally:
+            if self._engine is not None:
+                try:
+                    self._engine.close()
+                except Exception as e:
+                    logger.warning("BuildKGWorker: engine close failed: %s", e)
+            try:
+                if aux_client is not None:
+                    unload = getattr(aux_client, "unload", None)
+                    if callable(unload):
+                        unload()
+            except Exception:
+                pass
+            if emit_error is not None:
+                self.kg_failed.emit(emit_error)
+            elif emit_stats is not None:
+                self.kg_finished.emit(emit_stats)
 
 
 class SyncKnowledgeWorker(QThread):
@@ -2278,6 +2390,56 @@ class MainWindow(QMainWindow):
         stdio_row.addWidget(self.rag_mcp_stdio_copy_btn)
         adv_lay.addLayout(stdio_row)
 
+        # ------------------------------------------------------------------
+        # 知识图谱检索（spec 第八/九步）：策略下拉 + 构建按钮 + 状态
+        # ------------------------------------------------------------------
+        kg_row = QHBoxLayout(); kg_row.setSpacing(8)
+        kg_row.addWidget(QLabel("RAG 检索策略:"))
+        self.kg_strategy_combo = _combo(
+            ["naive（原文检索）", "local（实体细节）", "global（关系宏观）",
+             "hybrid（实体+关系）", "mix（实体+关系+原文）"])
+        _kg_map = {"naive": 0, "local": 1, "global": 2, "hybrid": 3, "mix": 4}
+        self.kg_strategy_combo.setCurrentIndex(
+            _kg_map.get(str(getattr(self.config, "rag_kg_strategy", "naive")), 0))
+        self.kg_strategy_combo.setToolTip(
+            "检索时使用的策略（spec：五种检索策略）：\n"
+            "• naive（默认）：原始实现，只用原文 chunk 向量召回；\n"
+            "• local：LLM 抽取低层实体关键词 → 命中实体拉邻边与关联实体（问细节）；\n"
+            "• global：抽取高层主题关键词 → 命中关系反查两端实体与度数（跨文档宏观）；\n"
+            "• hybrid：实体 + 关系两路；\n"
+            "• mix：实体 + 关系 + 原文 chunk 全部。\n"
+            "local/global/hybrid/mix 需要「构建知识图谱」完成后才生效；\n"
+            "图谱未构建时检索自动回退 naive。")
+        kg_row.addWidget(self.kg_strategy_combo)
+        kg_row.addSpacing(8)
+        # 三元组抽取方案（构建期 + 检索期关键词抽取共用，可随时切换重建）。
+        kg_row.addWidget(QLabel("抽取方案:"))
+        self.kg_extractor_combo = _combo(list(_KG_EXTRACTOR_DISPLAY.values()))
+        _kg_ext_fwd = {k: i for i, k in enumerate(_KG_EXTRACTOR_DISPLAY)}
+        self.kg_extractor_combo.setCurrentIndex(
+            _kg_ext_fwd.get(str(getattr(self.config, "rag_kg_extractor", "llm_raw")), 0))
+        self.kg_extractor_combo.setToolTip(
+            "三元组抽取方案（spec：三种方案可切换）：\n"
+            "• LLM 行解析（自实现）：辅助模型输出 entity/relation 行，本地解析；\n"
+            "• LLM 结构化（pydantic）：辅助模型输出严格 JSON，pydantic 校验入库；\n"
+            "• GLiNER（本地 NER）：不基于 LLM，本地模型抽实体 + 同句共现连边，\n"
+            "  无需启用辅助模型（需 pip install gliner，首次使用下载模型权重）。\n"
+            "切换方案后需重新「构建知识图谱」才会以新方案重建图谱数据。")
+        kg_row.addWidget(self.kg_extractor_combo)
+        kg_row.addSpacing(8)
+        self.kg_build_btn = QPushButton("构建知识图谱")
+        self.kg_build_btn.setToolTip(
+            "按当前「抽取方案」对知识库全部切片做实体/关系抽取，\n"
+            "构建知识图谱（实体表 + 关系表 + 向量 + 内存图快照）。\n"
+            "LLM 两种方案需要先：① 同步知识库；② 在「辅助模型」区域启用辅助模型；\n"
+            "GLiNER 方案不依赖辅助模型。")
+        self.kg_build_btn.clicked.connect(self._on_build_kg)
+        kg_row.addWidget(self.kg_build_btn)
+        self.kg_status_label = QLabel("状态: 未构建")
+        kg_row.addWidget(self.kg_status_label)
+        kg_row.addStretch(1)
+        adv_lay.addLayout(kg_row)
+
         lay.addWidget(adv_box)
         lay.addStretch(1)
 
@@ -3038,6 +3200,15 @@ class MainWindow(QMainWindow):
             bool(getattr(self.config, "rag_matryoshka_enabled", True)))
         self.bin_prefilter_chk.setChecked(
             bool(getattr(self.config, "rag_binary_prefilter_enabled", False)))
+        # RAG 检索策略（知识图谱，spec 第八步）：策略名 → 下拉索引。
+        _kg_fwd = {"naive": 0, "local": 1, "global": 2, "hybrid": 3, "mix": 4}
+        self.kg_strategy_combo.setCurrentIndex(
+            _kg_fwd.get(str(getattr(self.config, "rag_kg_strategy", "naive")), 0))
+        # 三元组抽取方案（llm_raw/llm_pydantic/gliner）：内部值 → 下拉索引。
+        _kg_ext_fwd = {k: i for i, k in enumerate(_KG_EXTRACTOR_DISPLAY)}
+        self.kg_extractor_combo.setCurrentIndex(
+            _kg_ext_fwd.get(str(getattr(self.config, "rag_kg_extractor", "llm_raw")), 0))
+        self._refresh_kg_status()
         _dims_load = str(getattr(self.config, "rag_embedding_dims", 256))
         if _dims_load not in ("128", "256", "512"):
             _dims_load = "256"
@@ -3191,6 +3362,14 @@ class MainWindow(QMainWindow):
         _num(self.chunk_overlap_edit, "rag_chunk_overlap", 50, int, "重叠")
         self.config.rag_matryoshka_enabled = self.matryoshka_chk.isChecked()
         self.config.rag_binary_prefilter_enabled = self.bin_prefilter_chk.isChecked()
+        # RAG 检索策略（知识图谱，spec 第八步）：下拉索引 → 策略名。
+        _kg_map_rev = {0: "naive", 1: "local", 2: "global", 3: "hybrid", 4: "mix"}
+        self.config.rag_kg_strategy = _kg_map_rev.get(
+            self.kg_strategy_combo.currentIndex(), "naive")
+        # 三元组抽取方案：下拉索引 → 内部值。
+        _kg_ext_rev = {i: k for i, k in enumerate(_KG_EXTRACTOR_DISPLAY)}
+        self.config.rag_kg_extractor = _kg_ext_rev.get(
+            self.kg_extractor_combo.currentIndex(), "llm_raw")
         _dims_save = self.embedding_dims_combo.currentText().strip()
         self.config.rag_embedding_dims = (
             int(_dims_save) if _dims_save in ("128", "256", "512") else 256)
@@ -3565,6 +3744,115 @@ class MainWindow(QMainWindow):
         # 崩溃报告实证：PyObject_SetAttr → subtype_dealloc → QThread::~QThread）。
         self._deps_worker.finished.connect(self._on_deps_thread_finished)
         self._deps_worker.start()
+
+    # ------------------------------------------------------------------
+    # 知识图谱构建（spec 第九步）
+    # ------------------------------------------------------------------
+
+    def _on_build_kg(self) -> None:
+        """「构建知识图谱」按钮：后台 KGBuilder（辅助模型抽取实体/关系）。"""
+        if getattr(self, "_kg_worker", None) is not None and self._kg_worker.isRunning():
+            QMessageBox.information(self, "构建中", "知识图谱正在构建中，请等待完成或取消。")
+            return
+        if getattr(self, "_sync_active", False):
+            QMessageBox.warning(self, "同步进行中", "知识库同步进行中，请等同步完成后再构建知识图谱。")
+            return
+        if getattr(self, "_busy", False):
+            QMessageBox.warning(
+                self, "Agent 运行中",
+                "Agent 正在执行（可能正在检索知识库）。请先「终止对话」后再构建。")
+            return
+        kb = self.knowledge_base_edit.text().strip()
+        ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
+        if not kb:
+            QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
+            return
+        # LLM 两种抽取方案必须有辅助模型；GLiNER 方案不依赖 LLM，跳过该校验。
+        _kg_ext_rev = {i: k for i, k in enumerate(_KG_EXTRACTOR_DISPLAY)}
+        _kg_scheme = _kg_ext_rev.get(self.kg_extractor_combo.currentIndex(), "llm_raw")
+        if _kg_scheme != "gliner" and not bool(getattr(self.config, "aux_llm_enabled", False)):
+            QMessageBox.warning(
+                self, "需要辅助模型",
+                "知识图谱抽取需要辅助模型：请先在「辅助模型（本地专用）」区域\n"
+                "启用辅助模型并加载，再点击「构建知识图谱」。\n"
+                "（或者把「抽取方案」切换为 GLiNER——不依赖 LLM）")
+            return
+        try:
+            self._gather_config_from_widgets()
+            from ..local.factory import configure_local_models
+            configure_local_models(self.config)
+        except Exception as e:
+            logger.warning("构建前应用配置失败: %s", e)
+        self._append_log("[kg] ────────── 开始构建知识图谱 ──────────")
+        self.kg_build_btn.setEnabled(False)
+        self.kg_status_label.setText("状态: 构建中…")
+        self._kg_worker = BuildKGWorker(ws, kb, config=self.config)
+        self._kg_worker.kg_progress.connect(self._on_kg_progress)
+        self._kg_worker.kg_finished.connect(self._on_kg_finished)
+        self._kg_worker.kg_failed.connect(self._on_kg_failed)
+        # deleteLater / 引用清理挂 built-in finished（run() 返回后触发）。
+        self._kg_worker.finished.connect(self._kg_worker.deleteLater)
+        self._kg_worker.finished.connect(self._on_kg_thread_finished)
+        self._log_poll_timer.start()
+        self._kg_worker.start()
+
+    def _on_kg_thread_finished(self) -> None:
+        self._kg_worker = None
+
+    def _on_kg_progress(self, done: int, total: int, msg: str) -> None:
+        if done == 0 or done >= total:
+            self._append_log(f"[kg] {msg}")
+        if total > 0 and done > 0:
+            pct = done * 100 // total
+            self.kg_status_label.setText(f"状态: 构建中 {done}/{total} ({pct}%)")
+        else:
+            self.kg_status_label.setText(f"状态: {msg}")
+
+    def _on_kg_finished(self, stats: dict) -> None:
+        self.kg_build_btn.setEnabled(True)
+        g = stats.get("graph") or {}
+        self.kg_status_label.setText(
+            f"状态: 已构建（实体 {g.get('nodes', 0)} / 关系 {g.get('edges', 0)}）")
+        self._append_log(
+            f"[kg] ✅ 完成：切片 {stats.get('chunks', 0)}，实体 {g.get('nodes', 0)}，"
+            f"关系 {g.get('edges', 0)}，向量 {stats.get('vectors', 0)}，"
+            f"耗时 {stats.get('elapsed', 0)}s")
+        self._refresh_kg_status()
+
+    def _on_kg_failed(self, error: str) -> None:
+        self.kg_build_btn.setEnabled(True)
+        self.kg_status_label.setText("状态: 构建失败")
+        self._append_log(f"[kg] ❌ {error}")
+        self._refresh_kg_status()
+
+    def _refresh_kg_status(self) -> None:
+        """打开面板/构建结束时刷新 KG 状态标签（无引擎实例，轻量查 SQLite）。"""
+        try:
+            from ..rag.kg.builder import kg_dir_for, snapshot_path_for
+            from ..rag.kg.storage import KGStore
+            kb = self.knowledge_base_edit.text().strip()
+            ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
+            # 与 RAGEngine.__init__ 一致：rag_dir = <workspace>/rag。
+            rag_dir = os.path.join(ws, "rag")
+            if not os.path.isdir(kg_dir_for(rag_dir)):
+                self.kg_status_label.setText("状态: 未构建")
+                return
+            kg = KGStore(kg_dir_for(rag_dir))
+            try:
+                counts = kg.counts()
+            finally:
+                kg.close()
+            snap = snapshot_path_for(rag_dir)
+            built = os.path.isfile(snap)
+            if counts["entities"]:
+                self.kg_status_label.setText(
+                    f"状态: {'已构建' if built else '未完成'}"
+                    f"（实体 {counts['entities']} / 关系 {counts['relationships']}）")
+            else:
+                self.kg_status_label.setText("状态: 未构建")
+        except Exception as e:
+            logger.debug("KG 状态刷新失败: %s", e)
+            self.kg_status_label.setText("状态: 未知")
 
     def _on_deps_thread_finished(self) -> None:
         """QThread 内建 finished（run() 已返回）——此刻清 worker 引用才安全。"""
@@ -4095,7 +4383,7 @@ class MainWindow(QMainWindow):
             logger.debug("UI: _on_sync_progress error: %s", e)
 
     def _poll_sync_logs(self) -> None:
-        """定时轮询 sync_worker._log_buffer，把新日志追加到 log_view。
+        """定时轮询 sync/kg worker 的 _log_buffer，把新日志追加到 log_view。
 
         绕过 Qt queued signal 机制——ONNX Runtime 在 embedding 期间持有
         GIL，sync_progress 信号虽然是 queued 但主线程可能无法及时处理。
@@ -4107,6 +4395,8 @@ class MainWindow(QMainWindow):
         """
         try:
             worker = self._sync_worker
+            if worker is None:
+                worker = self._kg_worker
             if worker is None:
                 return
             with worker._log_buffer_lock:

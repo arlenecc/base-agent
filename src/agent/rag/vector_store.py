@@ -3453,6 +3453,66 @@ class VectorStore:
             return 0
         return table.count_rows()
 
+    # ------------------------------------------------------------------
+    # 知识图谱构建支持（rag/kg/）：切片遍历与按 id 反查
+    # ------------------------------------------------------------------
+
+    @property
+    def embedding_function(self) -> Any:
+        """当前生效的 embedding 函数（KG 向量化与查询向量共用同一实例）。"""
+        self._ensure_initialized()
+        return self._ef
+
+    def iter_all_chunks(self) -> List[Dict[str, Any]]:
+        """返回全部切片（id/text/source/chunk_index），供 KG 实体关系抽取遍历。"""
+        self._ensure_initialized()
+        table = self._ensure_table()
+        if table is None:
+            return []
+        arrow = table.to_arrow()
+        cols = {"id": "id", "text": "text", "source": "source",
+                "chunk_index": "chunk_index"}
+        out: List[Dict[str, Any]] = []
+        names = set(arrow.column_names)
+        n = arrow.num_rows
+        arrays = {k: (arrow.column(c).to_pylist() if c in names else [None] * n)
+                  for k, c in cols.items()}
+        for i in range(n):
+            out.append({
+                "id": arrays["id"][i],
+                "text": arrays["text"][i],
+                "source": arrays["source"][i],
+                "chunk_index": arrays["chunk_index"][i],
+            })
+        return out
+
+    def get_chunks_by_ids(self, chunk_ids: List[str]) -> List[Dict[str, Any]]:
+        """按 chunk id 批量反查切片（KG 实体/关系溯源回链，保序去重）。"""
+        if not chunk_ids:
+            return []
+        self._ensure_initialized()
+        table = self._ensure_table()
+        if table is None:
+            return []
+        uniq = list(dict.fromkeys(chunk_ids))
+        found: Dict[str, Dict[str, Any]] = {}
+        # LanceDB SQL in-list 上限保守分批（每批 100）。
+        for s in range(0, len(uniq), 100):
+            batch = uniq[s:s + 100]
+            clauses = ", ".join("'" + str(c).replace("'", "''") + "'"
+                                for c in batch)
+            try:
+                arrow = table.search().where(
+                    f"id IN ({clauses})", prefilter=True
+                ).select(["id", "text", "source", "chunk_index"]).limit(
+                    len(batch)).to_arrow()
+            except Exception as e:
+                logger.warning("VectorStore: get_chunks_by_ids 失败: %s", e)
+                continue
+            for row in arrow.to_pylist():
+                found[row.get("id")] = row
+        return [found[c] for c in uniq if c in found]
+
     def close(self) -> None:
         """Release heavy resources (LanceDB connection, embedding model, reranker).
 

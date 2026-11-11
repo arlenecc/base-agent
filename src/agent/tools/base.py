@@ -285,6 +285,41 @@ class _LegacyAliasTool(Tool):
         return self.registry.execute(self._facade, self._normalize(kwargs))
 
 
+class _AuxLLMProxy:
+    """辅助模型懒解析代理（KG 查询期关键词抽取用）。
+
+    每次调用都通过 getter 取当前辅助模型实例（UI 可随时加载/卸载）；
+    未加载时 ``available`` 为 False、``batch_chat`` 返回空输出——KG 抽取
+    降级（回退原始 query 向量）而不让检索崩溃。
+    """
+
+    def __init__(self, getter):
+        self._getter = getter
+
+    def _client(self):
+        try:
+            client = self._getter() if callable(self._getter) else None
+            return client
+        except Exception:
+            return None
+
+    @property
+    def available(self) -> bool:
+        return self._client() is not None
+
+    def batch_chat(self, *args, **kwargs):
+        client = self._client()
+        if client is None:
+            return [""]
+        return client.batch_chat(*args, **kwargs)
+
+    def __bool__(self) -> bool:
+        return self._client() is not None
+
+    def __repr__(self) -> str:
+        return f"_AuxLLMProxy(loaded={self.available})"
+
+
 class ToolRegistry:
     # run 的 Signature 缓存（按工具类）：工具集注册后固定，没必要每次
     # execute() 都重新构造 Signature 对象。
@@ -561,8 +596,16 @@ class ToolRegistry:
                 # 脚本/嵌入式/直接构造 Agent 的路径永远拿到硬编码 0.5。
                 # 由引擎自己持有并显式下传（非法值在引擎构造里安全回退）。
                 min_similarity=getattr(self.config, "rag_rerank_min_similarity", 0.5),
+                # 知识图谱检索策略（naive/local/global/hybrid/mix，spec 第八步）。
+                kg_strategy=getattr(self.config, "rag_kg_strategy", "naive"),
+                # 三元组抽取方案（llm_raw/llm_pydantic/gliner，构建+检索共用）。
+                kg_extractor=getattr(self.config, "rag_kg_extractor", "llm_raw"),
             )
             self._rag_engine = engine
+            # KG 查询期关键词抽取用辅助模型：工具注册时已持有 aux_llm_getter，
+            # 每次调用取最新实例（辅助模型可能被 UI 加载/卸载）。
+            if getattr(self, "_aux_llm_getter", None) is not None:
+                engine.set_aux_llm(_AuxLLMProxy(self._aux_llm_getter))
 
             registered = []
             for t in [RagToolsTool(engine, aux_llm_getter=self._aux_llm_getter)]:

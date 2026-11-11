@@ -50,7 +50,14 @@ rag = [
     "docling>=2.0.0",
     # BM25 hybrid retrieval: 原生 FTS (simple tokenizer) + jieba CJK 预分词
     "jieba>=0.42",
+    # 知识图谱内存图（rag/kg/graph.py 基于 nx.Graph 无向图）；pydantic 供
+    # llm_pydantic 三元组抽取方案做结构化校验（fastmcp 亦传递依赖）。
+    "networkx>=3.0",
+    "pydantic>=2.0",
 ]
+# KG 三元组抽取的 GLiNER 方案（可选，不基于 LLM 的本地 NER）：包较重
+# （torch/transformers），且首次使用需下载 NER 模型权重，故独立 extra。
+gliner = ["gliner>=0.2"]
 # PDF OCR (optional, heavy dependency ~500MB)
 # rapidocr 3.x 起为统一包名（兼容层 rapidocr-onnxruntime 仅供旧环境回退，
 # 见 parsers._get_ocr_engine）；模型目录与 docling 共享，且支持 CoreML EP。

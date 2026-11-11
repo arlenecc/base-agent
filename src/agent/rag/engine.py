@@ -662,6 +662,8 @@ class RAGEngine:
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
         clamp_model: str = "",
         min_similarity: Optional[float] = None,
+        kg_strategy: str = "naive",
+        kg_extractor: str = "llm_raw",
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -714,6 +716,16 @@ class RAGEngine:
         # _save_manifest（temp+replace 后者覆盖），manifest 合并状态互相踩。
         # 改用模块级、按 rag_dir 键控的锁才能真正互斥。
         self._ingest_lock = _ingest_lock_for(self._rag_dir)
+        # 知识图谱（rag/kg/）：检索策略（naive=无图谱的原始实现，spec 第八步）。
+        # 非 naive 策略要求图谱已构建（「构建知识图谱」按钮），否则检索自动
+        # 回退 naive 并告警。查询期的关键词抽取用辅助模型（set_aux_llm 注入；
+        # 未注入时回退原始 query 向量，三路召回退化为单路）。
+        self._kg_strategy = str(kg_strategy or "naive").lower()
+        # 三元组抽取方案（llm_raw / llm_pydantic / gliner，与构建期共用配置）：
+        # 决定查询期 extract_keywords 用辅助模型还是 GLiNER。
+        self._kg_extractor_scheme = str(kg_extractor or "llm_raw").lower()
+        self._aux_llm: Any = None
+        self._kg_retriever: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # properties
@@ -734,6 +746,90 @@ class RAGEngine:
     @knowledge_base.setter
     def knowledge_base(self, value: str) -> None:
         self._knowledge_base = value
+
+    # ------------------------------------------------------------------
+    # 知识图谱（rag/kg/）
+    # ------------------------------------------------------------------
+
+    def set_aux_llm(self, client: Any) -> None:
+        """注入辅助模型客户端（查询关键词抽取 / KG 构建）。
+
+        agent 侧由 ToolRegistry 的 aux_llm_getter 接线；UI 侧由配置面板传入。
+        """
+        self._aux_llm = client
+        if self._kg_retriever is not None:
+            self._kg_retriever._extractor.set_client(client)
+
+    def set_kg_strategy(self, strategy: str) -> None:
+        """切换检索策略（naive/local/global/hybrid/mix）。"""
+        self._kg_strategy = str(strategy or "naive").lower()
+
+    def set_kg_extractor(self, scheme: str) -> None:
+        """切换三元组抽取方案（llm_raw / llm_pydantic / gliner）。
+
+        检索器已存在时重建其 extractor（方案切换即时生效）。
+        """
+        self._kg_extractor_scheme = str(scheme or "llm_raw").lower()
+        if self._kg_retriever is not None:
+            from .kg.extractor import create_extractor
+            self._kg_retriever._extractor = create_extractor(
+                self._kg_extractor_scheme, self._aux_llm)
+
+    def kg_ready(self) -> bool:
+        """图谱是否已构建（entities 表非空且有向量）。"""
+        try:
+            from .kg.builder import kg_dir_for
+            from .kg.storage import KGStore
+            kg = KGStore(kg_dir_for(self._rag_dir))
+            try:
+                counts = kg.counts()
+            finally:
+                kg.close()
+            return counts["entities"] > 0 and counts["vectors"] > 0
+        except Exception as e:
+            logger.debug("KG: 图谱可用性检查失败: %s", e)
+            return False
+
+    def _get_kg_retriever(self):
+        if self._kg_retriever is None:
+            from .kg.extractor import create_extractor
+            from .kg.retriever import KGRetriever
+            from .chunker import estimate_tokens
+            extractor = create_extractor(self._kg_extractor_scheme, self._aux_llm)
+            self._kg_retriever = KGRetriever(
+                self._rag_dir, self._get_store(), extractor,
+                estimate_tokens=estimate_tokens)
+        return self._kg_retriever
+
+    def _kg_search(self, query: str, strategy: str) -> Optional[List[Dict[str, Any]]]:
+        """知识图谱检索路径；图谱未构建或无召回时返回 None（回退 naive）。"""
+        try:
+            retriever = self._get_kg_retriever()
+            if not retriever.graph_ready():
+                logger.warning("KG: 策略 %s 需要知识图谱（尚未构建），回退 naive。"
+                               "请在配置面板点击「构建知识图谱」", strategy)
+                return None
+            store = self._get_store()
+
+            def _chunk_recall(q: str, k: int) -> List[Dict[str, Any]]:
+                return store.search_with_rerank(
+                    q, top_k=k, min_similarity=self._min_similarity,
+                    use_reranker=self._rerank_enabled)
+
+            def _rerank(q: str, cands: List[Dict[str, Any]], k: int):
+                return store.rerank(q, cands, top_k=k,
+                                    min_similarity=self._min_similarity)
+
+            results = retriever.search(query, strategy,
+                                       chunk_recall=_chunk_recall,
+                                       rerank=_rerank)
+            # KG 策略的结果量由 token 预算控制（实体 6000 / 关系 8000 /
+            # 总 30000，spec 第七步），不按 top_k 截断——top_k 是 naive 原文
+            # 检索的最终条数语义。
+            return results or None
+        except Exception as e:
+            logger.warning("KG: 图谱检索失败，回退 naive: %s", e, exc_info=True)
+            return None
 
     # ------------------------------------------------------------------
     # ingestion pipeline (流式：worker 并行解析+chunk，主线程增量 embed+store)
@@ -2099,6 +2195,16 @@ class RAGEngine:
         if store_count == 0:
             logger.info("🔍 知识库检索: 向量库为空，无结果返回 (查询=%r)", query[:60])
             return []
+        # 知识图谱策略分发（spec 第八步）：naive = 原始实现；local/global/
+        # hybrid/mix 走 KG 三路召回，图谱未构建或无召回时自动回退 naive。
+        if self._kg_strategy != "naive":
+            kg_results = self._kg_search(query, self._kg_strategy)
+            if kg_results:
+                logger.info("🔍 知识库检索: KG 策略 %s 命中 %d 条", self._kg_strategy,
+                            len(kg_results))
+                return kg_results
+            logger.info("  └─ KG 策略 %s 无结果/不可用，回退 naive 原文检索",
+                        self._kg_strategy)
         # 构造 SQL 过滤条件：source 字段存完整路径，用 LIKE 匹配文档名。
         where = None
         if source:
@@ -2268,6 +2374,19 @@ class RAGEngine:
         store = self._get_store()
         info = store.get_document_digest(name)
         md_path = info.get("md_path") if info else None
+        # 先收集将被删除的 chunk id（KG purge 需要按 id 前缀剔除证据）。
+        # chunk id = f"{_hash_source(source)}_{chunk_idx}"，source 为完整路径。
+        kg_chunk_prefixes: List[str] = []
+        try:
+            from .vector_store import _hash_source
+            seen_sources = set()
+            for c in store.iter_all_chunks():
+                src = c.get("source") or ""
+                if name in src and src not in seen_sources:
+                    seen_sources.add(src)
+                    kg_chunk_prefixes.append(_hash_source(src))
+        except Exception as e:
+            logger.debug("KG: 收集待删 chunk 前缀失败（跳过 KG 清理）: %s", e)
         store.delete_document(name)      # 元数据（documents 表）
         store.delete_by_source(name)     # 向量 chunks + 失效 FTS/ANN 索引
         if md_path and os.path.isfile(md_path):
@@ -2275,8 +2394,34 @@ class RAGEngine:
                 os.remove(md_path)
             except OSError as e:
                 logger.warning("删除文档 markdown 缓存失败: %s", e)
+        # 知识遗忘同步生效到 KG：剔除证据 → weight 重算 → 重建图快照。
+        if kg_chunk_prefixes:
+            try:
+                self._kg_purge(kg_chunk_prefixes)
+            except Exception as e:
+                logger.warning("KG: 文档证据清理失败: %s", e)
         logger.info("🗑 已删除文档（知识遗忘）: %s", name)
         return info is not None
+
+    def _kg_purge(self, chunk_id_prefixes: List[str]) -> None:
+        """KG 侧的知识遗忘：删证据行、重算 weight、重建内存图与快照。"""
+        from .kg.builder import kg_dir_for, snapshot_path_for
+        from .kg.graph import KnowledgeGraph
+        from .kg.storage import KGStore
+        kg = KGStore(kg_dir_for(self._rag_dir))
+        try:
+            stats = kg.purge_document(chunk_id_prefixes)
+            if stats["entities"] or stats["relationships"]:
+                graph = KnowledgeGraph()
+                graph.rebuild_from_store(kg)
+                graph.save_snapshot(snapshot_path_for(self._rag_dir))
+                # 使检索器缓存的图失效（下次检索重建/重载快照）。
+                if self._kg_retriever is not None:
+                    self._kg_retriever.close()
+                    self._kg_retriever = None
+            logger.info("KG: 文档证据已清理 %s", stats)
+        finally:
+            kg.close()
 
     def get_document(self, doc_name: str) -> Optional[str]:
         """返回指定文档经解析/提取/清洗后的完整 markdown 正文（磁盘透传）。
@@ -2455,6 +2600,9 @@ class RAGEngine:
             "chunks_stored": chunk_count,
             "sources": sources,
             "has_knowledge_base": bool(self._knowledge_base and os.path.isdir(self._knowledge_base)),
+            "kg_strategy": self._kg_strategy,
+            "kg_extractor": self._kg_extractor_scheme,
+            "kg_ready": self.kg_ready(),
         }
 
     def clear(self) -> None:
@@ -2482,6 +2630,18 @@ class RAGEngine:
                     logger.info("  已清除同步记录文件")
                 except OSError as e:
                     logger.warning("  同步记录文件删除失败: %s", e)
+        # 知识图谱随知识库清空（三张表 + 快照），下次需重新构建。
+        try:
+            import shutil
+            kg_dir = os.path.join(self._rag_dir, "kg")
+            if os.path.isdir(kg_dir):
+                shutil.rmtree(kg_dir, ignore_errors=True)
+                if self._kg_retriever is not None:
+                    self._kg_retriever.close()
+                    self._kg_retriever = None
+                logger.info("  已清除知识图谱（kg/）")
+        except Exception as e:
+            logger.warning("  知识图谱清理失败: %s", e)
         logger.info("  知识库已清空")
 
     def close(self) -> None:
@@ -2498,6 +2658,13 @@ class RAGEngine:
         # 不先撤 worker 的话，它们随后会对着已关闭的 LanceDB/ONNX 会话报错，
         # 并把大文档的切片内存继续占着（线程是 daemon，不会阻止进程退出）。
         self._cancelled.set()
+        # 释放 KG 检索器（SQLite 连接）。
+        if self._kg_retriever is not None:
+            try:
+                self._kg_retriever.close()
+            except Exception:
+                pass
+            self._kg_retriever = None
         # 等待在途 ingest 退出：worker 的取消是协作式的（文件/批次边界生效），
         # 若此刻直接 close store，它们在途的 add_streaming 会对着已关闭的
         # LanceDB 报错，整轮已解析数据全废，OCR/docling 单例也会被提前摘掉。

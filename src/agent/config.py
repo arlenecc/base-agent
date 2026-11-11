@@ -131,6 +131,18 @@ class AgentConfig:
     rag_binary_prefilter_enabled: bool = False
     # 二值粗筛候选数（第一阶段汉明距离保留的 top N，默认 200）。
     rag_binary_prefilter_top: int = 200
+    # RAG 检索策略（知识图谱能力，spec 第八步）：
+    #   naive（默认）= 无图谱的原始实现；local/global/hybrid/mix 为 KG 策略，
+    #   仅在「构建知识图谱」完成后生效（未构建时检索自动回退 naive）。
+    rag_kg_strategy: str = "naive"
+    # 知识图谱三元组抽取方案（构建期 + 检索期关键词抽取共用）：
+    #   - "llm_raw"（默认）：自实现方案，辅助模型输出 entity/relation 行文本，
+    #     本地按 <|#|> 分隔符解析；
+    #   - "llm_pydantic"：辅助模型输出严格 JSON，pydantic BaseModel 校验后入库
+    #     （结构化输出，非法字段整体拒绝）；
+    #   - "gliner"：不基于 LLM，本地 GLiNER NER 模型抽实体 + 同句共现启发式
+    #     连边（需 pip install gliner，首次使用下载模型权重；无需启用辅助模型）。
+    rag_kg_extractor: str = "llm_raw"
     # PDF 统一解析引擎切换（仅影响「有文本层的常规 PDF/office 文档」首选谁，
     # 扫描件/图片重 PDF 始终走 parsers 的 RapidOCR 路径）：
     #   - "docling"（默认，现状）：docling 统一解析，不可用回退按格式解析器
@@ -387,7 +399,7 @@ class AgentConfig:
                    "local_llm_mmproj_path", "local_llm_tokenizer_path",
                    "aux_local_llm_mmproj_path", "aux_local_llm_tokenizer_path",
                    "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path",
-                   "rag_mcp_scope")
+                   "rag_mcp_scope", "rag_kg_strategy", "rag_kg_extractor")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
                     "rag_ocr_scale_dynamic", "aux_llm_enabled",
