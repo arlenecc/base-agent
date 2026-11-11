@@ -148,6 +148,13 @@ class AgentConfig:
     rag_kg_max_entities: int = 20
     rag_kg_max_relations: int = 50
     rag_kg_max_description_chars: int = 100
+    # 补漏轮（gleaning）：首轮漏抽/截断/零关系时，带上一轮结果再抽一次，
+    # 只取新增或修正项。提升召回，代价是触发时多一次 LLM 调用。
+    rag_kg_glean_enabled: bool = True
+    # 第一种 LLM 抽取方案（llm_raw）改用 JSON 格式 prompt（宽松 JSON 解析，
+    # 不依赖 pydantic）。与「llm_pydantic」方案无关：后者始终 JSON + 严格校验。
+    # 仅配置文件可调（不放到配置面板）。
+    rag_kg_llm_raw_json: bool = False
     # PDF 统一解析引擎切换（仅影响「有文本层的常规 PDF/office 文档」首选谁，
     # 扫描件/图片重 PDF 始终走 parsers 的 RapidOCR 路径）：
     #   - "docling"（默认，现状）：docling 统一解析，不可用回退按格式解析器
@@ -413,7 +420,8 @@ class AgentConfig:
                     "local_llm_enable_thinking", "aux_local_llm_enable_thinking",
                     "local_llm_flash_attn", "aux_local_llm_flash_attn",
                     "rag_matryoshka_enabled", "rag_binary_prefilter_enabled",
-                    "web_allow_private_hosts", "rag_mcp_enabled")
+                    "web_allow_private_hosts", "rag_mcp_enabled",
+                    "rag_kg_glean_enabled", "rag_kg_llm_raw_json")
 
     @classmethod
     def _coerce(cls, name: str, value):

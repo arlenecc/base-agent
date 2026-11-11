@@ -667,6 +667,8 @@ class RAGEngine:
         kg_max_entities: int = 20,
         kg_max_relations: int = 50,
         kg_max_description_chars: int = 100,
+        kg_glean: bool = True,
+        kg_raw_json: bool = False,
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -731,6 +733,10 @@ class RAGEngine:
         self._kg_max_entities = max(1, int(kg_max_entities))
         self._kg_max_relations = max(0, int(kg_max_relations))
         self._kg_max_description_chars = max(1, int(kg_max_description_chars))
+        # 补漏轮开关（首轮漏抽/截断时再抽一次，仅 LLM 方案生效）。
+        self._kg_glean = bool(kg_glean)
+        # llm_raw 方案的 JSON 输出开关（不涉及 llm_pydantic）。
+        self._kg_raw_json = bool(kg_raw_json)
         self._aux_llm: Any = None
         self._kg_retriever: Optional[Any] = None
 
@@ -806,7 +812,8 @@ class RAGEngine:
                 self._kg_extractor_scheme, self._aux_llm,
                 max_entities=self._kg_max_entities,
                 max_relations=self._kg_max_relations,
-                max_desc_chars=self._kg_max_description_chars)
+                max_desc_chars=self._kg_max_description_chars,
+                glean=self._kg_glean, raw_json=self._kg_raw_json)
             self._kg_retriever = KGRetriever(
                 self._rag_dir, self._get_store(), extractor,
                 estimate_tokens=estimate_tokens)
@@ -911,7 +918,8 @@ class RAGEngine:
             self._kg_extractor_scheme, self._aux_llm,
             max_entities=self._kg_max_entities,
             max_relations=self._kg_max_relations,
-            max_desc_chars=self._kg_max_description_chars)
+            max_desc_chars=self._kg_max_description_chars,
+            glean=self._kg_glean, raw_json=self._kg_raw_json)
         if not extractor.available:
             raise RuntimeError(getattr(extractor, "unavailable_reason", "")
                                or "抽取器不可用")

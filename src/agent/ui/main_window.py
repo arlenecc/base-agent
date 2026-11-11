@@ -896,7 +896,9 @@ class BuildKGWorker(QThread):
                 max_entities=int(getattr(self._config, "rag_kg_max_entities", 20)),
                 max_relations=int(getattr(self._config, "rag_kg_max_relations", 50)),
                 max_desc_chars=int(getattr(
-                    self._config, "rag_kg_max_description_chars", 100)))
+                    self._config, "rag_kg_max_description_chars", 100)),
+                glean=bool(getattr(self._config, "rag_kg_glean_enabled", True)),
+                raw_json=bool(getattr(self._config, "rag_kg_llm_raw_json", False)))
             if not extractor.available:
                 raise RuntimeError(getattr(extractor, "unavailable_reason", "")
                                    or "抽取器不可用")
@@ -2585,6 +2587,15 @@ class MainWindow(QMainWindow):
             "描述越长信息越全，但每个切片生成的 token 越多、构建越慢。")
         kg_limits_row.addWidget(QLabel("描述字数"))
         kg_limits_row.addWidget(self.kg_max_desc_edit)
+        kg_limits_row.addSpacing(10)
+        self.kg_glean_chk = QCheckBox("补漏轮")
+        self.kg_glean_chk.setChecked(
+            bool(getattr(self.config, "rag_kg_glean_enabled", True)))
+        self.kg_glean_chk.setToolTip(
+            "首轮抽取不完整时（被截断 / 零实体 / 有实体但零关系）带着上一轮\n"
+            "结果再抽一次，只取新增或修正项。提升召回，代价是触发时每片\n"
+            "多一次 LLM 调用（构建时间增加）。仅对两个 LLM 方案生效。")
+        kg_limits_row.addWidget(self.kg_glean_chk)
         kg_limits_row.addStretch(1)
         adv_lay.addLayout(kg_limits_row)
 
@@ -3363,6 +3374,8 @@ class MainWindow(QMainWindow):
             str(getattr(self.config, "rag_kg_max_relations", 50)))
         self.kg_max_desc_edit.setText(
             str(getattr(self.config, "rag_kg_max_description_chars", 100)))
+        self.kg_glean_chk.setChecked(
+            bool(getattr(self.config, "rag_kg_glean_enabled", True)))
         self._refresh_kg_status()
         _dims_load = str(getattr(self.config, "rag_embedding_dims", 256))
         if _dims_load not in ("128", "256", "512"):
@@ -3538,6 +3551,7 @@ class MainWindow(QMainWindow):
              "描述字数上限")
         self.config.rag_kg_max_description_chars = min(
             max(self.config.rag_kg_max_description_chars, 10), 2000)
+        self.config.rag_kg_glean_enabled = bool(self.kg_glean_chk.isChecked())
         # PDF 解析引擎（docling | marker | ovis）：显示标签 → 内部值。
         self.config.rag_pdf_engine = _PDF_DISPLAY_TO_VALUE.get(
             self.pdf_engine_combo.currentText().strip(), "docling")

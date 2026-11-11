@@ -605,6 +605,8 @@ class ToolRegistry:
                 kg_max_relations=getattr(self.config, "rag_kg_max_relations", 50),
                 kg_max_description_chars=getattr(
                     self.config, "rag_kg_max_description_chars", 100),
+                kg_glean=bool(getattr(self.config, "rag_kg_glean_enabled", True)),
+                kg_raw_json=bool(getattr(self.config, "rag_kg_llm_raw_json", False)),
             )
             self._rag_engine = engine
             # KG 查询期关键词抽取用辅助模型：工具注册时已持有 aux_llm_getter，

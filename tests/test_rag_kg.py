@@ -1124,7 +1124,7 @@ class TestBuilderDisambiguation:
                 self._i += 1
                 return [outputs[min(self._i - 1, len(outputs) - 1)]]
 
-        builder = KGBuilder(rag_dir, store, KGExtractor(SeqLLM()))
+        builder = KGBuilder(rag_dir, store, KGExtractor(SeqLLM(), glean=False))
         try:
             stats = builder.build()
         finally:
@@ -1544,3 +1544,172 @@ class TestExtractionLimits:
             assert len(e["description"]) <= 30
         finally:
             kg.close()
+
+
+# ---------------------------------------------------------------------------
+# 补漏轮（gleaning）+ prompt 加固（围栏 / 注入防护 / JSON 转义）
+# ---------------------------------------------------------------------------
+
+class TestGleanAndPromptHardening:
+    @staticmethod
+    def _seq_extractor(outputs, **kw):
+        class SeqLLM(FakeLLM):
+            def __init__(self):
+                super().__init__()
+                self._i = 0
+
+            def batch_chat(self, messages_list, *args, **kwargs):
+                self.calls.append(messages_list)
+                text = messages_list[0][-1]["content"] if messages_list else ""
+                if "high_level_keywords" in text:
+                    return [self.keywords]
+                if "Description List" in text:
+                    return [self.summary]
+                self._i += 1
+                return [outputs[min(self._i - 1, len(outputs) - 1)]]
+
+        llm = SeqLLM()
+        return KGExtractor(llm, **kw), llm
+
+    def test_glean_merges_incremental_rows(self):
+        first = ("entity<|#|>苹果公司<|#|>Organization<|#|>科技公司\n"
+                 "relation<|#|>苹果公司<|#|>乔布斯<|#|>创始人<|#|>创办")
+        second = ("entity<|#|>史蒂夫·乔布斯<|#|>Person<|#|>联合创始人\n"
+                  "relation<|#|>苹果公司<|#|>乔布斯<|#|>创始人<|#|>创办\n"
+                  "<|COMPLETE|>")
+        ex, llm = self._seq_extractor([first, second])
+        ents, rels = ex.extract_entities_relations("苹果公司由乔布斯创办。")
+        assert len(llm.calls) == 2          # 首轮无完成标记 → 补一轮
+        assert {e.name for e in ents} == {"苹果公司", "史蒂夫·乔布斯"}
+        assert len(rels) == 1               # 无向端点对去重
+
+    def test_no_glean_when_complete(self):
+        out = ("entity<|#|>苹果公司<|#|>Organization<|#|>科技公司\n"
+               "relation<|#|>苹果公司<|#|>乔布斯<|#|>创始人<|#|>创办\n"
+               "<|COMPLETE|>")
+        ex, llm = self._seq_extractor([out])
+        ex.extract_entities_relations("x")
+        assert len(llm.calls) == 1
+
+    def test_glean_disabled(self):
+        out = "entity<|#|>苹果公司<|#|>Organization<|#|>科技公司\n"
+        ex, llm = self._seq_extractor([out], glean=False)
+        ex.extract_entities_relations("x")
+        assert len(llm.calls) == 1
+
+    def test_glean_triggers_when_entities_but_no_relations(self):
+        first = ("entity<|#|>苹果公司<|#|>Organization<|#|>科技公司\n"
+                 "<|COMPLETE|>")
+        second = ("relation<|#|>苹果公司<|#|>乔布斯<|#|>创始人<|#|>创办\n"
+                  "<|COMPLETE|>")
+        ex, llm = self._seq_extractor([first, second])
+        ents, rels = ex.extract_entities_relations("x")
+        assert len(llm.calls) == 2 and len(rels) == 1
+
+    def test_pydantic_glean(self):
+        from agent.rag.kg.extractor import PydanticLLMExtractor
+        first = ('{"entities": [{"name": "苹果公司", "type": "Organization",'
+                 ' "description": "科技"}], "relations": []}')
+        second = ('{"entities": [], "relations": [{"src": "苹果公司", '
+                  '"dst": "乔布斯", "keywords": "创始人", "description": "创办"}]}')
+        ex, llm = self._seq_extractor(
+            [first, second], glean=True)
+        pex = PydanticLLMExtractor(llm)
+        ents, rels = pex.extract_entities_relations("x")
+        assert len(llm.calls) == 2
+        assert len(ents) == 1 and len(rels) == 1
+
+    def test_prompts_fenced_and_untrusted(self):
+        from agent.rag.kg import prompts
+        assert "untrusted metadata" in prompts.EXTRACT_TASK
+        assert "```\n{input_text}\n```" in prompts.EXTRACT_TASK
+        assert "untrusted metadata" in prompts.PYDANTIC_EXTRACT_TASK
+        assert "```\n{input_text}\n```" in prompts.PYDANTIC_EXTRACT_TASK
+        assert "{previous_output}" in prompts.CONTINUE_EXTRACT_TASK
+        assert "{previous_output}" in prompts.PYDANTIC_CONTINUE_EXTRACT_TASK
+
+    def test_prompt_hardening_content(self):
+        from agent.rag.kg import prompts
+        # 禁止句子片段 / 泛称
+        assert "sentence fragments" in prompts.EXTRACT_SYSTEM
+        assert "sentence fragments" in prompts.PYDANTIC_EXTRACT_SYSTEM
+        # JSON 转义规则
+        assert "JSON Escaping" in prompts.PYDANTIC_EXTRACT_SYSTEM
+        # N-ary 拆分例子
+        assert "共同创办" in prompts.EXTRACT_SYSTEM
+        # pydantic 实体类型改为完整定义（不再是逗号列表）
+        assert "Organization: Companies, institutions" in prompts.PYDANTIC_EXTRACT_SYSTEM
+        # 示例改中文（避免小模型被英文示例带偏）
+        assert "苹果公司" in prompts.EXTRACT_SYSTEM
+        # 关系字段顺序的错误/正确对照
+        assert "字段错序" in prompts.EXTRACT_SYSTEM
+
+
+# ---------------------------------------------------------------------------
+# llm_raw 的 JSON 输出模式（rag_kg_llm_raw_json，配置文件开关）
+# ---------------------------------------------------------------------------
+
+class TestRawJsonMode:
+    def test_json_parser_is_tolerant(self):
+        from agent.rag.kg.extractor import parse_json_extraction_output
+        raw = ('{"entities": ['
+               '{"name": "苹果公司", "type": "Organization", "description": "科技"},'
+               '{"name": "", "type": "Person"},'
+               '{"name": "某物", "type": "未知类型"}],'
+               '"relations": ['
+               '{"src": "苹果公司", "dst": "乔布斯", "keywords": ["创始人", "创办"],'
+               ' "description": "创办"},'
+               '{"src": "", "dst": "x"}]}')
+        ents, rels = parse_json_extraction_output(raw)
+        assert [e.name for e in ents] == ["苹果公司", "某物"]
+        assert ents[1].type == "Other"          # 非法类型归一化
+        assert rels[0].keywords == "创始人,创办"  # 列表自动拼逗号串
+        assert len(rels) == 1
+
+    def test_json_mode_uses_json_prompt_and_parser(self):
+        out = ('{"entities": [{"name": "苹果公司", "type": "Organization",'
+               ' "description": "科技"}],'
+               ' "relations": [{"src": "苹果公司", "dst": "乔布斯",'
+               ' "keywords": "创始人", "description": "创办"}]}')
+        ex = KGExtractor(FakeLLM(extract_output=out), json_output=True)
+        assert ex.json_output is True
+        assert "JSON Escaping" in ex._system_prompt      # JSON 版 prompt
+        ents, rels = ex.extract_entities_relations("x")
+        assert [e.name for e in ents] == ["苹果公司"]
+        assert len(rels) == 1
+
+    def test_json_mode_glean_merges(self):
+        first = ('{"entities": [{"name": "苹果公司", "type": "Organization",'
+                 ' "description": "科技"}], "relations": []}')
+        second = ('{"entities": [], "relations": [{"src": "苹果公司",'
+                  ' "dst": "乔布斯", "keywords": "创始人", "description": "创办"}]}')
+
+        class SeqLLM(FakeLLM):
+            def __init__(self):
+                super().__init__()
+                self._i = 0
+
+            def batch_chat(self, messages_list, *args, **kwargs):
+                self.calls.append(messages_list)
+                self._i += 1
+                return [[first, second][min(self._i - 1, 1)]]
+
+        llm = SeqLLM()
+        ex = KGExtractor(llm, json_output=True)
+        ents, rels = ex.extract_entities_relations("x")
+        assert len(llm.calls) == 2     # 首轮零关系 → 补漏
+        assert len(ents) == 1 and len(rels) == 1
+
+    def test_default_row_mode_unchanged(self):
+        ex = KGExtractor(FakeLLM(extract_output=""))
+        assert ex.json_output is False
+        assert "<|#|>" in ex._system_prompt
+
+    def test_config_switch_roundtrip(self, tmp_path):
+        from agent.config import AgentConfig
+        c = AgentConfig()
+        assert c.rag_kg_llm_raw_json is False     # 默认关（保持行格式）
+        c.rag_kg_llm_raw_json = True
+        p = tmp_path / "config.json"
+        c.save(str(p))
+        assert AgentConfig.load(str(p)).rag_kg_llm_raw_json is True
