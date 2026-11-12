@@ -111,6 +111,30 @@ _ASSISTANT_MARK = "<|im_start|>assistant\n"
 _KV_MAX_TOKENS = 32768
 
 
+# KV 前缀复用适用的调用组：
+#   * "main"：主对话（跨轮复用 system+历史，避免每句全量预填充）；
+#   * "kg"  ：构建期抽取等**稳定前缀批量任务**（同一任务里 system+任务说明
+#             不变，只有切片正文变化）——每次只 prefill 变化的正文段。
+#             只用于辅助模型实例（BuildKGWorker 临时构建、结束即 close），
+#             与主对话不是同一个 LocalLLMClient，绝不共享/覆盖主缓存。
+#   * "aux" ：一次性辅助调用（关键词/摘要等 prompt 每轮都变），不持久化。
+_PERSIST_KV_GROUPS = ("main", "kg")
+
+
+def _persist_kv_group(kv_group: str) -> bool:
+    return kv_group in _PERSIST_KV_GROUPS
+
+
+def _kv_reuse_enabled(kv_group: str, kv_reuse: bool) -> bool:
+    """该次调用是否启用持久 KV 复用。
+
+    ``kg``（构建期抽取）是**任务内的稳定前缀复用**，与对话的「跨轮复用」
+    两回事：辅助模型默认关闭 kv_reuse（aux_local_llm_kv_reuse=False），但抽取
+    每片仍必须只 prefill 正文段，因此 kg 不受该开关约束。
+    """
+    return _persist_kv_group(kv_group) and (bool(kv_reuse) or kv_group == "kg")
+
+
 def _assistant_prompt_prefix(prompt: str) -> str:
     """取模板在最后一个 assistant 起始标记后预置的片段。
 
@@ -1217,6 +1241,16 @@ class LocalLLMClient:
             return []
         # 同实例串行化：避免与 chat_stream / 其它生成争用同一模型权重。
         with self._gen_lock:
+            # 单条 + kg 组（构建期抽取）必须走 chat_stream：batch_generate
+            # 每批都是**全新前向**，没有跨轮 prefix cache；逐片抽取若走这里，
+            # 每片都要全量预填充 system+任务说明，前缀复用完全失效。
+            # 只放行 "kg"：主对话（main）的调用语义保持不变（其 KV 优化只
+            # 服务于对话流畅度，不因构建任务改变）；批量（>1 条）仍走连续
+            # 批处理，吞吐优先。
+            if len(messages_list) == 1 and kv_group == "kg":
+                return [self._batch_collect_one(
+                    messages_list[0], tools, temperature, max_tokens,
+                    enable_thinking, kv_group)]
             if self._backend != "mlx":
                 return [
                     self._batch_collect_one(
@@ -1404,16 +1438,12 @@ class LocalLLMClient:
         from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 
         prompt_ids = tok.encode(prompt)
-        # KV 缓存按「调用组」隔离：主对话(kv_group="main")用持久缓存跨轮复用；
-        # 辅助调用(知识图谱抽取/RAG 重排/技能检索/工具描述等)走一次性本地缓存，
+        # KV 缓存按「调用组」隔离：主对话(kv_group="main")与构建期抽取
+        # ("kg") 用持久缓存跨轮复用；其余辅助调用走一次性本地缓存，
         # 绝不污染主对话的实例级缓存——否则辅助调用会改写 self._mlx_cache /
         # _kv_thread / _cache_token_ids，导致下一轮主对话被判「跨线程 / 前缀不符」
         # 而整体重建，退回每句全量预填充（约 20s）。
-        persist = (kv_group == "main")
-        # 跨轮复用开关：关闭后每轮整体重建（全量预填充）——与 GGUF 行为对齐，
-        # 用于排查前缀错位乱码或换取更低显存占用。
-        if not self._kv_reuse:
-            persist = False
+        persist = _kv_reuse_enabled(kv_group, self._kv_reuse)
         cache = self._mlx_cache if persist else None
         cached_ids = self._cache_token_ids if persist else []
         reuse = 0
@@ -1652,13 +1682,17 @@ class LocalLLMClient:
                      enable_thinking: Optional[bool] = None, max_tokens: Optional[int] = None):
         """GGUF 生成入口：优先走「前缀复用」路径，否则退回旧路径。
 
-        复用只用于主对话（``kv_group == "main"``）且开关打开时。辅助调用
-        （知识图谱抽取 / RAG 精简 / 技能检索）的 prompt 每轮都变，与 MLX 的
-        aux 一次性缓存同款处理：整体 reset 后生成，不参与跨轮复用。
+        复用对持久前缀组（``main`` 主对话 / ``kg`` 构建抽取）且开关打开时
+        生效。扩展与**同前缀分叉**都走复用：后者（KG 逐片抽取，system+任务
+        说明不变、正文变化）用 ``kv_cache_seq_rm`` 把 KV 裁到公共前缀，只 eval
+        正文段；底层不支持部分删除（hybrid/recurrent）时自动退回全量预填充。
+        其余 aux 调用与 MLX 的 aux 一次性缓存同款处理：整体 reset 后生成，
+        不参与跨轮复用。
         """
         mt = self._max_tokens if max_tokens is None else int(max_tokens)
-        persist = (kv_group == "main")
-        if self._kv_reuse and persist and self._gguf_fmt is not None:
+        # kg 组不受 aux 的 kv_reuse 开关约束（任务内稳定前缀，见 _kv_reuse_enabled）。
+        persist = _kv_reuse_enabled(kv_group, self._kv_reuse)
+        if persist and self._gguf_fmt is not None:
             try:
                 yield from self._stream_gguf_reuse(
                     messages, tools, temperature)
@@ -1679,12 +1713,16 @@ class LocalLLMClient:
         """GGUF 跨轮前缀复用：只把**新增**的 token eval 进 llama.cpp 上下文。
 
         为什么必须自己管（而不是靠 llama-cpp-python 内置的 prefix-match）：
-        本 build 的 ``kv_cache_seq_rm`` 不支持（generate() 会打印
-        "prefix-match found but partial kv removal not supported"，随即
-        reset 全量重算），实测复用完全不生效、每轮都付全量预填充（~2.3s /
-        1500 token）。这里改成 append-only：上下文永不 reset，只要新 prompt
-        是已 eval 序列的**严格扩展**就只 eval 增量；分叉/回退/超长则 reset
-        后全量（无法裁剪，与 MLX 的 ArraysCache 退化路径同款）。
+        ``create_chat_completion`` 的 prefix-match 在部分内存实现上不可用
+        （会打印 "prefix-match found but partial kv removal not supported"，
+        随即 reset 全量重算），实测复用完全不生效、每轮都付全量预填充
+        （~2.3s / 1500 token）。这里自己维护上下文：
+
+        * 新 prompt 是已 eval 序列的**严格扩展** → 只 eval 增量（主对话常态）；
+        * **同前缀分叉** → 用 ``_gguf_trim_kv`` 把 KV 裁到公共前缀，只 eval
+          变化的后缀（KG 逐片抽取：system+任务说明不变、只有正文不同）；
+        * 首轮 / 回退 / 底层不支持部分删除 / 超长 → reset 后全量（与 MLX 的
+          ArraysCache 不可裁剪退化路径同款）。
         """
         # 双视图历史：把 assistant 消息还原成生成时的逐 token 序列（与 MLX 同款），
         # 否则下轮 prompt 在 assistant 处就分叉、复用直接失效。
@@ -1740,6 +1778,11 @@ class LocalLLMClient:
                 common += 1
         if cached and common == len(cached) and common < len(ids):
             suffix = ids[common:]      # 严格扩展 → 只 eval 增量
+            reuse_n = common
+        elif cached and 0 < common < len(ids) and self._gguf_trim_kv(common):
+            # 同前缀分叉（KG 逐片抽取：system+任务说明相同、只有正文不同）
+            # → 把 KV 裁回公共前缀，只 eval 变化的正文段。
+            suffix = ids[common:]
             reuse_n = common
         else:
             suffix = ids               # 首轮 / 分叉 / 回退 → 全量
@@ -1884,6 +1927,35 @@ class LocalLLMClient:
                 }
             yield ev
 
+    def _gguf_trim_kv(self, keep: int) -> bool:
+        """把 llama.cpp 上下文的 KV 裁到前 ``keep`` 个 token。
+
+        仅「同前缀分叉」场景需要（KG 逐片抽取：system+任务说明不变，只有
+        切片正文变化）。``Llama.eval`` 只能 append，必须显式删掉分叉点之后的
+        KV 并对齐 ``n_tokens``，下一轮 eval 才会从正确位置/位置编码续算。
+
+        底层不支持部分删除时（hybrid / recurrent 内存，llama.cpp 会打印
+        partial kv removal not supported）返回 False，调用方退回 reset +
+        全量预填充——功能不受影响，只是该模型拿不到增量收益。
+        """
+        if getattr(self._model, "_is_recurrent", False) or getattr(
+                self._model, "_is_hybrid", False):
+            return False
+        try:
+            ctx = getattr(self._model, "_ctx", None)
+            rm = getattr(ctx, "kv_cache_seq_rm", None)
+            if not callable(rm) or keep <= 0:
+                return False
+            if not bool(rm(-1, int(keep), -1)):
+                return False
+            # 底层 KV 已裁到 keep，同步 Python 侧游标；eval 内部的
+            # kv_cache_seq_rm(-1, n_tokens, -1) 随之变成 no-op。
+            self._model.n_tokens = int(keep)
+            return True
+        except Exception as e:
+            logger.debug("GGUF KV 部分裁剪失败: %s", e)
+            return False
+
     def _gguf_stop_ids(self) -> set:
         """GGUF 生成终止 token 集合（EOS；模板的 EOG 在采样循环里按 vocab 判定）。"""
         ids: set = set()
@@ -1946,7 +2018,7 @@ class LocalLLMClient:
         # ≈ 数秒）会随 reset 一起被冲掉。事后在后台把它**重放回上下文**：
         # 用户隔一会儿再问时首轮即可命中前缀（否则必然全量预填充）。重放走
         # 非阻塞抢锁——主对话正在生成就放弃（它结束时 KV 反正会被重建）。
-        is_aux = (kv_group != "main")
+        is_aux = not _persist_kv_group(kv_group)
         prev_ids = list(self._gguf_ids) if is_aux else []
         prev_hist = list(self._gguf_gen_history) if is_aux else []
         self._gguf_ids = []

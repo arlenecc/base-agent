@@ -83,6 +83,13 @@ class KGBuilder:
         self._embedder = KGEmbedder(store.embedding_function)
         # 实体消歧（入库前解析到已有实体，不重复建行）。
         self._resolver = resolver or EntityResolver(self._kg_store)
+        # 描述归纳延后：抽取循环里只登记，全部抽取结束后统一归纳。抽取期间若
+        # 夹杂 summarize 调用（kv_group="aux"）会 reset GGUF/ONNX 的底层上下文、
+        # 切换 MLX 缓存，下一片抽取就得重新预填充 system+任务说明——稳定前缀
+        # 复用失效。延后同时消掉了「每多一条描述就重归纳一遍」的重复调用。
+        self._defer_summaries = False
+        self._pending_entities: Dict[str, str] = {}      # name_key → 展示名
+        self._pending_relations: Dict[str, tuple] = {}   # pair_key → (src, dst)
 
     def close(self) -> None:
         self._kg_store.close()
@@ -148,39 +155,50 @@ class KGBuilder:
             self._log(f"[kg] 实体消歧完成：扫描 {cons['scanned']} 个实体，"
                       f"合并 {cons['merged']} 个重复实体")
 
-        for done, chunk in enumerate(chunks, 1):
-            if self._cancel_event is not None and self._cancel_event.is_set():
-                self._log("[kg] 收到取消信号，构建中止（已完成部分已入库）")
-                graph.save_snapshot(snapshot_path)
-                raise KGCancellation()
-            text = (chunk.get("text") or "").strip()
-            chunk_id = chunk.get("id") or ""
-            source = chunk.get("source") or ""
-            if not text or not chunk_id:
-                continue
-            try:
-                entities, relations = self._extractor.extract_entities_relations(
-                    text, section_context=f"来源文档: {source}")
-                created, merged = self._commit_extraction(
-                    entities, relations, chunk_id, source)
-                stats["entities"] += created
-                stats["merged_entities"] += merged
-                stats["relationships"] += len(relations)
-                stats["chunks"] += 1
-            except KGCancellation:
-                raise
-            except Exception as e:  # 单片失败不中断整体
-                stats["errors"] += 1
-                logger.warning("KG: 切片 %s 抽取失败: %s", chunk_id, e)
-                self._log(f"[kg] ⚠ 切片 {chunk_id} 抽取失败: {e}")
-            self._progress(done, total, f"知识图谱抽取 {done}/{total}")
-            if done % 20 == 0 or done == total:
-                self._log(f"[kg] 抽取进度 {done}/{total}"
-                          f"（新增实体 {stats['entities']}，"
-                          f"关系 {stats['relationships']}）")
-            if done % SNAPSHOT_EVERY == 0:
-                self._refresh_graph(graph)
-                graph.save_snapshot(snapshot_path)
+        # 抽取阶段：描述归纳只登记不执行（见 __init__ 中的说明），保证整轮
+        # 抽取的 LLM 调用都是「同一 system+任务说明 + 不同切片正文」的稳定
+        # 前缀，后端只需 prefill 变化的正文段。
+        self._defer_summaries = True
+        try:
+            for done, chunk in enumerate(chunks, 1):
+                if self._cancel_event is not None and self._cancel_event.is_set():
+                    self._log("[kg] 收到取消信号，构建中止（已完成部分已入库）")
+                    graph.save_snapshot(snapshot_path)
+                    raise KGCancellation()
+                text = (chunk.get("text") or "").strip()
+                chunk_id = chunk.get("id") or ""
+                source = chunk.get("source") or ""
+                if not text or not chunk_id:
+                    continue
+                try:
+                    entities, relations = self._extractor.extract_entities_relations(
+                        text, section_context=f"来源文档: {source}")
+                    created, merged = self._commit_extraction(
+                        entities, relations, chunk_id, source)
+                    stats["entities"] += created
+                    stats["merged_entities"] += merged
+                    stats["relationships"] += len(relations)
+                    stats["chunks"] += 1
+                except KGCancellation:
+                    raise
+                except Exception as e:  # 单片失败不中断整体
+                    stats["errors"] += 1
+                    logger.warning("KG: 切片 %s 抽取失败: %s", chunk_id, e)
+                    self._log(f"[kg] ⚠ 切片 {chunk_id} 抽取失败: {e}")
+                self._progress(done, total, f"知识图谱抽取 {done}/{total}")
+                if done % 20 == 0 or done == total:
+                    self._log(f"[kg] 抽取进度 {done}/{total}"
+                              f"（新增实体 {stats['entities']}，"
+                              f"关系 {stats['relationships']}）")
+                if done % SNAPSHOT_EVERY == 0:
+                    self._refresh_graph(graph)
+                    graph.save_snapshot(snapshot_path)
+            # 抽取全部结束 → 统一归纳多描述实体/关系（此时才允许打断前缀）
+            self._flush_pending_summaries()
+        finally:
+            self._defer_summaries = False
+            self._pending_entities.clear()
+            self._pending_relations.clear()
 
         # 全部抽取完成 → 向量化 → 建图 → 最终快照（spec 第六步）
         self._log("[kg] 抽取完成，开始实体/关系向量化...")
@@ -229,7 +247,7 @@ class KGBuilder:
             name_map[name] = canonical
             created += 1 if is_new else 0
             merged += 1 if was_merged else 0
-            self._maybe_summarize_entity(canonical)
+            self._summarize_or_queue_entity(canonical)
         # 关系：引用了未抽取的实体 → 同样先消歧（命中则复用已有实体），
         # 未命中才现场建 UNKNOWN 节点（spec 第六步）。
         for rel in relations:
@@ -245,7 +263,7 @@ class KGBuilder:
                 src_c, dst_c, rel.keywords,
                 (rel.description or "")[:max_desc], chunk_id,
                 file_path=source)
-            self._maybe_summarize_relationship(src_c, dst_c)
+            self._summarize_or_queue_relationship(src_c, dst_c)
         return created, merged
 
     def _canonical_endpoint(self, name_map: Dict[str, str], name: str,
@@ -257,6 +275,47 @@ class KGBuilder:
             name, "UNKNOWN", "", chunk_id, source)
         name_map[name] = canonical
         return canonical
+
+    # -- 描述归纳（抽取期延后） -------------------------------------------
+
+    def _summarize_or_queue_entity(self, name: str) -> None:
+        """抽取期只登记待归纳实体，其余场景立即归纳。"""
+        if self._defer_summaries:
+            self._pending_entities.setdefault(normalize_name(name), name)
+            return
+        self._maybe_summarize_entity(name)
+
+    def _summarize_or_queue_relationship(self, src: str, dst: str) -> None:
+        if self._defer_summaries:
+            self._pending_relations.setdefault(pair_key(src, dst), (src, dst))
+            return
+        self._maybe_summarize_relationship(src, dst)
+
+    def _flush_pending_summaries(self) -> None:
+        """统一归纳抽取期登记的实体/关系（每个只归纳一次）。"""
+        items = ([(True, name) for name in self._pending_entities.values()]
+                 + [(False, pair) for pair in self._pending_relations.values()])
+        self._pending_entities.clear()
+        self._pending_relations.clear()
+        if not items:
+            return
+        self._log(f"[kg] 抽取完成，开始归纳多描述实体/关系（待检查 {len(items)} 项）...")
+        for i, (is_entity, payload) in enumerate(items, 1):
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                self._log("[kg] 收到取消信号，描述归纳中止（已完成部分保留）")
+                return
+            if is_entity:
+                try:
+                    self._maybe_summarize_entity(payload)
+                except Exception as e:  # 归纳是增强项，失败不影响已入库数据
+                    logger.warning("KG: 实体描述归纳失败（%s）: %s", payload, e)
+            else:
+                try:
+                    self._maybe_summarize_relationship(*payload)
+                except Exception as e:
+                    logger.warning("KG: 关系描述归纳失败（%s）: %s", payload, e)
+            if i % 10 == 0 or i == len(items):
+                self._log(f"[kg] 描述归纳进度 {i}/{len(items)}")
 
     def _maybe_summarize_entity(self, name: str) -> None:
         row = self._kg_store.get_entity_by_key(normalize_name(name))

@@ -1713,3 +1713,113 @@ class TestRawJsonMode:
         p = tmp_path / "config.json"
         c.save(str(p))
         assert AgentConfig.load(str(p)).rag_kg_llm_raw_json is True
+
+
+# ---------------------------------------------------------------------------
+# 稳定前缀复用：抽取期 kv_group="kg" + 描述归纳延后
+# ---------------------------------------------------------------------------
+
+class RecordingLLM(FakeLLM):
+    """记录每次调用用的 kv_group（以及是否归纳调用）。"""
+
+    def __init__(self, outputs):
+        super().__init__()
+        self._outputs = list(outputs)
+        self.kv_groups = []
+        self.kinds = []
+
+    def batch_chat(self, messages_list, *args, **kwargs):
+        self.calls.append(messages_list)
+        self.kv_groups.append(kwargs.get("kv_group"))
+        text = messages_list[0][-1]["content"] if messages_list else ""
+        if "Description List" in text:
+            self.kinds.append("summary")
+            return [self.summary]
+        self.kinds.append("extract")
+        return [self._outputs.pop(0) if self._outputs else ""]
+
+
+class TestStablePrefixReuse:
+    def test_persist_kv_group_semantics(self):
+        from agent.local.llm import _persist_kv_group
+        assert _persist_kv_group("main") is True
+        assert _persist_kv_group("kg") is True
+        assert _persist_kv_group("aux") is False
+        assert _persist_kv_group("") is False
+
+    def test_kg_reuse_exempt_from_aux_kv_switch(self):
+        """辅助模型默认 kv_reuse=False，但抽取（kg）必须照常复用前缀。"""
+        from agent.local.llm import _kv_reuse_enabled
+        assert _kv_reuse_enabled("kg", False) is True     # 构建期抽取
+        assert _kv_reuse_enabled("kg", True) is True
+        assert _kv_reuse_enabled("main", True) is True    # 主对话沿用原语义
+        assert _kv_reuse_enabled("main", False) is False
+        assert _kv_reuse_enabled("aux", True) is False
+
+    def test_raw_extractor_all_rounds_use_kg_group(self):
+        # 首轮空输出 → 触发补漏轮；两轮都必须带 kg 组，才能复用稳定前缀。
+        llm = RecordingLLM(["", ""])
+        KGExtractor(llm).extract_entities_relations("切片正文", "来源文档: a.md")
+        assert len(llm.calls) == 2
+        assert llm.kv_groups == ["kg", "kg"]
+
+    def test_pydantic_extractor_all_rounds_use_kg_group(self):
+        llm = RecordingLLM([PYDANTIC_BAD_JSON, PYDANTIC_BAD_JSON])
+        PydanticLLMExtractor(llm).extract_entities_relations("切片正文", "ctx")
+        assert len(llm.calls) == 2          # 首轮无实体 → 补漏
+        assert llm.kv_groups == ["kg", "kg"]
+
+    def test_chat_falls_back_when_client_lacks_kv_group(self):
+        # 极简客户端（无 tools/kv_group 形参）→ TypeError 兜底仍能抽取。
+        class MinimalLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def batch_chat(self, messages_list, temperature=0.7, max_tokens=256):
+                self.calls += 1
+                return ["entity<|#|>苹果<|#|>Organization<|#|>科技公司<|COMPLETE|>"]
+
+        llm = MinimalLLM()
+        ents, _ = KGExtractor(llm, glean=False).extract_entities_relations("x")
+        assert [e.name for e in ents] == ["苹果"]
+        assert llm.calls == 1
+
+    def test_builder_defers_summaries_until_extraction_done(self, rag_dir):
+        chunks = [
+            {"id": "c1_0", "text": "苹果公司发布手机。", "source": "a.md",
+             "chunk_index": 0},
+            {"id": "c2_0", "text": "苹果公司总部在库比蒂诺。", "source": "a.md",
+             "chunk_index": 0},
+        ]
+        llm = RecordingLLM([
+            "entity<|#|>苹果公司<|#|>Organization<|#|>发布手机的公司<|COMPLETE|>",
+            "entity<|#|>苹果公司<|#|>Organization<|#|>总部位于库比蒂诺<|COMPLETE|>",
+        ])
+        builder = KGBuilder(rag_dir, FakeStore(chunks),
+                            KGExtractor(llm, glean=False))
+        try:
+            stats = builder.build()
+        finally:
+            builder.close()
+        assert stats["chunks"] == 2
+        # 两次抽取先全部完成，归纳（同一实体的第 2 条描述入库后才触发）最后做。
+        assert llm.kinds == ["extract", "extract", "summary"]
+        # 抽取调用全部走 kg 组；归纳是一次性任务，走默认 aux（不持久化）。
+        assert llm.kv_groups[:2] == ["kg", "kg"]
+        assert llm.kv_groups[2] == "aux"
+
+    def test_builder_single_desc_skips_summary(self, rag_dir):
+        chunks = [
+            {"id": "c1_0", "text": "苹果公司发布手机。", "source": "a.md",
+             "chunk_index": 0},
+        ]
+        llm = RecordingLLM(
+            ["entity<|#|>苹果公司<|#|>Organization<|#|>发布手机的公司<|COMPLETE|>"])
+        builder = KGBuilder(rag_dir, FakeStore(chunks),
+                            KGExtractor(llm, glean=False))
+        try:
+            builder.build()
+        finally:
+            builder.close()
+        assert llm.kinds == ["extract"]      # 只有 1 条描述，无需归纳
+

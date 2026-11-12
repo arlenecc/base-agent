@@ -526,7 +526,8 @@ def test_gguf_kv_reuse_disabled_uses_legacy_path(monkeypatch):
     c._loaded = True      # 跳过真实权重加载
     calls = {"legacy": 0}
 
-    def fake_legacy(self, messages, tools, temperature, max_tokens=None):
+    def fake_legacy(self, messages, tools, temperature, max_tokens=None,
+                    kv_group="main"):
         calls["legacy"] += 1
         return iter([])
 
@@ -557,7 +558,8 @@ def test_gguf_kv_reuse_enabled_tries_reuse_then_falls_back(monkeypatch):
     def boom_reuse(self, messages, tools, temperature):
         raise RuntimeError("boom")
 
-    def fake_legacy(self, messages, tools, temperature, max_tokens=None):
+    def fake_legacy(self, messages, tools, temperature, max_tokens=None,
+                    kv_group="main"):
         calls["legacy"] += 1
         return iter([])
 
@@ -567,6 +569,178 @@ def test_gguf_kv_reuse_enabled_tries_reuse_then_falls_back(monkeypatch):
     assert calls["legacy"] == 1
     assert reset_calls["n"] >= 1      # 退回前 reset
     assert c._gguf_ids == []          # 状态清空
+
+
+def test_gguf_trim_kv_updates_cursor_and_frees_suffix():
+    """同前缀分叉：KV 裁到 keep、n_tokens 对齐（抽取逐片复用的核心）。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="gguf")
+    trims = []
+
+    class FakeCtx:
+        def kv_cache_seq_rm(self, seq, p0, p1):
+            trims.append((seq, p0, p1))
+            return True
+
+    class FakeLlama:
+        n_tokens = 5000
+        _ctx = FakeCtx()
+
+    c._model = FakeLlama()
+    assert c._gguf_trim_kv(1200) is True
+    assert trims == [(-1, 1200, -1)]
+    assert c._model.n_tokens == 1200
+
+
+def test_gguf_trim_kv_rejects_unsupported_and_hybrid():
+    """底层不支持部分删除 / hybrid-recurrent → 返回 False（调用方全量重建）。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="gguf")
+
+    class RefuseCtx:
+        def kv_cache_seq_rm(self, seq, p0, p1):
+            return False
+
+    class FakeLlama:
+        n_tokens = 100
+        _ctx = RefuseCtx()
+
+    c._model = FakeLlama()
+    assert c._gguf_trim_kv(30) is False
+    assert c._model.n_tokens == 100     # 失败不改进度游标
+
+    class HybridLlama:
+        _is_hybrid = True
+        n_tokens = 100
+
+        class _ctx:
+            @staticmethod
+            def kv_cache_seq_rm(seq, p0, p1):
+                raise AssertionError("hybrid 不该尝试部分删除")
+
+    c._model = HybridLlama()
+    assert c._gguf_trim_kv(30) is False
+
+
+def test_gguf_extraction_fork_reuses_prefix(monkeypatch):
+    """抽取分叉（同 system+任务说明、正文不同）：只 eval 正文 + 生成 token。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="gguf")
+    c._loaded = True
+    c._max_tokens = 0          # 生成循环只跑 1 步
+    trims = []
+
+    class FakeCtx:
+        def kv_cache_seq_rm(self, seq, p0, p1):
+            trims.append((seq, p0, p1))
+            return True
+
+    class FakeLlama:
+        def __init__(self):
+            self._ctx = FakeCtx()
+            self.n_tokens = 5
+            self.evaluated = []
+
+        def eval(self, toks):
+            self.evaluated.extend(toks)
+            self.n_tokens += len(toks)
+
+        def sample(self, **kwargs):
+            return 7
+
+        def detokenize(self, toks, prev_tokens=None):
+            return "x"
+
+        def n_ctx(self):
+            return 0
+
+        def token_eos(self):
+            return -1
+
+    m = FakeLlama()
+    c._model = m
+    c._gguf_fmt = object()
+    c._gguf_ids = [1, 2, 3, 4, 5]     # 上一片：前缀 1-3 + 正文 4-5
+    monkeypatch.setattr(
+        c, "_gguf_render",
+        lambda msgs, tools, add_generation_prompt=True:
+        ("prompt", [1, 2, 3, 10, 11]))
+    list(c.chat_stream([{"role": "user", "content": "切片2"}], temperature=0.1))
+    assert trims == [(-1, 3, -1)]          # 只裁掉分叉点之后的 KV
+    assert m.evaluated == [10, 11, 7]      # 只 prefill 新正文 + eval 生成的 token
+    assert c._gguf_ids == [1, 2, 3, 10, 11, 7]
+
+
+def test_gguf_extraction_fork_falls_back_to_full_prefill(monkeypatch):
+    """裁剪不可用：reset 后整段 eval，功能不降级。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="gguf")
+    c._loaded = True
+    c._max_tokens = 0
+
+    class RefuseCtx:
+        def kv_cache_seq_rm(self, seq, p0, p1):
+            return False
+
+    class FakeLlama:
+        def __init__(self):
+            self._ctx = RefuseCtx()
+            self.n_tokens = 5
+            self.evaluated = []
+            self.resets = 0
+
+        def reset(self):
+            self.resets += 1
+            self.n_tokens = 0
+
+        def eval(self, toks):
+            self.evaluated.extend(toks)
+            self.n_tokens += len(toks)
+
+        def sample(self, **kwargs):
+            return 7
+
+        def detokenize(self, toks, prev_tokens=None):
+            return "x"
+
+        def n_ctx(self):
+            return 0
+
+        def token_eos(self):
+            return -1
+
+    m = FakeLlama()
+    c._model = m
+    c._gguf_fmt = object()
+    c._gguf_ids = [1, 2, 3, 4, 5]
+    monkeypatch.setattr(
+        c, "_gguf_render",
+        lambda msgs, tools, add_generation_prompt=True:
+        ("prompt", [1, 2, 3, 10, 11]))
+    list(c.chat_stream([{"role": "user", "content": "切片2"}], temperature=0.1))
+    assert m.resets == 1
+    assert m.evaluated == [1, 2, 3, 10, 11, 7]
+
+
+def test_batch_chat_single_kg_prompt_uses_stream_prefix_reuse(monkeypatch):
+    """单条 + kg 组：batch_chat 必须绕开 batch_generate（无前缀缓存），
+    走 chat_stream 的 KV 前缀复用路径。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="mlx")
+    c._loaded = True
+    monkeypatch.setattr(c, "_ensure_model", lambda: None)
+    seen = []
+
+    def fake_collect(messages, tools, temperature, max_tokens,
+                     enable_thinking, kv_group):
+        seen.append(kv_group)
+        return "抽取结果"
+
+    monkeypatch.setattr(c, "_batch_collect_one", fake_collect)
+    out = c.batch_chat([[{"role": "user", "content": "切片正文"}]],
+                       kv_group="kg")
+    assert out == ["抽取结果"]
+    assert seen == ["kg"]
 
 
 def test_gguf_invalidate_kv_cache_resets_context():

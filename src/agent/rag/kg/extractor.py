@@ -253,7 +253,13 @@ class KGExtractor(BaseKGExtractor):
     def set_client(self, client: Any) -> None:
         self._llm = client
 
-    def _chat(self, system: str, user: str, max_tokens: int = 2048) -> str:
+    def _chat(self, system: str, user: str, max_tokens: int = 2048,
+              kv_group: str = "aux") -> str:
+        """单轮调用。
+
+        kv_group：KV 缓存分组。构建期抽取传 "kg"（稳定前缀跨片复用，每次只
+        prefill 切片正文）；关键词/描述归纳等一次性任务用默认 "aux"（不持久化）。
+        """
         if self._llm is None:
             return ""
         messages = [
@@ -265,9 +271,9 @@ class KGExtractor(BaseKGExtractor):
         try:
             outs = self._llm.batch_chat(
                 [messages], tools=None, temperature=0.1, max_tokens=max_tokens,
-                enable_thinking=False)
+                enable_thinking=False, kv_group=kv_group)
         except TypeError:
-            # 客户端不支持 enable_thinking 形参时退回最简调用。
+            # 客户端不支持 enable_thinking/kv_group 形参时退回最简调用。
             outs = self._llm.batch_chat([messages], temperature=0.1,
                                         max_tokens=max_tokens)
         return (outs[0] if outs else "") or ""
@@ -289,7 +295,8 @@ class KGExtractor(BaseKGExtractor):
             section_context=ctx,
             input_text=chunk_text,
         )
-        raw = self._chat(self._system_prompt, user, max_tokens=4096)
+        raw = self._chat(self._system_prompt, user, max_tokens=4096,
+                         kv_group="kg")
         parser = (parse_json_extraction_output if self.json_output
                   else parse_extraction_output)
         entities, relations = parser(raw)
@@ -303,7 +310,8 @@ class KGExtractor(BaseKGExtractor):
                 input_text=chunk_text,
                 previous_output=(raw or "").strip()[:4000] or "（上一轮无有效输出）",
             )
-            raw2 = self._chat(self._system_prompt, cont_user, max_tokens=4096)
+            raw2 = self._chat(self._system_prompt, cont_user, max_tokens=4096,
+                              kv_group="kg")
             e2, r2 = parser(raw2)
             entities, relations = _merge_extraction(entities, relations, e2, r2)
             logger.info("KG: 补漏轮生效（首轮 %d 实体/%d 关系 → 合并后 %d/%d）",
@@ -450,7 +458,8 @@ class PydanticLLMExtractor(KGExtractor):
             section_context=ctx,
             input_text=chunk_text,
         )
-        raw = self._chat(self._system_prompt, user, max_tokens=4096)
+        raw = self._chat(self._system_prompt, user, max_tokens=4096,
+                         kv_group="kg")
         entities, relations = self._parse_output(raw)
         if self.glean and _needs_glean(raw, entities, relations, json_mode=True):
             cont_user = self._continue_template.format(
@@ -459,7 +468,8 @@ class PydanticLLMExtractor(KGExtractor):
                 input_text=chunk_text,
                 previous_output=(raw or "").strip()[:4000] or "（上一轮无有效输出）",
             )
-            raw2 = self._chat(self._system_prompt, cont_user, max_tokens=4096)
+            raw2 = self._chat(self._system_prompt, cont_user, max_tokens=4096,
+                              kv_group="kg")
             e2, r2 = self._parse_output(raw2)
             entities, relations = _merge_extraction(entities, relations, e2, r2)
             logger.info("KG: pydantic 补漏轮生效（首轮 %d 实体/%d 关系 → 合并后 %d/%d）",
