@@ -24,14 +24,16 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import List, Optional
+import time
+from typing import Dict, List, Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
-    QPushButton, QTextEdit, QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QProgressBar, QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from ..atomic_io import atomic_write_text
@@ -58,6 +60,92 @@ _FILE_FILTER = (
 
 def _supported(filepath: str) -> bool:
     return os.path.splitext(filepath)[1].lower() in _CONVERT_EXTS
+
+
+# ---------------------------------------------------------------------------
+# 文件级增量记录（断点续转）
+# ---------------------------------------------------------------------------
+
+_STATE_FILENAME = ".convert_tool_state.json"
+_STATE_VERSION = 1
+
+
+def _fingerprint(path: str) -> Optional[List[int]]:
+    """源文件指纹 [size, mtime_ns]；读不到（已删除等）返回 None。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return [int(st.st_size), int(st.st_mtime_ns)]
+
+
+class ConvertManifest:
+    """转换工具的文件级增量记录（保存目录下 ``.convert_tool_state.json``）。
+
+    用途：批量转换中途崩溃/被终止后，下次只转没转过的文件，不必从头再来。
+      * 跳过条件：记录为成功 + 源文件 size/mtime_ns 未变 + 输出文件仍存在；
+      * 源文件改动、输出被删、上次失败 → 重新转换（失败记录保留错误信息）；
+      * 每完成一个文件立即原子落盘，崩溃最多丢当前这一个文件的记录。
+    """
+
+    def __init__(self, save_dir: str):
+        self._path = os.path.join(save_dir, _STATE_FILENAME)
+        self._rows: Dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            rows = data.get("files") if isinstance(data, dict) else None
+            if isinstance(rows, dict):
+                self._rows = {str(k): v for k, v in rows.items()
+                              if isinstance(v, dict)}
+        except FileNotFoundError:
+            return
+        except Exception as e:  # 损坏的旧记录不应阻断转换
+            logger.warning("转换工具：增量记录损坏，已忽略并重建: %s", e)
+            self._rows = {}
+
+    def _save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            atomic_write_text(self._path, json.dumps(
+                {"version": _STATE_VERSION, "files": self._rows},
+                ensure_ascii=False, indent=1))
+        except OSError as e:  # 记录写不进去不影响本次转换
+            logger.warning("转换工具：增量记录写入失败（忽略）: %s", e)
+
+    def is_done(self, key: str, src_path: str, out_path: str) -> bool:
+        row = self._rows.get(key)
+        if not row or not row.get("ok"):
+            return False
+        if row.get("src") != _fingerprint(src_path):
+            return False
+        return os.path.isfile(out_path)
+
+    def mark_ok(self, key: str, src_path: str, out_path: str) -> None:
+        try:
+            out_size = os.path.getsize(out_path)
+        except OSError:
+            out_size = None
+        self._rows[key] = {
+            "ok": True,
+            "src": _fingerprint(src_path),
+            "out": os.path.basename(out_path),
+            "out_size": out_size,
+            "at": time.time(),
+        }
+        self._save()
+
+    def mark_failed(self, key: str, src_path: str, error: str) -> None:
+        self._rows[key] = {
+            "ok": False,
+            "src": _fingerprint(src_path),
+            "error": str(error)[:300],
+            "at": time.time(),
+        }
+        self._save()
 
 
 def _pick_image_engine(config) -> str:
@@ -155,12 +243,14 @@ class ConvertWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, files: List[str], save_dir: str, base_dir: str,
-                 config, parent: Optional[QWidget] = None):
+                 config, parent: Optional[QWidget] = None,
+                 skip_done: bool = True):
         super().__init__(parent)
         self._files = files
         self._save_dir = save_dir
         self._base_dir = base_dir
         self._config = config
+        self._skip_done = bool(skip_done)
         self._cancel = False
 
     def cancel(self) -> None:
@@ -176,17 +266,30 @@ class ConvertWorker(QThread):
         total = len(self._files)
         ok = 0
         failed = 0
+        skipped = 0
+        # 增量记录：崩溃/终止后重跑只处理未完成的文件（源文件改动会自动重转）。
+        manifest = ConvertManifest(self._save_dir)
         try:
             for i, f in enumerate(self._files):
                 if self._cancel:
                     break
                 name = os.path.basename(f)
+                out = self._out_path(f)
+                key = os.path.relpath(f, self._base_dir).replace(os.sep, "/")
+
+                if self._skip_done and manifest.is_done(key, f, out):
+                    skipped += 1
+                    self.progress.emit(i + 1, total, name, "已转换，跳过")
+                    self.log.emit(f"[{i + 1}/{total}] 跳过（已转换）：{name}")
+                    continue
+
                 self.progress.emit(i, total, name, "解析 / 提取（含图片识别）")
                 self.log.emit(f"[{i + 1}/{total}] 解析：{name}")
                 try:
                     md = convert_file(f, self._config)
                 except Exception as e:
                     failed += 1
+                    manifest.mark_failed(key, f, str(e))
                     self.file_done.emit(name, False, str(e))
                     self.log.emit(f"  ✗ 失败：{e}")
                     continue
@@ -197,30 +300,33 @@ class ConvertWorker(QThread):
                 self.progress.emit(i, total, name, "结果清洗 / Markdown 转换")
                 if not md.strip():
                     failed += 1
+                    manifest.mark_failed(key, f, "提取内容为空")
                     self.file_done.emit(name, False, "提取内容为空")
                     self.log.emit("  ✗ 提取内容为空，跳过写入")
                     continue
 
                 self.progress.emit(i, total, name, "写入文件")
-                out = self._out_path(f)
                 try:
                     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
                     atomic_write_text(out, md)
                 except OSError as e:
                     failed += 1
+                    manifest.mark_failed(key, f, f"写入失败：{e}")
                     self.file_done.emit(name, False, f"写入失败：{e}")
                     self.log.emit(f"  ✗ 写入失败：{e}")
                     continue
 
                 ok += 1
+                manifest.mark_ok(key, f, out)
                 chars = len(md)
                 self.file_done.emit(name, True, f"{chars} 字符 → {out}")
                 self.log.emit(f"  ✓ 已保存：{out}（{chars} 字符）")
 
-            done = ok + failed
+            done = min(ok + failed + skipped, total)
             # 整体进度条推进到 100%（或全部已完成的数量）。
-            self.progress.emit(min(done, total), total, "", "完成")
-            self.finished.emit({"total": total, "ok": ok, "failed": failed})
+            self.progress.emit(done, total, "", "完成")
+            self.finished.emit({"total": total, "ok": ok, "failed": failed,
+                                "skipped": skipped})
         except Exception as e:
             logger.warning("转换工具执行失败: %s", e)
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -286,6 +392,13 @@ class ConvertToolDialog(QDialog):
         self.start_btn.setStyleSheet("font-weight:600;")
         self.start_btn.clicked.connect(self._on_start_or_stop)
         bar.addWidget(self.start_btn)
+        self.skip_done_chk = QCheckBox("跳过已转换")
+        self.skip_done_chk.setChecked(True)
+        self.skip_done_chk.setToolTip(
+            "增量模式：保存目录下记录每个文件的转换状态（.convert_tool_state.json）。\n"
+            "已成功转换、源文件未改动且输出文件仍存在的会跳过；\n"
+            "崩溃或中止后重跑只处理剩余文件。取消勾选则全部重新转换。")
+        bar.addWidget(self.skip_done_chk)
         self.file_count_label = QLabel("未选择文件")
         bar.addWidget(self.file_count_label, 1)
         lay.addLayout(bar)
@@ -420,11 +533,16 @@ class ConvertToolDialog(QDialog):
 
         self.log_view.clear()
         self.log_view.append(f"共 {len(files)} 个文件，保存目录：{out}")
+        self.log_view.append(
+            "增量模式：跳过已转换文件（源文件改动会自动重转）"
+            if self.skip_done_chk.isChecked() else
+            "全量模式：忽略增量记录，全部重新转换")
         self.progress.setRange(0, len(files))
         self.progress.setValue(0)
         self.status_label.setText("准备中…")
 
-        self._worker = ConvertWorker(files, out, base_dir, self._config, self)
+        self._worker = ConvertWorker(files, out, base_dir, self._config, self,
+                                     skip_done=self.skip_done_chk.isChecked())
         self._worker.progress.connect(self._on_progress)
         self._worker.file_done.connect(self._on_file_done)
         self._worker.log.connect(self._on_log)
@@ -485,9 +603,10 @@ class ConvertToolDialog(QDialog):
         self.pick_out_btn.setEnabled(True)
         self.status_label.setText(
             f"完成：共 {summary['total']} 个，成功 {summary['ok']} 个，"
-            f"失败 {summary['failed']} 个")
+            f"跳过 {summary.get('skipped', 0)} 个，失败 {summary['failed']} 个")
         self.log_view.append(
-            f"==== 全部完成：成功 {summary['ok']} / 失败 {summary['failed']} ====")
+            f"==== 全部完成：成功 {summary['ok']} / 跳过 {summary.get('skipped', 0)}"
+            f" / 失败 {summary['failed']} ====")
 
     def _on_failed(self, msg: str) -> None:
         from PyQt6.QtWidgets import QMessageBox
