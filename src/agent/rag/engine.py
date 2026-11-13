@@ -2593,6 +2593,38 @@ class RAGEngine:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # 切片阅读器（检索即展示：气泡点开查看原文 + 前/后翻页）
+    # ------------------------------------------------------------------
+
+    def get_chunk_window(self, source: str,
+                         chunk_index: Any) -> Dict[str, Any]:
+        """返回当前切片 + 同文档前/后各一片。
+
+        ``{"current": {...}, "prev": {...}|None, "next": {...}|None}``；
+        文档首/末片时对应方向为 None。只读取已存在的 store（不在 UI 线程
+        触发懒加载/重模型初始化）；源文件已删除或切片已变更时返回空 dict，
+        由调用方回退到气泡里携带的文本。
+        """
+        try:
+            idx = int(chunk_index)
+        except (TypeError, ValueError):
+            return {}
+        store = getattr(self, "_store", None)
+        if store is None or not source:
+            return {}
+        try:
+            rows = store.get_chunks_by_source_indices(
+                source, [idx - 1, idx, idx + 1])
+        except Exception as e:
+            logger.warning("RAG: 读取切片窗口失败: %s", e)
+            return {}
+        cur = rows.get(idx)
+        if cur is None:
+            return {}
+        return {"current": cur, "prev": rows.get(idx - 1),
+                "next": rows.get(idx + 1)}
+
+    # ------------------------------------------------------------------
     # Meta-context + Targeted RAG (文档缩略版本)
     # ------------------------------------------------------------------
 

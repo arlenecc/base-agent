@@ -44,6 +44,7 @@ from ..rag.engine import RAGEngine, effective_embedding_model
 from ..rag.vector_store import DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL
 from .ocr_test_dialog import OcrTestDialog
 from .convert_tool_dialog import ConvertToolDialog
+from .chunk_viewer import ChunkViewerDialog
 
 
 CONFIG_PATH = DEFAULT_CONFIG_PATH
@@ -1346,6 +1347,29 @@ class LogWindow(_HostedPanelDialog):
 
 
 # ===========================================================================
+# 对话区：可点击的参考切片气泡
+# ===========================================================================
+
+
+class _ChatView(QTextEdit):
+    """对话区。QTextEdit 不自带 anchorClicked，这里把气泡链接转成信号。
+
+    只拦截 ``chunk://`` 链接：其余 HTML 保持原有行为（选中/滚动/拖拽）。
+    """
+
+    chunk_clicked = pyqtSignal(str)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            href = self.anchorAt(event.position().toPoint())
+            if href.startswith("chunk://"):
+                self.chunk_clicked.emit(href)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
+# ===========================================================================
 # Keyed plain text editor: Enter sends, Shift+Enter newline
 # ===========================================================================
 
@@ -1603,6 +1627,11 @@ class MainWindow(QMainWindow):
         # 仍为 False，就用 _pending_final_answer 补显示一次。
         self._turn_has_visible = False
         self._pending_final_answer = ""
+        # 检索即展示：本轮工具返回的切片附件（只在 UI 侧流转，不进上下文），
+        # 回合结束后渲染成气泡；token → 附件 供点击时取原文。
+        self._turn_attachments: List[Dict[str, Any]] = []
+        self._chunk_refs: Dict[str, Dict[str, Any]] = {}
+        self._chunk_ref_seq = 0
         self._busy = False
         # True = 主模型权重加载/预热尚未结束。此时发送按钮禁用、_on_send 拒绝
         # 入队：否则用户看到「已就绪」就发消息，worker.run() 会因队列非空整段
@@ -3084,13 +3113,17 @@ class MainWindow(QMainWindow):
         llay.addLayout(chat_header)
 
         # chat view —— 思考/日志移走后，左栏整块都是对话区
-        self.chat_view = QTextEdit()
+        self.chat_view = _ChatView()
         self.chat_view.setReadOnly(True)
+        # 检索即展示：点气泡链接 → 打开切片阅读器（QTextEdit 无 anchorClicked）
+        self.chat_view.chunk_clicked.connect(self._on_chunk_clicked)
         # 限制对话区保留的段落数。长会话（多轮工具调用 + 大段输出）会让
         # QTextDocument 无限增长，最终吃光内存并让滚动/重排越来越卡。
         self.chat_view.document().setMaximumBlockCount(5000)
         self.chat_view.document().setDefaultStyleSheet(
             ".u{color:#2563eb}.a{color:#059669}.t{color:#7c3aed}.sys{color:#9ca3af}"
+            ".chips{color:#6b7280;font-size:9pt}"
+            ".chip{color:#2563eb}"
         )
         llay.addWidget(self.chat_view, 1)
 
@@ -4498,6 +4531,7 @@ class MainWindow(QMainWindow):
         self._streaming_assistant = False
         self._turn_has_visible = False
         self._pending_final_answer = ""
+        self._turn_attachments = []
         self._summary_stripper = _SummaryStripper()
         self._blank_shrinker = _BlankShrinker()
         self._set_controls_busy(True)
@@ -4824,6 +4858,82 @@ class MainWindow(QMainWindow):
         cls = "t" if getattr(result, "success", True) else "sys"
         self._append_chat(f'<p class="{cls}">↳ <b>{self._escape(name)}</b> → {self._escape(snippet)}</p>')
         self._append_log(f"[tool-end] {name} success={getattr(result,'success',True)} :: {snippet}")
+        # 检索即展示：切片附件只在 UI 侧暂存，回合结束后统一渲染成气泡。
+        atts = getattr(result, "attachments", None)
+        if atts:
+            self._turn_attachments.extend(
+                a for a in atts if isinstance(a, dict))
+
+    # ------------------------------------------------------------------
+    # 检索即展示：参考切片气泡
+    # ------------------------------------------------------------------
+
+    def _render_chunk_bubbles(self) -> None:
+        """把本轮检索命中的切片渲染成可点击气泡（附在回复末尾）。"""
+        atts, self._turn_attachments = self._turn_attachments, []
+        if not atts:
+            return
+        # 同一片可能被多轮检索命中：按 (source, chunk_index) 聚合，保留首次
+        # 出现的文本与顺序，``used`` 标记取并集（任一次模型参考过就算）。
+        merged: Dict[tuple, Dict[str, Any]] = {}
+        for att in atts:
+            key = (att.get("source") or "", att.get("chunk_index"))
+            cur = merged.get(key)
+            if cur is None:
+                merged[key] = dict(att)
+            elif att.get("used"):
+                cur["used"] = True
+        links = []
+        for att in merged.values():
+            self._chunk_ref_seq += 1
+            token = f"c{self._chunk_ref_seq}"
+            self._chunk_refs[token] = att
+            try:
+                idx_s = str(int(att.get("chunk_index")) + 1)
+            except (TypeError, ValueError):
+                idx_s = "?"
+            doc = os.path.basename(att.get("source") or "") or "文档"
+            label = f"📄 {doc} · 第 {idx_s} 片"
+            if att.get("used"):
+                label += " · 已参考"
+            links.append(
+                '<span style="background-color:#eef2ff;">&nbsp;'
+                f'<a href="chunk://{token}" class="chip">{self._escape(label)}</a>'
+                "&nbsp;</span>")
+        # 引用表只保留最近 500 条，避免长会话无限增长（旧气泡失效可接受）。
+        while len(self._chunk_refs) > 500:
+            self._chunk_refs.pop(next(iter(self._chunk_refs)), None)
+        self._append_chat(
+            '<p class="chips">📎 参考切片（点击查看原文）：<br/>'
+            + "&nbsp;&nbsp;".join(links) + "</p>")
+        self._scroll_to_bottom(self.chat_view)
+
+    def _on_chunk_clicked(self, href: str) -> None:
+        if not href.startswith("chunk://"):
+            return
+        att = self._chunk_refs.get(href[len("chunk://"):])
+        if att is None:
+            return
+        try:
+            ChunkViewerDialog(self, att, fetch=self._fetch_chunk_window).exec()
+        except Exception as e:
+            self._append_log(f"[ui] 打开切片阅读器失败: {e}")
+
+    def _fetch_chunk_window(self, source: str, index: int) -> Dict[str, Any]:
+        """切片阅读器翻页取数（UI 线程只读调用；异常/引擎不可用返回 {}）。"""
+        engine = None
+        try:
+            if self._agent is not None:
+                engine = self._agent.tools.get_rag_engine()
+        except Exception:
+            engine = None
+        if engine is None:
+            return {}
+        try:
+            return engine.get_chunk_window(source, index)
+        except Exception as e:
+            self._append_log(f"[ui] 读取相邻切片失败: {e}")
+            return {}
 
     def _on_log(self, line: str) -> None:
         self._append_log(line)
@@ -4948,6 +5058,8 @@ class MainWindow(QMainWindow):
             self._show_fallback_answer(self._pending_final_answer)
             self._flush_stream(final=True)
         self._pending_final_answer = ""
+        # 正文已落盘 → 追加本轮检索命中的参考切片气泡。
+        self._render_chunk_bubbles()
         self._busy = False
         self._streaming_assistant = False
         self._set_controls_busy(False)
@@ -5091,6 +5203,8 @@ class MainWindow(QMainWindow):
         self._streaming_assistant = False
         self._pending_content.clear()
         self._pending_reasoning.clear()
+        self._turn_attachments = []
+        self._chunk_refs.clear()
         self._total_tokens = 0
         self.token_label.setText("总计 0 tokens")
         if self._agent is not None:

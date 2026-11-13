@@ -3513,6 +3513,50 @@ class VectorStore:
                 found[row.get("id")] = row
         return [found[c] for c in uniq if c in found]
 
+    @_store_op
+    def get_chunks_by_source_indices(
+        self, source: str, indices: List[int],
+    ) -> Dict[int, Dict[str, Any]]:
+        """按（source, chunk_index）取切片 —— 切片阅读器前后翻页用。
+
+        返回 ``{chunk_index: {id, text, source, chunk_index}}``；缺失的序号
+        不出现在结果里（文档首/末片时相邻片不存在）。
+        """
+        if not source or not indices:
+            return {}
+        wanted: List[int] = []
+        for i in indices:
+            try:
+                v = int(i)
+            except (TypeError, ValueError):
+                continue
+            if v >= 0:
+                wanted.append(v)
+        wanted = sorted(set(wanted))
+        if not wanted:
+            return {}
+        self._ensure_initialized()
+        table = self._ensure_table()
+        if table is None:
+            return {}
+        esc = str(source).replace("'", "''")
+        idx_list = ", ".join(str(i) for i in wanted)
+        where = f"source = '{esc}' AND chunk_index IN ({idx_list})"
+        try:
+            arrow = table.search().where(where, prefilter=True).select(
+                ["id", "text", "source", "chunk_index"]).limit(
+                len(wanted) + 1).to_arrow()
+        except Exception as e:
+            logger.warning("VectorStore: get_chunks_by_source_indices 失败: %s", e)
+            return {}
+        out: Dict[int, Dict[str, Any]] = {}
+        for row in arrow.to_pylist():
+            try:
+                out[int(row.get("chunk_index"))] = row
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def close(self) -> None:
         """Release heavy resources (LanceDB connection, embedding model, reranker).
 

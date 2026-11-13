@@ -16,10 +16,67 @@ logger = logging.getLogger(__name__)
 # 工具输出体积兜底（与 mcp_client / tools.memory 同策略）：引擎侧未对内部分片
 # 截断时，一次检索就能把上下文撑爆。
 _MAX_TOOL_OUTPUT_CHARS = 200_000
+# 检索即展示模式下，唯一进上下文的切片正文上限（字符）。单切片通常
+# ~800-1500 字；超长切片按此截断，避免一次检索就吃掉大块上下文。
+_MAX_PRESENTATION_CHUNK_CHARS = 1500
+# 知识图谱结果：实体/关系是摘要形态，体积可控，**始终**进上下文。
+_GRAPH_KINDS = ("kg_entity", "kg_relation")
 _ENGINE_RELEASED_ERROR = (
     "知识库引擎已释放（应用关闭或配置重建中），本次调用不可用；"
     "不要重试同一调用，等待新会话或重新同步知识库。"
 )
+
+
+def _is_graph_item(item: Dict[str, Any]) -> bool:
+    return item.get("kind") in _GRAPH_KINDS
+
+
+def _chunk_attachments(items: list) -> list:
+    """召回切片 → UI 气泡附件（同文档同序号去重，保留重排后的顺序）。
+
+    只有第一条（排名最高、真正进上下文的那片）标记 ``used=True``；所有切片
+    （含 used 的）都会展示给用户。
+    """
+    out: list = []
+    seen = set()
+    for r in items:
+        key = (r.get("source") or "", r.get("chunk_index"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "kind": "chunk",
+            "source": r.get("source") or "",
+            "chunk_index": r.get("chunk_index"),
+            "score": float(r.get("score") or 0.0),
+            "text": r.get("text") or "",
+            "used": not out,        # 第一条 = 排名最高、模型参考的那片
+        })
+    return out
+
+
+def _format_presentation_output(graph_items: list, top_chunk: Any,
+                                total_chunks: int) -> str:
+    """检索即展示：图谱条目全量 + 排名最高的一段原文。"""
+    lines: list = []
+    if graph_items:
+        lines.append(f"知识图谱命中 {len(graph_items)} 条实体/关系：")
+        lines.extend(str(it.get("text") or "") for it in graph_items)
+    if top_chunk is not None:
+        text = top_chunk.get("text") or ""
+        if len(text) > _MAX_PRESENTATION_CHUNK_CHARS:
+            text = text[:_MAX_PRESENTATION_CHUNK_CHARS] + "…"
+        src = os.path.basename(top_chunk.get("source") or "")
+        score = float(top_chunk.get("score") or 0.0)
+        lines.append(
+            f"知识库检索到 {total_chunks} 个相关切片；以下是与问题最相关的一段"
+            f"原文（其余 {max(0, total_chunks - 1)} 条已作为参考资料展示给用户，"
+            "未注入上下文，无需复述）：")
+        lines.append(f"### 来源: {src} (相关度: {score:.4f})")
+        lines.append(text)
+    if not lines:
+        lines.append("（知识库中未找到相关内容。）")
+    return "\n".join(lines)
 
 
 def _cap_output(text: str) -> str:
@@ -58,6 +115,8 @@ class RagSearchTool(Tool):
         "在本地知识库中检索**资料内容**。仅当问题依赖用户的资料时使用"
         "（如查某主题的原文、某本书的细节）；「知识库里有什么/你能做什么」"
         "这类问题不适用——前者用 rag_tools(op='outline') 列文档，后者直接回答。"
+        "检索只把**最相关的一段原文**提供给你参考，其余召回切片会以气泡形式"
+        "展示给用户（用户可点击查看），据此作答即可，不要声称看不到其余内容。"
     )
     parameters = {
         "type": "object",
@@ -147,6 +206,31 @@ class RagSearchTool(Tool):
         try:
             # 先取重排后的原始分片（含完整 text，未截断），供辅助模型通读归纳。
             chunks = self._engine.search(query, top_k=top_k, source=source or None)
+            # 检索即展示（Retrieval-as-Presentation）：默认数据分流——只有排名
+            # 最高的 1 个切片进上下文，其余切片只作为 UI 附件（气泡）展示，
+            # 避免召回多时模型被长上下文拖慢、召回少时又漏信息。图谱实体/关系
+            # 是摘要形态，仍全量进上下文。
+            if bool(getattr(cfg, "rag_presentation_mode", True)):
+                if chunks:
+                    graph_items = [r for r in chunks if _is_graph_item(r)]
+                    doc_chunks = [r for r in chunks if not _is_graph_item(r)]
+                    top_chunk = doc_chunks[0] if doc_chunks else None
+                    output = _format_presentation_output(
+                        graph_items, top_chunk, len(doc_chunks))
+                    logger.info(
+                        "✅ RAG 检索 %d 条 → 上下文注入 图谱 %d / 原文 %d，"
+                        "气泡展示 %d 条",
+                        len(chunks), len(graph_items), int(top_chunk is not None),
+                        len(doc_chunks),
+                    )
+                    return ToolResult(
+                        success=True, output=_cap_output(output),
+                        attachments=_chunk_attachments(doc_chunks))
+                # 无召回：沿用原格式化路径的「未找到」提示。
+                results = self._engine.search_formatted(
+                    query, top_k=top_k, source=source or None,
+                )
+                return ToolResult(success=True, output=_cap_output(results))
             aux = self._aux_llm_getter() if self._aux_llm_getter else None
             condensed = ""
             if chunks and aux is not None:
@@ -449,7 +533,9 @@ class RagToolsTool(_FanoutTool):
     name = "rag_tools"
     description = (
         "Unified local knowledge-base operations. op one of:\n"
-        "- search(query, top_k?, source?): retrieve material content\n"
+        "- search(query, top_k?, source?): retrieve material content; only the "
+        "top-ranked excerpt is provided to you, other hits are shown to the user "
+        "as reference chips (do not claim you cannot see them)\n"
         "- outline(book_name?): list all docs (no arg) or a document's outline\n"
         "- status(): knowledge-base status (chunks, sources)\n"
         "- ingest(force?): re-index the knowledge-base directory"

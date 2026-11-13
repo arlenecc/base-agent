@@ -359,8 +359,12 @@ class KGRetriever:
         if not ids:
             return []
         chunks = self._store.get_chunks_by_ids(ids)
-        return [{"text": c.get("text") or "",
+        # 带上 id / chunk_index：检索即展示模式下这些切片要变成可点击气泡，
+        # 阅读器需要按（source, chunk_index）翻页（缺字段会退化成「第 ? 片」）。
+        return [{"id": c.get("id") or "",
+                 "text": c.get("text") or "",
                  "source": c.get("source") or "",
+                 "chunk_index": c.get("chunk_index"),
                  "score": 0.0, "kind": "kg_backref_chunk"}
                 for c in chunks]
 

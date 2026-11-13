@@ -99,6 +99,12 @@ class AgentConfig:
     rag_embedding_dims: int = 128
     # rag_search 默认返回条数（重排后的最终结果数）。
     rag_search_top_k: int = 5
+    # 检索即展示（Retrieval-as-Presentation）：开启后 rag_search 不再把所有
+    # 召回切片塞进模型上下文——只有**排名最高的 1 个切片**进上下文供模型参考
+    # 作答，其余切片按原顺序以气泡形式附在回复末尾，供用户点击查看原文。
+    # 知识图谱的实体/关系仍全量进上下文（它们本身就是摘要形态，体积可控）。
+    # 关闭时退回旧行为：全部结果格式化/精简后注入。
+    rag_presentation_mode: bool = True
     # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：
     # 总量落在 [min, max] 区间才调用辅助模型浓缩；低于 min 原样注入（内容少，
     # 精简只会丢细节、白耗一次辅助模型调用）；高于 max 也不送辅助模型（超出
@@ -421,7 +427,8 @@ class AgentConfig:
                     "local_llm_flash_attn", "aux_local_llm_flash_attn",
                     "rag_matryoshka_enabled", "rag_binary_prefilter_enabled",
                     "web_allow_private_hosts", "rag_mcp_enabled",
-                    "rag_kg_glean_enabled", "rag_kg_llm_raw_json")
+                    "rag_kg_glean_enabled", "rag_kg_llm_raw_json",
+                    "rag_presentation_mode")
 
     @classmethod
     def _coerce(cls, name: str, value):

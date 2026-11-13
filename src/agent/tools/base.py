@@ -40,6 +40,9 @@ class ToolResult:
     success: bool
     output: str = ""
     error: str = ""
+    # 仅 UI 使用的旁路数据（如检索命中的文档切片），**绝不进模型上下文**：
+    # to_message() 只返回 output/error，内核回灌与历史落盘都走它。
+    attachments: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_message(self) -> str:
         if self.success:
