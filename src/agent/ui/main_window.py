@@ -1573,11 +1573,22 @@ class MainWindow(QMainWindow):
     # 预热在子线程阻塞跑，不能直接碰 QWidgets（跨线程崩溃），统一走信号
     # queued 投到 UI 线程更新 status_label。
     warmup_status = pyqtSignal(str)
+    # 定时任务（scheduler 线程 → UI 线程）：
+    #   sched_result(name, text)：tool 任务执行结果，追加到对话气泡；
+    #   sched_agent(name, prompt)：agent 任务，投递到常驻对话线程执行；
+    #   sched_log(line)：调度器日志（任务在 worker/scheduler 线程创建/执行，
+    #   不能直接碰 log_view）。
+    sched_result = pyqtSignal(str, str)
+    sched_agent = pyqtSignal(str, str)
+    sched_log = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self.model_loaded.connect(self._on_model_loaded)
         self.warmup_status.connect(self._on_warmup_status)
+        self.sched_result.connect(self._on_scheduled_result)
+        self.sched_agent.connect(self._on_scheduled_agent)
+        self.sched_log.connect(self._append_log)
         self.setWindowTitle("Base Augment Agent")
         self.resize(1280, 820)
 
@@ -1621,6 +1632,9 @@ class MainWindow(QMainWindow):
         self._dedup_worker: Optional[VectorDedupWorker] = None
         self._deps_worker: Optional[InstallDepsWorker] = None
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
+        # 定时任务：服务对象 + 待执行的 agent 任务队列（当前对话忙时排队）。
+        self._scheduler = None
+        self._pending_scheduled: List[Tuple[str, str, str]] = []
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         # 本轮是否真的往对话气泡写入过可见正文（_summary_stripper 剥离后）。
         # 内核事后构造的兜底答复不走 on_content，气泡会一片空白；收尾时若本标志
@@ -1701,6 +1715,9 @@ class MainWindow(QMainWindow):
         self._wire_signals()
         self._setup_log_bridge()
         self._apply_config_to_widgets()
+        # 定时任务服务：工具层通过 scheduler.get_scheduler() 取用；必须在
+        # _rebuild_agent 之前就绪（模型可能一开始就调用 schedule_tools）。
+        self._init_scheduler()
         # 首次启动：默认本地模型缺失 → 模态联网下载（hf-mirror.com），完成后才继续
         # 初始化（_rebuild_agent 会加载 embedding/reranker，缺权重必然报错）。
         self._ensure_default_models()
@@ -2787,6 +2804,9 @@ class MainWindow(QMainWindow):
                 # 加载失败也要解锁，否则发送按钮永久禁用。
                 self._set_warming(False)
                 self.status_label.setText("主模型加载失败，请重新加载")
+        # 模型就绪后拉起此前排队的定时 agent 任务（启动期触发的任务）。
+        if success and key == "main":
+            self._drain_pending_scheduled()
 
     def _on_warmup_status(self, msg: str) -> None:
         """预热/加载阶段的状态提示（warmup_status / bridge.status 信号，跨线程安全入队）。
@@ -2821,6 +2841,8 @@ class MainWindow(QMainWindow):
             logger.info("忽略已被替换的旧 worker 的预热收尾信号")
             return
         self._set_warming(False)
+        # 预热完成 → 拉起启动期触发、排队中的 agent 定时任务。
+        self._drain_pending_scheduled()
         # 若用户已在对话中（例如重新加载模型时旧 worker 的收尾信号延迟到达），
         # 不要用「可对话」覆盖运行状态文案。
         if not self._busy:
@@ -3630,6 +3652,12 @@ class MainWindow(QMainWindow):
                     self._orphan_workers.append(old_worker)
             self._worker = None
         self._gather_config_from_widgets()
+        # 工作区可能已切换：定时任务文件跟着 workspace 走（路径未变则 no-op）。
+        if getattr(self, "_scheduler", None) is not None:
+            try:
+                self._scheduler.reconfigure(self.config.workspace)
+            except Exception as e:
+                self._append_log(f"[scheduler] ⚠ 切换工作区失败: {e}")
         # 配置可能改了 PDF 引擎 / OvisOCR2 模型——重新注入 RAG 层（与 __init__
         # 的同款调用保持一致，否则改设置要重启应用才生效）。
         try:
@@ -4515,14 +4543,28 @@ class MainWindow(QMainWindow):
         text = self.send_editor.toPlainText().strip()
         if not text:
             return
+        if self._start_turn(text):
+            self.send_editor.clear()
+
+    def _start_turn(self, text: str, display_html: Optional[str] = None) -> bool:
+        """启动一个对话回合（用户输入与定时任务 agent 任务共用）。
+
+        ``display_html`` 非空时用它代替「你: …」气泡（定时任务头部），否则按
+        普通用户消息呈现。返回 False 表示未启动（Agent 未就绪）。
+        """
         if self._agent is None:
             self._rebuild_agent()
         if self._agent is None:
-            QMessageBox.warning(self, "未就绪", "Agent 未初始化，请先应用配置。")
-            return
+            if display_html is None:
+                QMessageBox.warning(self, "未就绪", "Agent 未初始化，请先应用配置。")
+            else:
+                self._append_chat('<p class="sys">⏰ 定时任务跳过：Agent 未就绪</p>')
+            return False
 
-        self._append_user(text)
-        self.send_editor.clear()
+        if display_html:
+            self._append_chat(display_html)
+        else:
+            self._append_user(text)
         self._busy = True
         # 流式状态必须在每回合开始时统一复位：上一次「强制终止」可能发生在
         # <summary> 已开未闭的时刻（_streaming_assistant/stripper 残留），
@@ -4550,6 +4592,7 @@ class MainWindow(QMainWindow):
             self._worker = worker
             worker.set_input(text)
             worker.start()
+        return True
 
     def _on_stop(self) -> None:
         # 终止当前 agent 对话（不再处理同步取消，同步取消由 _on_stop_sync 负责）
@@ -4935,6 +4978,79 @@ class MainWindow(QMainWindow):
             self._append_log(f"[ui] 读取相邻切片失败: {e}")
             return {}
 
+    # ------------------------------------------------------------------
+    # 定时任务（APScheduler）
+    # ------------------------------------------------------------------
+
+    def _init_scheduler(self) -> None:
+        """创建并启动定时任务服务（任务定义在 workspace/.agent 下持久化）。"""
+        from ..scheduler import SchedulerService, set_scheduler
+
+        try:
+            self._scheduler = SchedulerService(
+                self.config.workspace,
+                tool_executor=self._exec_scheduled_tool,
+                agent_submitter=lambda name, prompt: self.sched_agent.emit(name, prompt),
+                notify=lambda name, text: self.sched_result.emit(name, text),
+                log=lambda line: self.sched_log.emit(line),
+            )
+            set_scheduler(self._scheduler)
+        except Exception as e:
+            self._scheduler = None
+            self._append_log(f"[scheduler] ❌ 启动失败: {e}")
+
+    def _exec_scheduled_tool(self, name: str, args: Dict[str, Any]):
+        """scheduler 线程调用：直接执行注册表中的工具（不经确认门控）。"""
+        from ..tools import ToolResult
+
+        agent = self._agent
+        if agent is None:
+            return ToolResult(False, error="Agent 未就绪（应用启动/重建中），本次任务跳过")
+        if getattr(self, "_sync_active", False):
+            return ToolResult(False, error="知识同步进行中（主/辅模型已卸载），本次任务跳过")
+        return agent.tools.execute(name, args)
+
+    def _on_scheduled_result(self, name: str, text: str) -> None:
+        """tool 类型任务结果 → 对话气泡（UI 线程）。"""
+        stamp = time.strftime("%H:%M:%S")
+        body = self._escape(text or "").replace("\n", "<br/>")
+        self._append_chat(
+            f'<p class="sys">⏰ 定时任务「{self._escape(name)}」 {stamp}</p>'
+            f"<p>{body}</p>")
+        self._append_log(f"[scheduler] {name} -> {(text or '')[:200]}")
+        self._scroll_to_bottom(self.chat_view, force=True)
+
+    def _on_scheduled_agent(self, name: str, prompt: str) -> None:
+        """agent 类型任务 → 复用常驻对话线程执行（MLX KV 缓存不跨线程）。"""
+        if (getattr(self, "_sync_active", False)
+                or self._is_worker_running(self._sync_worker)):
+            self._append_chat(
+                f'<p class="sys">⏰ 定时任务「{self._escape(name)}」跳过：知识同步进行中</p>')
+            return
+        text = (f"【定时任务】{prompt}\n\n"
+                "（这是定时任务自动触发，请直接执行并给出结果，不要反问用户。）")
+        header = f'<p class="sys">⏰ 定时任务「{self._escape(name)}」</p>'
+        if self._busy:
+            self._pending_scheduled.append((name, text, header))
+            self._append_chat(
+                f'<p class="sys">⏰ 定时任务「{self._escape(name)}」已排队，'
+                "本轮对话结束后自动执行</p>")
+            return
+        if self._agent is None or getattr(self, "_warming", False):
+            self._pending_scheduled.append((name, text, header))
+            self._append_log(f"[scheduler] agent 任务「{name}」排队等待模型就绪")
+            return
+        self._start_turn(text, display_html=header)
+
+    def _drain_pending_scheduled(self) -> None:
+        """对话空闲后拉起排队的 agent 定时任务（一次一个）。"""
+        if (self._busy or self._warming or not self._pending_scheduled
+                or self._agent is None):
+            return
+        name, text, header = self._pending_scheduled.pop(0)
+        self._append_log(f"[scheduler] 开始执行排队的 agent 任务「{name}」")
+        self._start_turn(text, display_html=header)
+
     def _on_log(self, line: str) -> None:
         self._append_log(line)
 
@@ -5069,6 +5185,8 @@ class MainWindow(QMainWindow):
         # 见 AgentWorker 类注释）。所以这里不 join、不置 None；旧实现 wait(2000)
         # 是因为每回合新建线程、run() 已返回，那时才能立刻 join。
         self._show_pending_skill_dialog()
+        # 空闲了 → 拉起排队中的定时 agent 任务（一次一个）。
+        self._drain_pending_scheduled()
 
     def _on_error(self, msg: str) -> None:
         self._append_chat(f'<p class="sys">⚠ {self._escape(msg)}</p>')
@@ -5238,6 +5356,14 @@ class MainWindow(QMainWindow):
                     _dlg.close()
             except Exception:
                 pass
+        # --- 先停定时任务调度器：避免关窗后往已销毁的对话气泡发结果。
+        try:
+            if getattr(self, "_scheduler", None) is not None:
+                from ..scheduler import set_scheduler
+                self._scheduler.shutdown(wait=False)
+                set_scheduler(None)
+        except Exception:
+            pass
         # --- 停止日志轮询定时器
         try:
             self._log_poll_timer.stop()

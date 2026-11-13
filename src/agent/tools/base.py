@@ -360,6 +360,7 @@ class ToolRegistry:
         from .skill_search import SkillToolsTool
         from .checkpoint import UpdateWorkingCheckpointTool, StartLongTermUpdateTool
         from .plan import UpdatePlanTool
+        from .schedule_tool import ScheduleTool
 
         tools_to_register = [
             # 合并后的门面工具（op 参数分发）
@@ -371,6 +372,8 @@ class ToolRegistry:
             WebScanTool(),            # 唯一 web 工具（含 render=true 浏览器渲染）
             AskUserTool(),
             WorkMemoryTool(),
+            # 定时任务：对话直接创建/管理 cron/interval/一次性任务
+            ScheduleTool(),
             # 沉淀态原子工具（对齐 GenericAgent）
             UpdateWorkingCheckpointTool(),
             StartLongTermUpdateTool(),

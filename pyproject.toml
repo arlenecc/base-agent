@@ -15,6 +15,8 @@ dependencies = [
     # 路径）+ rag_mcp_server.py（对外暴露 RAG）。协议版本协商、三种传输、
     # tools/resources/prompts 都由它负责，因此不再是可选依赖。
     "fastmcp>=4.0",
+    # 定时任务：cron / interval / 一次性调度 + 后台执行（scheduler/）。
+    "APScheduler>=3.10,<4",
 ]
 
 [project.optional-dependencies]

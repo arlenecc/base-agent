@@ -85,6 +85,15 @@ try:
 except Exception:
     pass
 
+# --- APScheduler (scheduler 服务在函数内延迟导入，静态分析看不到) ---
+try:
+    hiddenimports += collect_submodules('apscheduler')
+    datas += collect_data_files('apscheduler')
+except Exception:
+    pass
+# 本项目在函数内延迟导入的模块（静态分析同样看不到）
+hiddenimports += ['agent.scheduler', 'agent.scheduler.service']
+
 # --- numpy (semantic chunker vector ops) ---
 try:
     hiddenimports += collect_submodules('numpy')

@@ -34,9 +34,9 @@
 | L1 | 工具级裁剪 | 注入本轮前 | 按 RAW 区余额 ÷ 并发数分配 `maxlen` | 单条 ≤ 6K 字符 |
 | L2 | 回合摘要 | 每轮结束 | 强制 `<summary>` ≤30 字物理快照 | 每轮 ≤ 30 字 |
 | L3 | 会话折叠 | 预算告罄 / 每 N 轮 | 旧轮 → 一行摘要（同类项合并） | 折叠区 ≤ 2.7k token |
-| L4 | 记忆蒸馏 | 任务完成 / 检查点 | 沉淀进工作记忆 → 知识图谱 → SKILL.md | 系统提示 ≤ 3.9k token |
+| L4 | 记忆蒸馏 | 任务完成 / 检查点 | 沉淀进工作记忆 → 知识图谱 → SKILL.md | 系统提示 ≤ 5k token |
 
-**30k 预算分配**：`SYS 3.9k / EARLIER 2.7k / RAW 12k / TOOLS 5.1k / RESERVE 6.3k`。
+**30k 预算分配**：`SYS 5k / EARLIER 2.7k / RAW 12k / TOOLS 5.1k / RESERVE 5.2k`。
 关键不变量是 **L2+L3 让历史恒定 O(1)** —— 旧实现把整条历史每轮重发，
 上下文随轮次线性膨胀，只能靠超阈值后的被动摘要兜底。
 
@@ -44,53 +44,59 @@
 
 - **多模型兼容** — 支持所有 OpenAI 兼容 API（OpenAI / DeepSeek / Qwen / 本地 vLLM 等）
 - **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计（仅计输出 token，不含 prompt）；结构化 read 超时（流式 chunk 间隔上限 60s），本地模型生成中途卡住时自动报错而非永久卡死
-- **工具调用** — 内置 21 个工具（原子 8 + 能力 12 + 1 个条件注册；另有 2 个原子命名别名，`webexec_js` / `web_execute_js` 仅在配置浏览器端点时注册），支持模型自主决策和工具链式调用
+- **工具调用** — 内置 13 个工具（`file_tools` / `long_memory` / `skill_tools` / `rag_tools` 四个门面 + `code_run` / `shell_run` / `web_scan` / `ask_user` / `work_memory` / `schedule_tools` / `update_working_checkpoint` / `start_long_term_update` / `update_plan`）；旧原子工具名（`file_read` / `rag_search` / `memory_search` / `skill_load` 等）保留兼容别名但不进 schema，支持模型自主决策和工具链式调用
 - **内核控制流** — 三态自动机（THINK / ACT / CONSOLIDATE）+ 五级信息压缩，上下文硬性控制在 30k 以内
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过本地 embedding 模型（默认 `jina-embeddings-v5`）+ LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，重排序精准召回；可选**两段式检索**（二值量化粗筛：查询向量 sign 二值化 + 位打包后 XOR+Popcount 汉明距离全表极速粗筛 top 200 → 候选集内余弦 + BM25 精筛 → reranker 深度打分，大向量库下显著更快）
+- **知识图谱检索（RAG KG）** — 配置面板「构建知识图谱」把知识库切片抽成实体/关系图：辅助模型三方案抽取（`llm_raw` / `llm_pydantic` / `gliner`，含补漏轮）、单片实体/关系/描述上限可配置；入库前做规则 + 语义向量消歧（余弦 ≥0.92 合并同义实体，配置面板「实体消歧」可对存量库补做）；检索策略 `naive` / `local` / `global` / `hybrid` / `mix` 可切换，实体与关系始终进模型上下文
+- **检索即展示（Retrieval-as-Presentation）** — 检索命中的文档切片默认不再全量灌进上下文：只有**排名最高的 1 条**进模型参考，其余切片以可点击气泡附在回复末尾，点开在独立窗口阅读原文并可切换同文档前/后切片（`rag_presentation_mode`，默认开启；关闭退回旧的全量注入）
+- **定时任务** — 基于 APScheduler，对话里直接说「每天 9 点」「每周一 9 点」「2026-11-20 14:30」「30 分钟后」「每 30 分钟…」即可创建任务：支持 cron / 间隔 / 每周几 / 指定日期 / 当前时间后推；`kind=agent` 由主模型在对话线程执行并流式显示，`kind=tool` 直接调用 `code_run` / `shell_run` / MCP 自定义工具并以气泡回显结果；任务定义持久化在 `<workspace>/.agent/scheduler_jobs.json`，重启自动恢复
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、本地 Reranker（`jina-reranker-v2-base-multilingual` ONNX 重排序）等可选增强也会一并检测与自动安装
 - **统一解析引擎三选一** — PDF/office 文档走统一引擎回退链：`docling`（默认）→ `marker` → `ovis`（OvisOCR2 VLM）→ PyMuPDF 纯文本兜底。docling 全量管线：布局/表格模型走 **MPS**（torch Metal，比 CPU 快 ~35%），OCR 走 **Apple Vision（ocrmac，ANE 推理）**；单本图片书实测 ~6-10 分钟（MPS + scale 2.0 调优后，比早期 CPU 配置快约 10 倍）。OvisOCR2（`OvisOCR2-0.8B-MLX-4bit`，mlx-vlm）作为第三配置项：PyMuPDF 取页/裁表 → VLM 转 Markdown（文本页的表格区域自动裁剪回填），配置窗口「OCR模型」行可选模型与路径。三引擎实测（M4，10 页中文扫描书）：docling 18-25s / ovis 50-51s / marker 215s
 - **OCR scale 可配置** — docling 的 OCR 渲染 scale 默认固定 **2.0**（原 3.0；位图内存 ∝ scale²，实测转换快 34%、质量不变）；`rag_ocr_scale_dynamic` 开启后按页动态决策（表格页 2.5、低 DPI/文本页 2.0，预分析带缓存）
 - **OCR 兜底路径与内存护栏** — 引擎链末端是 PyMuPDF+RapidOCR 轻量路径（仅出纯文本）：引擎全局单例 + 信号量串行，每 5 页检查原生缓存增量（超 1.2GB 自动冲刷并降级 CPU EP），CoreML 模式下每 50 页周期重建；识别前做尺寸归一化 + 灰度 CLAHE + 锐化预处理（均可配置关闭）。以上行为可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` / `rag_ocr_binarize` 中调整
-- **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、reranker 精排过程和最终结果排名
+- **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在**独立日志窗口**；知识检索时展示向量检索候选数、reranker 精排过程和最终结果排名
 - **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→8 次、引用最近错误**和已试过且失败的方案**、明确禁止「停下来问用户是否继续」）；**首次失败**即要求换方法（禁止原样重发、禁止把错误念给用户）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 3 次就把步骤标 `blocked` 会被守卫拦回。失败上下文跨自动续跑段传递，续跑段仍知道上一段卡在哪
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性；「终止对话」会立即中断并回收 `code_run`/`shell_run` 子进程（旧实现子进程要跑到自身超时，最长 600s）
-- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱 + 技能检索共用同一份本地 jina 嵌入实例）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + 本地 reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler。**MLX 缓存上限显式压到 1GB**（默认可达统一内存的 75%，16GB 机器上实测把同步进程 footprint 顶到 19GB 的元凶）；docling converter 空闲 90 秒自动释放 + 每次转换后 `torch.mps.empty_cache()` 归还 MPS 缓冲；HuggingFace 全程离线（`HF_HUB_OFFLINE=1`，根治 convert 期间联网 connect 挂死）；单文档转换 1 小时硬超时兜底；日志/思考/计划面板均有行数上限防无限增长
+- **内存管理** — Embedding 模型进程级单例共享（RAG + 长期记忆图谱 + 技能检索共用同一份本地 jina 嵌入实例）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 长期记忆图谱 LanceDB 连接 + ONNX 模型 + 本地 reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler。**MLX 缓存上限显式压到 1GB**（默认可达统一内存的 75%，16GB 机器上实测把同步进程 footprint 顶到 19GB 的元凶）；docling converter 空闲 90 秒自动释放 + 每次转换后 `torch.mps.empty_cache()` 归还 MPS 缓冲；HuggingFace 全程离线（`HF_HUB_OFFLINE=1`，根治 convert 期间联网 connect 挂死）；单文档转换 1 小时硬超时兜底；日志/思考/计划面板均有行数上限防无限增长
 - **Flash attention 默认启用** — 长上下文与显存受限设备收益明显（GGUF 上 Metal compute buffer 实测 612→493 MiB，-19%）。GGUF 通过 `flash_attn=True` 生效；MLX 由 `mlx_lm` 原生使用 `mx.fast.scaled_dot_product_attention`（融合 SDPA，无独立开关）。GGUF 加载按「量化 KV + FA → f16 + FA → 最保守」逐级降级，不支持的构建会自动退让而不会加载失败；可在高级配置取消勾选 `FA`，或改 `local_llm_flash_attn` / `aux_local_llm_flash_attn`。注意 FA 是 `type_k/type_v=q8_0` 量化 KV 的前置条件，启用后 KV INT8 量化会真正生效（KV 显存减半）。
 - **健壮性** — `shell_run` 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树；MCP stdio 连接由 fastmcp 的 `StdioTransport(keep_alive=False)` 在 `stop()` 时回收；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
-- **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
+- **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；浏览器相关工具已并入 `web_scan(render=true)`；Tool descriptions 精简（`rag_tools` 的 search/outline 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `long_memory(op="search")` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制（风险分级）** — 工作区内操作自动执行；`code_run` / `shell_run` 默认**直接执行**，仅破坏性/影响系统与安全的操作才弹确认（`tools/risk.py` 静态分级：sudo、系统电源控制、进程杀伤、磁盘操作、管道下载执行、`git push --force`、写工作区之外的路径；读系统文件、工作区内读写、`pip install` 等一律不拦），`config.always_confirm_code=True` 可恢复逐次确认；MCP 工具仍逐次确认；确认弹窗只显示**用途说明**（启发式优先：注释/docstring/命令名映射，零延迟；无注释时才用 LLM 兜底生成 ≤20 字用途），不贴代码全文，避免超长文本把按钮顶出屏幕
-- **技能系统** — 自动识别用户意图匹配技能；支持目录化技能（`.agent/skills/` 下每个技能一个目录，含 `skill.json` 元数据 + `prompt.md` 指令），`SkillIndex` 维护 `_index.json` 索引，`skill_search` / `skill_load` 按需发现与加载，技能指令不进系统提示词，节省 token
+- **技能系统** — 自动识别用户意图匹配技能；支持目录化技能（`agent/skills/` 与 `.agent/skills/` 下每个技能一个目录，含 `skill.json` 元数据 + `prompt.md` 指令），`SkillIndex` 维护 `_index.json` 索引，统一用 `skill_tools(op="search" / "semantic_search" / "load" / "save")` 按需发现与加载，技能指令不进系统提示词，节省 token
 
 ## 界面布局
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ [Base URL] [API Key] [模型] [获取模型]                    Row 0  │
-│ [上下文长度] [温度] [top_p] [min_p] [top_k] [重复惩罚] [超时] [应用配置] │
-│ [工作目录] [知识库] [同步知识] [停止同步]                   Row 2  │
-│ [OCR模型] [mlx-vlm▾] [模型名] [本地路径]                   Row 1.5 │
-│ [Embedding] [impl▾] [模型名] [本地路径]                    Row 3  │
+│ 对话   [清空对话] [终止对话]     [⚙ 配置] [知识同步] [日志]        │
 ├──────────────────────────────┬───────────────────────────────────┤
-│ [对话] — [清空对话] [终止对话] │ 思考过程 / 日志                    │
-│                              │                                   │
-│ 对话内容...                   │ 推理过程实时显示...                 │
-│                              │ 知识同步进度实时显示...              │
-│                              │ 检索过程日志实时显示...              │
+│                              │ 执行计划（目标 + 步骤进度）          │
+│ 对话区                        │                                   │
+│  ├─ 你 / 助手 气泡            ├───────────────────────────────────┤
+│  ├─ 工具调用与结果             │ 思考过程（推理流实时显示）           │
+│  ├─ 📎 参考切片气泡（可点击）   │                                   │
+│  └─ ⏰ 定时任务结果气泡         │                                   │
 ├──────────────────────────────┴───────────────────────────────────┤
-│ 输入框                                               [发送]      │
+│                  0.0 tok/s  |  总计 N tokens                     │
 ├──────────────────────────────────────────────────────────────────┤
-│ [状态栏]                                   [进度条] [token 速度]  │
+│ 输入框（Enter 发送 / Shift+Enter 换行）                  [发送]   │
+├──────────────────────────────────────────────────────────────────┤
+│ [状态栏]                                           [进度条]      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+- **配置窗口**（⚙ 配置）：模型 / 采样参数 / 工作目录 / 知识库 / RAG 与知识图谱等全部配置都收在这里，不再占用主界面。
+- **日志窗口**（日志）：全链路运行日志、知识同步进度与检索日志。
+- **参考切片气泡**：回答末尾的 `📄 文档名 · 第 N 片` 链接可点开原文阅读器，支持同文档前/后翻页（方向键可操作）。
+- **定时任务气泡**：`⏰ 定时任务「名称」` + 执行输出；agent 类型任务则直接以流式回复展示。
+
 **按钮说明**：
-- 「同步知识」：增量同步知识库（右键可强制全量重处理）
-- 「停止同步」：仅在同步进行中启用，协作式取消（完成当前文件/批次后退出）
+- 「知识同步」：左键增量同步，右键强制全量重处理
 - 「终止对话」：终止当前 agent 对话（完成当前工具后退出）
-- 「应用配置」：在 agent 运行期间会被阻止，需先终止当前对话
+- 「配置」中的应用配置在 agent 运行期间会被阻止，需先终止当前对话
 
 ## 快速开始
 
@@ -115,7 +121,7 @@ pip install -e ".[all]"
 
 | 分组 | 安装命令 | 包含内容 |
 |------|---------|---------|
-| 核心 | `pip install -e .` | PyQt6, httpx, beautifulsoup4 |
+| 核心 | `pip install -e .` | PyQt6, httpx, beautifulsoup4, fastmcp（MCP 客户端/服务端）, APScheduler（定时任务） |
 | RAG | `pip install -e ".[rag]"` | lancedb, fastembed, python-docx, openpyxl, python-pptx, PyMuPDF, ebooklib, docling, chonkie, jieba |
 | OCR | `pip install -e ".[ocr]"` | rapidocr 3.x（图片型 PDF 识别，未装时回退 1.x 兼容层）+ opencv-python-headless（图像预处理归一化/增强） |
 | 测试 | `pip install -e ".[test]"` | pytest, pytest-qt（`qapp` fixture，UI 测试必需） |
@@ -234,47 +240,34 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 
 ## 内置工具
 
-工具分三层：**原子工具**（对齐 GenericAgent 的 9 个）→ **能力工具**（base-agent 原有）→ **外部协议**（MCP）。
+工具已收敛为 **4 个门面工具 + 9 个独立工具**（共 13 个），旧原子工具名保留为兼容别名（`_legacy`，不进 schema，模型只看到合并后的名字）。
 
-### 第一层：原子工具
+| 工具 | 形态 | 功能 | 需确认 |
+|------|------|------|--------|
+| `file_tools` | 门面 | `read` / `write` / `append` / `modify` / `patch` / `list` / `delete` / `move` / `copy` / `search`，工作区沙箱 + 原子写 | 否 |
+| `long_memory` | 门面 | `graph`（知识图谱 CRUD：实体/关系/观察）/ `search`（语义检索观察） | 否 |
+| `skill_tools` | 门面 | `search` / `semantic_search` / `load` / `save`（能力固化） | 否 |
+| `rag_tools` | 门面 | `search`（可 `source` 定向；默认 top-1 进上下文 + 其余切片气泡）/ `outline`（文档目录结构）/ `status` / `ingest` | `ingest` 是 |
+| `code_run` | 独立 | 执行 Python 代码（能力核心，可编程覆盖任意操作） | 风险分级 |
+| `shell_run` | 独立 | 执行 Shell 命令（独立进程组，超时/终止 killpg） | 风险分级 |
+| `web_scan` | 独立 | 抓取网页内容；`render=true` 走浏览器渲染 | 否 |
+| `ask_user` | 独立 | 向用户提问（中断自动机） | 否 |
+| `work_memory` | 独立 | 短期草稿（键值对 scratchpad） | 否 |
+| `schedule_tools` | 独立 | 定时任务：`create` / `list` / `delete` / `run_now` / `pause` / `resume` | 否 |
+| `update_working_checkpoint` | 独立 | 短期工作记忆（每轮自动回注） | 否 |
+| `start_long_term_update` | 独立 | 触发 L4 经验蒸馏 | 否 |
+| `update_plan` | 独立 | 任务计划（目标 + 步骤，驱动右栏计划面板） | 否 |
 
-| 工具 | 功能 | 需确认 |
-|------|------|--------|
-| `code_run` | 执行 Python 代码 —— **能力核心**，可编程覆盖任意操作 | ✅ |
-| `file_read` | 读取文件 | ❌ |
-| `file_write` | 写入/追加文件 | ❌ |
-| `file_patch` | 精确替换唯一文本块（`file_modify` 的原子命名别名） | ❌ |
-| `web_scan` | 抓取网页内容 | ❌ |
-| `web_execute_js` | 浏览器执行 JS（`webexec_js` 的原子命名别名，需配置端点） | ❌ |
-| `update_working_checkpoint` | 短期工作记忆（每轮自动回注） | ❌ |
-| `ask_user` | 向用户提问（中断自动机） | ❌ |
-| `start_long_term_update` | 触发 L4 经验蒸馏 | ❌ |
-
-### 第二层：能力工具
-
-| 工具 | 功能 | 需确认 |
-|------|------|--------|
-| `shell_run` | 执行 Shell 命令 —— `code_run` 的系统侧延伸 | ✅ |
-| `work_memory` | 短期草稿（键值对 scratchpad） | ❌ |
-| `memory_graph` | 知识图谱 CRUD（实体/关系/观察） | ❌ |
-| `memory_search` | 长期记忆语义检索 | ❌ |
-| `skill_search` | 关键词搜索技能目录 | ❌ |
-| `skill_semantic_search` | 混合检索技能（SKILL.md 向量 + BM25） | ❌ |
-| `skill_load` | 加载技能完整指令 | ❌ |
-| `skill_save` | **能力进化**：把成功流程固化为 SKILL.md（自动进索引） | ❌ |
-| `rag_search` | 搜索本地知识库（支持按文档名定向检索） | ❌ |
-| `rag_outline` | 获取文档缩略版本（目录结构 + 章节标题） | ❌ |
-| `rag_status` | 查看知识库状态 | ❌ |
-| `rag_ingest` | 增量索引知识库 | ❌ |
+兼容别名（仅 `execute`/`get` 可命中，不出现在模型 schema）：`file_read` / `file_write` / `file_append` / `file_modify` / `file_patch` / `file_list` / `file_delete` / `file_move` / `file_copy` / `file_search` / `memory_graph` / `memory_search` / `skill_search` / `skill_load` / `skill_semantic_search` / `skill_save` / `rag_search` / `rag_outline` / `rag_status` / `rag_ingest`。
 
 ### 能力进化闭环
 
 ```
 任务成功
-  ├─ start_long_term_update → 蒸馏事实/偏好/坑 → memory_graph（经验）
-  ├─ skill_save             → 固化可复用流程 → workspace/skills/<name>/SKILL.md（能力）
-  └─ rag_ingest             → 外部语料灌入本地知识库（素材）
-下次同类任务 → skill_semantic_search 命中 → skill_load → 直接复用
+  ├─ start_long_term_update → 蒸馏事实/偏好/坑 → long_memory(graph)（经验）
+  ├─ skill_tools(op="save") → 固化可复用流程 → workspace/skills/<name>/SKILL.md（能力）
+  └─ rag_tools(op="ingest") → 外部语料灌入本地知识库（素材）
+下次同类任务 → skill_tools(op="semantic_search") 命中 → op="load" → 直接复用
 ```
 
 ## 本地知识库 (RAG)
@@ -296,7 +289,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 
 ### 同步全链路日志
 
-同步过程中，右侧日志面板会实时显示每个阶段的详细进度：
+同步过程中，独立日志窗口会实时显示每个阶段的详细进度：
 
 ```
 ══════════════════════════════════════════
@@ -337,7 +330,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 
 ### 检索日志
 
-检索知识库时，日志面板也会展示详细的检索过程：
+检索知识库时，日志窗口也会展示详细的检索过程：
 
 ```
 🔍 知识库检索开始: 查询="如何配置 RAG" 目标结果数=3 向量库总量=48
@@ -381,16 +374,16 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
   └─ 存入 LanceDB documents 表（文档名 / 缩略版本 / 章节列表 / md 缓存路径）
 
 用户提问「某本书里 XXX 是怎么说的？」
-  ├─ ① rag_outline("书名") → 返回全书目录结构（掌握全局）
+  ├─ ① rag_tools(op="outline", book_name="书名") → 返回全书目录结构（掌握全局）
   ├─ ② 大模型规划需要哪些章节的细节
-  ├─ ③ rag_search(query, source="书名") → 定向检索该书内的原文片段
+  ├─ ③ rag_tools(op="search", query="概念词", source="书名") → 定向检索原文片段
   ├─ ④ 细节追加到 context，滚动累加
   └─ ⑤ 综合全局结构 + 按需细节 → 最终答案
 ```
 
-- **缩略版本**：`rag_outline` 返回完整目录结构（标题层级），让大模型对全书有全局视野。**不生成逐章摘要**——逐章 LLM 摘要慢、费 token、且对本地模型易产生空结果，标题层级已足以支撑定向检索。
+- **缩略版本**：`rag_tools(op="outline")` 返回完整目录结构（标题层级），让大模型对全书有全局视野。**不生成逐章摘要**——逐章 LLM 摘要慢、费 token、且对本地模型易产生空结果，标题层级已足以支撑定向检索。
 - **纯文本目录提取**：除标准 Markdown 标题（`#`~`######`）外，还支持从纯文本（无标题语法的 PDF/EPUB 解析结果）启发式提取目录：识别「目录/Contents」标记块、中文章节标题（`第X章`/`第X节`/`X卷`）、编号标题（`1.1`）、EPUB 链接（`[TITLE](#anchor)`）、全大写短行。
-- **定向检索**：`rag_search` 支持 `source` 参数（文档名关键词），限定在某本书内检索，避免混入其它文档。
+- **定向检索**：`rag_tools(op="search")` 支持 `source` 参数（文档名关键词），限定在某本书内检索，避免混入其它文档。
 - **增量重刷**：同步时无论文件是否修改，都会扫描 Markdown 缓存，对缺记录或旧格式（含已废弃的「章节摘要」段/空目录）的文档重刷为纯目录结构。
 
 - **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + **字节采样指纹** `source_hash`，小文件全量哈希 / 大文件头中尾各 64KB），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。manifest **逐批增量落盘**（每个写入批次提交后立即合并写盘，只记「全部切片已入库」的文件）——无论是点「停止同步」还是直接杀掉程序，已完成文件下次都跳过，未完成的下次幂等重做（按 source 删旧写新，无重复无缺失）。
@@ -416,6 +409,39 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 - **删除即清理**：源文件从知识库移除后，同步时一并清理向量、documents 元数据行与 manifest 条目。
 - **BM25 索引一致性**：写入（含单批写完的提前出口）与删除都会失效 FTS 标记并按需重建，`reload()` 也会重置——避免「混合检索静默退化成纯向量」或「已删文档仍被召回」。
 - **Reranker 加载去重**：reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程；超时后后台线程完成时仍写入结果，后续调用直接复用。close 之后的实例直接拒绝加载；后台加载完成时若实例已 close，状态置 `failed` 而非卡在 `loading`（后者会让重排静默失效）。默认加载本地 `jina-reranker-v2-base-multilingual-onnx`（INT8 量化）；`reranker_provider=api` 时加载 FastEmbed `BAAI/bge-reranker-v2-m3-int8`（~570MB，fp32 全量 2.27GB）。
+
+### 知识图谱检索（RAG KG）
+
+在向量检索之外，可把知识库切片抽成**实体—关系图**参与召回（`src/agent/rag/kg/`）。构建与检索都在配置面板控制，未构建时检索自动回退 `naive`。
+
+**构建**（配置面板「构建知识图谱」）：
+- 遍历向量库全部切片，用**辅助模型**抽取实体/关系（不影响主模型）；三种方案可切换：
+  - `llm_raw`：`entity<|#|>...` / `relation<|#|>...` 行文本 + 本地解析（默认，可选 JSON prompt：`rag_kg_llm_raw_json`）；
+  - `llm_pydantic`：严格 JSON + pydantic 校验；
+  - `gliner`：本地 GLiNER NER + 同句共现关系（不占 LLM，需 `pip install gliner`）。
+- 单片上限可配置：`rag_kg_max_entities`（默认 20）/ `rag_kg_max_relations`（50）/ `rag_kg_max_description_chars`（100）；抽取带**补漏轮**（首轮漏抽/截断时再问一次，`rag_kg_glean_enabled`）。
+- 入库前**实体消歧**：规则归一（简称/全称/括号/机构后缀/全半角）+ 语义向量合并（余弦 ≥0.92 并查集），配置面板「实体消歧」可对存量库补做。
+- 构建期**稳定前缀 KV 复用**：辅助模型按 `kg` 缓存组复用 system+任务说明，每片只 prefill 切片正文（MLX / GGUF 均支持，GGUF 不支持部分裁剪时自动回退全量）；描述归纳延后到抽取结束后统一执行，避免打断前缀。
+
+**检索**（`rag_kg_strategy`）：
+| 策略 | 行为 |
+|------|------|
+| `naive` | 原始向量 + BM25 + rerank（默认） |
+| `local` | 命中实体 → 拉一跳邻边与邻居实体（问细节） |
+| `global` | 命中关系 → 反查两端实体与度数（跨文档宏观主题） |
+| `hybrid` | local + global 合并 |
+| `mix` | 实体/关系 + 原文 chunk 召回 + 实体反查 chunk（交错去重，查询直召优先） |
+
+图谱结果（`kg_entity` / `kg_relation`）是摘要形态，**始终进模型上下文**；`mix` 模式反查出的原文 chunk 与普通检索切片一样走下面的「检索即展示」。
+
+### 检索即展示（切片气泡）
+
+默认开启（`rag_presentation_mode`）。`rag_tools(op="search")` 召回后做数据分流：
+
+- **只有排名最高的 1 个切片**进入模型上下文（≤1500 字），避免召回多时上下文膨胀、响应变慢；
+- **所有召回切片**（含被参考的那片）以 `📄 文档名 · 第 N 片` 胶囊附在回复末尾，点开是独立原文阅读器，可用「上一片 / 下一片」或方向键继续阅读同文档相邻切片——切片边界截断不再影响阅读；
+- 附件走 `ToolResult.attachments` 旁路，只存在于 UI，不进上下文/历史/落盘；
+- 关闭 `rag_presentation_mode` 即退回旧的「全量结果（或辅助模型精简后）注入」。
 
 ### 支持的文档格式
 
@@ -468,11 +494,11 @@ Markdown 文本
 
 ### 使用方式
 
-1. 在界面第三行「知识库」中输入文档目录路径（或点击 `…` 选择）
+1. 在配置窗口「知识库」中输入文档目录路径（或点击 `…` 选择）
 2. 点击「同步知识」执行增量同步（只处理新增/修改的文件）；右键点击可强制全量重处理
 3. 需要清理存量重复内容时，点击「向量去重」（扫描向量库，清理文本完全相同的重复向量，每组只留最早入库的一份）；也可直接删掉 `workspace/rag/documents/*.md` 缓存——但注意**缓存缺失不会触发重新解析**（跳过判断只看 manifest 指纹），要让新清洗规则应用到已入库文档必须选「强制全量重新处理」
-4. 右侧日志面板实时显示同步进度
-5. 同步完成后，对话中模型会自动调用 `rag_search` 检索相关知识
+4. 日志窗口实时显示同步进度
+5. 同步完成后，对话中模型会自动调用 `rag_tools(op="search")` 检索相关知识
 6. 同步进行中禁止发送消息（此时主/辅模型已卸载，且 Agent 侧引擎与同步 worker 会并发读写同一张表）
 
 ### Token 控制
@@ -521,7 +547,7 @@ workspace/.agent/
   └─ 同步写入短期记忆当天桶 __auto_facts__（只保留当天，跨天重置）
 ```
 
-- **长期记忆**：全部事实持久化到知识图谱，靠 `memory_search` 按需语义检索。
+- **长期记忆**：全部事实持久化到知识图谱，靠 `long_memory(op="search")`（兼容别名 `memory_search`）按需语义检索。
 - **短期记忆**：当天抽取的事实保留在 `work_memory` 的 `__auto_facts__` 键（`{"date": "YYYY-MM-DD", "facts": [...]}`），对话时直接注入上下文；跨天后自动清空（历史已在长期记忆）。
 - **独立抽取客户端**：抽取线程使用独立的 `LLMClient` 实例（`_get_extract_llm()` 惰性创建，独立的 `httpx.Client` 连接池），避免与对话线程并发争用同一个非线程安全的 `httpx.Client`；`_fact_extract_lock` 非阻塞锁进一步防止多个抽取堆积。`Agent.close()` 显式释放该独立客户端。
 
@@ -530,7 +556,7 @@ workspace/.agent/
 观察通过共享 embedding 函数（默认本地 `jina-embeddings-v5-text-nano`）嵌入后存入 LanceDB，支持语义检索：
 
 ```
-memory_search(query) → GraphMemoryStore.search()
+long_memory(op="search", query=...) → GraphMemoryStore.search()
   ├─ LanceDB 向量检索 top_k 条观察
   ├─ 返回 {entity, text, score}
   └─ 向量索引不可用时回退到关键词子串匹配
@@ -554,8 +580,8 @@ RAG 知识库和知识图谱记忆共用同一份 embedding 模型实例（进�
 - **SYSTEM_PROMPT**：精简至 ~200 tok，操作原则/确认策略/工具约定/记忆/技能/RAG 引导各一条、无冗余
 - **Knowledge base 状态**：仅当 RAG 可用时注入（无 KB 时不注入），仅含文档名列表（不含路径），最多 8 个
 - **工作记忆**：手动 scratchpad（compact JSON，value 截断 200 字符）+ 当天自动抽取事实（列表形式）
-- **长期记忆**：不注入 prompt，靠 `memory_search` 工具按需检索（避免长期记忆膨胀拖慢每轮响应）
-- **Tool descriptions**：精简（`rag_search` 的 query 描述从 ~150 字压到一句话，`rag_outline` 去除重复的「定向检索」解释）
+- **长期记忆**：不注入 prompt，靠 `long_memory(op="search")` 工具按需检索（避免长期记忆膨胀拖慢每轮响应）
+- **Tool descriptions**：精简（`rag_tools` 的 search/outline 去除冗长重复解释）
 - **记忆抽取 prompt**：`_EXTRACT_SYSTEM` 规则压缩去重
 
 ```
@@ -573,8 +599,8 @@ RAG 知识库和知识图谱记忆共用同一份 embedding 模型实例（进�
 | 工具 | 操作 |
 |------|------|
 | `work_memory` | `set` / `get` / `list` / `clear`（短期 scratchpad） |
-| `memory_graph` | `create_entity` / `delete_entity` / `add_observations` / `create_relation` / `list_entities` / `get_entity` / `snapshot` / `clear` |
-| `memory_search` | 语义检索观察，返回 `{entity, text, score}` |
+| `long_memory(op="graph")` | `create_entity` / `delete_entity` / `add_observations` / `create_relation` / `list_entities` / `get_entity` / `snapshot` / `clear` |
+| `long_memory(op="search")` | 语义检索观察，返回 `{entity, text, score}` |
 
 ### 兼容性
 
@@ -593,27 +619,57 @@ RAG 知识库和知识图谱记忆共用同一份 embedding 模型实例（进�
 ```
 用户请求
   ├─ SkillManager.match() 命中扁平技能 → prompt 注入系统提示
-  │   （目录技能注册的扁平记录引导 agent 调用 skill_load 加载全文）
-  └─ 复杂任务 → agent 主动调用 skill_semantic_search(query) 混合检索
+  │   （目录技能注册的扁平记录引导 agent 调用 skill_tools(op="load") 加载全文）
+  └─ 复杂任务 → agent 主动调用 skill_tools(op="semantic_search", query=...) 混合检索
                 │  向量检索（description 0.6 + examples 0.4 融合，取 3 候选）
                 │  + BM25 全文检索（取 3 候选）→ 去重 → 剔除相似度 < 0.5
                 │  返回候选的 name+tags+description，由 agent 判断选用
-                └─ skill_load(dir) 读取 SKILL.md 全文（或 references/ 支持文件）并遵循
+                └─ skill_tools(op="load", dir=...) 读取 SKILL.md 全文（或 references/ 支持文件）并遵循
 ```
 
 关键设计：
 
-- **按需加载**：技能全文不进系统提示词，仅在需要时通过 `skill_load` 读入，避免技能增多导致 prompt 膨胀
+- **按需加载**：技能全文不进系统提示词，仅在需要时通过 `skill_tools(op="load")` 读入，避免技能增多导致 prompt 膨胀
 - **索引防抖**：扫描器在目录 mtime 变化或 300s 间隔后重建，LanceDB 表懒构建
 - **混合检索**：向量相似度（description/examples 0.6:0.4 加权融合）+ BM25 关键词双通道，统一用余弦相似度排序，阈值 0.5 过滤
 - **小批次索引（防内存爆炸）**：`build()` 以 `batch_size=8` 分批 embed + 写入，每批处理 8 个 skill 后立即释放；description/examples/combined 文本分别截断至 2000/3000/6000 字符。实测 2757 个 skill 全量索引：峰值 RSS 4.19 GB（此前一次性处理全部文本时达 65 GB 导致系统卡死），耗时 12.4 分钟
-- **路径安全**：`skill_load` 对 `path` / `entry` 做 realpath 前缀检查，拒绝 `..` 等路径穿越
+- **路径安全**：`skill_tools(op="load")` 对 `path` / `entry` 做 realpath 前缀检查，拒绝 `..` 等路径穿越
 - **创建技能**：`SkillManager.create_dir_skill(name, keywords, prompt, ...)` 自动生成目录结构并注册扁平记录
+
+## 定时任务（APScheduler）
+
+用户可以在对话里直接说「每天早上 9 点帮我总结知识库新增内容」「每 30 分钟跑一次这个脚本」，模型会调用 `schedule_tools` 创建任务。
+
+**两类任务**：
+- `kind="agent"`：自然语言任务（prompt），由主模型在**常驻对话线程**执行，结果按普通回合流式显示在对话框；对话忙/预热中/同步中会排队或跳过，空闲后自动拉起。
+- `kind="tool"`：直接调用已注册工具，适合固定脚本/命令或外部 MCP 工具：
+  - `code_run` + `{"code": "..."}`
+  - `shell_run` + `{"command": "..."}`
+  - 任意 MCP/自定义工具名 + 参数对象
+  结果以「⏰ 定时任务」气泡追加到对话框。
+
+**触发规则**（六选一）：
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `cron` | 五段 crontab（分 时 日 月 周，本地时区） | `"0 9 * * *"` |
+| `interval_minutes` | 每隔 N 分钟（≥1） | `30` |
+| `run_at` | 一次性执行时间（ISO） | `"2026-11-14 09:00"` |
+| `weekday` + `time` | 每周几 + HH:MM（周一/星期一/mon/1-7；循环） | `"周一"` + `"09:00"` |
+| `date` + `time` | 指定日期 + HH:MM（支持 `YYYY-MM-DD` / `MM-DD` / `M月D日`；一次性） | `"2026-11-20"` 或 `"11月20日"` + `"14:30"` |
+| `delay_minutes` / `delay_hours` | 从当前时间后推 N 分钟/小时（一次性） | `30` / `2` |
+
+**管理**：`op=list` 查看（含下次/上次执行、状态）；`delete` / `pause` / `resume` / `run_now` 按任务 ID 或任务名操作。
+
+**持久化与生命周期**：
+- 任务定义存 `<workspace>/.agent/scheduler_jobs.json`（原子写，重启自动恢复）。
+- 一次性任务执行后自删；错过执行窗口（应用关闭期间到点、超过 5 分钟）自动清理。
+- 任务在 daemon 线程执行，同一任务不会叠跑；退出应用不会被长任务卡住。
+- 知识同步期间：tool / agent 任务均跳过（主/辅模型已卸载），并提示跳过原因；对话占用或模型预热时 agent 任务排队，空闲后自动执行。
 
 ## 上下文治理（30k 硬上限）
 
 Agent 不再「超了才压」，而是**先分配后消费**：30k 预算按
-`SYS 3.9k / EARLIER 2.7k / RAW 12k / TOOLS 5.1k / RESERVE 6.3k` 切分，
+`SYS 5k / EARLIER 2.7k / RAW 12k / TOOLS 5.1k / RESERVE 5.2k` 切分，
 每一级压缩都在自己的配额内花钱。
 
 - **L1 工具级裁剪**：单条工具结果按「RAW 区余额 ÷ 并发调用数」动态算出 `maxlen`，
@@ -706,22 +762,28 @@ src/agent/
 │   ├── hybrid_chunker.py    # Hybrid 分片（文档结构 + 语义分块）
 │   ├── semantic_chunker.py  # chonkie SemanticChunker 语义分片（复用共享 embedding 模型）
 │   ├── vector_store.py      # LanceDB 向量存储 + 本地 jina 嵌入 + jina 重排序
+│   ├── kg/                  # 知识图谱：builder / extractor / storage / graph / resolver / retriever
 │   └── deps.py              # 依赖检查与自动安装
+├── scheduler/
+│   └── service.py        # 定时任务服务（APScheduler + JSON 持久化 + daemon 执行）
 ├── tools/
 │   ├── base.py           # 工具注册中心 + AliasTool（MCP + RAG 生命周期管理）
 │   ├── checkpoint.py     # update_working_checkpoint / start_long_term_update
-│   ├── file_ops.py       # 文件读写工具
+│   ├── plan.py           # update_plan（任务计划）
+│   ├── file_ops.py       # file_tools 门面（read/write/append/modify/patch/list/delete/move/copy/search）
 │   ├── shell_run.py      # Shell 执行
 │   ├── code_run.py       # Python 代码执行（协作式取消 + 泄漏线程追踪）
-│   ├── web.py            # 网页抓取 / JS 执行
-│   ├── interact.py       # 用户交互
-│   ├── memory.py         # 记忆工具（work_memory / memory_graph / memory_search）
-│   ├── skill_search.py   # 技能工具（skill_search / skill_load）
-│   ├── rag_tool.py       # RAG 检索工具
+│   ├── web.py            # web_scan（含 browser render）
+│   ├── interact.py       # ask_user
+│   ├── memory.py         # work_memory + long_memory 门面（graph/search）
+│   ├── skill_search.py   # skill_tools 门面（search/load/semantic_search/save）
+│   ├── rag_tool.py       # rag_tools 门面（search/outline/status/ingest）
+│   ├── schedule_tool.py  # schedule_tools 门面（create/list/delete/run_now/pause/resume）
 │   ├── mcp_client.py     # MCP 客户端（fastmcp 4.x + 同步桥接）
 │   └── mcp_tool.py       # MCP 工具适配
 └── ui/
-    └── main_window.py    # PyQt6 主窗口（QTimer 日志轮询、信号槽、QThread worker）
+    ├── main_window.py    # PyQt6 主窗口（QTimer 日志轮询、信号槽、QThread worker、定时任务接线）
+    └── chunk_viewer.py   # 参考切片阅读器（原文 + 前后翻页）
 ```
 
 ## 运行测试
@@ -736,11 +798,11 @@ pytest tests/ -v
 pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 ```
 
-测试覆盖：Agent 推理循环、工具调用、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全 + SKILL.md 混合检索）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。
+测试覆盖：Agent 推理循环、工具调用、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、知识图谱抽取/消歧/检索策略、检索即展示切片气泡、定时任务调度与持久化、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全 + SKILL.md 混合检索）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。
 
 `tests/test_kernel.py` 覆盖内核专项：三态转移表、L0–L4 五级压缩原语、Session 折叠与
 「无悬挂 tool 消息」不变量、30k 预算配额、**长任务下 prompt 峰值不越过 30k**、
-9 个原子工具与能力工具的注册、`AliasTool` 委派、`update_working_checkpoint` /
+13 个内置工具（门面 + 独立）的注册、`AliasTool` 委派、`update_working_checkpoint` /
 `start_long_term_update` / `skill_save` 的行为与路径穿越防护。
 
 近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**、**`_JsonStore.reload` 不再丢弃防抖窗口内的写入**、**manifest 并发合并与有意删除**、**LPT 分片不产生空片**、**OCR 路由的 CoreML 门控与暗色页反色**。
@@ -749,7 +811,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 停牌后快速失败、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启重建干净 session 等。
 
-当前共 682 个用例全部通过（`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`；未安装这些可选依赖时报环境错误，不影响其余测试）。
+当前共收集 1228 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 
@@ -1183,6 +1245,8 @@ python -m agent.tools.rag_mcp_server --transport http --port 8080 --scope lan
 
 ### 暴露的工具
 
+**RAG 检索 / 文档管理（7 个工具名，`delete_document` / `forget_context` 为同义别名）**：
+
 | 工具名 | 能力 |
 |--------|------|
 | `ingest_document` | 复杂文档解析入库（PDF / Office / Markdown 等） |
@@ -1191,6 +1255,18 @@ python -m agent.tools.rag_mcp_server --transport http --port 8080 --scope lan
 | `extract_metadata` | 智能元数据提取（章节目录 + 摘要） |
 | `hybrid_search_with_rerank` | 混合检索与重排序（向量 + BM25 + rerank） |
 | `get_document` | 原始文件透传（解析后的完整 markdown） |
+
+**知识图谱（9）**：
+
+| 工具名 | 能力 |
+|--------|------|
+| `ingest_knowledge` | 按文档（或全库）抽取实体/关系建图，`rebuild=true` 重建 |
+| `add_entity` / `add_relationship` | 手工写入实体 / 关系 |
+| `get_entity` / `delete_entity` | 实体详情（属性 + 关联边 + 别名）/ 删除实体及其边 |
+| `get_path` | 两实体间寻路（`bfs` / `dfs` / `dijkstra`） |
+| `get_neighbors` | 一跳邻居与经由关系、权重 |
+| `get_subgraph` | 从根节点按 BFS 深度提取子图（可按关系类型过滤） |
+| `search_graph` | 图谱检索（`local` / `global` / `hybrid` / `mix`） |
 
 所有工具均为薄封装，直接复用应用内已加载的 `RAGEngine`，返回统一 JSON 结构 `{"status":"ok"|"error","data"|"message"}`。
 
