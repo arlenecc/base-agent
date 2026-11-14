@@ -13,7 +13,9 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, clean_docling_markdown, normalize_markdown
-from .chunker import chunk_documents, estimate_tokens, configure_tokenizer
+from .chunker import (
+    chunk_documents, estimate_tokens, configure_tokenizer, merge_adjacent_chunks,
+)
 from .document_outline import (
     build_digest,
     has_markdown_headings,
@@ -1705,9 +1707,14 @@ class RAGEngine:
                                                 overlap_percent=self._overlap_percent,
                                                 use_semantic=self._use_semantic,
                                             ))
-                                    # 直通片与各章二次切分混在一起，chunk_index 必须
-                                    # 按整篇文档重排：记录 id 是 hash(source)_index，
-                                    # 重复索引会让 LanceDB 主键冲突、整片被覆盖。
+                                    # 直通片与各章二次切分混在一起，短章节还必须与
+                                    # 相邻片合并——否则「只有标题/一句话」的章节会
+                                    # 以几个字的碎片进入向量库（RAG 召回全是碎句）。
+                                    doc_chunks = merge_adjacent_chunks(
+                                        doc_chunks, self._chunk_size)
+                                    # chunk_index 必须按整篇文档重排：记录 id 是
+                                    # hash(source)_index，重复索引会让 LanceDB 主键
+                                    # 冲突、整片被覆盖。
                                     for i, c in enumerate(doc_chunks):
                                         c["chunk_index"] = i
                                     if not doc_chunks:

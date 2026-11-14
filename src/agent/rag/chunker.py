@@ -308,6 +308,41 @@ def chunk_documents(
     return _clamp_chunk_budget(all_chunks, chunk_size)
 
 
+def merge_adjacent_chunks(
+    chunks: List[Dict[str, Any]], chunk_size: int,
+) -> List[Dict[str, Any]]:
+    """把相邻的小切片合并到 ``chunk_size`` 预算内（保持顺序）。
+
+    某些快速路径（EPUB 按章直出）不经过 ``chunk_documents`` 的内部合并，
+    一个只有标题/一句话的短章节会直接成为独立切片。这里做一次统一收口：
+    只要「当前片 + 下一片」仍放得下就合并，避免几个字的碎片进入向量库。
+    合并后的文本用 ``\\n\\n`` 分隔，与电子书章节在 Markdown 里的分隔一致。
+    """
+    if len(chunks) <= 1:
+        return chunks
+    out: List[Dict[str, Any]] = []
+    cur = dict(chunks[0])
+    for nxt in chunks[1:]:
+        left = (cur.get("text") or "").strip()
+        right = (nxt.get("text") or "").strip()
+        if not right:
+            continue
+        if not left:
+            cur = dict(nxt)
+            continue
+        same_source = (cur.get("source") or "") == (nxt.get("source") or "")
+        merged = left + "\n\n" + right
+        if same_source and estimate_tokens(merged) <= chunk_size:
+            cur["text"] = merged
+            continue
+        out.append(cur)
+        cur = dict(nxt)
+    out.append(cur)
+    for i, c in enumerate(out):
+        c["chunk_index"] = i
+    return out
+
+
 def _covers_source(chunks: List[Dict[str, Any]], source: str) -> bool:
     """用布尔覆盖数组权威判定切片是否覆盖原文所有非空白字符。
 

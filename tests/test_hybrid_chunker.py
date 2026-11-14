@@ -103,6 +103,45 @@ def test_hybrid_merges_undersized_and_applies_overlap(topic_ef):
         assert estimate_tokens(c) >= 80, f"chunk too small: {estimate_tokens(c)}"
 
 
+def test_hybrid_fills_toward_chunk_size_not_min(topic_ef):
+    """相邻小节应一直合并到接近 chunk_size，而不是刚到 min 就停。
+
+    旧实现 current_tokens < min_chunk_size 才继续合并，chunk_size=800 时每片
+    只有 ~100-200 token，本书 9 万字被切成 450 片；修复后应接近 800。
+    """
+    from agent.rag.hybrid_chunker import hybrid_chunk_text
+
+    sections = [
+        f"## 小节{i}\n\n" + "短内容。" * 20
+        for i in range(30)
+    ]
+    text = "\n\n".join(sections)
+    chunks = hybrid_chunk_text(
+        text, chunk_size=800, chunk_overlap=0, min_chunk_size=100,
+        overlap_percent=0.0, embedding_function=topic_ef,
+    )
+    assert chunks
+    # 30 个 ~85 token 的小节应合成 ~4 片，而不是 15 片。
+    assert len(chunks) <= 6, f"碎片化：{len(chunks)} 片"
+    for c in chunks[:-1]:
+        assert estimate_tokens(c) >= 300, f"chunk still fragmented: {estimate_tokens(c)}"
+
+
+def test_merge_adjacent_chunks_for_epub_fast_path():
+    """EPUB 快速路径的短章节必须与相邻片合并，不能直出几个字的碎片。"""
+    from agent.rag.chunker import merge_adjacent_chunks
+
+    chunks = [
+        {"source": "book.epub", "chunk_index": i,
+         "text": f"## 第{i}节\n\n短内容。"}
+        for i in range(10)
+    ]
+    merged = merge_adjacent_chunks(chunks, chunk_size=200)
+    assert len(merged) < len(chunks)
+    assert [c["chunk_index"] for c in merged] == list(range(len(merged)))
+    assert all(estimate_tokens(c["text"]) <= 200 for c in merged)
+
+
 def test_hybrid_no_headings_falls_back_to_paragraphs(topic_ef):
     """Text without headings should still chunk (paragraph-based)."""
     from agent.rag.hybrid_chunker import hybrid_chunk_text

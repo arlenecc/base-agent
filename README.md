@@ -277,7 +277,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 ```
 文档目录 → 增量比对（manifest：mtime+size+字节采样指纹）
 → 统一解析 (docling → Markdown，单实例串行) → 清洗（注释/残留标签剥离 + 密度压缩）
-→ Hybrid 智能分片 (结构+语义, 1000 tokens, 5% overlap)
+→ Hybrid 智能分片 (结构+语义, 800 tokens, 10% overlap)
 → 内容去重 / 向量去重 → 向量化 (默认本地 jina-embeddings-v5 / MLX int4)
 → LanceDB 存储（int8 向量 + 二进制向量 vector_bin + 完整原文 + BM25 全文索引）
 检索时: 向量相似度 top_k×4 + BM25 关键词 top_k×4 → 合并去重 → reranker 精排（默认本地 jina-reranker-v2）
@@ -310,7 +310,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
     ├─ 清洗完成: new_doc.docx → 11800 字符 (耗时 0.02s)
     ├─ 转换 Markdown: new_doc.docx
     ├─ Markdown 完成: new_doc.docx (11800 字符)
-    ├─ 文档切片: new_doc.docx → 24 个切片 (每片约 1000 tokens, 重叠 50 tokens, 耗时 0.01s)
+    ├─ 文档切片: new_doc.docx → 24 个切片 (每片约 800 tokens, 重叠 80 tokens, 耗时 0.01s)
     └─ ✅ 文件处理完成: new_doc.docx (24 切片, 总耗时 0.21s)
 ━━━ Step 4/6: 向量化 + 存入向量库 ━━━
   ├─ 向量化: 首批 24 个切片正在嵌入...
@@ -467,14 +467,14 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 ```
 Markdown 文本
   ├─ 按标题结构（#~######）+ 空行段落边界切分
-  ├─ 超长章节（>1000 tokens）→ chonkie SemanticChunker 语义细分
+  ├─ 超长章节（>800 tokens）→ chonkie SemanticChunker 语义细分
   │    （复用共享 embedding 模型（默认本地 jina-embeddings-v5），按语义相似度边界切分）
-  ├─ 合并过小块至 ≥100 tokens
-  └─ 相邻块 5% overlap（50 tokens，句子边界对齐，保证跨块上下文连续）
+  ├─ 相邻块尽量合并到接近 chunk_size（默认 800 tokens），只有邻居都放不下才保留小片
+  └─ 相邻块 10% overlap（80 tokens，句子边界对齐，保证跨块上下文连续）
 ```
 
-- **大小**：语义块最小 100 tokens、最大 1000 tokens（`rag_chunk_size`）、重叠 5%（`rag_chunk_overlap` = 50）
-  - 1000/5% 是「切片够大以承载完整语义单元、重叠够小以免冗余向量」的折中；旧值 800/10% 会让重叠 token 占比偏高、向量库膨胀。
+- **大小**：默认上限 800 tokens（`rag_chunk_size`）、100 tokens 仅作下限兜底；重叠 10%（`rag_chunk_overlap_percent` = 0.10）
+  - 800 能承载更完整的语义单元、减少分片数与检索噪声；embedding 窗口较小时（如 bge 512）需把 `rag_chunk_size` 调回 ≤510。
 - **嵌入模型**：默认本地 `jina-embeddings-v5-text-nano`（与向量存储共享同一份嵌入权重，不重复加载）
 - **三级回退**：hybrid → 语义分块（chonkie）→ 递归分块（无模型依赖），任何环境都能工作
 
@@ -811,7 +811,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 停牌后快速失败、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启重建干净 session 等。
 
-当前共收集 1228 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
+当前共收集 1230 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 

@@ -237,14 +237,19 @@ def _merge_to_target_size(
     min_chunk_size: int,
     source: Optional[str] = None,
 ) -> List[str]:
-    """Greedily merge adjacent chunks toward the [min, max] token target.
+    """Greedily merge adjacent chunks toward the ``chunk_size`` ceiling.
 
     SemanticChunker splits on *semantic* boundaries, so chunks can be smaller
     than the target when a document has many short, topically-distinct
     sentences.  We merge adjacent chunks (which are already topically
     contiguous, since semantic splitting only cuts at low-similarity points)
-    until each reaches ``min_chunk_size`` tokens, without exceeding
-    ``chunk_size``.
+    as long as the combined size still fits ``chunk_size``.  ``min_chunk_size``
+    is the floor (a chunk smaller than it is only left in place when both
+    neighbours are already full).
+
+    历史教训：旧条件 ``current_tokens < min_chunk_size`` 会在刚达到下限时
+    立即收手，chunk_size=800 的配置实际产出 100-200 token 的碎片（9 万字
+    电子书被切成 450 片）。合并的目标必须是「填满上限」，不是「超过下限」。
 
     合并优先按原文跨度切片（``source[start:end]``）而不是字符串拼接：书里
     重复的代码块/样板段落会让 ``str.find`` 命中更早的实例，拼出来的 chunk
@@ -267,7 +272,12 @@ def _merge_to_target_size(
         nxt_tokens = estimate_tokens(nxt)
         joined: Optional[str] = None
         joined_span = None
-        if current_tokens < min_chunk_size and current_tokens + nxt_tokens <= chunk_size:
+        # 关键：只要下一片仍放得下就继续合并，而不是「达到 min_chunk_size
+        # 就收手」。旧条件 current_tokens < min_chunk_size 会让每个切片都停在
+        # ~100 token（chunk_size=800 时产出大量 100-200 token 的碎片），检索
+        # 召回的自然是一小段话而不是完整语义段。min_chunk_size 只作为下限
+        # 语义（尾部小片无法与邻居合并时才允许低于它），上限始终是 chunk_size。
+        if current_tokens + nxt_tokens <= chunk_size:
             if (current_span is not None and spans[i] is not None
                     and spans[i][0] >= current_span[1]):
                 cand = source[current_span[0]:spans[i][1]]
