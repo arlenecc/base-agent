@@ -54,7 +54,7 @@
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、本地 Reranker（`jina-reranker-v2-base-multilingual` ONNX 重排序）等可选增强也会一并检测与自动安装
 - **统一解析引擎三选一** — PDF/office 文档走统一引擎回退链：`docling`（默认）→ `marker` → `ovis`（OvisOCR2 VLM）→ PyMuPDF 纯文本兜底。docling 全量管线：布局/表格模型走 **MPS**（torch Metal，比 CPU 快 ~35%），OCR 走 **Apple Vision（ocrmac，ANE 推理）**；单本图片书实测 ~6-10 分钟（MPS + scale 2.0 调优后，比早期 CPU 配置快约 10 倍）。OvisOCR2（`OvisOCR2-0.8B-MLX-4bit`，mlx-vlm）作为第三配置项：PyMuPDF 取页/裁表 → VLM 转 Markdown（文本页的表格区域自动裁剪回填），配置窗口「OCR模型」行可选模型与路径。三引擎实测（M4，10 页中文扫描书）：docling 18-25s / ovis 50-51s / marker 215s
-- **OCR scale 可配置** — docling 的 OCR 渲染 scale 默认固定 **2.0**（原 3.0；位图内存 ∝ scale²，实测转换快 34%、质量不变）；`rag_ocr_scale_dynamic` 开启后按页动态决策（表格页 2.5、低 DPI/文本页 2.0，预分析带缓存）
+- **OCR scale 可配置** — docling 的 OCR 渲染 scale 默认固定 **2.0**（原 3.0；位图内存 ∝ scale²，实测转换快 34%、质量不变）；`rag_ocr_scale_dynamic` 开启后按页动态决策（表格页 2.5、低 DPI/文本页 2.0，预分析带缓存）；Apple Vision 识别级别可选 `accurate`（默认，精确）/ `fast`（更快、质量略低）（`rag_ocr_vision_level`）
 - **OCR 兜底路径与内存护栏** — 引擎链末端是 PyMuPDF+RapidOCR 轻量路径（仅出纯文本）：引擎全局单例 + 信号量串行，每 5 页检查原生缓存增量（超 1.2GB 自动冲刷并降级 CPU EP），CoreML 模式下每 50 页周期重建；识别前做尺寸归一化 + 灰度 CLAHE + 锐化预处理（均可配置关闭）。以上行为可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` / `rag_ocr_binarize` 中调整
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在**独立日志窗口**；知识检索时展示向量检索候选数、reranker 精排过程和最终结果排名
 - **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→8 次、引用最近错误**和已试过且失败的方案**、明确禁止「停下来问用户是否继续」）；**首次失败**即要求换方法（禁止原样重发、禁止把错误念给用户）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 3 次就把步骤标 `blocked` 会被守卫拦回。失败上下文跨自动续跑段传递，续跑段仍知道上一段卡在哪
@@ -227,6 +227,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 | 🌐 `rag_ocr_scale_base` | docling OCR 渲染固定 scale（位图内存 ∝ scale²） | `2.0` |
 | 🌐 `rag_ocr_scale_dynamic` | OCR scale 动态策略开关（表格页用 `table` 值、其余用 `base`） | `false` |
 | 🌐 `rag_ocr_scale_table` | 动态策略下表格页的 scale | `2.5` |
+| 🌐 `rag_ocr_vision_level` | Apple Vision 识别级别：`accurate`（精确，默认）/ `fast`（更快、质量略低）；同时作用于 docling 与 ocrmac 兜底路径 | `accurate` |
 | `rag_ocr_coreml` | RapidOCR（兜底路径）是否启用 CoreML EP | `false` |
 | `rag_ocr_preprocess` | RapidOCR 图像预处理（归一化 + CLAHE + 锐化） | `true` |
 | `rag_ocr_binarize` | RapidOCR 二值化 | `true` |
@@ -811,7 +812,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 停牌后快速失败、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启重建干净 session 等。
 
-当前共收集 1230 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
+当前共收集 1234 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 

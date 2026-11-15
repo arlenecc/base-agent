@@ -59,6 +59,15 @@ _BACKEND_TO_LLM_TYPE = {"mlx": "MLX-LM", "onnx": "ONNX", "gguf": "GGUF"}
 # PDF 解析引擎下拉标签 ↔ 内部标识（#133：rag_pdf_engine 取值 docling/marker/ovis）。
 _PDF_DISPLAY_TO_VALUE = {"docling": "docling", "marker": "marker", "OvisOCR": "ovis"}
 _PDF_VALUE_TO_DISPLAY = {"docling": "docling", "marker": "marker", "ovis": "OvisOCR"}
+# Apple Vision 识别级别：显示中文 + 内部值，config 里仍存 accurate/fast。
+_OCR_VISION_DISPLAY_TO_VALUE = {
+    "精确 (accurate)": "accurate",
+    "快速 (fast)": "fast",
+}
+_OCR_VISION_VALUE_TO_DISPLAY = {
+    "accurate": "精确 (accurate)",
+    "fast": "快速 (fast)",
+}
 
 # KG 三元组抽取方案下拉标签 ↔ 内部标识（rag_kg_extractor：llm_raw/llm_pydantic/gliner）。
 _KG_EXTRACTOR_DISPLAY = {
@@ -1618,6 +1627,7 @@ class MainWindow(QMainWindow):
             base=getattr(self.config, "rag_ocr_scale_base", 2.0),
             dynamic=getattr(self.config, "rag_ocr_scale_dynamic", False),
             table=getattr(self.config, "rag_ocr_scale_table", 2.5),
+            vision_level=getattr(self.config, "rag_ocr_vision_level", "accurate"),
         )
         self._bridge = Bridge()
         self._callbacks = BridgeCallbacks(self._bridge)
@@ -1993,6 +2003,7 @@ class MainWindow(QMainWindow):
                 base=getattr(self.config, "rag_ocr_scale_base", 2.0),
                 dynamic=getattr(self.config, "rag_ocr_scale_dynamic", False),
                 table=getattr(self.config, "rag_ocr_scale_table", 2.5),
+                vision_level=getattr(self.config, "rag_ocr_vision_level", "accurate"),
             )
         except Exception as e:  # pragma: no cover - 注入失败不阻塞转换
             logger.debug("转换工具：RAG 配置注入失败（忽略）: %s", e)
@@ -2311,6 +2322,15 @@ class MainWindow(QMainWindow):
             "1 = 单实例串行（最省内存，默认）；\n"
             "2-6 = 多实例并发识别，吞吐更高但常驻内存同比上升。\n"
             "对扫描件/图片型 PDF 的 OCR 阶段收益最明显，纯文本 PDF 基本无感。")
+        # Apple Vision 识别级别（rag_ocr_vision_level）：精确模式质量最好，
+        # 快速模式更快但复杂版式/小字识别率略低。
+        self.ocr_vision_combo = _combo(["精确 (accurate)", "快速 (fast)"], 116)
+        self.ocr_vision_combo.setToolTip(
+            "Apple Vision（ocrmac）识别级别（rag_ocr_vision_level）：\n"
+            "· accurate（默认）：精确模式，中文/复杂版式质量最好；\n"
+            "· fast：快速模式，速度更快，但小字/竖排/复杂表格识别率略低。\n"
+            "同时作用于 docling 主解析链路和 ocrmac 兜底识别；"
+            "切换后下一次同步/转换生效（已构建的 docling converter 会自动重建）。")
         self.ocr_impl_combo = _combo(["mlx-vlm", "onnx", "gguf"], 110)
         # 仅「类型 + 本地路径」：OCR 始终本地 VLM，模型名由 config 默认值
         # （rag_ocr_model_name=OvisOCR2-0.8B-MLX-4bit）决定，留空自动从
@@ -2332,6 +2352,7 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("并发实例")); r.addWidget(self.parse_concurrency_combo)
         r.addWidget(QLabel("自定义OCR")); r.addWidget(self.ocr_impl_combo)
         r.addWidget(QLabel("OCR并发")); r.addWidget(self.ocr_concurrency_combo)
+        r.addWidget(QLabel("Vision级别")); r.addWidget(self.ocr_vision_combo)
         r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
         # 「保存设置」：把当前「自定义OCR」行的设置落盘，并让识别测试下拉框
         # 出现这个自定义模型（下拉第四项名字取自路径）。不重建整个 RAG。
@@ -3384,6 +3405,11 @@ class MainWindow(QMainWindow):
         # OCR并发（rag_ocr_pool_size，RapidOCR 引擎池）：同样夹在 1-6。
         _ocr_pool = int(getattr(self.config, "rag_ocr_pool_size", 1) or 1)
         self.ocr_concurrency_combo.setCurrentText(str(min(max(_ocr_pool, 1), 6)))
+        # Apple Vision 识别级别（精确 / 快速）
+        self.ocr_vision_combo.setCurrentText(
+            _OCR_VISION_VALUE_TO_DISPLAY.get(
+                getattr(self.config, "rag_ocr_vision_level", "accurate"),
+                _OCR_VISION_VALUE_TO_DISPLAY["accurate"]))
         # OCR 模型（OvisOCR2，#133）：仅类型 + 路径；模型名用 config 默认值
         self.ocr_impl_combo.setCurrentText(
             getattr(self.config, "rag_ocr_engine", "mlx-vlm") or "mlx-vlm")
@@ -3622,6 +3648,9 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             _ocr_pool = 1
         self.config.rag_ocr_pool_size = min(max(_ocr_pool, 1), 6)
+        # Apple Vision 识别级别：显示标签 → 内部值；非法值兜底 accurate。
+        self.config.rag_ocr_vision_level = _OCR_VISION_DISPLAY_TO_VALUE.get(
+            self.ocr_vision_combo.currentText().strip(), "accurate")
         # OCR 模型（OvisOCR2，#133）：实现/模型名/本地路径
         self.config.rag_ocr_engine = self.ocr_impl_combo.currentText().strip() or "mlx-vlm"
         # 模型名不暴露给 UI：保持 config 默认值（OvisOCR2-0.8B-MLX-4bit），
@@ -3674,6 +3703,7 @@ class MainWindow(QMainWindow):
                 base=getattr(self.config, "rag_ocr_scale_base", 2.0),
                 dynamic=getattr(self.config, "rag_ocr_scale_dynamic", False),
                 table=getattr(self.config, "rag_ocr_scale_table", 2.5),
+                vision_level=getattr(self.config, "rag_ocr_vision_level", "accurate"),
             )
             # OCR 引擎池 + docling 转换器池（UI「OCR并发」/「并发实例」）：此前主应用
             # 路径漏了 set_ocr_config，导致改 OCR 并发数只能靠重启生效；这里补齐，

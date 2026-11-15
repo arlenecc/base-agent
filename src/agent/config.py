@@ -200,6 +200,10 @@ class AgentConfig:
     rag_ocr_scale_base: float = 2.0
     rag_ocr_scale_dynamic: bool = False
     rag_ocr_scale_table: float = 2.5
+    # Apple Vision（ocrmac）识别级别：accurate（默认，精确）| fast（更快、质量略低）。
+    # 同时作用于 docling 的 OcrMacOptions 与 ocrmac 兜底路径；切换后已构建的
+    # docling converter 会释放重建，下一次同步/转换生效。
+    rag_ocr_vision_level: str = "accurate"
     # OCR（图片型 PDF）：Apple M 系列上让 RapidOCR 走 CoreML EP（CPU+GPU+ANE），
     # 关掉则回退 onnxruntime 默认 EP。
     #
@@ -419,6 +423,7 @@ class AgentConfig:
                    "local_llm_mmproj_path", "local_llm_tokenizer_path",
                    "aux_local_llm_mmproj_path", "aux_local_llm_tokenizer_path",
                    "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path",
+                   "rag_ocr_vision_level",
                    "rag_mcp_scope", "rag_kg_strategy", "rag_kg_extractor")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
@@ -605,6 +610,12 @@ class AgentConfig:
         # 用户若显式选了别的 OvisOCR2 目录名则不受影响。
         if self.rag_ocr_model_name == "OvisOCR2-0.8B-MLX-4bit":
             self.rag_ocr_model_name = "OvisOCR3-MLX-4bit-mixed46"
+        # Apple Vision 识别级别只接受 accurate / fast；手改配置写成其它值
+        # （True/None/"precise"）时回退到精确模式，避免 OcrMacOptions 构造失败。
+        self.rag_ocr_vision_level = str(
+            self.rag_ocr_vision_level or "").strip().lower()
+        if self.rag_ocr_vision_level not in ("accurate", "fast"):
+            self.rag_ocr_vision_level = "accurate"
         # 本地 embedding 默认模型定为 jina-embeddings-v5-text-nano（MLX int4，
         # EuroBERT-210M，支持 Matryoshka；中文实测检索/STS 不劣于 v3 且约 4 倍速）。
         # 空路径（旧配置默认走 fastembed 网络模型）、历史默认 bge-small-zh-v1.5-mlx

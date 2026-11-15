@@ -109,36 +109,45 @@ _DOCLING_USE_MPS = False
 _DOCLING_VLM_ENABLED = False
 _DOCLING_VLM_PRESET = "granite_docling"  # VlmConvertOptions.from_preset 的 preset id
 _ocr_scale_table = 2.5
+_ocr_vision_level = "accurate"
 
 
 def set_ocr_scale_config(base: float = 2.0, dynamic: bool = False,
-                         table: float = 2.5) -> None:
-    """注入 OCR scale 配置（UI 保存设置 / 应用配置时调用）。
+                         table: float = 2.5,
+                         vision_level: str = "accurate") -> None:
+    """注入 OCR 配置（UI 保存设置 / 应用配置时调用）。
 
-    base   固定 scale（rag_ocr_scale_base）
-    dynamic 动态策略开关（rag_ocr_scale_dynamic，默认 False）
-    table  动态策略下表格页的 scale（rag_ocr_scale_table）
+    base         固定 scale（rag_ocr_scale_base）
+    dynamic      动态策略开关（rag_ocr_scale_dynamic，默认 False）
+    table        动态策略下表格页的 scale（rag_ocr_scale_table）
+    vision_level Apple Vision 识别级别（rag_ocr_vision_level：accurate/fast）
 
-    任一值变化时释放已构建的 converter 单例——scale / 动态开关在 converter
-    构建时固化（OcrMacOptions 构造 + pipeline_cls 选择），不重建的话改配置
-    要重启应用才生效。
+    任一值变化时释放已构建的 converter 单例——scale / 动态开关 / Vision
+    级别都在 converter 构建时固化（OcrMacOptions 构造 + pipeline_cls 选择），
+    不重建的话改配置要重启应用才生效。
     """
     global _ocr_scale_base, _ocr_scale_dynamic, _ocr_scale_table
+    global _ocr_vision_level
     new_base = float(base) if base else 2.0
     new_dynamic = bool(dynamic)
     new_table = float(table) if table else 2.5
+    # 同一份级别同时注入 ocrmac 兜底路径（ocr_with_ocrmac），两条链路一致。
+    from .ocr_engine import set_ocrmac_recognition_level
+    new_vision = set_ocrmac_recognition_level(vision_level)
     changed = (new_base != _ocr_scale_base
                or new_dynamic != _ocr_scale_dynamic
-               or new_table != _ocr_scale_table)
+               or new_table != _ocr_scale_table
+               or new_vision != _ocr_vision_level)
     _ocr_scale_base = new_base
     _ocr_scale_dynamic = new_dynamic
     _ocr_scale_table = new_table
+    _ocr_vision_level = new_vision
     _set_scale_cfg(new_dynamic, new_base, new_table)
     if changed and _converters:
         logger.info(
-            "OCR scale 配置变化（base=%.1f dynamic=%s table=%.1f），"
+            "OCR 配置变化（base=%.1f dynamic=%s table=%.1f vision=%s），"
             "释放 converter 以重建",
-            new_base, new_dynamic, new_table,
+            new_base, new_dynamic, new_table, new_vision,
         )
         release_converter()
 
@@ -438,7 +447,8 @@ def _build_converter():
                         from docling.datamodel.pipeline_options import OcrMacOptions
                         # OCR 渲染 scale（#132）：默认 2.0（3.0→2.0 省 56% 位图内存）。
                         pdf_opts.ocr_options = OcrMacOptions(
-                            lang=["zh-Hans", "en-US"], recognition="accurate",
+                            lang=["zh-Hans", "en-US"],
+                            recognition=_ocr_vision_level,
                             scale=_ocr_scale_base,
                         )
                         pdf_opts.do_ocr = True

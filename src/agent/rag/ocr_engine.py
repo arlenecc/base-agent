@@ -599,6 +599,27 @@ _OCRMAC_LOCK = threading.Lock()
 # 语言优先级：中文在前。ocrmac 默认 ['en-US', 'es-ES', ...] 不含中文，
 # 对中文页面会大面积漏识别。英文保留在列表里以混排（变量名/引用）兼容。
 _OCRMAC_LANGS = ["zh-Hans", "en-US"]
+# Apple Vision 识别级别：accurate（默认，精确）| fast（更快、质量略低）。
+# 由 config.rag_ocr_vision_level 经 set_ocrmac_recognition_level() 注入。
+_OCRMAC_RECOGNITION_LEVEL = "accurate"
+_OCRMAC_LEVELS = ("accurate", "fast")
+
+
+def set_ocrmac_recognition_level(level: str) -> str:
+    """设置 Apple Vision 识别级别，返回归一化后的值。
+
+    非法值（None/True/"precise" 等）回退 accurate；下一张图即生效，
+    无需重建任何引擎（ocrmac 每次识别新建 VNRecognizeTextRequest）。
+    """
+    global _OCRMAC_RECOGNITION_LEVEL
+    value = str(level or "").strip().lower()
+    if value not in _OCRMAC_LEVELS:
+        value = "accurate"
+    if value != _OCRMAC_RECOGNITION_LEVEL:
+        logger.info("ocrmac 识别级别切换: %s -> %s",
+                    _OCRMAC_RECOGNITION_LEVEL, value)
+        _OCRMAC_RECOGNITION_LEVEL = value
+    return value
 
 
 def ocrmac_available() -> bool:
@@ -666,7 +687,7 @@ def ocr_with_ocrmac(img: "Any") -> Optional[str]:
             lines = []
             for text, _conf, _box in _om.OCR(
                     pil, language_preference=_OCRMAC_LANGS,
-                    recognition_level="accurate").recognize():
+                    recognition_level=_OCRMAC_RECOGNITION_LEVEL).recognize():
                 t = (text or "").strip()
                 if t:
                     lines.append(t)
