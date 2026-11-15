@@ -817,7 +817,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 停牌后快速失败、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启重建干净 session 等。
 
-当前共收集 1247 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
+当前共收集 1263 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 
@@ -1212,6 +1212,9 @@ rapidocr 模块上验证 CoreML providers 真的排到最前、CPU 保留作回�
 | 258 | `_set_controls_busy` 重置同步控件 | agent 一跑同步按钮变回可点，与 agent 检索抢表 | `_sync_active` 期间跳过对同步控件/进度条的重置 |
 | 259 | `add_streaming` 后续批次「先删后嵌」拉长空窗 | embed 耗时数秒内该 source 在库中被删空，并发检索返回空 | 改为「先嵌后删+写」（与首批同序），空窗缩到一次 add |
 | 260 | `reload()` 无脑清 FTS 标志 | 同步后首次检索全库重建 BM25（秒级到分钟级），索引其实在磁盘 | 探测磁盘索引存在则直接 `_fts_ready=True`，不存在才回落重建 |
+| 261 | 本地模型工具调用文本解析覆盖不足 | 裸换行/未闭合标签/裸 `<function>`/`tool`+`args` 别名/数组/嵌套 JSON 解析失败，内容被 `_ToolCallSplitter` 抑制后按空回复重试 3 次退出 | 容错解析：控制字符 + 尾逗号修复、`raw_decode` 扫描嵌套 JSON、OpenAI 形状/别名；解析失败时内核再统一兜底解析一次 |
+| 262 | 输出调用文本但没执行按「空回复」处理 | 用户看到「模型连续多次返回空响应」，误以为是网络问题 | 内核识别工具标记 → 格式纠正重试 ≤2 次 → 仍失败给可见说明；有实质正文（≥120 字）不打断，避免误伤格式讲解 |
+| 263 | 内核因单次生成超长 close 流时调用解析丢失 | `<tool_call>` 已生成但 done 事件未到达，调用不执行、直接空转 | 本地客户端 `last_partial_text()` 取回原文兜底解析；GGUF 解析含 reasoning、空名槽位回退文本解析 |
 
 ## 部署
 

@@ -68,8 +68,129 @@ _QWEEN_FUNC_RE = re.compile(
 _QWEEN_PARAM_RE = re.compile(
     r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL | re.IGNORECASE
 )
-# Hermes / 通用 JSON: {"name": ..., "arguments": {...}}（arguments 可为字符串）
-_JSON_CALL_RE = re.compile(r"\{[^{}]*\"name\"\s*:.*?\}", re.DOTALL)
+# 非 Qwen 写法：<function name="tool">...</function>
+_FUNC_NAME_ATTR_RE = re.compile(
+    r"<function\s+name=[\"']?([^\"'\s>]+)[\"']?\s*>(.*?)</function>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _escape_control_chars_in_strings(text: str) -> str:
+    """把 JSON 字符串字面量里的裸换行/制表符转义。
+
+    本地小模型写多行 file content 时经常直接输出真实换行（非法 JSON），
+    json.loads 失败后整个工具调用被丢弃——表现为「只输出了调用工具但没执行」。
+    """
+    out = []
+    in_str = False
+    escaped = False
+    for ch in text:
+        if in_str:
+            if escaped:
+                out.append(ch)
+                escaped = False
+            elif ch == "\\":
+                out.append(ch)
+                escaped = True
+            elif ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            else:
+                out.append(ch)
+        else:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+    return "".join(out)
+
+
+def _strip_trailing_commas(text: str) -> str:
+    """去掉 JSON 对象/数组的尾逗号（只处理字符串外的逗号，不碰内容）。"""
+    out = []
+    in_str = False
+    escaped = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+                out.append(ch)
+            elif ch == ",":
+                j = i + 1
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                if not (j < n and text[j] in "}]"):
+                    out.append(ch)     # 不是尾逗号才保留
+            else:
+                out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _iter_json_values(text: str, limit: int = 200):
+    """从夹杂自然语言的文本里依次提取 JSON 值（对象/数组）。
+
+    裸 JSON 常被模型包在解释文字里（"好的，调用如下：{...} 请稍等"）。旧
+    ``_JSON_CALL_RE`` 用 ``[^{}]*`` 匹配，arguments 里再嵌套对象就截断成非法
+    JSON，调用被整体丢弃——表现为「只输出了调用工具但没执行」。这里改用
+    ``raw_decode`` 从每个 ``{``/``[`` 起点尝试，支持任意嵌套与前后噪声。
+    """
+    repaired = _strip_trailing_commas(_escape_control_chars_in_strings(text))
+    dec = json.JSONDecoder()
+    i, n = 0, len(repaired)
+    attempts = 0
+    while i < n and attempts < limit:
+        j = min((k for k in (repaired.find("{", i), repaired.find("[", i))
+                 if k >= 0), default=-1)
+        if j < 0:
+            return
+        attempts += 1
+        try:
+            obj, end = dec.raw_decode(repaired, j)
+        except json.JSONDecodeError:
+            i = j + 1
+            continue
+        yield obj
+        i = end
+
+
+def _loads_json_tolerant(text: str):
+    """json.loads 的容错版：代码围栏、控制字符、尾逗号、前后噪声、Python 字面量。"""
+    s = (text or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    repaired = _strip_trailing_commas(_escape_control_chars_in_strings(s))
+    try:
+        return json.loads(repaired)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    # 前后夹杂解释文字 / 围栏里有额外行：取第一个完整 JSON 值。
+    for obj in _iter_json_values(repaired):
+        return obj
+    # 少数本地模型直接输出 Python dict repr（单引号）。
+    import ast
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError) as e:
+        raise ValueError(str(e)) from e
+
 # 残留的孤立 think 标签字面量（模型偶发不配对输出）——从正文里剔除。
 # 兼容长写法 <thinking>/</thinking>（部分模型/模板使用）；只认短写法会
 # 让长写法整段漏过拆分、被当成正文文本渲染成「空思考块」。
@@ -194,39 +315,108 @@ def parse_tool_calls(text: str,
     calls: List[Dict[str, Any]] = []
     seen_xml = False
 
-    # 1) Qwen XML
+    def _append_obj(obj: Any, explicit: bool = True) -> None:
+        """收录工具调用对象。
+
+        ``explicit=False`` 用于**裸 JSON 扫描**：文本里任何 JSON 都可能只是
+        示例数据（如 {"name": "Alice"}），必须同时出现 arguments/args/
+        parameters 才算调用，避免把普通答案误派发成工具调用。
+        """
+        items = obj if isinstance(obj, list) else [obj]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            # {"tool_calls": [...]}（OpenAI 响应形状）
+            nested = item.get("tool_calls")
+            if isinstance(nested, list):
+                _append_obj(nested, explicit=explicit)
+                continue
+            fn = item.get("function")
+            if isinstance(fn, dict) and (fn.get("name") or fn.get("tool")):
+                # {"function": {"name":..., "arguments":...}}（OpenAI 消息形状）
+                item = {"name": fn.get("name") or fn.get("tool"),
+                        "arguments": fn.get("arguments", fn.get("args", {}))}
+            elif isinstance(fn, str) and fn.strip():
+                # {"function": "file_tools", "parameters": {...}}
+                item = {"name": fn,
+                        "arguments": item.get("parameters",
+                                             item.get("arguments", {}))}
+            name = item.get("name") or item.get("tool")
+            if not name:
+                continue
+            if not explicit and not any(
+                    k in item for k in ("arguments", "args", "parameters")):
+                continue
+            calls.append(_dict_to_tool_call(item, len(calls)))
+
+    def _append_func(name: str, body: str) -> None:
+        args: Dict[str, Any] = {}
+        for pk, pv in _QWEEN_PARAM_RE.findall(body):
+            args[pk.strip()] = pv.strip()
+        if not args:
+            # <function=name>{json}</function>（非 parameter 子标签）也要认
+            try:
+                parsed = _loads_json_tolerant(body)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        calls.append({
+            "id": _new_tool_call_id(len(calls)),
+            "type": "function",
+            "function": {"name": name.strip(),
+                         "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+
+    # 1) Qwen XML（<tool_call> 包裹）+ 裸 <function=...>
     for block in _TOOL_CALL_BLOCK_RE.findall(text):
         for fn_name, fn_body in _QWEEN_FUNC_RE.findall(block):
-            fn_name = fn_name.strip()
-            args: Dict[str, Any] = {}
-            for pk, pv in _QWEEN_PARAM_RE.findall(fn_body):
-                args[pk.strip()] = pv.strip()
-            calls.append({
-                "id": _new_tool_call_id(len(calls)),
-                "type": "function",
-                "function": {"name": fn_name, "arguments": json.dumps(args, ensure_ascii=False)},
-            })
+            _append_func(fn_name, fn_body)
+            seen_xml = True
+        for fn_name, fn_body in _FUNC_NAME_ATTR_RE.findall(block):
+            _append_func(fn_name, fn_body)
+            seen_xml = True
+    if not seen_xml:
+        # 模型漏了 <tool_call> 包裹，只输出 <function=name>...</function>
+        for fn_name, fn_body in _QWEEN_FUNC_RE.findall(text):
+            _append_func(fn_name, fn_body)
+            seen_xml = True
+        for fn_name, fn_body in _FUNC_NAME_ATTR_RE.findall(text):
+            _append_func(fn_name, fn_body)
             seen_xml = True
 
-    # 2) Hermes JSON 嵌在 <tool_call> 里
+    # 2) Hermes JSON 嵌在 <tool_call> 里（容错：代码围栏/裸换行/尾逗号）
     for block in _TOOL_CALL_BLOCK_RE.findall(text):
         if seen_xml and _QWEEN_FUNC_RE.search(block):
             continue
         try:
-            obj = json.loads(block.strip())
-            calls.append(_dict_to_tool_call(obj, len(calls)))
-        except (json.JSONDecodeError, TypeError):
+            _append_obj(_loads_json_tolerant(block))
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
-    # 3) 裸 JSON（不在任何 <tool_call> 标签内也要抓）
+    # 2b) 未闭合的 <tool_call>（模型被 max_tokens 截断 / 漏闭合）：从最后一个
+    #     开始标签解析到文本末尾。旧实现只认闭合标签，内容被 _ToolCallSplitter
+    #     抑制后 parse 也为空 → 内核按空回复重试 3 次退出。
     if not calls:
-        for m in _JSON_CALL_RE.finditer(text):
-            try:
-                obj = json.loads(m.group(0))
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if isinstance(obj, dict) and "name" in obj:
-                calls.append(_dict_to_tool_call(obj, len(calls)))
+        lower = text.lower()
+        idx = lower.rfind("<tool_call>")
+        if idx >= 0:
+            tail = text[idx + len("<tool_call>"):]
+            tail = re.sub(r"</tool_call>\s*$", "", tail, flags=re.IGNORECASE)
+            for fn_name, fn_body in _QWEEN_FUNC_RE.findall(tail):
+                _append_func(fn_name, fn_body)
+            if not calls:
+                try:
+                    _append_obj(_loads_json_tolerant(tail))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+
+    # 3) 裸 JSON（不在任何 <tool_call> 标签内也要抓）
+    #    整段扫描 JSON 值而不是正则截取：arguments 里嵌套对象/多行内容时
+    #    ```{...}``` 与自然语言包裹都不会再截断。
+    if not calls:
+        for obj in _iter_json_values(text):
+            _append_obj(obj, explicit=False)
 
     # 4) 「标签名即工具名」文本块。本地小模型没走标准 function-call 协议时，
     #    常把调用写成 <update_plan>{...}</update_plan>（无 <tool_call> 包裹、
@@ -246,20 +436,32 @@ def parse_tool_calls(text: str,
                 if not body.startswith("{"):
                     continue
                 try:
-                    obj = json.loads(body)
+                    obj = _loads_json_tolerant(body)
                 except (json.JSONDecodeError, TypeError, ValueError):
                     continue
                 if isinstance(obj, dict):
-                    calls.append(_dict_to_tool_call(
-                        {"name": name, "arguments": obj}, len(calls)))
+                    _append_obj({"name": name, "arguments": obj})
 
-    return calls
+    # 去重：同一调用可能同时命中「块内 XML」「裸 XML」「裸 JSON」多条路径。
+    unique: List[Dict[str, Any]] = []
+    seen: set = set()
+    for c in calls:
+        fn = c.get("function") or {}
+        key = (fn.get("name", ""), fn.get("arguments", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(c)
+    return unique
 
 
 def _dict_to_tool_call(obj: Any, idx: int) -> Dict[str, Any]:
     """把 {'name':..., 'arguments':...} 规整成 OpenAI 风格 tool_call 槽位。"""
-    name = str(obj.get("name", ""))
-    raw = obj.get("arguments", {})
+    name = str(obj.get("name") or obj.get("tool") or "").strip().strip("\"'")
+    # 部分模板会写成 functions.file_tools / namespace 形式，注册表只认短名。
+    if name.startswith("functions."):
+        name = name[len("functions."):]
+    raw = obj.get("arguments", obj.get("args", obj.get("parameters", {})))
     if isinstance(raw, str):
         try:
             args = raw if raw.strip().startswith(("{", "[")) else json.dumps(
@@ -613,6 +815,9 @@ class LocalLLMClient:
         # chat_stream（chat_stream 内部还要再取同一把锁）——普通 Lock 会让同一
         # 线程二次加锁永久自死锁（GGUF 辅助模型上表现为构建/逐章摘要全卡住）。
         self._gen_lock = threading.RLock()
+        # 本轮已生成原文（内部列表引用，不复制）。内核因单次生成超长提前
+        # close() 流时拿不到 done 事件，用它取回文本做工具调用兜底解析。
+        self._partial_raw_parts: List[str] = []
         # 跨轮 KV 缓存（仅 MLX 路径）：多轮对话复用 system+历史 的 KV 状态，
         # 每轮只预填充本轮新增 token（对齐 Ollama 的 prompt cache 行为）。
         self._mlx_cache = None
@@ -1193,6 +1398,7 @@ class LocalLLMClient:
         max_tokens: Optional[int] = None,
     ) -> Iterator[StreamEvent]:
         self._ensure_model()
+        self._partial_raw_parts = []
         # 双视图历史的第二视图只有本地复用型后端读得懂（MLX 的 KV 前缀、
         # GGUF 的 append-only 上下文、ONNX 的 past 续算都要它把 assistant
         # 消息还原成生成时的逐 token 序列）。三个本地后端都会先
@@ -1211,6 +1417,18 @@ class LocalLLMClient:
                 yield from self._stream_gguf(messages, tools, temperature, kv_group, enable_thinking, max_tokens)
             else:
                 yield from self._stream_onnx(messages, tools, temperature, kv_group, enable_thinking, max_tokens)
+
+    def last_partial_text(self) -> str:
+        """本轮已生成的原文（含被 content 通道抑制的 <tool_call> 块）。
+
+        内核因「单次生成超长」提前 close() 流时收不到 done 事件，工具调用
+        解析结果会一并丢失——用它取回已生成文本做兜底解析，避免「调用已经
+        生成却没执行」按空回复重试 3 次退出。
+        """
+        try:
+            return "".join(self._partial_raw_parts or [])
+        except Exception:
+            return ""
 
     # ------------------------------------------------------------------
     # 批量生成（Batching 模式）：辅助模型高吞吐场景（长文 map-reduce 多分片、
@@ -1334,6 +1552,7 @@ class LocalLLMClient:
         tool = _ToolCallSplitter()
         summary = _SummarySpanRouter()
         full: List[str] = []
+        self._partial_raw_parts = full     # 供内核提前 close 时兜底解析
 
         def emit_content(seg: str):
             # 正文通道：剔工具调用块（summary 完整标签保留给内核，由 UI 侧
@@ -1383,6 +1602,11 @@ class LocalLLMClient:
                 raw = raw_getter() or ""
             except Exception as e:  # 防御：原始输出拿不到不该中断收尾
                 logger.debug("LLM: raw_content unavailable: %s", e)
+        # raw 取不到时退回本次完整文本（含 think / tool_call 标记）：
+        # 内核靠 raw_content 识别「输出了工具调用但解析失败」并纠正格式；
+        # 空 raw 会让这种轮次退化成普通空回复，连试 3 次后误导用户。
+        if not raw:
+            raw = text
         yield StreamEvent("done", tool_calls=calls, usage={}, raw_content=raw)
 
     # ---- MLX ----
@@ -2045,6 +2269,7 @@ class LocalLLMClient:
 
         splitter = _ThinkSplitter()
         full: List[str] = []
+        self._partial_raw_parts = full
         calls_acc: Dict[int, Dict[str, Any]] = {}
         for chunk in create(**kwargs):
             choices = (chunk.get("choices") or []) if isinstance(chunk, dict) else []
@@ -2053,6 +2278,9 @@ class LocalLLMClient:
             delta = choices[0].get("delta", {}) or {}
             rc = delta.get("reasoning_content")
             if rc:
+                # 思考文本也进 full：模型常把工具调用写在思考里（正文为空），
+                # 只解析 content 会把这类调用整体丢掉 → 内核空转退出。
+                full.append(rc)
                 yield StreamEvent("reasoning", content=rc)
             ct = delta.get("content")
             if ct:
@@ -2076,12 +2304,16 @@ class LocalLLMClient:
         for kind, seg in splitter.flush():
             if seg:
                 yield StreamEvent(kind, content=seg)
-        if not calls_acc:
+        calls_acc_list = [calls_acc[k] for k in sorted(calls_acc)]
+        # 流被截断时会出现空名字槽位；丢弃后回退到文本解析，而不是把
+        # 「未知工具」发给 dispatcher 反复失败。
+        calls_acc_list = [
+            c for c in calls_acc_list
+            if ((c.get("function") or {}).get("name") or "").strip()]
+        if not calls_acc_list:
             text = "".join(full)
             calls_acc_list = parse_tool_calls(
                 text, _registered_tool_names(tools))
-        else:
-            calls_acc_list = [calls_acc[k] for k in sorted(calls_acc)]
         # 收尾再归位：create_chat_completion 结束后 Llama.n_tokens 停在 aux
         # prompt+生成的长度，与 _gguf_ids=[] 不一致。复位后下轮主对话（无论走
         # 复用还是 preload）都从干净上下文开始，不会因状态错位触发 -3。
@@ -2091,7 +2323,10 @@ class LocalLLMClient:
             pass
         if is_aux and prev_ids:
             self._schedule_main_kv_restore(prev_ids, prev_hist)
-        yield StreamEvent("done", tool_calls=calls_acc_list, usage={})
+        # raw_content 供内核识别「输出了调用但解析失败」（GGUF 的 KV 重建不走
+        # _rebuild_raw_messages，带上不会有副作用）。
+        yield StreamEvent("done", tool_calls=calls_acc_list, usage={},
+                          raw_content="".join(full))
 
     def _schedule_main_kv_restore(self, ids: List[int],
                                   gen_history: List[List[int]]) -> None:
@@ -2172,6 +2407,7 @@ class LocalLLMClient:
         self._onnx_prompt_ids = ids_list
         input_ids = np.array([feed_ids], dtype=np.int64)
         full: List[str] = []
+        self._partial_raw_parts = full
         generated: List[int] = []
         # 同 MLX：模板可能已把 <think> 预填进生成提示（见 _stream_mlx 注释）。
         splitter = _ThinkSplitter(

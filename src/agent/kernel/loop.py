@@ -42,6 +42,17 @@ _MAX_SAME_REDIRECTS = 2
 
 # 空响应 / 流中断的重试上限
 _MAX_EMPTY_RETRY = 3
+# 模型输出了工具调用文本、但解析器没抽出结构化 tool_calls 时的重试上限。
+# 这类「只在思考/正文里写了调用，实际没执行」不能当普通空回复处理，否则
+# 用户看到的是连试 3 次后「模型连续多次返回空响应」。
+_MAX_TOOL_PARSE_RETRY = 2
+_TOOL_MARKUP_RE = re.compile(
+    r"<tool_call\b|<function[=\s]|\"(?:arguments|args)\"\s*:", re.IGNORECASE
+)
+# 正文达到该长度时，出现工具调用标记更可能是在「讲解写法」而不是空转：
+# 例如用户问「tool_call 怎么写」，回答里必然带示例。这种有实质正文的轮次
+# 不按解析失败重试，避免把正常回答打断成格式错误提示。
+_TOOL_MARKUP_PROSE_MIN = 120
 _LLM_RETRY_BASE_DELAY = 1.5
 _MAX_LLM_RETRIES = 2
 
@@ -378,6 +389,7 @@ class KernelLoop:
         self._tool_mode = "full"
         self._schema_tokens = 0
         self._empty_retry = 0
+        self._tool_parse_retry = 0
         self._shrink_guard = 0
         self._reask_guard = 0
         self._turns_used = 0
@@ -479,6 +491,7 @@ class KernelLoop:
         提前清零会让重试永远触不到上限（空回复无限循环）。
         """
         self._empty_retry = 0
+        self._tool_parse_retry = 0
         self._reask_guard = 0
 
     def _emit_ui(self, attr: str, *args) -> None:
@@ -512,6 +525,7 @@ class KernelLoop:
         session = self.session
         self.state = KernelState.THINK
         self._empty_retry = 0
+        self._tool_parse_retry = 0
         self._shrink_guard = 0
         self._reask_guard = 0
         self._finish_nudge = 0
@@ -571,6 +585,7 @@ class KernelLoop:
             self._plan_finish_nudge = int(seed.get("plan_finish_nudge", 0) or 0)
             self._block_nudge = int(seed.get("block_nudge", 0) or 0)
             self._empty_retry = int(seed.get("empty_retry", 0) or 0)
+            self._tool_parse_retry = int(seed.get("tool_parse_retry", 0) or 0)
             self._reask_guard = int(seed.get("reask_guard", 0) or 0)
             self._plan_nudged = int(seed.get("plan_nudged", 0) or 0)
             self._last_redirect_hint = str(seed.get("last_redirect_hint", "") or "")
@@ -984,6 +999,34 @@ class KernelLoop:
                         "[ERROR] 上一轮回复为空或流被截断，请重新生成；"
                         "如需操作必须显式调用工具。")
                     continue
+                if event == "retry_tool":
+                    self._rollback_turn(session)
+                    if self._is_local_backend:
+                        pending = _carry_task(
+                            "[ERROR] 检测到你输出了工具调用文本，但它没有被解析成可执行调用。"
+                            "请**直接**按下列格式发起一个调用（不要写在思考过程里）：\n"
+                            '<tool_call>{"name":"file_tools","arguments":{"op":"read",'
+                            '"path":"..."}}</tool_call>\n'
+                            "参数中的换行/引号必须正确转义；要写多行文件时，"
+                            "先用 code_run 生成内容，不要直接塞进 JSON 字符串。")
+                    else:
+                        pending = _carry_task(
+                            "[ERROR] 检测到你只在正文/思考里描述了工具调用，"
+                            "但没有真正发起 function call。"
+                            "请直接使用工具调用（tool_calls）发起，"
+                            "不要把调用写成正文文字。")
+                    continue
+                if event == "done_tool_parse":
+                    # 重试额度用尽：给用户一条可见、可行动的说明，不能空着退场。
+                    # 模型若还给了正文（可能是不完整但有用的内容），保留它。
+                    final_text = (resp.content or "").strip() or (
+                        "（检测到工具调用文本，但格式无法解析，已停止重试。"
+                        "请检查模型输出格式，或换用支持 function calling 的模型。）")
+                    session.finish_turn(rec, final_text, [], [],
+                                        l2_summary(final_text),
+                                        raw_content=resp.raw_content)
+                    exit_reason = ExitReason.DONE
+                    break
                 if event == "reask":
                     self._reask_guard += 1
                     if self._reask_guard <= 1:
@@ -1473,6 +1516,16 @@ class KernelLoop:
                             stream.close()   # 终止底层采样循环
                         except Exception:
                             pass
+                        # 本地后端会把 <tool_call> 块从 content 通道抑制掉，且
+                        # close() 后 done 事件不会到达——调用解析结果随之丢失。
+                        # 取回本轮已生成原文，供下方统一兜底解析，避免「调用
+                        # 已经生成却没执行」退化成空回复重试。
+                        getter = getattr(self._llm(), "last_partial_text", None)
+                        if callable(getter):
+                            try:
+                                raw_buf = getter() or ""
+                            except Exception:
+                                pass
                         break
                     if last_emit is None:
                         last_emit = now
@@ -1539,14 +1592,40 @@ class KernelLoop:
         # 正确的重置点是「一轮被真正提交」之后（见 _reset_retry_guards）。
 
         text = "".join(content_buf)
+        parsed = [self._to_tool_call(c) for c in calls]
+        named = [tc for tc in parsed if tc.name]
+        if len(named) != len(parsed):
+            # 流被截断时 native tool_calls 可能只有空名字：静默保留会让
+            # dispatcher 报「未知工具」，模型反复重发同一个空调用。
+            self.log(f"[kernel] 丢弃 {len(parsed) - len(named)} 个缺少工具名的调用")
         resp = LLMResponse(
             content=text,
             reasoning=reasoning_text,
-            tool_calls=self._unique_call_ids(
-                [self._to_tool_call(c) for c in calls]),
+            tool_calls=self._unique_call_ids(named),
             usage=usage,
             raw_content=raw_buf,
         )
+        if not resp.tool_calls:
+            # 后端（GGUF/HTTP 等）可能把调用写在正文/思考里且没解析成功。
+            # 内核在这里做一次统一兜底解析：能救回就正常执行，救不回再交给
+            # _no_tool_event 走格式纠正——避免「只输出调用但没执行」被当成
+            # 普通空回复，连试 3 次后误导用户。
+            blob = "\n".join(p for p in (raw_buf, text, reasoning_text) if p)
+            if blob.strip() and _TOOL_MARKUP_RE.search(blob):
+                try:
+                    from ..local.llm import parse_tool_calls
+                    names = [(s.get("function") or {}).get("name")
+                             for s in (self.schemas() or [])
+                             if isinstance(s, dict)]
+                    recovered = [self._to_tool_call(c) for c in
+                                 parse_tool_calls(blob, [n for n in names if n])]
+                    recovered = [tc for tc in recovered if tc.name]
+                    if recovered:
+                        resp.tool_calls = self._unique_call_ids(recovered)
+                        self.log("[kernel] 文本工具调用兜底解析成功："
+                                 + ", ".join(tc.name for tc in resp.tool_calls))
+                except Exception as e:
+                    self.log(f"[kernel] 文本工具调用兜底解析失败: {e}")
         resp.summary = l2_summary(text, [tc.name for tc in resp.tool_calls]) if text else ""
         return resp
 
@@ -1677,6 +1756,7 @@ class KernelLoop:
             "block_nudge": self._block_nudge,
             "empty_retry": self._empty_retry,
             "reask_guard": self._reask_guard,
+            "tool_parse_retry": self._tool_parse_retry,
             "plan_nudged": self._plan_nudged,
             # 同 hint 连续拦截计数跨段继承：否则每段各重置，5 段又能各拦 2 次。
             "last_redirect_hint": self._last_redirect_hint,
@@ -1994,6 +2074,22 @@ class KernelLoop:
 
     def _no_tool_event(self, resp: LLMResponse) -> str:
         content = (resp.content or "").strip()
+        # 工具调用文本存在、但解析器没抽出结构化调用（格式不标准 / 未闭合 /
+        # JSON 里有裸换行）。不能按普通空回复处理：给一次明确的格式纠正，
+        # 超过上限则返回可见错误，而不是让用户看到「连续 3 次空响应」。
+        raw = (resp.raw_content or content or (resp.reasoning or "")).strip()
+        if raw and _TOOL_MARKUP_RE.search(raw):
+            # 有实质正文（≥120 字）时不重试：正常回答/讲解里出现调用示例，
+            # 打断重试反而会丢掉用户要的答案。真正的空转形态是正文为空、
+            # 只有一句「我来调用」+ 调用文本。
+            prose = strip_summary_tags(content).strip()
+            if len(prose) < _TOOL_MARKUP_PROSE_MIN:
+                self._tool_parse_retry += 1
+                self.log("[kernel] 检测到工具调用文本但未解析成结构化调用 "
+                         f"({self._tool_parse_retry}/{_MAX_TOOL_PARSE_RETRY})")
+                if self._tool_parse_retry <= _MAX_TOOL_PARSE_RETRY:
+                    return "retry_tool"
+                return "done_tool_parse"
         if not content and not (resp.reasoning or "").strip():
             self._empty_retry += 1
             return "retry" if self._empty_retry <= _MAX_EMPTY_RETRY else "done"

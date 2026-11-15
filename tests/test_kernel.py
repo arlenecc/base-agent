@@ -274,6 +274,74 @@ def test_kernel_same_tool_varied_fail_fuse(cfg):
     assert result.text.strip()
 
 
+def test_kernel_retries_unparsed_tool_markup(cfg):
+    """思考里只写了工具调用、没解析成结构化调用时，要纠正格式而不是空转退出。"""
+    with open(os.path.join(cfg.workspace, "a.txt"), "w", encoding="utf-8") as f:
+        f.write("ok")
+
+    # 真正无法解析的调用文本（JSON 非法），确保走到 retry_tool 纠正路径；
+    # 可解析的裸调用会被内核兜底解析直接执行（另有测试覆盖）。
+    bad_call = '<tool_call>{"name": "file_tools", "arguments": {op: read}</tool_call>'
+    good_tc = [{"id": "c1", "function": {
+        "name": "file_tools",
+        "arguments": json.dumps({"op": "read", "path": "a.txt"}),
+    }}]
+    mock = MockLLM([
+        [_evt("reasoning", bad_call), _evt("done", usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=good_tc, usage={"total_tokens": 1})],
+        [_evt("content", "读完：ok"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent._auto_continue = False
+    agent._distill_min_turns = 999
+
+    result = agent.kernel.run("读一下 a.txt")
+
+    assert result.reason is ExitReason.DONE
+    assert "读完" in result.text
+    assert len(mock.calls) == 3
+
+
+def test_kernel_recovers_call_from_closed_stream(cfg):
+    """单次生成超长被内核 close 时，被抑制的工具调用仍要兜底解析执行。
+
+    本地后端把 <tool_call> 块从 content 抑制掉；流被提前关闭时 done 事件
+    不会到达，调用解析结果随之丢失——旧行为会退化成空回复重试 3 次退出。
+    """
+    with open(os.path.join(cfg.workspace, "a.txt"), "w", encoding="utf-8") as f:
+        f.write("ok")
+
+    class ChattyLLM:
+        def __init__(self):
+            self.round = 0
+
+        def chat_stream(self, messages, tools=None, temperature=0.7, **kwargs):
+            self.round += 1
+            if self.round == 1:
+                # 先吐一段正文触发「单次生成超长」保护，内核会 close()
+                for _ in range(60):
+                    yield _evt("content", "啰嗦的正文" * 20)
+                return
+            yield _evt("content", "读完：ok")
+            yield _evt("done", usage={"total_tokens": 1})
+
+        def last_partial_text(self):
+            return ('<tool_call>{"name":"file_tools","arguments":'
+                    '{"op":"read","path":"a.txt"}}</tool_call>')
+
+    llm = ChattyLLM()
+    agent = Agent(llm=llm, config=cfg, callbacks=Noop())
+    agent.kernel._max_single_gen_tokens = 5
+    agent._auto_continue = False
+    agent._distill_min_turns = 999
+
+    result = agent.kernel.run("读一下 a.txt")
+
+    assert result.reason is ExitReason.DONE
+    assert "读完" in result.text
+    assert llm.round >= 2, "兜底解析出的调用必须真正执行并进入下一轮"
+
+
 def test_kernel_summary_flood_treated_as_empty(cfg):
     """<summary> 千次级退化复读按空回复重试，恢复后正常作答。
 
