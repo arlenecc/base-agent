@@ -254,6 +254,74 @@ def test_volatile_context_hints_directory_skill(tmp_path):
     assert "# Relevant skill" not in agent.volatile_context()
 
 
+def test_skill_hint_index_matches_workspace_skill(tmp_path):
+    """workspace/skills 的 SKILL.md 也要有轻量关键词提示（不依赖向量）。"""
+    from agent.skill_hint import SkillHintIndex
+
+    demo = tmp_path / "skills" / "invoice-organizer"
+    demo.mkdir(parents=True)
+    (demo / "SKILL.md").write_text(
+        "---\nname: invoice-organizer\n"
+        "description: 把报销发票按月份整理归档并命名\n"
+        "tags: [发票, 归档]\n---\nbody",
+        encoding="utf-8",
+    )
+    other = tmp_path / "skills" / "unity-tilemap-2d"
+    other.mkdir(parents=True)
+    (other / "SKILL.md").write_text(
+        "---\nname: unity-tilemap-2d\ndescription: 在 Unity 里做 2D 瓦片地图\n---\n",
+        encoding="utf-8",
+    )
+
+    idx = SkillHintIndex(str(tmp_path / "skills"))
+    hits = idx.search("帮我按月份整理报销发票", top_k=1)
+    assert hits and hits[0]["path"] == "invoice-organizer"
+    assert hits[0]["score"] >= 2
+    assert idx.search("今天天气怎么样") == []
+
+
+def test_volatile_context_hints_workspace_skill(tmp_path):
+    """没有 .agent/skills 命中时，workspace/skills 提示索引要兜底。"""
+    from agent.agent import Agent
+    from agent.skill_hint import SkillHintIndex
+
+    demo = tmp_path / "skills" / "invoice-organizer"
+    demo.mkdir(parents=True)
+    (demo / "SKILL.md").write_text(
+        "---\nname: invoice-organizer\ndescription: 整理报销发票并归档\n"
+        "tags: [发票]\n---\n",
+        encoding="utf-8",
+    )
+    cfg = AgentConfig(workspace=str(tmp_path))
+    cfg.ensure_workspace()
+    sm = SkillManager(path=os.path.join(str(tmp_path), ".agent", "skills.json"),
+                      skills_dir=os.path.join(str(tmp_path), ".agent", "skills"))
+
+    class _EmptyIndex:
+        def search(self, query, top_k=1):
+            return []
+
+    class _Tools:
+        def get_rag_engine(self):
+            return None
+
+        def get_skill_index(self):
+            return _EmptyIndex()
+
+        def get_skill_hint_index(self):
+            return SkillHintIndex(str(tmp_path / "skills"))
+
+    agent = Agent.__new__(Agent)
+    agent.config = cfg
+    agent.skills = sm
+    agent.tools = _Tools()
+    agent._last_user_text = "把这些报销发票按月份整理归档"
+
+    text = agent.volatile_context()
+    assert "# Relevant skill: invoice-organizer" in text
+    assert 'path="invoice-organizer"' in text
+
+
 # ---------------------------------------------------------------------------
 # skill_search / skill_load tools
 # ---------------------------------------------------------------------------

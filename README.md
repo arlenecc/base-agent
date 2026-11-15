@@ -34,7 +34,7 @@
 | L1 | 工具级裁剪 | 注入本轮前 | 按 RAW 区余额 ÷ 并发数分配 `maxlen` | 单条 ≤ 6K 字符 |
 | L2 | 回合摘要 | 每轮结束 | 强制 `<summary>` ≤30 字物理快照 | 每轮 ≤ 30 字 |
 | L3 | 会话折叠 | 预算告罄 / 每 N 轮 | 旧轮 → 一行摘要（同类项合并） | 折叠区 ≤ 2.7k token |
-| L4 | 记忆蒸馏 | 任务完成 / 检查点 | 沉淀进工作记忆 → 知识图谱 → SKILL.md | 系统提示 ≤ 5k token |
+| L4 | 记忆蒸馏 | 任务完成 / 检查点 | 沉淀进知识图谱；技能固化需满足门槛（创建计划 >3 步 + 用户引导/纠正 + 全部完成） | 系统提示 ≤ 5k token |
 
 **30k 预算分配**：`SYS 5k / EARLIER 2.7k / RAW 12k / TOOLS 5.1k / RESERVE 5.2k`。
 关键不变量是 **L2+L3 让历史恒定 O(1)** —— 旧实现把整条历史每轮重发，
@@ -44,7 +44,7 @@
 
 - **多模型兼容** — 支持所有 OpenAI 兼容 API（OpenAI / DeepSeek / Qwen / 本地 vLLM 等）
 - **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计（仅计输出 token，不含 prompt）；结构化 read 超时（流式 chunk 间隔上限 60s），本地模型生成中途卡住时自动报错而非永久卡死
-- **工具调用** — 内置 13 个工具（`file_tools` / `long_memory` / `skill_tools` / `rag_tools` 四个门面 + `code_run` / `shell_run` / `web_scan` / `ask_user` / `work_memory` / `schedule_tools` / `update_working_checkpoint` / `start_long_term_update` / `update_plan`）；旧原子工具名（`file_read` / `rag_search` / `memory_search` / `skill_load` 等）保留兼容别名但不进 schema，支持模型自主决策和工具链式调用
+- **工具调用** — 内置 12 个工具（`file_tools` / `long_memory` / `skill_tools` / `rag_tools` 四个门面 + `code_run` / `shell_run` / `web_scan` / `ask_user` / `schedule_tools` / `update_working_checkpoint` / `start_long_term_update` / `update_plan`）；旧原子工具名（`file_read` / `rag_search` / `memory_search` / `skill_load` 等）保留兼容别名但不进 schema，支持模型自主决策和工具链式调用
 - **内核控制流** — 三态自动机（THINK / ACT / CONSOLIDATE）+ 五级信息压缩，上下文硬性控制在 30k 以内
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过本地 embedding 模型（默认 `jina-embeddings-v5`）+ LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，重排序精准召回；可选**两段式检索**（二值量化粗筛：查询向量 sign 二值化 + 位打包后 XOR+Popcount 汉明距离全表极速粗筛 top 200 → 候选集内余弦 + BM25 精筛 → reranker 深度打分，大向量库下显著更快）
@@ -241,7 +241,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 
 ## 内置工具
 
-工具已收敛为 **4 个门面工具 + 9 个独立工具**（共 13 个），旧原子工具名保留为兼容别名（`_legacy`，不进 schema，模型只看到合并后的名字）。
+工具已收敛为 **4 个门面工具 + 8 个独立工具**（共 12 个），旧原子工具名保留为兼容别名（`_legacy`，不进 schema，模型只看到合并后的名字）。
 
 | 工具 | 形态 | 功能 | 需确认 |
 |------|------|------|--------|
@@ -253,7 +253,6 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 | `shell_run` | 独立 | 执行 Shell 命令（独立进程组，超时/终止 killpg） | 风险分级 |
 | `web_scan` | 独立 | 抓取网页内容；`render=true` 走浏览器渲染 | 否 |
 | `ask_user` | 独立 | 向用户提问（中断自动机） | 否 |
-| `work_memory` | 独立 | 短期草稿（键值对 scratchpad） | 否 |
 | `schedule_tools` | 独立 | 定时任务：`create` / `list` / `delete` / `run_now` / `pause` / `resume` | 否 |
 | `update_working_checkpoint` | 独立 | 短期工作记忆（每轮自动回注） | 否 |
 | `start_long_term_update` | 独立 | 触发 L4 经验蒸馏 | 否 |
@@ -266,10 +265,13 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 ```
 任务成功
   ├─ start_long_term_update → 蒸馏事实/偏好/坑 → long_memory(graph)（经验）
-  ├─ skill_tools(op="save") → 固化可复用流程 → workspace/skills/<name>/SKILL.md（能力）
+  ├─ 技能固化门槛：创建计划 >3 步 + 用户引导/纠正过 + 最终全部完成
+  │    └─ skill_tools(op="save") → workspace/skills/<name>/SKILL.md（能力）
   └─ rag_tools(op="ingest") → 外部语料灌入本地知识库（素材）
 下次同类任务 → skill_tools(op="semantic_search") 命中 → op="load" → 直接复用
 ```
+
+简单任务（≤3 步计划、一次成功）只沉淀事实/经验，不生成技能。
 
 ## 本地知识库 (RAG)
 
@@ -524,7 +526,8 @@ Observation（观察）= 挂在实体上的自由文本事实
 
 ```
 workspace/.agent/
-├── work_memory.json           # 短期工作记忆（键值对 scratchpad）
+├── work_memory.json           # 短期内部状态（checkpoint / 自动事实）
+├── logs/skills.log            # 技能检索/加载/保存/索引结构化日志（JSONL）
 ├── long_memory.graph.json     # 知识图谱 JSON（实体 + 关系）
 ├── long_memory.graph.json.vectors/  # LanceDB 观察向量索引
 ├── skills.json                # SkillManager 数据（扁平技能记录 + 请求计数）
@@ -549,7 +552,7 @@ workspace/.agent/
 ```
 
 - **长期记忆**：全部事实持久化到知识图谱，靠 `long_memory(op="search")`（兼容别名 `memory_search`）按需语义检索。
-- **短期记忆**：当天抽取的事实保留在 `work_memory` 的 `__auto_facts__` 键（`{"date": "YYYY-MM-DD", "facts": [...]}`），对话时直接注入上下文；跨天后自动清空（历史已在长期记忆）。
+- **短期记忆**：当天抽取的事实保留在内部 `WorkMemory` 的 `__auto_facts__` 键（`{"date": "YYYY-MM-DD", "facts": [...]}`），对话时直接注入上下文；跨天后自动清空（历史已在长期记忆）。
 - **独立抽取客户端**：抽取线程使用独立的 `LLMClient` 实例（`_get_extract_llm()` 惰性创建，独立的 `httpx.Client` 连接池），避免与对话线程并发争用同一个非线程安全的 `httpx.Client`；`_fact_extract_lock` 非阻塞锁进一步防止多个抽取堆积。`Agent.close()` 显式释放该独立客户端。
 
 ### 语义检索
@@ -599,7 +602,6 @@ RAG 知识库和知识图谱记忆共用同一份 embedding 模型实例（进�
 
 | 工具 | 操作 |
 |------|------|
-| `work_memory` | `set` / `get` / `list` / `clear`（短期 scratchpad） |
 | `long_memory(op="graph")` | `create_entity` / `delete_entity` / `add_observations` / `create_relation` / `list_entities` / `get_entity` / `snapshot` / `clear` |
 | `long_memory(op="search")` | 语义检索观察，返回 `{entity, text, score}` |
 
@@ -631,11 +633,14 @@ RAG 知识库和知识图谱记忆共用同一份 embedding 模型实例（进�
 关键设计：
 
 - **按需加载**：技能全文不进系统提示词，仅在需要时通过 `skill_tools(op="load")` 读入，避免技能增多导致 prompt 膨胀
+- **自动提示**：每轮用户输入同时查 `.agent/skills` 关键词索引和 `workspace/skills` 的 SKILL.md frontmatter 提示索引（不加载 embedding），命中时注入明确的 `skill_tools(op="load")` 入口
 - **索引防抖**：扫描器在目录 mtime 变化或 300s 间隔后重建，LanceDB 表懒构建
-- **混合检索**：向量相似度（name+tags+description 与 examples 两路取较大值）+ BM25 关键词双通道，统一用余弦相似度排序，阈值 0.28 过滤（按默认多语言本地模型标定，无关查询通常 ≤0.15）
+- **模型切换自动重建**：索引目录记录 `embedding_signature.txt`；用户切换 embedding 模型后，下次检索检测到签名变化即全量重建，避免旧向量与新查询向量不可比导致静默返回无关结果
+- **混合检索**：向量相似度（name+tags+description 与 examples 两路取较大值）+ BM25 关键词双通道，统一用余弦相似度排序，BM25 归一化后最多加 0.5 排序分（避免精确关键词命中被弱向量候选挤出 Top5），阈值 0.28 过滤（按默认多语言本地模型标定，无关查询通常 ≤0.15）
 - **小批次索引（防内存爆炸）**：`build()` 以 `batch_size=8` 分批 embed + 写入，每批处理 8 个 skill 后立即释放；description/examples/combined 文本分别截断至 2000/3000/6000 字符。实测 2757 个 skill 全量索引：峰值 RSS 4.19 GB（此前一次性处理全部文本时达 65 GB 导致系统卡死），耗时 12.4 分钟
 - **路径安全**：`skill_tools(op="load")` 对 `path` / `entry` 做 realpath 前缀检查，拒绝 `..` 等路径穿越
-- **创建技能**：`SkillManager.create_dir_skill(name, keywords, prompt, ...)` 自动生成目录结构并注册扁平记录
+- **创建技能**：`SkillManager.create_dir_skill(name, keywords, prompt, ...)` 自动生成目录结构并注册扁平记录；`skill_tools(op="save")` 默认不覆盖同名技能，需显式 `overwrite=true`，避免自动学习覆盖手写/下载的技能
+- **结构化日志**：检索（query/候选/score）、加载（path/字符数/回退）、保存（name/路径）、索引 build/sync/error、学习门槛判定与固化结果统一写入 `<workspace>/.agent/logs/skills.log`（JSONL，2MB × 3 份轮转）；日志失败不影响技能主流程，也不会刷进 UI 日志；`BASE_AGENT_SKILL_LOG=0` 可关闭，常见 API Key/Token 会自动脱敏
 
 ## 定时任务（APScheduler）
 
@@ -776,7 +781,7 @@ src/agent/
 │   ├── code_run.py       # Python 代码执行（协作式取消 + 泄漏线程追踪）
 │   ├── web.py            # web_scan（含 browser render）
 │   ├── interact.py       # ask_user
-│   ├── memory.py         # work_memory + long_memory 门面（graph/search）
+│   ├── memory.py         # long_memory 门面（graph/search）+ WorkMemory 内部存储
 │   ├── skill_search.py   # skill_tools 门面（search/load/semantic_search/save）
 │   ├── rag_tool.py       # rag_tools 门面（search/outline/status/ingest）
 │   ├── schedule_tool.py  # schedule_tools 门面（create/list/delete/run_now/pause/resume）
@@ -803,7 +808,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 `tests/test_kernel.py` 覆盖内核专项：三态转移表、L0–L4 五级压缩原语、Session 折叠与
 「无悬挂 tool 消息」不变量、30k 预算配额、**长任务下 prompt 峰值不越过 30k**、
-13 个内置工具（门面 + 独立）的注册、`AliasTool` 委派、`update_working_checkpoint` /
+12 个内置工具（门面 + 独立）的注册、`AliasTool` 委派、`update_working_checkpoint` /
 `start_long_term_update` / `skill_save` 的行为与路径穿越防护。
 
 近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**、**`_JsonStore.reload` 不再丢弃防抖窗口内的写入**、**manifest 并发合并与有意删除**、**LPT 分片不产生空片**、**OCR 路由的 CoreML 门控与暗色页反色**。
@@ -812,7 +817,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 停牌后快速失败、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启重建干净 session 等。
 
-当前共收集 1236 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
+当前共收集 1247 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 

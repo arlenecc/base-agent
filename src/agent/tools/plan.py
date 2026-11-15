@@ -16,7 +16,10 @@ import copy
 from typing import Any, Optional
 
 from ..config import AgentConfig
-from ..kernel.session import Session, normalize_plan
+from ..kernel.session import (
+    PLAN_CREATED_STEPS_KEY, USER_GUIDANCE_KEY, Session, normalize_plan,
+)
+from ..skills import _keywords_of
 from .base import Tool, ToolRegistry, ToolResult
 
 # patch 允许修改的字段（title 用 replace 语义单独处理，不进这里）
@@ -129,7 +132,8 @@ class UpdatePlanTool(Tool):
         op = str(op or "").strip().lower()
 
         if op == "clear":
-            sess.clear_plan()
+            # 模型主动 clear 不代表任务成功完成，不作为技能学习依据。
+            sess.clear_plan(record=False)
             self._notify(sess)
             # clear 后必须给「下一步」指引：实测本地模型 clear 完就停在原地，
             # 原样重发 clear 直到撞上重复调用熔断（用户看到的是「计划建了又
@@ -154,7 +158,21 @@ class UpdatePlanTool(Tool):
             # doing/done 覆盖回 doing，计划面板显示错乱。
             if all(s["status"] == "pending" for s in plan["steps"]):
                 plan["steps"][0]["status"] = "doing"
+            # 如果旧的未完成计划还在，而新计划目标与它毫无关键词交集，说明
+            # 用户其实开了新任务；之前因旧计划未完成累加的「引导次数」不能
+            # 算到新任务头上，否则新任务会被误判为「用户引导过」而学习。
+            old = sess.get_plan()
+            if isinstance(old, dict):
+                old_goal = str(old.get("goal") or "").strip()
+                new_goal = str(goal or "").strip()
+                old_tokens = set(_keywords_of(old_goal)) if old_goal else set()
+                new_tokens = set(_keywords_of(new_goal)) if new_goal else set()
+                if old_tokens and new_tokens and not (old_tokens & new_tokens):
+                    sess.working.pop(USER_GUIDANCE_KEY, None)
             sess.set_plan(plan)
+            # 记录「创建时」的步骤数：技能学习门槛按创建时的规模判断，
+            # 之后 append 出来的步骤不改变这个值。
+            sess.working[PLAN_CREATED_STEPS_KEY] = len(plan["steps"])
             self._notify(sess)
             out = f"plan created: {len(plan['steps'])} step(s)"
             raw_n = len(steps) if isinstance(steps, list) else 1

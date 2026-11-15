@@ -1,4 +1,4 @@
-"""In-process memory stores: work memory (scratchpad) and long-term memory."""
+"""In-process memory stores: short-term work memory and long-term memory."""
 from __future__ import annotations
 
 import atexit

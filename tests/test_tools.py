@@ -342,24 +342,6 @@ def test_ask_user_invokes_callback(config, recording_callbacks):
 
 
 # ---------------------------------------------------------------------------
-# work_memory
-# ---------------------------------------------------------------------------
-
-def test_work_memory_set_get_list_clear(config):
-    reg = _reg(config)
-    assert reg.execute("work_memory", {"op": "list"}).output.strip() == "{}"
-
-    assert reg.execute("work_memory", {"op": "set", "key": "goal", "value": "fix bug"}).success
-    assert reg.execute("work_memory", {"op": "get", "key": "goal"}).output == "fix bug"
-
-    listing = reg.execute("work_memory", {"op": "list"}).output
-    assert "goal" in listing and "fix bug" in listing
-
-    reg.execute("work_memory", {"op": "clear"})
-    assert reg.execute("work_memory", {"op": "list"}).output.strip() == "{}"
-
-
-# ---------------------------------------------------------------------------
 # memory_graph / memory_search
 # ---------------------------------------------------------------------------
 
@@ -398,7 +380,6 @@ def test_destructive_flags(config):
     assert reg.get("shell_run").destructive is True
     assert reg.get("web_scan").destructive is False
     assert reg.get("ask_user").destructive is False
-    assert reg.get("work_memory").destructive is False
     assert reg.get("long_memory").destructive is False
     assert reg.get("skill_tools").destructive is False
     assert reg.get("rag_tools").destructive is False
@@ -431,7 +412,7 @@ def test_registry_exposes_function_schemas(config):
     expected = {
         "code_run", "shell_run", "file_tools",
         "web_scan", "ask_user",
-        "work_memory", "long_memory", "skill_tools",
+        "long_memory", "skill_tools",
     }
     assert expected <= names
 

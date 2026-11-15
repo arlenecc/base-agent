@@ -29,6 +29,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .skill_log import log_skill_event
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -37,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 _SKILL_FILENAME = "SKILL.md"
 _SKILL_TABLE_NAME = "skills"
+# 记录建表时使用的 embedding 模型名：用户切换模型后，旧向量与新查询向量
+# 不可比，必须在检索前重建，否则会静默返回一堆无关技能（甚至空结果）。
+_EMBED_SIGNATURE_FILE = "embedding_signature.txt"
 
 # Similarity fusion between description and examples embeddings is ``max``:
 # 两路各自都是「这个技能相关」的独立证据，取较大值即可。旧实现用 0.6:0.4
@@ -55,6 +60,9 @@ _INDEX_VERSION = 2
 # Number of candidates from each channel (vector / BM25).
 _VECTOR_TOP_K = 3
 _BM25_TOP_K = 3
+# BM25-only 候选的排序权重：BM25 是精确关键词证据，归一化后最多可贡献 0.5
+# 的排序分，避免它虽然命中却因为余弦低而被 5 条弱向量候选挤出 Top5。
+_BM25_SCORE_WEIGHT = 0.5
 # Max chars of description/examples kept for embedding and combined text.
 # SKILL.md body sections (especially "Examples") can be tens of KB; embedding
 # them whole is wasteful (the model truncates at ~2k tokens anyway) and makes
@@ -529,16 +537,53 @@ class SkillVectorStore:
                     self._db = lancedb.connect(self._db_path)
         return self._db
 
+    # ------------------------------------------------------------------
+    # embedding 模型签名（切换模型后强制重建，避免旧向量参与检索）
+    # ------------------------------------------------------------------
+    def embedding_signature(self) -> str:
+        """当前 embedding 模型的稳定标识；取不到时返回空串。"""
+        try:
+            ef = self._get_ef()
+            name = ef.name() if hasattr(ef, "name") else type(ef).__name__
+            return str(name or "").strip()
+        except Exception:
+            return ""
+
+    def read_stored_signature(self) -> str:
+        path = os.path.join(self._db_path, _EMBED_SIGNATURE_FILE)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    def write_signature(self) -> None:
+        sig = self.embedding_signature()
+        if not sig:
+            return
+        try:
+            from .atomic_io import atomic_write_text
+            os.makedirs(self._db_path, exist_ok=True)
+            atomic_write_text(
+                os.path.join(self._db_path, _EMBED_SIGNATURE_FILE), sig + "\n"
+            )
+        except Exception as e:
+            logger.debug("skill_retriever: write embedding signature failed: %s", e)
+
     def _get_table(self):
         # 双检锁：check-then-act 竞态会让两个线程各自 open_table，
         # 其中一个句柄被丢弃（LanceDB 表句柄持有版本快照与缓存）。
+        # 打开失败（索引目录损坏/被占用）不能把异常抛给检索工具：返回 None，
+        # 让 ensure_indexed 走重建；重建也失败时上层返回「无候选」而不是崩溃。
         if self._table is None:
             with self._lock:
                 if self._table is None:
-                    db = self._get_db()
-                    if _SKILL_TABLE_NAME in db.table_names():
-                        self._table = db.open_table(_SKILL_TABLE_NAME)
-                    else:
+                    try:
+                        db = self._get_db()
+                        if _SKILL_TABLE_NAME in db.table_names():
+                            self._table = db.open_table(_SKILL_TABLE_NAME)
+                    except Exception as e:
+                        logger.warning("skill_retriever: open skills table failed: %s", e)
                         self._table = None
         return self._table
 
@@ -937,6 +982,9 @@ class SkillRetriever:
         # 外部（skill_save / UI）直接写了 SKILL.md：此时目录 mtime 可能还没
         # 变到 _should_scan 能察觉，必须显式标脏，否则新技能永远进不了索引。
         self._dirty = False
+        # 索引构建/同步失败后的冷却截止时间：避免索引目录损坏时每次检索都
+        # 重新扫描几百个 SKILL.md + 重试注定失败的建表。
+        self._index_error_until = 0.0
 
     @property
     def skills_dir(self) -> str:
@@ -963,13 +1011,64 @@ class SkillRetriever:
             deleted skills — never a full rebuild.
         """
         with self._index_lock:
+            if time.time() < self._index_error_until:
+                return
             table = self._store._get_table()
+            # 用户切换 embedding 模型后，旧表的向量与新查询向量不可比：
+            # 直接全量重建，而不是继续用旧索引静默返回无关结果。
+            current_sig = self._store.embedding_signature()
+            stored_sig = self._store.read_stored_signature()
+            if (table is not None and current_sig and stored_sig
+                    and current_sig != stored_sig):
+                logger.info(
+                    "skill_retriever: embedding model changed (%s -> %s), rebuilding",
+                    stored_sig, current_sig,
+                )
+                skills = self._scanner.scan(force=True)
+                try:
+                    rows = self._store.build(skills)
+                except Exception as e:
+                    logger.warning("skill_retriever: rebuild after model change failed: %s", e)
+                    self._index_error_until = time.time() + 60.0
+                    log_skill_event(
+                        os.path.dirname(os.path.abspath(self._skills_dir)),
+                        "index_error", phase="rebuild_model_changed", error=str(e),
+                    )
+                    return
+                if rows > 0:
+                    self._store.write_signature()
+                log_skill_event(
+                    os.path.dirname(os.path.abspath(self._skills_dir)),
+                    "index_rebuild", reason="embedding_model_changed",
+                    old_model=stored_sig, new_model=current_sig,
+                    skills=len(skills), rows=rows,
+                )
+                self._dirty = False
+                return
             if table is None:
                 # First run: table missing → build.
                 skills = self._scanner.scan(force=True)
-                self._store.build(skills)
+                try:
+                    rows = self._store.build(skills)
+                except Exception as e:
+                    logger.warning("skill_retriever: initial build failed: %s", e)
+                    self._index_error_until = time.time() + 60.0
+                    log_skill_event(
+                        os.path.dirname(os.path.abspath(self._skills_dir)),
+                        "index_error", phase="build", error=str(e),
+                    )
+                    return
+                if rows > 0:
+                    self._store.write_signature()
+                log_skill_event(
+                    os.path.dirname(os.path.abspath(self._skills_dir)),
+                    "index_build", skills=len(skills), rows=rows,
+                )
                 self._dirty = False
                 return
+            # 老索引没有签名文件：补写当前模型，下一次切模型才能检测到差异。
+            if not stored_sig and current_sig:
+                self._store.write_signature()
             # 表已存在：目录变了、或被显式标脏时才同步。
             #
             # 注意不能只靠 _should_scan()：skill_save 写完 SKILL.md 后调用
@@ -977,7 +1076,21 @@ class SkillRetriever:
             # _should_scan() 恒为 False → 刚保存的技能永远不会被嵌入。
             if self._dirty or self._scanner._should_scan():
                 skills = self._scanner.scan(force=True)
-                self._store.sync(skills)
+                try:
+                    counts = self._store.sync(skills)
+                except Exception as e:
+                    logger.warning("skill_retriever: index sync failed: %s", e)
+                    self._index_error_until = time.time() + 60.0
+                    log_skill_event(
+                        os.path.dirname(os.path.abspath(self._skills_dir)),
+                        "index_error", phase="sync", error=str(e),
+                    )
+                    return
+                self._store.write_signature()
+                log_skill_event(
+                    os.path.dirname(os.path.abspath(self._skills_dir)),
+                    "index_sync", total=len(skills), **counts,
+                )
                 self._dirty = False
 
     def retrieve(self, query: str, llm=None) -> Dict[str, Any]:
@@ -994,7 +1107,9 @@ class SkillRetriever:
           * BM25 results carry a raw ``bm25_score``; for a unified, comparable
             ranking we also attach a cosine similarity as ``score`` (reused from
             the vector channel when the same skill matched there, otherwise
-            looked up on demand).
+            looked up on demand), then boost it by the query-normalized BM25
+            score (max +0.5) so exact keyword hits are not buried by weak
+            vector candidates.
           * De-duplicated by ``dir``; candidates with
             ``score < _MIN_SIMILARITY`` dropped (BM25 hits are kept).
         """
@@ -1017,7 +1132,7 @@ class SkillRetriever:
         bm25_by_dir = {r.get("dir", ""): r for r in bm25_results if r.get("dir")}
         # 只为「仅 BM25 命中」的候选准备查询向量并复用。embedding 失败时
         # 短路：不再对每个候选重试注定失败的 ONNX 调用，BM25 命中本身已足以
-        # 保留候选，score 记 0 让其自然排到后面。
+        # 保留候选；随后统一按归一化 BM25 提升排序分（见下）。
         query_vec = None
         embed_dead = False
         for d, bm in bm25_by_dir.items():
@@ -1040,6 +1155,19 @@ class SkillRetriever:
             merged[d]["score"] = sim
 
         candidates = list(merged.values())
+        # 把 BM25 原始分归一化后并入排序分：同一查询内 BM25 最高者拿满分，
+        # 其余按比例折算，最多提升到 0.5。这样「CI」这类精确关键词命中不会
+        # 因为余弦低而排在一堆弱相关向量候选之后。
+        max_bm25 = max(
+            (float(c.get("bm25_score") or 0.0) for c in candidates), default=0.0
+        )
+        if max_bm25 > 0:
+            for c in candidates:
+                norm = float(c.get("bm25_score") or 0.0) / max_bm25
+                c["bm25_norm"] = round(norm, 4)
+                c["score"] = max(
+                    float(c.get("score") or 0.0), _BM25_SCORE_WEIGHT * norm
+                )
         # Filter by minimum similarity (vector similarity in [0,1]).
         # 但 BM25 命中本身就是关键词证据，不能因为余弦没过阈值就丢掉：缩写 /
         # 专有名词 / 跨语言查询下余弦天然偏低（实测查询 "CI" 对中文描述的技能

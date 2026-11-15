@@ -19,6 +19,7 @@ from typing import Optional
 from ..atomic_io import atomic_write_text
 from ..config import AgentConfig
 from ..skill_index import SkillIndex
+from ..skill_log import log_skill_event
 from .base import Tool, ToolRegistry, ToolResult, _FanoutTool
 
 
@@ -163,11 +164,22 @@ class SkillSearchTool(Tool):
             if len(results) > _MAX_LIST:
                 out += (f"\n… (共 {len(results)} 个技能，仅显示前 {_MAX_LIST} 个；"
                         f"用 op='search' + query 精确查找)")
+            log_skill_event(self.config.workspace, "keyword_list",
+                            count=len(results))
             return ToolResult(True, output=out)
         # Default: search
         if not query:
             return ToolResult(False, error="op 'search' requires 'query'")
         results = idx.search(query, top_k=top_k)
+        log_skill_event(
+            self.config.workspace, "keyword_search",
+            query=query, top_k=top_k, count=len(results),
+            results=[
+                {"name": r.get("name", ""), "path": r.get("path", ""),
+                 "score": r.get("score")}
+                for r in results
+            ],
+        )
         return ToolResult(True, output=json.dumps(results, ensure_ascii=False))
 
 
@@ -215,6 +227,8 @@ class SkillSemanticSearchTool(Tool):
 
         candidates = result.get("candidates", [])
         if not candidates:
+            log_skill_event(self.config.workspace, "semantic_search",
+                            query=query, top_k=top_k, count=0)
             return ToolResult(True, output="找不到匹配的技能。")
 
         # Compact output: dir + name + tags + description (truncated).
@@ -228,6 +242,16 @@ class SkillSemanticSearchTool(Tool):
                 "score": round(c["score"], 4),
             }
             items.append(item)
+        log_skill_event(
+            self.config.workspace, "semantic_search",
+            query=query, top_k=top_k, count=len(candidates),
+            candidates=[
+                {"dir": c.get("dir", ""), "name": c.get("name", ""),
+                 "score": round(c.get("score") or 0, 4),
+                 "bm25": round(c.get("bm25_score") or 0, 4)}
+                for c in candidates[:top_k]
+            ],
+        )
         return ToolResult(True, output=json.dumps(items, ensure_ascii=False, indent=2))
 
 
@@ -293,33 +317,47 @@ class SkillLoadTool(Tool):
                     )
                 # 旧体系（SkillIndex）的技能入口是 prompt.md，SKILL.md 缺失时
                 # 回退一次，否则这些技能永远读不出来。
+                fallback_used = ""
                 if not os.path.isfile(target) and entry == "SKILL.md":
                     legacy = _resolve_within(abs_dir, "prompt.md")
                     if legacy is not None and os.path.isfile(legacy):
                         target = legacy
+                        fallback_used = "prompt.md"
                 if os.path.isfile(target):
                     try:
                         text = _read_text_capped(target)
                     except (OSError, UnicodeDecodeError) as e:
+                        log_skill_event(self.config.workspace, "load_failed",
+                                        path=path, entry=entry,
+                                        source="semantic", error=str(e))
                         return ToolResult(False, error=f"read failed: {e}")
                     # 技能目录是符号链接时，读到的内容来自工作区之外——把真实
                     # 来源标注出来，否则用户（和模型）都看不出自己读的是哪。
                     # 基线必须用**语义检索器自己的** skills 根目录：abs_dir 来自
                     # 它（根是 <workspace>/skills），拿 .agent/skills 当基线会把
                     # 每一个正常技能都误标成外部链接。
+                    external = False
                     try:
                         if _is_external_skill_dir(abs_dir, retriever.skills_dir):
+                            external = True
                             text = (
                                 f"[提示] 该技能目录是符号链接，实际内容来自工作区之外：\n"
                                 f"{abs_dir}\n\n{text}"
                             )
                     except Exception:  # pragma: no cover - 标注失败不影响读取
                         pass
+                    log_skill_event(
+                        self.config.workspace, "load",
+                        path=path, entry=entry, file=os.path.basename(target),
+                        chars=len(text), source="semantic",
+                        fallback=fallback_used, external=external,
+                    )
                     return ToolResult(True, output=text)
 
         # 2) Fall back to the legacy SkillIndex (skill.json + prompt.md).
         idx = _get_skill_index(self.config, self.registry)
         content = idx.read_skill_content(path, entry)
+        fallback_used = ""
         if content is None:
             # 目录技能在 skill.json 里声明自己的入口文件（老技能是
             # prompt.md）。工具默认 entry 是 SKILL.md，老技能因此永远读不到
@@ -330,9 +368,17 @@ class SkillLoadTool(Tool):
                     continue
                 content = idx.read_skill_content(path, fallback)
                 if content is not None:
-                    return ToolResult(True, output=content)
+                    fallback_used = fallback
+                    break
         if content is None:
+            log_skill_event(self.config.workspace, "load_failed",
+                            path=path, entry=entry, source="legacy")
             return ToolResult(False, error=f"skill not found or entry file missing: {path}/{entry}")
+        log_skill_event(
+            self.config.workspace, "load",
+            path=path, entry=entry, file=fallback_used or entry,
+            chars=len(content), source="legacy", fallback=fallback_used,
+        )
         return ToolResult(True, output=content)
 
     @staticmethod
@@ -352,6 +398,9 @@ class SkillLoadTool(Tool):
 # ---------------------------------------------------------------------------
 
 _SAFE_SKILL_NAME_RE = re.compile(r"[^a-z0-9\-]+")
+# SkillScanner 会跳过这些目录名（扫描测试目录时的既有规则）。同名技能写进去
+# 也不会被索引，必须在保存入口拒绝，而不是让用户以为保存成功。
+_RESERVED_SKILL_NAMES = {"test", "tests", "node_modules", "__pycache__"}
 _MAX_SKILL_BODY = 8_000
 
 _SKILL_TEMPLATE = """---
@@ -402,6 +451,8 @@ class SkillSaveTool(Tool):
             "steps": {"type": "string", "description": "Numbered steps that were verified to work"},
             "pitfalls": {"type": "string", "description": "Gotchas / things that failed (optional)"},
             "tags": {"type": "string", "description": "Comma-separated tags (optional)"},
+            "overwrite": {"type": "boolean",
+                          "description": "Overwrite an existing SKILL.md with the same name (default false)."},
         },
         "required": ["name", "description", "steps"],
     }
@@ -414,18 +465,47 @@ class SkillSaveTool(Tool):
         self.registry = registry
 
     def run(self, name: str, description: str, steps: str,
-            when_to_use: str = "", pitfalls: str = "", tags: str = "") -> ToolResult:
+            when_to_use: str = "", pitfalls: str = "", tags: str = "",
+            overwrite: bool = False) -> ToolResult:
         slug = _SAFE_SKILL_NAME_RE.sub("-", (name or "").strip().lower()).strip("-")[:64]
         if not slug:
+            log_skill_event(self.config.workspace, "save_failed",
+                            name=name or "", reason="invalid_name")
             return ToolResult(False, error="invalid skill name (need [a-z0-9-])")
+        if slug in _RESERVED_SKILL_NAMES:
+            log_skill_event(self.config.workspace, "save_failed",
+                            name=slug, reason="reserved_name")
+            return ToolResult(
+                False,
+                error=f"skill name {slug!r} is reserved (scanner skips this directory)",
+            )
         if not (steps or "").strip():
+            log_skill_event(self.config.workspace, "save_failed",
+                            name=slug, reason="missing_steps")
             return ToolResult(False, error="steps is required")
+
+        # 严格布尔解析：字符串 "false" 不能被当成真值（与 checkpoint 一致）。
+        if isinstance(overwrite, str):
+            overwrite = overwrite.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            overwrite = bool(overwrite)
 
         root = os.path.join(self.config.workspace, "skills")
         # 双重防护：slug 已过滤掉非 [a-z0-9-]，再校验一次 realpath 前缀
         target_dir = _resolve_within(root, slug)
         if target_dir is None:
+            log_skill_event(self.config.workspace, "save_failed",
+                            name=slug, reason="outside_skills_dir")
             return ToolResult(False, error=f"refusing path outside skills dir: {slug!r}")
+        if os.path.isfile(os.path.join(target_dir, "SKILL.md")) and not overwrite:
+            # 防止自动蒸馏覆盖用户手写/下载的同名技能；需要更新时显式传
+            # overwrite=true。
+            log_skill_event(self.config.workspace, "save_failed",
+                            name=slug, reason="already_exists")
+            return ToolResult(
+                False,
+                error=f"skill already exists: {slug} (pass overwrite=true to replace)",
+            )
 
         tag_list = [t.strip() for t in re.split(r"[,，]", tags or "") if t.strip()][:8]
         body = _SKILL_TEMPLATE.format(
@@ -445,6 +525,8 @@ class SkillSaveTool(Tool):
             # SKILL.md；写失败时 tmp 还不清理。
             atomic_write_text(path, body)
         except OSError as e:
+            log_skill_event(self.config.workspace, "save_failed",
+                            name=slug, reason="write_error", error=str(e))
             return ToolResult(False, error=f"write failed: {e}")
 
         # 让检索器下次调用前重新同步向量索引。
@@ -490,11 +572,19 @@ class SkillSaveTool(Tool):
                 idx.scan(force=True)
         except OSError as e:
             logger.warning("skill_save: mirror to .agent/skills failed: %s", e)
+            log_skill_event(self.config.workspace, "save_mirror_failed",
+                            name=slug, error=str(e))
 
         note = ("下次可用 skill_tools(op=\"semantic_search\") 或 "
                 "skill_tools(op=\"search\") 召回（索引会自动增量同步）")
         if mirrored:
             note += f"；已镜像到 {mirrored} 以便关键词检索命中"
+        log_skill_event(
+            self.config.workspace, "save",
+            name=slug, path=path, mirrored=mirrored,
+            description=(description or "").strip()[:200],
+            steps_chars=len((steps or "").strip()),
+        )
         return ToolResult(True, output=f"skill saved: {path}\n{note}。")
 
 
@@ -527,6 +617,7 @@ class SkillToolsTool(_FanoutTool):
             "steps": {"type": "string", "description": "Numbered verified steps (save)"},
             "pitfalls": {"type": "string", "description": "Gotchas (save)"},
             "tags": {"type": "string", "description": "Comma-separated tags (save)"},
+            "overwrite": {"type": "boolean", "description": "Replace an existing same-name skill (save, default false)"},
         },
         "required": ["op"],
     }
@@ -537,7 +628,8 @@ class SkillToolsTool(_FanoutTool):
         "search": {"query", "top_k"},
         "semantic_search": {"query", "top_k"},
         "load": {"path", "entry"},
-        "save": {"name", "description", "steps", "when_to_use", "pitfalls", "tags"},
+        "save": {"name", "description", "steps", "when_to_use", "pitfalls", "tags",
+                 "overwrite"},
     }
     # 合并前 skill_search 本身有 op="list"（列出全部），现在等价形态是
     # skill_tools(op="search") 不带 query。
@@ -579,4 +671,5 @@ class SkillToolsTool(_FanoutTool):
             name=kwargs.get("name", ""), description=kwargs.get("description", ""),
             steps=kwargs.get("steps", ""), when_to_use=kwargs.get("when_to_use", ""),
             pitfalls=kwargs.get("pitfalls", ""), tags=kwargs.get("tags", ""),
+            overwrite=kwargs.get("overwrite", False),
         )

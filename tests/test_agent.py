@@ -1452,3 +1452,105 @@ def test_system_prompt_book_content_outline_then_search():
     # 无书名分支：无参列出 → 单篇直接做 / 多篇挑最相关的做并注明依据。
     assert "问句没点名文档" in SYSTEM_PROMPT
     assert "挑文档名/主题与问题最相关的一篇" in SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# 技能学习门槛
+# ---------------------------------------------------------------------------
+
+def _session_with_completed_plan(created_steps: int, done: int, blocked: int,
+                                 guidance: int):
+    from agent.kernel import ContextBudget, Session
+    from agent.kernel.session import (
+        COMPLETED_PLAN_KEY, PLAN_CREATED_STEPS_KEY, RUN_ID_KEY,
+        USER_GUIDANCE_KEY,
+    )
+
+    sess = Session(ContextBudget())
+    sess.working[RUN_ID_KEY] = 2
+    sess.working[USER_GUIDANCE_KEY] = guidance
+    sess.working[PLAN_CREATED_STEPS_KEY] = created_steps
+    total = max(created_steps, done + blocked)
+    steps = []
+    for i in range(total):
+        status = "done" if i < done else ("blocked" if i < done + blocked else "pending")
+        steps.append({"id": str(i + 1), "title": f"s{i + 1}", "status": status})
+    sess.set_plan({"goal": "test", "steps": steps})
+    # 模拟收尾：create 后到 clear 之间可能有 patch/append，快照以收尾时为准
+    sess.working[PLAN_CREATED_STEPS_KEY] = created_steps
+    sess.clear_plan()
+    assert isinstance(sess.working.get(COMPLETED_PLAN_KEY), dict)
+    return sess
+
+
+def test_skill_learning_eligible_requires_long_guided_complete():
+    from agent.agent import _skill_learning_eligible
+
+    ok, _ = _skill_learning_eligible(
+        _session_with_completed_plan(created_steps=5, done=5, blocked=0, guidance=1))
+    assert ok
+
+    ok, reason = _skill_learning_eligible(
+        _session_with_completed_plan(created_steps=3, done=3, blocked=0, guidance=1))
+    assert not ok and "3" in reason
+
+    ok, reason = _skill_learning_eligible(
+        _session_with_completed_plan(created_steps=5, done=4, blocked=1, guidance=1))
+    assert not ok and "未全部完成" in reason
+
+    ok, reason = _skill_learning_eligible(
+        _session_with_completed_plan(created_steps=5, done=5, blocked=0, guidance=0))
+    assert not ok and "引导" in reason
+
+
+def test_skill_learning_rejects_previous_task_snapshot():
+    from agent.agent import _skill_learning_eligible
+    from agent.kernel.session import RUN_ID_KEY
+
+    sess = _session_with_completed_plan(
+        created_steps=5, done=5, blocked=0, guidance=1)
+    sess.working[RUN_ID_KEY] = 3  # 下一轮任务开始，旧快照不应再被采纳
+    ok, reason = _skill_learning_eligible(sess)
+    assert not ok and "不属于本轮" in reason
+
+
+def test_user_guidance_and_completed_plan_are_tracked(config, recording_callbacks):
+    """第二个用户输入落在未完成计划上 → 计为引导；收尾后快照可判定。"""
+    from agent.agent import _skill_learning_eligible
+    from agent.kernel.session import (
+        COMPLETED_PLAN_KEY, PLAN_CREATED_STEPS_KEY, RUN_ID_KEY,
+        USER_GUIDANCE_KEY,
+    )
+
+    patch = lambda i: [{"id": f"p{i}", "function": {"name": "update_plan", "arguments": json.dumps({
+        "op": "patch", "step_id": str(i), "status": "done",
+    })}}]
+
+    mock = MockLLM([
+        [_evt("done", tool_calls=patch(1), usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=patch(2), usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=patch(3), usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=patch(4), usage={"total_tokens": 1})],
+        [_evt("content", "完成。"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent._auto_continue = False
+    agent._distill_min_turns = 999
+
+    # 模拟上一轮用户任务留下的「4 步、未完成」计划
+    agent.session.set_plan({
+        "goal": "四步任务",
+        "steps": [{"id": str(i), "title": f"步骤{i}",
+                   "status": "doing" if i == 1 else "pending"} for i in range(1, 5)],
+    })
+    agent.session.working[PLAN_CREATED_STEPS_KEY] = 4
+    agent.session.working[RUN_ID_KEY] = 1
+
+    agent.run("继续")
+    assert agent.session.working.get(USER_GUIDANCE_KEY) == 1
+    rec = agent.session.working.get(COMPLETED_PLAN_KEY)
+    assert isinstance(rec, dict)
+    assert rec["steps"] == 4 and rec["done"] == 4 and rec["created_steps"] == 4
+    assert agent.session.working.get(PLAN_CREATED_STEPS_KEY) is None
+    ok, _ = _skill_learning_eligible(agent.session)
+    assert ok

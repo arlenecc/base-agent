@@ -431,6 +431,8 @@ def test_retrieve_keeps_bm25_only_candidate(tmp_path):
     result = retriever.retrieve("CI", llm=None)
     dirs = [c["dir"] for c in result["candidates"]]
     assert dirs == ["ci-pipeline"], f"BM25 命中被误杀: {result['candidates']}"
+    # 归一化 BM25 最高分应把排序分抬到 0.5，避免被弱向量候选挤到 Top5 之外
+    assert result["candidates"][0]["score"] >= 0.5
     retriever.close()
 
 

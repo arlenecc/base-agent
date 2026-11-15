@@ -23,7 +23,6 @@ from agent.llm_client import StreamEvent  # noqa: E402
 from agent.skills import SkillManager  # noqa: E402
 from agent.tools.base import ToolRegistry, _redact_args  # noqa: E402
 from agent.tools.file_ops import FileModifyTool  # noqa: E402
-from agent.tools.memory import WorkMemoryTool  # noqa: E402
 from agent.tools.plan import UpdatePlanTool  # noqa: E402
 
 
@@ -212,19 +211,37 @@ def test_file_modify_strict_bool_and_empty_old(cfg):
     assert open(p, encoding="utf-8").read() == "Y X X"  # 只替换第一处
 
 
-def test_work_memory_get_always_returns_string(cfg):
-    tool = WorkMemoryTool()
-    tool.bind(cfg, None)
-    assert tool.run("set", key="k", value=123).success
-    res = tool.run("get", key="k")
-    assert res.success and isinstance(res.output, str) and res.output == "123"
-
-
 def test_plan_op_accepts_non_string(cfg):
     reg = SimpleNamespace(session=None)
     tool = UpdatePlanTool()
     tool.bind(cfg, reg)
     assert not tool.run(op=123).success  # 不抛 AttributeError
+
+
+def test_new_plan_goal_resets_user_guidance(cfg):
+    """旧计划未完成时的新目标若完全不同，不能把旧任务的引导次数算过来。"""
+    from agent.kernel import ContextBudget, Session
+    from agent.kernel.session import USER_GUIDANCE_KEY
+
+    sess = Session(ContextBudget())
+    sess.set_plan({"goal": "整理报销发票",
+                   "steps": [{"id": "1", "title": "收集发票", "status": "doing"}]})
+    sess.working[USER_GUIDANCE_KEY] = 1
+    reg = SimpleNamespace(session=sess)
+    tool = UpdatePlanTool()
+    tool.bind(cfg, reg)
+
+    assert tool.run("create", goal="写一首关于秋天的诗",
+                    steps=[{"title": "构思"}]).success
+    assert USER_GUIDANCE_KEY not in sess.working
+
+    # 同一任务的重写计划（关键词有交集）应保留引导计数
+    sess.set_plan({"goal": "整理报销发票",
+                   "steps": [{"id": "1", "title": "收集发票", "status": "doing"}]})
+    sess.working[USER_GUIDANCE_KEY] = 1
+    assert tool.run("create", goal="把报销发票按月份整理",
+                    steps=[{"title": "收集"}]).success
+    assert sess.working.get(USER_GUIDANCE_KEY) == 1
 
 
 def test_create_dir_skill_rejects_dotdot(cfg):

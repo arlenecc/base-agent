@@ -1305,8 +1305,8 @@ class KernelLoop:
             elif (self._is_greeting(user_input)
                   and not (resp.content or "").strip()):
                 # 严格问候（hi/你好/在吗…）却没有任何文字答复：本地弱模型常无视
-                # 「寒暄禁止调工具」的指令，先成功写一次 checkpoint（work_memory
-                # set）把失败计数 ft 重置为 0，再发 work_memory({}) 空参空转。原
+                # 「寒暄禁止调工具」的指令，先成功写一次 checkpoint 把失败计数
+                # ft 重置为 0，再发 update_working_checkpoint({}) 空参空转。原
                 # 阈值要 ft>=2 才触发，被这次「成功→失败」恰好绕过。问候本身不需要
                 # 任何工具，与其烧轮等它「自觉」，不如只要严格问候 + 无文字答复就直接
                 # 构造一句礼貌文字回复并结束本轮（不论工具成功/失败）。注意用
@@ -1338,15 +1338,11 @@ class KernelLoop:
                     "update_plan 补标 done；若确实不可行，标 blocked 并写明原因。）"
                 )
 
-        if emit_finished:
-            try:
-                self.hooks.finished(session, final_text)
-            except Exception as e:
-                self.log(f"[kernel] finished hook error: {e}")
-
         # 任务正常完成且计划步骤已全部收尾时，自动清空执行计划（关闭计划面板），
         # 避免「计划 N/N 完成却一直挂在面板上关不掉」。仅在确实存在计划、且无未
         # 完成步骤时才清——中途放弃 / 达上限的未完成计划保持原样，便于续跑或复盘。
+        # 必须先于 finished 钩子执行：钩子里的技能学习判定要读计划完成快照
+        # （Session.clear_plan 写入）；旧顺序在 emit_finished=True 时永远读不到。
         if (exit_reason == ExitReason.DONE
                 and session.get_plan() is not None
                 and not session.plan_open_steps()):
@@ -1357,6 +1353,12 @@ class KernelLoop:
                     cb(None)
                 except Exception:
                     pass
+
+        if emit_finished:
+            try:
+                self.hooks.finished(session, final_text)
+            except Exception as e:
+                self.log(f"[kernel] finished hook error: {e}")
 
         return KernelResult(final_text, exit_reason, self._turns_used,
                             self.distill_requested)
@@ -1775,8 +1777,8 @@ class KernelLoop:
             else:
                 self._fail_repeat_streak = 1
             # 「同一工具连续失败」计数（不限参数是否相同）：弱模型在问候等
-            # 简单场景常死磕同一个工具、只换参数（work_memory({}) →
-            # work_memory({key_info}) 退化），签名每次略变但始终失败。这与
+            # 简单场景常死磕同一个工具、只换参数（file_tools({}) →
+            # file_tools({...}) 退化），签名每次略变但始终失败。这与
             # 「换工具/换方法探索」不同，应在问候场景尽快收尾。本轮失败若
             # 都来自同一个工具名且与上轮失败工具相同 → 累加；否则清零。
             names = {tc.name for tc, _ in failed}

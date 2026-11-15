@@ -249,8 +249,8 @@ def test_kernel_same_tool_varied_fail_fuse(cfg):
     scripts = []
     for i in range(8):
         tc = [{"id": f"w{i}",
-               "function": {"name": "work_memory",
-                            "arguments": json.dumps({"key_info": f"尝试{i}"})}}]
+               "function": {"name": "file_tools",
+                            "arguments": json.dumps({"op": "read", "path": f"f{i}.txt"})}}]
         scripts.append([_evt("done", tool_calls=tc, usage={"total_tokens": 1})])
     scripts.append([_evt("content", "好的，收尾。"),
                     _evt("done", usage={"total_tokens": 1})])
@@ -269,7 +269,7 @@ def test_kernel_same_tool_varied_fail_fuse(cfg):
 
     assert result.reason is ExitReason.DONE
     # 第 6 次失败后熔断：之后不再派发（脚本备了 8 轮也只用到 6）
-    assert dispatched.count("work_memory") == 6
+    assert dispatched.count("file_tools") == 6
     # 收尾文字非空，不静默
     assert result.text.strip()
 
@@ -548,7 +548,7 @@ def test_atomic_and_capability_tools_are_registered(cfg):
     # 其余保持独立。
     for t in ("code_run", "file_tools", "web_scan", "update_plan",
               "update_working_checkpoint", "ask_user", "start_long_term_update",
-              "shell_run", "work_memory", "long_memory", "skill_tools",
+              "shell_run", "long_memory", "skill_tools",
               "rag_tools"):
         assert t in names, f"缺少工具 {t}"
 

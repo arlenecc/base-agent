@@ -356,7 +356,7 @@ class ToolRegistry:
         from .shell_run import ShellRunTool
         from .web import WebScanTool
         from .interact import AskUserTool
-        from .memory import WorkMemoryTool, LongMemoryTool
+        from .memory import LongMemoryTool
         from .skill_search import SkillToolsTool
         from .checkpoint import UpdateWorkingCheckpointTool, StartLongTermUpdateTool
         from .plan import UpdatePlanTool
@@ -371,7 +371,6 @@ class ToolRegistry:
             ShellRunTool(),
             WebScanTool(),            # 唯一 web 工具（含 render=true 浏览器渲染）
             AskUserTool(),
-            WorkMemoryTool(),
             # 定时任务：对话直接创建/管理 cron/interval/一次性任务
             ScheduleTool(),
             # 沉淀态原子工具（对齐 GenericAgent）
@@ -655,6 +654,29 @@ class ToolRegistry:
 
         return _get_skill_index(self.config, self)
 
+    def get_skill_hint_index(self):
+        """Return the cached lightweight hint index over ``<workspace>/skills``.
+
+        只读 SKILL.md frontmatter，不加载 embedding；用于每轮对话的自动提示。
+        与 ``get_skill_index``（扫 ``.agent/skills``）互补。
+        """
+        skills_dir = os.path.join(self.config.workspace, "skills")
+        cache = getattr(self, "_skill_hint_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(self, "_skill_hint_cache", cache)
+        idx = cache.get(skills_dir)
+        if idx is not None:
+            return idx
+        with self._retriever_lock:
+            idx = cache.get(skills_dir)
+            if idx is not None:
+                return idx
+            from ..skill_hint import SkillHintIndex
+            idx = SkillHintIndex(skills_dir)
+            cache[skills_dir] = idx
+            return idx
+
     def get_skill_retriever(self):
         """Return the shared SkillRetriever (hybrid skill search), lazily built.
 
@@ -684,6 +706,15 @@ class ToolRegistry:
             db_path = os.path.join(self.config.workspace, ".agent", "skill_index.lancedb")
             from ..skill_retriever import SkillRetriever
             from ..rag.vector_store import get_or_create_embedding_function
+            # 先把 config 的 embedding provider 同步到 vector_store（幂等）：
+            # 本地模型（默认 jina MLX）在 provider 还停留在 api 时会被当成
+            # FastEmbed 模型名，直接报 unsupported → 技能索引静默为空。
+            # UI 启动时会调用 configure_local_models，但无头/测试入口不一定。
+            try:
+                from ..local.factory import configure_local_models
+                configure_local_models(self.config)
+            except Exception as e:
+                logger.debug("skill embedding provider sync failed: %s", e)
             # 必须复用 RAG 配置里的 embedding 模型：SkillVectorStore 默认用
             # DEFAULT_EMBEDDING_MODEL，用户改了模型就会额外驻留第二个
             # FastEmbed 单例（各 ~137MB C++ 堆），且两侧索引不一致。

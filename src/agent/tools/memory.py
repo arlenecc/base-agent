@@ -1,14 +1,11 @@
-"""work_memory and knowledge-graph memory tools.
+"""Knowledge-graph memory tool.
 
-WorkMemory stays a simple key-value scratchpad (unchanged).
+WorkMemory 仍是内部键值存储（供 checkpoint / 自动事实使用），但不再作为
+模型可直接调用的工具暴露。
 
 LongTermMemory is now a knowledge graph (entities + relations + observations)
-backed by GraphMemoryStore with LanceDB semantic search.  Three tools expose
-the graph to the agent:
-
-  - work_memory         — short-term scratchpad (set/get/list/clear)
-  - memory_graph        — CRUD on the knowledge graph
-  - memory_search       — semantic recall over observations
+backed by GraphMemoryStore with LanceDB semantic search.  The graph is exposed
+to the agent via ``long_memory`` (graph/search).
 """
 from __future__ import annotations
 
@@ -134,53 +131,6 @@ def _cap_output(text: str) -> str:
         return text
     return (text[:_MAX_TOOL_OUTPUT_CHARS]
             + f"\n… [输出超过 {_MAX_TOOL_OUTPUT_CHARS} 字符，已截断]")
-
-
-# ---------------------------------------------------------------------------
-# Work memory tool (unchanged)
-# ---------------------------------------------------------------------------
-
-
-class WorkMemoryTool(Tool):
-    name = "work_memory"
-    description = "Task scratchpad. op: set(key,value), get(key), list, clear."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "op": {"type": "string", "enum": ["set", "get", "list", "clear"]},
-            "key": {"type": "string"},
-            "value": {"type": "string"},
-        },
-        "required": ["op"],
-    }
-
-    config: AgentConfig
-    registry: ToolRegistry
-
-    def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
-        self.config = config
-        self.registry = registry
-
-    def run(self, op: str, key: str = "", value: str = "") -> ToolResult:
-        wm = _work_memory(self.config)
-        if op == "set":
-            if not key:
-                return ToolResult(False, error="op 'set' requires 'key'")
-            wm.set(key, value)
-            return ToolResult(True, output=f"set {key}")
-        if op == "get":
-            if not key:
-                return ToolResult(False, error="op 'get' requires 'key'")
-            v = wm.get(key)
-            # work_memory 存的是任意 JSON 值；非字符串 output 会让上层的
-            # len(res.output) 抛 TypeError，整批 dispatch 崩掉。
-            return ToolResult(True, output=str(v) if v is not None else "")
-        if op == "list":
-            return ToolResult(True, output=json.dumps(wm.list(), ensure_ascii=False))
-        if op == "clear":
-            wm.clear()
-            return ToolResult(True, output="cleared")
-        return ToolResult(False, error=f"unknown op: {op}")
 
 
 # ---------------------------------------------------------------------------

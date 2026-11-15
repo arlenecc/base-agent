@@ -34,6 +34,16 @@ _MAX_PLAN_GOAL = 300
 # 状态标记（省 token：一个字符表示一步）
 _PLAN_MARK = {"done": "✓", "doing": "▶", "pending": " ", "blocked": "✗", "skipped": "⊘"}
 
+# 技能学习门控元数据（存在 Session.working，Agent 在蒸馏时读取）
+# run_id：区分「本次用户任务」与上一任务的残留记录
+RUN_ID_KEY = "__run_id__"
+# 用户在本轮任务中追加引导/纠正的次数（计划仍有未完成步骤时的新用户输入）
+USER_GUIDANCE_KEY = "__user_guidance__"
+# 计划收尾时留下的快照（步数/完成数/所属 run_id）
+COMPLETED_PLAN_KEY = "__completed_plan__"
+# update_plan(create) 时的原始步骤数（append 不改变这个值）
+PLAN_CREATED_STEPS_KEY = "__plan_created_steps__"
+
 
 def render_plan_dict(plan: Optional[Dict[str, Any]]) -> str:
     """把一份 plan dict 渲染成紧凑多行文本（``Session.render_plan`` 的纯函数版）。
@@ -226,8 +236,27 @@ class Session:
         p = self.working.get("plan")
         return p if isinstance(p, dict) else None
 
-    def clear_plan(self) -> None:
+    def clear_plan(self, record: bool = True) -> None:
+        # 收尾前留一份快照：技能学习需要判断「创建时 >3 步、最终全部完成」。
+        # 内核在成功收尾时会先清计划再触发 finished 钩子，如果只让蒸馏线程
+        # 去读 get_plan()，永远只能看到 None。
+        # record=False 用于「模型主动 clear」与「新任务边界清旧计划」：它们
+        # 都不等于任务已成功完成，不能作为技能学习依据。
+        plan = self.working.get("plan")
+        if record and isinstance(plan, dict):
+            steps = [s for s in (plan.get("steps") or []) if isinstance(s, dict)]
+            self.working[COMPLETED_PLAN_KEY] = {
+                "goal": str(plan.get("goal") or "")[:_MAX_PLAN_GOAL],
+                "steps": len(steps),
+                "created_steps": int(
+                    self.working.get(PLAN_CREATED_STEPS_KEY) or len(steps)
+                ),
+                "done": sum(1 for s in steps if s.get("status") == "done"),
+                "blocked": sum(1 for s in steps if s.get("status") == "blocked"),
+                "run_id": int(self.working.get(RUN_ID_KEY) or 0),
+            }
         self.working.pop("plan", None)
+        self.working.pop(PLAN_CREATED_STEPS_KEY, None)
 
     def plan_open_steps(self) -> List[Dict[str, str]]:
         """未完成的步骤（pending / doing）——反思门的判据。"""

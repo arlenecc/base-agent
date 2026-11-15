@@ -138,7 +138,7 @@ RESERVE 5 500  模型输出 + 估算误差
 - **系统控制**：`shell_run`（`code_run` 的系统侧延伸）
 - **本地知识库**：`rag_search` / `rag_outline` / `rag_status` / `rag_ingest`
 - **外置经验**：`skill_search` / `skill_semantic_search` / `skill_load` / **`skill_save`（新增，能力固化）**
-- **记忆**：`work_memory` / `memory_graph` / `memory_search`
+- **记忆**：`memory_graph` / `memory_search`（`long_memory` 门面的兼容别名）
 - **外部协议**：MCP 工具（动态注册）
 
 ### 第三层：能力进化闭环

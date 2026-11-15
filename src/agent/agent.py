@@ -20,6 +20,8 @@ from .kernel import (
     ContextBudget, ExitReason, KernelHooks, KernelLoop, KernelResult, Session,
     l4_extract_json, l4_normalize,
 )
+from .kernel.session import COMPLETED_PLAN_KEY, RUN_ID_KEY, USER_GUIDANCE_KEY
+from .skill_log import log_skill_event
 from .kernel.compressor import DISTILL_PROMPT, DISTILL_SYSTEM
 from .tools.checkpoint import restore_checkpoint
 from .atomic_io import atomic_write_text
@@ -123,8 +125,9 @@ SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the us
 ## 通用规则
 1. 破坏性最小；不可逆/危险操作先确认（由工具层门控）。路径相对于工作区；`code_run`/`shell_run` 按风险分级、`rag_tools(op="ingest")` 重建索引、长期记忆清空/删实体、外部 MCP 会请求确认。
 2. 复杂任务先 `skill_tools(op="semantic_search", query=...)`，无结果再 `skill_tools(op="search", query=...)`；命中就 `skill_tools(op="load", path=...)` 照做。
-3. 语义检索（long_memory/skill_tools/rag_tools 的 search）的 query 用用户原话的自然语言，禁止翻译/转拼音/压成光杆关键词。
-4. 完成后用简洁纯文本回复。"""
+3. 技能固化门槛：只有创建计划超过 3 步、期间用户引导/纠正过、且最终全部完成的任务才用 `skill_tools(op="save")`；一步或一次成功的小任务不要固化。
+4. 语义检索（long_memory/skill_tools/rag_tools 的 search）的 query 用用户原话的自然语言，禁止翻译/转拼音/压成光杆关键词。
+5. 完成后用简洁纯文本回复。"""
 
 # ---------------------------------------------------------------------------
 # Token estimation: approximate token count from text length.
@@ -173,6 +176,11 @@ _MAX_PARALLEL_TOOLS = 8
 # 进展交回用户（MAX_TURNS 收尾文本本身就会总结进展），避免无限等待。
 _AUTO_CONTINUE_MAX = 4
 _AUTO_CONTINUE_WALL_CLOCK = 600.0   # 单次用户输入的全部续跑总时长（秒）
+
+# 自动技能固化门槛：只有「创建计划 >3 步 + 用户中途引导/纠正 + 最终全部
+# 完成」的任务才值得学习成 SKILL.md。一步就能做完的简单任务固化只会让
+# 技能库膨胀、稀释检索结果。
+_LEARN_MIN_PLAN_STEPS = 4
 
 # 后台 aux 任务（事实抽取 / L4 蒸馏 / 记忆维护）让路的空闲阈值：主对话
 # 安静这么久才动手，避免插队在两轮对话之间抢 GPU / _gen_lock / 冲 KV 缓存。
@@ -375,7 +383,13 @@ class _AgentKernelHooks(KernelHooks):
         # 总已把最近 raw_turns 轮的内容抽过，不会因折叠丢事实。
         turn_now = session.current_turn
         batch_due = (turn_now - agent._last_extract_turn) >= max(1, session.raw_turns)
-        if not (batch_due or agent.kernel.distill_requested):
+        # 达到技能学习门槛的任务必须在本轮结束就蒸馏，不能等累计到 raw_turns：
+        # 4~7 轮完成的合格任务如果只靠 batch_due，永远进不了 L4。
+        try:
+            skill_due = _skill_learning_eligible(session)[0]
+        except Exception:
+            skill_due = False
+        if not (batch_due or agent.kernel.distill_requested or skill_due):
             return
         agent._last_extract_turn = turn_now
         # 既有能力：异步抽取事实写知识图谱（不阻塞回复）
@@ -388,9 +402,10 @@ class _AgentKernelHooks(KernelHooks):
             agent._run_memory_maintenance_async()
         except Exception as e:
             agent._log(f"[kernel] memory maintenance error: {e}")
-        # L4 经验蒸馏（模型显式调用 start_long_term_update，或长任务）。
+        # L4 经验蒸馏（模型显式调用 start_long_term_update、达到技能门槛、或长任务）。
         # 阈值用 session.current_turn（真实轮数）；distill_requested 时立即蒸馏。
-        if agent.kernel.distill_requested or session.current_turn >= agent._distill_min_turns:
+        if (agent.kernel.distill_requested or skill_due
+                or session.current_turn >= agent._distill_min_turns):
             try:
                 agent._distill_experience_async(session)
             except Exception as e:
@@ -400,6 +415,39 @@ class _AgentKernelHooks(KernelHooks):
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
+
+
+def _skill_learning_eligible(session: Session) -> tuple[bool, str]:
+    """自动技能固化的门槛判断。
+
+    条件（全部满足）：
+      1. 本轮任务创建过计划，且**创建时**步骤数 > 3；
+      2. 计划最终全部步骤都是 done（无 blocked/pending）；
+      3. 任务过程中用户追加过引导/纠正（不是一次成功）；
+      4. 计划快照属于本轮用户任务（run_id 匹配），避免拿上一任务的成绩。
+    """
+    rec = session.working.get(COMPLETED_PLAN_KEY)
+    if not isinstance(rec, dict):
+        return False, "本次任务没有已完成计划"
+    try:
+        run_id = int(rec.get("run_id") or 0)
+        cur_run = int(session.working.get(RUN_ID_KEY) or 0)
+        planned = int(rec.get("created_steps") or rec.get("steps") or 0)
+        total = int(rec.get("steps") or 0)
+        done = int(rec.get("done") or 0)
+        blocked = int(rec.get("blocked") or 0)
+        guidance = int(session.working.get(USER_GUIDANCE_KEY) or 0)
+    except (TypeError, ValueError):
+        return False, "计划元数据异常"
+    if run_id != cur_run:
+        return False, "计划不属于本轮任务"
+    if planned < _LEARN_MIN_PLAN_STEPS:
+        return False, f"创建计划仅 {planned} 步（需 ≥{_LEARN_MIN_PLAN_STEPS}）"
+    if done != total or blocked:
+        return False, f"步骤未全部完成（{done}/{total}，blocked={blocked}）"
+    if guidance < 1:
+        return False, "用户未在任务中引导/纠正"
+    return True, f"计划 {planned} 步、用户引导 {guidance} 次、全部完成"
 
 
 class Agent:
@@ -994,7 +1042,7 @@ class Agent:
         只把当天事实注入上下文（见 _system_prompt），长期记忆则靠检索。
 
         Key 约定：``__auto_facts__`` → {"date": "YYYY-MM-DD", "facts": [...]}
-        使用保留前缀，避免与模型手动 work_memory set 的 key 冲突。
+        使用保留前缀，避免与 checkpoint 等内部键冲突。
         """
         import datetime
         from .tools.memory import _work_memory
@@ -1163,7 +1211,8 @@ class Agent:
         # 无关」。提示强制模型显式判断：新任务 → create 替换；继续 → 接着做。
         if (self.session.get_plan() is not None
                 and not self.session.plan_open_steps()):
-            self.session.clear_plan()
+            # 上一任务的计划；它不是本轮任务的完成证据。
+            self.session.clear_plan(record=False)
             self._log("[plan] 上一任务已收尾，清空计划以便重新规划")
         elif self.session.get_plan() is not None:
             open_ids = "; ".join(
@@ -1177,6 +1226,25 @@ class Agent:
                 "不要沿用无关步骤；若是要求**继续**上一个任务，则从剩余步骤接着执行。"
             )
             self._log("[plan] 上一任务计划未收尾，已注入新任务/继续任务的判断提示")
+
+        # 技能学习元数据：本轮开始时计划还有未完成步骤 → 说明用户是在引导/
+        # 纠正上一轮任务（"继续"、"不对，改成…"都算）；否则是新任务，清零。
+        if self.session.get_plan() is not None and self.session.plan_open_steps():
+            try:
+                self.session.working[USER_GUIDANCE_KEY] = int(
+                    self.session.working.get(USER_GUIDANCE_KEY) or 0
+                ) + 1
+            except (TypeError, ValueError):
+                self.session.working[USER_GUIDANCE_KEY] = 1
+        else:
+            self.session.working[USER_GUIDANCE_KEY] = 0
+        # 本轮用户任务编号：计划收尾快照靠它区分「本轮」与上一任务的残留。
+        try:
+            self.session.working[RUN_ID_KEY] = int(
+                self.session.working.get(RUN_ID_KEY) or 0
+            ) + 1
+        except (TypeError, ValueError):
+            self.session.working[RUN_ID_KEY] = 1
         # 每轮同步一次面板：即使模型本轮没调 update_plan，用户看到的也是
         # Session 的真实状态（而不是上一轮的残影）。
         # 必须传**深拷贝**：直接把 Session 里的活字典交给 UI 线程，正是
@@ -1456,7 +1524,16 @@ class Agent:
         产出三条去路，构成能力进化闭环：
           facts/lessons → 知识图谱（``memory_search`` 可召回）
           skill         → ``workspace/skills/<name>/SKILL.md``（自动进向量索引）
+
+        技能固化额外受门槛限制（``_skill_learning_eligible``）：只有创建计划
+        >3 步、用户中途引导/纠正过、最终全部完成的任务才写入 SKILL.md；
+        facts/lessons 不受此限，仍会正常沉淀。
         """
+        learn_ok, learn_reason = _skill_learning_eligible(session)
+        # 结构化日志：记录本次学习的判定依据，便于事后解释「为什么没固化」。
+        _rec = session.working.get(COMPLETED_PLAN_KEY)
+        _rec = _rec if isinstance(_rec, dict) else {}
+        _guidance = int(session.working.get(USER_GUIDANCE_KEY) or 0)
         # 窗口改增量：从上次蒸馏的行数快照往后取（留 2 行衔接上下文）。旧实现
         # 固定取最近 25 行，窗口随会话滑动重叠——同一批经验被反复蒸馏，知识
         # 图谱堆满措辞变体（字面去重挡不住语义重复）。无足够新增则跳过本次。
@@ -1501,18 +1578,42 @@ class Agent:
                     self._log(f"[distill] 写入 {len(observations)} 条经验到知识图谱")
                 sk = data.get("skill") or {}
                 if sk.get("name") and sk.get("summary"):
-                    self.tools.execute(
-                        "skill_tools",
-                        {
-                            "op": "save",
-                            "name": sk["name"],
-                            "description": sk["summary"],
-                            "when_to_use": sk.get("when_to_use", ""),
-                            "steps": sk.get("steps") or sk["summary"],
-                            "pitfalls": "; ".join(data["lessons"]),
-                        },
-                    )
-                    self._log(f"[distill] 固化技能 {sk['name']}")
+                    if not learn_ok:
+                        log_skill_event(
+                            self.config.workspace, "learn_skip",
+                            name=sk["name"], reason=learn_reason,
+                            plan_steps=_rec.get("created_steps") or _rec.get("steps") or 0,
+                            guidance=_guidance,
+                        )
+                        self._log(f"[distill] 跳过技能固化：{learn_reason}")
+                    else:
+                        res = self.tools.execute(
+                            "skill_tools",
+                            {
+                                "op": "save",
+                                "name": sk["name"],
+                                "description": sk["summary"],
+                                "when_to_use": sk.get("when_to_use", ""),
+                                "steps": sk.get("steps") or sk["summary"],
+                                "pitfalls": "; ".join(data["lessons"]),
+                            },
+                        )
+                        if getattr(res, "success", False):
+                            log_skill_event(
+                                self.config.workspace, "learn_save",
+                                name=sk["name"], reason=learn_reason,
+                                plan_steps=_rec.get("created_steps") or _rec.get("steps") or 0,
+                                guidance=_guidance,
+                                done=_rec.get("done") or 0,
+                            )
+                            self._log(f"[distill] 固化技能 {sk['name']}（{learn_reason}）")
+                        else:
+                            err = getattr(res, "error", "") or "unknown"
+                            log_skill_event(
+                                self.config.workspace, "learn_save_failed",
+                                name=sk["name"], error=err,
+                            )
+                            self._log(f"[distill] 技能固化失败：{err}")
             except Exception as e:
                 self._log(f"[distill] error: {e}")
             finally:
@@ -1764,7 +1865,7 @@ class Agent:
 
     # ------------------------------------------------------------------
     def volatile_context(self) -> str:
-        """每轮易变的即时上下文：知识库状态 + 工作记忆 scratchpad + 当天自动抽取
+        """每轮易变的即时上下文：知识库状态 + 内部工作记忆 + 当天自动抽取
         事实 + 按当前用户输入匹配到的技能。
 
         这些原本拼进系统提示，但本模型 KV 缓存（ArraysCache）不可裁剪，多轮只认
@@ -1833,7 +1934,7 @@ class Agent:
                         fact_block += f"\n- (…{dropped} more omitted)"
                     sub.append("# Today's facts (auto-extracted)\n" + fact_block)
                 if compact_wm:
-                    sub.append("# Work memory (scratchpad)\n" +
+                    sub.append("# Work memory (internal state)\n" +
                                json.dumps(compact_wm, ensure_ascii=False,
                                           separators=(",", ":")))
                 parts.append("\n\n".join(sub))
@@ -1852,19 +1953,27 @@ class Agent:
                           "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）")
                 parts.append(f"# Active skill: {matched.name}\n{sp}")
             elif user_text and self.tools is not None:
-                # 扁平 skills.json 只覆盖历史技能；当前主流是 .agent/skills
-                # 目录技能（skill_save / create_dir_skill 产出）。这里用关键词
-                # 索引做一次轻量兜底匹配，给模型一个明确的 load 入口，避免
-                # 「有匹配技能但模型没主动检索」。
-                try:
-                    hits = self.tools.get_skill_index().search(user_text, top_k=1)
-                except Exception:
-                    hits = []
-                if hits and int(hits[0].get("score") or 0) >= 2:
-                    h = hits[0]
-                    name = str(h.get("name") or "")
-                    path = str(h.get("path") or "")
-                    desc = str(h.get("description") or "")[:200]
+                # 两条轻量兜底：.agent/skills 的关键词索引 + workspace/skills
+                # 的 frontmatter 提示索引。后者覆盖用户下载/蒸馏出来的 SKILL.md
+                # 技能，避免模型不主动调用 semantic_search 时完全错过它们。
+                best = None
+                for getter_name in ("get_skill_index", "get_skill_hint_index"):
+                    getter = getattr(self.tools, getter_name, None)
+                    if not callable(getter):
+                        continue
+                    try:
+                        found = getter().search(user_text, top_k=1)
+                    except Exception:
+                        found = []
+                    if not found:
+                        continue
+                    score = int(found[0].get("score") or 0)
+                    if score >= 2 and (best is None or score > int(best.get("score") or 0)):
+                        best = found[0]
+                if best is not None:
+                    name = str(best.get("name") or "")
+                    path = str(best.get("path") or "")
+                    desc = str(best.get("description") or "")[:200]
                     parts.append(
                         f"# Relevant skill: {name}\n"
                         f"技能库中有匹配技能（path: {path}）：{desc}\n"
