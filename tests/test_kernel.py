@@ -237,6 +237,46 @@ def test_kernel_caps_rag_search_per_run(cfg):
     assert capped, "上限反馈必须回灌给模型"
 
 
+def test_kernel_plan_drives_actual_tool_execution(cfg):
+    """计划创建后必须真正执行工具并收尾，防「只规划不执行 / 到点放弃」。"""
+    with open(os.path.join(cfg.workspace, "a.txt"), "w", encoding="utf-8") as f:
+        f.write("hello-plan")
+
+    def call(name, **args):
+        return [{"id": f"c-{name}-{len(args)}", "function": {
+            "name": name, "arguments": json.dumps(args, ensure_ascii=False)}}]
+
+    mock = MockLLM([
+        [_evt("done", tool_calls=call(
+            "update_plan", op="create", goal="读取并汇总",
+            steps=[{"title": "读取文件"}, {"title": "汇总内容"}],
+        ), usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=call(
+            "file_tools", op="read", path="a.txt",
+        ), usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=(
+            call("update_plan", op="patch", step_id="1", status="done",
+                 note="读完") +
+            call("update_plan", op="patch", step_id="2", status="done",
+                 note="汇总完")
+        ), usage={"total_tokens": 1})],
+        [_evt("content", "文件内容是 hello-plan"),
+         _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent._auto_continue = False
+    agent._distill_min_turns = 999
+
+    result = agent.kernel.run("读取并汇总 a.txt")
+
+    assert result.reason is ExitReason.DONE
+    assert "hello-plan" in result.text
+    assert agent.session.get_plan() is None, "全部步骤完成后计划应自动关闭"
+    # 第三轮 prompt 里必须能看到文件读取的真实结果（工具结果已回灌）
+    third = "\n".join(str(m.get("content", "")) for m in mock.calls[2]["messages"])
+    assert "hello-plan" in third, "工具结果必须进入后续轮次，不能空转"
+
+
 def test_kernel_same_tool_varied_fail_fuse(cfg):
     """同一工具连败（参数各异）达阈值 → 熔断收尾。
 

@@ -87,7 +87,7 @@ _MIN_SINGLE_GEN_TOKENS = 8192
 # 下发前缀从 ~6200 token 降到 ~4100（实测 schema 全量 3984 / system 2238）。
 # 注意：不放进 update_plan——简单任务本就被规划门豁免，给了反而诱导建计划。
 _LITE_TOOL_NAMES = frozenset({
-    "file_tools", "code_run", "shell_run", "web_scan",
+    "file_tools", "code_run", "shell_run", "web_scan", "search_tool",
     "ask_user", "rag_tools", "long_memory",
 })
 # 输入含 URL/域名/明确点名工具时**强制全量工具组**：这类输入是用户在指挥
@@ -97,7 +97,7 @@ _LITE_TOOL_NAMES = frozenset({
 # 空白、任务不执行——正是用户报告的「计划不执行」。
 _NEEDS_FULL_TOOLS_RE = re.compile(
     r"(https?://|\b[a-z0-9-]+\.(?:com|cn|net|org|io|dev|app|xyz)\b|"
-    r"web_scan|code_run|shell_run|file_tools|rag_tools|long_memory|"
+    r"web_scan|search_tool|code_run|shell_run|file_tools|rag_tools|long_memory|"
     r"skill_tools)", re.I)
 
 # 寒暄 / 自我认知（能力、功能、身份）类问答：答案就在系统提示里，不需要

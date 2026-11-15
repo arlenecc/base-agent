@@ -44,7 +44,8 @@
 
 - **多模型兼容** — 支持所有 OpenAI 兼容 API（OpenAI / DeepSeek / Qwen / 本地 vLLM 等）
 - **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计（仅计输出 token，不含 prompt）；结构化 read 超时（流式 chunk 间隔上限 60s），本地模型生成中途卡住时自动报错而非永久卡死
-- **工具调用** — 内置 12 个工具（`file_tools` / `long_memory` / `skill_tools` / `rag_tools` 四个门面 + `code_run` / `shell_run` / `web_scan` / `ask_user` / `schedule_tools` / `update_working_checkpoint` / `start_long_term_update` / `update_plan`）；旧原子工具名（`file_read` / `rag_search` / `memory_search` / `skill_load` 等）保留兼容别名但不进 schema，支持模型自主决策和工具链式调用
+- **工具调用** — 内置 13 个工具（`file_tools` / `long_memory` / `skill_tools` / `rag_tools` 四个门面 + `code_run` / `shell_run` / `web_scan` / `search_tool` / `ask_user` / `schedule_tools` / `update_working_checkpoint` / `start_long_term_update` / `update_plan`）；旧原子工具名（`file_read` / `rag_search` / `memory_search` / `skill_load` 等）保留兼容别名但不进 schema，支持模型自主决策和工具链式调用
+- **联网搜索** — `search_tool`（别名 `web_search`）并发聚合 9 个主引擎 + 50 个实测可达的备用源；随机桌面 UA、逐引擎适配请求与解析，统一去重、广告/导航过滤、相关性校验与加权排序；主引擎不可用时自动回退，支持 `backup` / `all` 预设，本地知识库缺失信息时可主动补缺
 - **内核控制流** — 三态自动机（THINK / ACT / CONSOLIDATE）+ 五级信息压缩，上下文硬性控制在 30k 以内
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过本地 embedding 模型（默认 `jina-embeddings-v5`）+ LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，重排序精准召回；可选**两段式检索**（二值量化粗筛：查询向量 sign 二值化 + 位打包后 XOR+Popcount 汉明距离全表极速粗筛 top 200 → 候选集内余弦 + BM25 精筛 → reranker 深度打分，大向量库下显著更快）
@@ -241,7 +242,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 
 ## 内置工具
 
-工具已收敛为 **4 个门面工具 + 8 个独立工具**（共 12 个），旧原子工具名保留为兼容别名（`_legacy`，不进 schema，模型只看到合并后的名字）。
+工具已收敛为 **4 个门面工具 + 9 个独立工具**（共 13 个），旧原子工具名保留为兼容别名（`_legacy`，不进 schema，模型只看到合并后的名字）。
 
 | 工具 | 形态 | 功能 | 需确认 |
 |------|------|------|--------|
@@ -252,6 +253,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 | `code_run` | 独立 | 执行 Python 代码（能力核心，可编程覆盖任意操作） | 风险分级 |
 | `shell_run` | 独立 | 执行 Shell 命令（独立进程组，超时/终止 killpg） | 风险分级 |
 | `web_scan` | 独立 | 抓取网页内容；`render=true` 走浏览器渲染 | 否 |
+| `search_tool` | 独立 | 多引擎并发聚合搜索（别名 `web_search`）：9 个主引擎（Google / Bing / DuckDuckGo / Brave / Yahoo / Mojeek / Baidu / Sogou / 360）+ **50 个实测可达的备用源**（通用/新闻/百科/学术/代码/媒体，按响应延迟排序）；随机 UA、逐引擎适配、统一去重/过滤/相关性校验/加权排序、风控冷却；`engines="backup"` / `"all"` 预设，主引擎全冷却或结果过少时自动补跑备用源 | 否 |
 | `ask_user` | 独立 | 向用户提问（中断自动机） | 否 |
 | `schedule_tools` | 独立 | 定时任务：`create` / `list` / `delete` / `run_now` / `pause` / `resume` | 否 |
 | `update_working_checkpoint` | 独立 | 短期工作记忆（每轮自动回注） | 否 |
@@ -259,6 +261,20 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 | `update_plan` | 独立 | 任务计划（目标 + 步骤，驱动右栏计划面板） | 否 |
 
 兼容别名（仅 `execute`/`get` 可命中，不出现在模型 schema）：`file_read` / `file_write` / `file_append` / `file_modify` / `file_patch` / `file_list` / `file_delete` / `file_move` / `file_copy` / `file_search` / `memory_graph` / `memory_search` / `skill_search` / `skill_load` / `skill_semantic_search` / `skill_save` / `rag_search` / `rag_outline` / `rag_status` / `rag_ingest`。
+
+`search_tool` 的引擎可用性取决于出口 IP 与目标站风控：Bing / DuckDuckGo / Yahoo / Sogou / 360 通常可直接使用；Google、Brave、Mojeek 可能返回 403 / 429 / 验证码。失败引擎会在结果头部如实标注（如 `failed: google(HTTP 403)`），不会影响其余引擎的结果；配置 `web_proxy` 可改善可达性。
+
+**备用源（50 个，实测可达；代码中按响应延迟排序，下面按类别展示）**
+
+- 通用/新闻：`so_news`、`rightdao`、`yahoo_news`、`google_news_rss`、`aljazeera`、`bing_news_rss`、`wiby`、`mwmbl`、`bing_news`、`daum`、`seznam`、`bbc`、`marginalia`、`netease`、`toutiao`、`cn_bing`
+- 百科/参考：`wikipedia_rest`、`wikibooks`、`wikiquote`、`wiktionary`、`wikivoyage`、`wikipedia_ru`、`wikipedia_zh`、`wikipedia_ja`、`wikipedia_fr`、`wikipedia_es`、`wikipedia_de`、`wikipedia_en`、`wikidata`、`openlibrary`、`archive_org`
+- 学术：`doaj`、`crossref`、`europepmc`、`openalex`、`semantic_scholar`、`arxiv`、`datacite`、`openaire`、`zenodo`（Europe PMC 已覆盖 PubMed 索引）
+- 代码/包：`hn_algolia`、`stackexchange`、`github`、`gitlab`、`npm`、`crates`、`packagist`、`dockerhub`
+- 媒体：`dailymotion`、`bilibili`
+
+用法：`engines=["backup"]` 跑最快的通用/新闻备用源；`engines=["all"]` 跑主引擎 + 备用源；也可按名字指定单个源（支持 `wikipedia` / `wiki` / `hn` / `stackoverflow` / `google_news` 等别名）。主引擎全部冷却或合并结果少于 3 条时，自动补跑最快的 4 个通用备用源。
+
+系统提示要求：本地知识库/记忆/工作区都没有任务所需信息时**主动**调用 `search_tool`（别名 `web_search`）补缺；`web_scan(url=...)` 的 URL 必须从搜索结果返回的真实链接中挑选，禁止编造或拼接。
 
 ### 能力进化闭环
 
@@ -780,6 +796,7 @@ src/agent/
 │   ├── shell_run.py      # Shell 执行
 │   ├── code_run.py       # Python 代码执行（协作式取消 + 泄漏线程追踪）
 │   ├── web.py            # web_scan（含 browser render）
+│   ├── search.py         # search_tool（多引擎并发聚合：适配/去重/过滤/排序）
 │   ├── interact.py       # ask_user
 │   ├── memory.py         # long_memory 门面（graph/search）+ WorkMemory 内部存储
 │   ├── skill_search.py   # skill_tools 门面（search/load/semantic_search/save）
@@ -808,16 +825,16 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 `tests/test_kernel.py` 覆盖内核专项：三态转移表、L0–L4 五级压缩原语、Session 折叠与
 「无悬挂 tool 消息」不变量、30k 预算配额、**长任务下 prompt 峰值不越过 30k**、
-12 个内置工具（门面 + 独立）的注册、`AliasTool` 委派、`update_working_checkpoint` /
+13 个内置工具（门面 + 独立）的注册、`AliasTool` 委派、`update_working_checkpoint` /
 `start_long_term_update` / `skill_save` 的行为与路径穿越防护。
 
-近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**、**`_JsonStore.reload` 不再丢弃防抖窗口内的写入**、**manifest 并发合并与有意删除**、**LPT 分片不产生空片**、**OCR 路由的 CoreML 门控与暗色页反色**。
+近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、**`search_tool` 九主引擎 + 50 备用源的解析/去重/过滤/排序/冷却/自动回退**、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**、**`_JsonStore.reload` 不再丢弃防抖窗口内的写入**、**manifest 并发合并与有意删除**、**LPT 分片不产生空片**、**OCR 路由的 CoreML 门控与暗色页反色**。
 
 内核专项回归：`max_turns` 是「每次 run()」而非会话累计、reask 不掉最终轮、周期性 CONSOLIDATE 真的折叠、旧轮折叠后无悬挂 `tool` 消息、长任务 prompt 峰值不越过 30k。工具/RAG 专项：`skill_save` 后索引被标脏并能召回、`code_run` 超时关闭缓冲区、删除的知识库文件不再被 Step 7 复活、mtime 被保留的内容变更能被重新同步。
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 停牌后快速失败、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启重建干净 session 等。
 
-当前共收集 1263 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
+当前共收集 1304 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 

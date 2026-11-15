@@ -355,6 +355,7 @@ class ToolRegistry:
         from .code_run import CodeRunTool
         from .shell_run import ShellRunTool
         from .web import WebScanTool
+        from .search import SearchTool
         from .interact import AskUserTool
         from .memory import LongMemoryTool
         from .skill_search import SkillToolsTool
@@ -369,7 +370,9 @@ class ToolRegistry:
             SkillToolsTool(),         # search/load/semantic_search/save
             CodeRunTool(),
             ShellRunTool(),
-            WebScanTool(),            # 唯一 web 工具（含 render=true 浏览器渲染）
+            WebScanTool(),            # 唯一 web 抓取工具（含 render=true 浏览器渲染）
+            # 多引擎并发聚合搜索：模型没有 URL、需要最新/多来源信息时用
+            SearchTool(),
             AskUserTool(),
             # 定时任务：对话直接创建/管理 cron/interval/一次性任务
             ScheduleTool(),
@@ -383,6 +386,16 @@ class ToolRegistry:
         for t in tools_to_register:
             t.bind(self.config, self)
             self._tools[t.name] = t
+
+        # web_search 是 search_tool 的兼容别名：系统提示与用户口语常用这个名字。
+        # 与其它兼容别名一样不进 schemas()/names()，模型只看到一个搜索工具，
+        # 但历史会话/技能里写成 web_search 的调用仍能命中。
+        if "search_tool" in self._tools:
+            web_search = AliasTool("search_tool", "web_search",
+                                   "Alias for search_tool (web search).")
+            web_search._legacy = True  # type: ignore[attr-defined]
+            web_search.bind(self.config, self)
+            self._tools["web_search"] = web_search
 
         # Register RAG tools（rag_tools 在这里注册，别名要等它就绪）
         self._register_rag_tools()
