@@ -622,8 +622,8 @@ RAG 知识库和知识图谱记忆共用同一份 embedding 模型实例（进�
   ├─ SkillManager.match() 命中扁平技能 → prompt 注入系统提示
   │   （目录技能注册的扁平记录引导 agent 调用 skill_tools(op="load") 加载全文）
   └─ 复杂任务 → agent 主动调用 skill_tools(op="semantic_search", query=...) 混合检索
-                │  向量检索（description 0.6 + examples 0.4 融合，取 3 候选）
-                │  + BM25 全文检索（取 3 候选）→ 去重 → 剔除相似度 < 0.5
+                │  向量检索（name+tags+description 与 examples 两路取 max，取 3 候选）
+                │  + BM25 全文检索（取 3 候选）→ 去重 → 剔除相似度 < 0.28
                 │  返回候选的 name+tags+description，由 agent 判断选用
                 └─ skill_tools(op="load", dir=...) 读取 SKILL.md 全文（或 references/ 支持文件）并遵循
 ```
@@ -632,7 +632,7 @@ RAG 知识库和知识图谱记忆共用同一份 embedding 模型实例（进�
 
 - **按需加载**：技能全文不进系统提示词，仅在需要时通过 `skill_tools(op="load")` 读入，避免技能增多导致 prompt 膨胀
 - **索引防抖**：扫描器在目录 mtime 变化或 300s 间隔后重建，LanceDB 表懒构建
-- **混合检索**：向量相似度（description/examples 0.6:0.4 加权融合）+ BM25 关键词双通道，统一用余弦相似度排序，阈值 0.5 过滤
+- **混合检索**：向量相似度（name+tags+description 与 examples 两路取较大值）+ BM25 关键词双通道，统一用余弦相似度排序，阈值 0.28 过滤（按默认多语言本地模型标定，无关查询通常 ≤0.15）
 - **小批次索引（防内存爆炸）**：`build()` 以 `batch_size=8` 分批 embed + 写入，每批处理 8 个 skill 后立即释放；description/examples/combined 文本分别截断至 2000/3000/6000 字符。实测 2757 个 skill 全量索引：峰值 RSS 4.19 GB（此前一次性处理全部文本时达 65 GB 导致系统卡死），耗时 12.4 分钟
 - **路径安全**：`skill_tools(op="load")` 对 `path` / `entry` 做 realpath 前缀检查，拒绝 `..` 等路径穿越
 - **创建技能**：`SkillManager.create_dir_skill(name, keywords, prompt, ...)` 自动生成目录结构并注册扁平记录
@@ -812,7 +812,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 停牌后快速失败、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启重建干净 session 等。
 
-当前共收集 1234 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
+当前共收集 1236 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 

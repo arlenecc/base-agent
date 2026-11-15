@@ -11,6 +11,7 @@ from agent.skill_retriever import (
     SkillVectorStore,
     SkillRetriever,
     parse_skill_md,
+    _MIN_SIMILARITY,
     _parse_list_field,
     _normalize_vec,
 )
@@ -171,11 +172,11 @@ def test_retriever_hybrid_dedup_and_threshold(tmp_path):
         embedding_function=FakeEF(),
     )
     result = retriever.retrieve("organize my invoices and receipts", llm=None)
-    # 候选应去重（无重复 dir）且 score >= 0.5
+    # 候选应去重（无重复 dir）且 score >= 阈值
     dirs = [c["dir"] for c in result["candidates"]]
     assert len(dirs) == len(set(dirs))
     for c in result["candidates"]:
-        assert c["score"] >= 0.5
+        assert c["score"] >= _MIN_SIMILARITY
     retriever.close()
 
 

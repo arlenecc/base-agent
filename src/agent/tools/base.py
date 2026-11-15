@@ -645,6 +645,16 @@ class ToolRegistry:
         """Return the RAG engine instance, or None if not configured."""
         return self._rag_engine
 
+    def get_skill_index(self):
+        """Return the cached keyword SkillIndex (directory skills).
+
+        与 ``get_skill_retriever``（语义检索）分开：这里只做关键词匹配，
+        不加载 embedding 模型，适合每轮对话前做「是否有匹配技能」的轻量判断。
+        """
+        from .skill_search import _get_skill_index
+
+        return _get_skill_index(self.config, self)
+
     def get_skill_retriever(self):
         """Return the shared SkillRetriever (hybrid skill search), lazily built.
 

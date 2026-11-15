@@ -31,6 +31,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .atomic_io import atomic_write_json, backup_corrupt
+from .skills import _keywords_of
 
 logger = logging.getLogger(__name__)
 
@@ -338,13 +339,21 @@ class SkillIndex:
             score += len(query_tokens & name_tokens) * 3
             # Match against keywords
             raw_kw = skill.get("keywords", [])
-            kw_tokens = {k for k in raw_kw if isinstance(k, str)} \
-                if isinstance(raw_kw, list) else set()
+            kw_tokens = set()
+            if isinstance(raw_kw, list):
+                for k in raw_kw:
+                    if isinstance(k, str):
+                        # 关键词也要分词：中文关键词「知识库」与查询
+                        # 「知识库检索」在 bigram 层匹配，不能整串比较。
+                        kw_tokens.update(_tokenize(k))
             score += len(query_tokens & kw_tokens) * 2
             # Match against tags
             raw_tags = skill.get("tags", [])
-            tag_tokens = {t.lower() for t in raw_tags if isinstance(t, str)} \
-                if isinstance(raw_tags, list) else set()
+            tag_tokens = set()
+            if isinstance(raw_tags, list):
+                for t in raw_tags:
+                    if isinstance(t, str):
+                        tag_tokens.update(_tokenize(t))
             score += len(query_tokens & tag_tokens) * 2
             # Match against description (substring)
             desc = skill.get("description", "")
@@ -358,7 +367,9 @@ class SkillIndex:
         # 次级排序键（name）：同分时仅按 score 排序的结果取决于 os.scandir
         # 的任意顺序，两次查询可能返回不同顺序，模型侧表现为「结果不稳定」。
         scored.sort(key=lambda x: (-x[0], str(x[1].get("name", ""))))
-        return [s for _, s in scored[:top_k]]
+        # 带 score 返回：调用方（Agent 的每轮技能提示）需要按阈值过滤，
+        # 避免一个弱 bigram 命中就把不相关技能塞进上下文。
+        return [{**s, "score": sc} for sc, s in scored[:top_k]]
 
     def _resolve_within(self, *parts: str) -> Optional[str]:
         """Resolve parts under the skills dir, rejecting path traversal.
@@ -417,10 +428,11 @@ class SkillIndex:
 # Tokenizer (shared with skills.py)
 # ---------------------------------------------------------------------------
 
-import re
-
-_TOKEN_RE = re.compile(r"\w+")
-
-
 def _tokenize(text: str) -> List[str]:
-    return _TOKEN_RE.findall(text)
+    """CJK-aware tokenizer.
+
+    复用 ``skills._keywords_of``：``\\w+`` 对连续中文只能得到一个整串 token，
+    「知识库检索」无法命中关键词「知识库」/「检索」；该实现额外产出 CJK
+    bigram，中文技能检索才真正可用。
+    """
+    return _keywords_of(text)

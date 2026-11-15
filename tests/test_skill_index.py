@@ -127,6 +127,22 @@ def test_search_ranks_by_relevance(tmp_path):
     assert idx.search("") == []
 
 
+def test_search_chinese_phrase_matches_keywords(tmp_path):
+    """中文查询必须按 CJK bigram 命中关键词，不能把整句当一个 token。"""
+    skills_dir = tmp_path / "skills"
+    _make_skill(skills_dir, "kb", "知识库检索",
+                description="从知识库检索书籍内容并总结",
+                keywords=["知识库", "检索", "书籍"])
+    _make_skill(skills_dir, "web", "网页抓取",
+                description="抓取网页", keywords=["网页", "抓取"])
+
+    idx = SkillIndex(str(skills_dir))
+    for query in ("知识库检索", "检索书籍内容", "知识库"):
+        results = idx.search(query)
+        assert results and results[0]["path"] == "kb", query
+    assert idx.search("无关的天气查询") == []
+
+
 def test_read_skill_content(tmp_path):
     skills_dir = tmp_path / "skills"
     _make_skill(skills_dir, "pdf", "PDF", prompt="# PDF skill\nDo the thing.")
@@ -201,6 +217,41 @@ def test_create_dir_skill_index_integration(tmp_path):
     idx = SkillIndex(skills_dir)
     results = idx.search("report")
     assert results and results[0]["name"] == "Report Gen"
+
+
+def test_volatile_context_hints_directory_skill(tmp_path):
+    """目录技能不在 skills.json 时，Agent 也要给出 load 提示。"""
+    from agent.agent import Agent
+
+    skills_dir = os.path.join(str(tmp_path), ".agent", "skills")
+    _make_skill(skills_dir, "kb", "知识库检索",
+                description="从知识库检索书籍内容并总结",
+                keywords=["知识库", "检索", "书籍"])
+    cfg = AgentConfig(workspace=str(tmp_path))
+    cfg.ensure_workspace()
+    idx = SkillIndex(skills_dir)
+    sm = SkillManager(path=os.path.join(str(tmp_path), ".agent", "skills.json"),
+                      skills_dir=skills_dir)
+
+    class _Tools:
+        def get_rag_engine(self):
+            return None
+
+        def get_skill_index(self):
+            return idx
+
+    agent = Agent.__new__(Agent)
+    agent.config = cfg
+    agent.skills = sm
+    agent.tools = _Tools()
+
+    agent._last_user_text = "帮我从知识库里检索这本书的内容并总结"
+    text = agent.volatile_context()
+    assert "# Relevant skill: 知识库检索" in text
+    assert 'skill_tools(op="load"' in text
+
+    agent._last_user_text = "今天天气怎么样"
+    assert "# Relevant skill" not in agent.volatile_context()
 
 
 # ---------------------------------------------------------------------------

@@ -1851,6 +1851,26 @@ class Agent:
                     sp = (sp[:_MAX_SKILL_PROMPT_CHARS] +
                           "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）")
                 parts.append(f"# Active skill: {matched.name}\n{sp}")
+            elif user_text and self.tools is not None:
+                # 扁平 skills.json 只覆盖历史技能；当前主流是 .agent/skills
+                # 目录技能（skill_save / create_dir_skill 产出）。这里用关键词
+                # 索引做一次轻量兜底匹配，给模型一个明确的 load 入口，避免
+                # 「有匹配技能但模型没主动检索」。
+                try:
+                    hits = self.tools.get_skill_index().search(user_text, top_k=1)
+                except Exception:
+                    hits = []
+                if hits and int(hits[0].get("score") or 0) >= 2:
+                    h = hits[0]
+                    name = str(h.get("name") or "")
+                    path = str(h.get("path") or "")
+                    desc = str(h.get("description") or "")[:200]
+                    parts.append(
+                        f"# Relevant skill: {name}\n"
+                        f"技能库中有匹配技能（path: {path}）：{desc}\n"
+                        f"若与当前任务相关，先调用 skill_tools(op=\"load\", "
+                        f"path=\"{path}\") 读取完整指令，再按指令执行。"
+                    )
         except Exception:  # pragma: no cover
             pass
         return "\n\n".join(parts)

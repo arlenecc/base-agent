@@ -6,13 +6,13 @@ sections (``When to Use This Skill``, ``When NOT to Use``, examples), then
 builds a dedicated LanceDB table for retrieval.
 
 Retrieval combines:
-  * vector search over the ``description`` embedding and the ``examples``
-    embedding, fused 0.6 : 0.4;
+  * vector search over the ``name + tags + description`` embedding and the
+    ``examples`` embedding, fused with ``max`` (either channel is evidence);
   * BM25 full-text search over a combined ``name + tags + description +
     examples`` text column.
 
 The union of vector candidates (3) and BM25 candidates (3) is de-duplicated,
-filtered by a minimum similarity of 0.5, then the remaining candidates'
+filtered by a minimum similarity, then the remaining candidates'
 ``name + tags + description`` are handed to the LLM for a final pick.
 
 This module is independent of the RAG ``VectorStore`` (which stores document
@@ -38,11 +38,20 @@ logger = logging.getLogger(__name__)
 _SKILL_FILENAME = "SKILL.md"
 _SKILL_TABLE_NAME = "skills"
 
-# Similarity fusion weights for description vs examples embeddings.
-_DESC_WEIGHT = 0.6
-_EXAMPLES_WEIGHT = 0.4
+# Similarity fusion between description and examples embeddings is ``max``:
+# 两路各自都是「这个技能相关」的独立证据，取较大值即可。旧实现用 0.6:0.4
+# 加权平均，examples 通道一旦偏题（技能没有 Examples 章节、回退成描述本身
+# 或泛化文本），就会把本来命中的描述相似度整体拉低——中文查询下大量合法
+# 技能因此跌破阈值，检索返回「找不到匹配的技能」。
 # Minimum similarity for a candidate to survive filtering.
-_MIN_SIMILARITY = 0.5
+# 0.28 是按默认多语言本地模型（jina-v5-nano）标定的：中文短查询对英文技能
+# 描述的余弦普遍落在 0.28~0.6（「做一份…PPT」对 pptx 为 0.296），而完全
+# 无关的查询（天气/订票/算术）最高仅 ~0.15。阈值仍高于噪声上限，同时不再
+# 误杀合法候选；BM25 命中的候选不受此阈值影响（见 retrieve）。
+_MIN_SIMILARITY = 0.28
+# Index layout version. 索引文本/融合方式变化时递增，让 fingerprint 失配，
+# 下次 ensure_indexed() 自动重建存量向量（否则旧向量会一直参与检索）。
+_INDEX_VERSION = 2
 # Number of candidates from each channel (vector / BM25).
 _VECTOR_TOP_K = 3
 _BM25_TOP_K = 3
@@ -261,6 +270,16 @@ class SkillMetadata:
         return f"name: {self.name}\ntags: {tag_str}\ndescription: {self.description}".strip()
 
 
+def _embed_text_of(s: "SkillMetadata") -> str:
+    """Indexed text for the description vector: name + tags + description."""
+    parts = [s.name]
+    if s.tags:
+        parts.append(" ".join(s.tags))
+    if s.description:
+        parts.append(s.description)
+    return ". ".join(parts)
+
+
 def parse_skill_md(text: str, dir: str) -> Optional[SkillMetadata]:
     """Parse a SKILL.md file's text into a :class:`SkillMetadata`.
 
@@ -282,8 +301,11 @@ def parse_skill_md(text: str, dir: str) -> Optional[SkillMetadata]:
     examples = _extract_section(text, _EXAMPLES_HEADINGS)
 
     # Content fingerprint for incremental sync (dir unchanged but content edited).
+    # 混入索引版本：索引文本或融合方式升级后，即使 SKILL.md 没变也要更新向量。
     import hashlib
-    fingerprint = hashlib.md5(text.encode("utf-8")).hexdigest()
+    fingerprint = hashlib.md5(
+        (f"v{_INDEX_VERSION}\n" + text).encode("utf-8")
+    ).hexdigest()
 
     return SkillMetadata(
         name=name,
@@ -618,8 +640,11 @@ class SkillVectorStore:
         """Embed one batch of skills and build their table rows."""
         from .rag.vector_store import _tokenize_for_fts
 
-        # 截断后再 embedding，避免超长 SKILL.md 导致内存/耗时爆炸。
-        descriptions = [_truncate(s.description or s.name, _MAX_DESC_CHARS) for s in batch]
+        # 描述向量必须包含 name/tags：技能名就是最凝练的语义标签
+        # （test-driven-development / brand-guidelines / pptx）。只嵌入
+        # description 时，中文查询与「名字即关键词」的英文技能对不上，
+        # 例如「用测试驱动开发…」无法召回 test-driven-development。
+        descriptions = [_truncate(_embed_text_of(s), _MAX_DESC_CHARS) for s in batch]
         examples = [
             _truncate(s.examples or s.when_to_use or s.description or s.name, _MAX_EXAMPLES_CHARS)
             for s in batch
@@ -792,7 +817,9 @@ class SkillVectorStore:
             logger.warning("skill_retriever: examples vector search failed: %s", e)
             ex_res = []
 
-        # Fuse the two vector results by skill dir, weighting 0.6:0.4.
+        # Fuse the two vector results by skill dir: either channel matching is
+        # evidence, so take the higher score (weighted average let an off-topic
+        # examples channel drag valid description hits below the threshold).
         fused: Dict[str, Dict[str, Any]] = {}
         for r in desc_res:
             d = r.get("dir", "")
@@ -805,9 +832,7 @@ class SkillVectorStore:
                 continue
             ex_score = self._distance_to_similarity(r.get("_distance"))
             if d in fused:
-                # Both channels hit the same skill: weighted fusion.
-                desc_score = fused[d]["score"]
-                fused[d]["score"] = _DESC_WEIGHT * desc_score + _EXAMPLES_WEIGHT * ex_score
+                fused[d]["score"] = max(fused[d]["score"], ex_score)
             else:
                 entry = self._row_to_dict(r)
                 entry["score"] = ex_score
@@ -965,12 +990,13 @@ class SkillRetriever:
 
         Fusion semantics:
           * Vector results carry a cosine-similarity ``score`` in [0,1] (the
-            description/examples channels already fused 0.6:0.4).
+            description/examples channels are fused with ``max``).
           * BM25 results carry a raw ``bm25_score``; for a unified, comparable
             ranking we also attach a cosine similarity as ``score`` (reused from
             the vector channel when the same skill matched there, otherwise
             looked up on demand).
-          * De-duplicated by ``dir``; candidates with ``score < 0.5`` dropped.
+          * De-duplicated by ``dir``; candidates with
+            ``score < _MIN_SIMILARITY`` dropped (BM25 hits are kept).
         """
         self.ensure_indexed()
 
