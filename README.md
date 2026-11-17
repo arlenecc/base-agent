@@ -44,8 +44,10 @@
 
 - **多模型兼容** — 支持所有 OpenAI 兼容 API（OpenAI / DeepSeek / Qwen / 本地 vLLM 等）
 - **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计（仅计输出 token，不含 prompt）；结构化 read 超时（流式 chunk 间隔上限 60s），本地模型生成中途卡住时自动报错而非永久卡死
-- **工具调用** — 内置 13 个工具（`file_tools` / `long_memory` / `skill_tools` / `rag_tools` 四个门面 + `code_run` / `shell_run` / `web_scan` / `search_tool` / `ask_user` / `schedule_tools` / `update_working_checkpoint` / `start_long_term_update` / `update_plan`）；旧原子工具名（`file_read` / `rag_search` / `memory_search` / `skill_load` 等）保留兼容别名但不进 schema，支持模型自主决策和工具链式调用
+- **工具调用** — 内置 14 个工具（`file_tools` / `long_memory` / `skill_tools` / `rag_tools` 四个门面 + `code_run` / `shell_run` / `web_scan` / `search_tool` / `doc_search_tool` / `ask_user` / `schedule_tools` / `update_working_checkpoint` / `start_long_term_update` / `update_plan`）；旧原子工具名（`file_read` / `rag_search` / `memory_search` / `skill_load` 等）保留兼容别名但不进 schema，支持模型自主决策和工具链式调用
 - **联网搜索** — `search_tool`（别名 `web_search`）并发聚合 9 个主引擎 + 50 个实测可达的备用源；随机桌面 UA、逐引擎适配请求与解析，统一去重、广告/导航过滤、相关性校验与加权排序；主引擎不可用时自动回退，支持 `backup` / `all` 预设，本地知识库缺失信息时可主动补缺
+- **长文档问句检索** — `doc_search_tool` 面向用户自己的 Markdown/TXT 长文档：标题优先语义切片（7500–8000 字、1% overlap、语义低谷自适应阈值）+ ColBERT 词向量残差量化（2/4bit）写入 LanceDB 三表；问句用 BM25 + 中心向量 RRF 粗筛 20 条，再流式反量化 + MaxSim 精排返回 topN，不必把整本书塞进上下文
+- **检索阅读模式** — 配置窗口「高级配置 → 检索阅读模式」：文档解析为 Markdown 后，由 ColBERT 三表旁路接管切片 / 词向量 / 入库 / 召回 / MaxSim 精排；可配 2/4bit 残差、粗筛 10/20/50/100、精选 topN 1/3/5、ANN 索引；召回切片只作为回复末尾气泡展示，不进入模型上下文；模型缺失自动从 hf-mirror.com 下载
 - **内核控制流** — 三态自动机（THINK / ACT / CONSOLIDATE）+ 五级信息压缩，上下文硬性控制在 30k 以内
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过本地 embedding 模型（默认 `jina-embeddings-v5`）+ LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，重排序精准召回；可选**两段式检索**（二值量化粗筛：查询向量 sign 二值化 + 位打包后 XOR+Popcount 汉明距离全表极速粗筛 top 200 → 候选集内余弦 + BM25 精筛 → reranker 深度打分，大向量库下显著更快）
@@ -242,7 +244,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 
 ## 内置工具
 
-工具已收敛为 **4 个门面工具 + 9 个独立工具**（共 13 个），旧原子工具名保留为兼容别名（`_legacy`，不进 schema，模型只看到合并后的名字）。
+工具已收敛为 **4 个门面工具 + 10 个独立工具**（共 14 个），旧原子工具名保留为兼容别名（`_legacy`，不进 schema，模型只看到合并后的名字）。
 
 | 工具 | 形态 | 功能 | 需确认 |
 |------|------|------|--------|
@@ -254,6 +256,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 | `shell_run` | 独立 | 执行 Shell 命令（独立进程组，超时/终止 killpg） | 风险分级 |
 | `web_scan` | 独立 | 抓取网页内容；`render=true` 走浏览器渲染 | 否 |
 | `search_tool` | 独立 | 多引擎并发聚合搜索（别名 `web_search`）：9 个主引擎（Google / Bing / DuckDuckGo / Brave / Yahoo / Mojeek / Baidu / Sogou / 360）+ **50 个实测可达的备用源**（通用/新闻/百科/学术/代码/媒体，按响应延迟排序）；随机 UA、逐引擎适配、统一去重/过滤/相关性校验/加权排序、风控冷却；`engines="backup"` / `"all"` 预设，主引擎全冷却或结果过少时自动补跑备用源 | 否 |
+| `doc_search_tool` | 独立 | 用户长文档问句检索（Jina ColBERT v2 64 维 ONNX INT8 + LanceDB 三表）：`index` 标题优先语义切片 + Token 剪枝 + 残差量化入库，`search` BM25 + 中心向量 RRF 粗筛 20 → 流式反量化 + MaxSim 精排，另有 `list` / `delete` / `stats`；支持 `.md/.markdown/.txt/.rst` | `delete` 是 |
 | `ask_user` | 独立 | 向用户提问（中断自动机） | 否 |
 | `schedule_tools` | 独立 | 定时任务：`create` / `list` / `delete` / `run_now` / `pause` / `resume` | 否 |
 | `update_working_checkpoint` | 独立 | 短期工作记忆（每轮自动回注） | 否 |
@@ -275,6 +278,18 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 用法：`engines=["backup"]` 跑最快的通用/新闻备用源；`engines=["all"]` 跑主引擎 + 备用源；也可按名字指定单个源（支持 `wikipedia` / `wiki` / `hn` / `stackoverflow` / `google_news` 等别名）。主引擎全部冷却或合并结果少于 3 条时，自动补跑最快的 4 个通用备用源。
 
 系统提示要求：本地知识库/记忆/工作区都没有任务所需信息时**主动**调用 `search_tool`（别名 `web_search`）补缺；`web_scan(url=...)` 的 URL 必须从搜索结果返回的真实链接中挑选，禁止编造或拼接。
+
+**长文档检索（`doc_search_tool`）**
+
+- **入库**：`doc_search_tool(op="index", path="/path/to/book.md")`（也支持目录批量、或 `text` + `title` 直接传原文），索引默认落在 `<workspace>/.agent/colbert_docs.lancedb`。
+- **切片**：优先按标题结构分片；章节内过长时在相邻句相似度的语义低谷处切；阈值默认 0.55，按分布自适应（下限 0.15）；单片 7500–8000 字、1% overlap、断点必须是句末；表格/代码块不超长时整块保留；过小切片与同章节相邻片合并，结构/语义都失效才递归兜底。
+- **量化**：切片先做 Token 剪枝（去标点/空白/停用词/低信息词，保留名词、动词、专名、数词），再用 ColBERT 编码；长切片按 512 token 局部窗口编码，避免长上下文导致 MaxSim 退化。每个切片的 token 中心向量以 fp16 存 `doc_summary_vec`，残差按 `scale=2*maxAbs/(2^bits-1)`、`offset=-maxAbs` 量化后打包进 `doc_residuals.residual_blob`（4bit 两值/字节，2bit 四值/字节）。
+- **检索**：问句按 `[QueryMarker]`、文档按 `[DocumentMarker]` 编码；BM25 与中心向量各召回 20 条，用 RRF 融合粗筛；命中切片流式解压残差、反量化还原 token 向量，用 BLAS 矩阵乘做 MaxSim 精排，返回 topN（默认 5）。
+- 三张表：`document`（doc_id/title/content + 内部 `content_fts` / `source` / `chunk_index`）、`doc_summary_vec`（doc_id + float16 中心向量）、`doc_residuals`（doc_id/token_count/dim/quant_bits/scale/offset/residual_blob）。
+
+**主应用「检索阅读模式」**
+
+配置窗口「高级配置」下方新增「检索阅读模式」区域：启用后，知识库同步在文档解析为 Markdown 之后直接使用上述 ColBERT 链路，跳过原有 token 切片、embedding、普通向量库和 reranker；`rag_tools` 召回的长切片全部转为回复末尾的气泡，模型上下文只收到引导性说明。可配置残差位数（2/4bit）、粗筛候选（10/20/50/100）、精选 topN（1/3/5）、是否使用 ANN，以及模型目录 / 切片长度 / 最小切片 / 语义阈值；「构建/续建向量索引」会对中心向量表建立 LanceDB ANN 索引。模型目录留空时自动使用 `~/.base-agent/models/jina-colbert-v2-64-onnx-int8`，缺失则从 `hf-mirror.com` 下载 `arlenecc/jina-colbert-v2-64-onnx-int8`。
 
 ### 能力进化闭环
 
@@ -783,6 +798,9 @@ src/agent/
 │   ├── chunker.py           # Token 级别递归切片 + 分片回退链编排
 │   ├── hybrid_chunker.py    # Hybrid 分片（文档结构 + 语义分块）
 │   ├── semantic_chunker.py  # chonkie SemanticChunker 语义分片（复用共享 embedding 模型）
+│   ├── colbert_runtime.py   # Jina ColBERT v2 ONNX：query/doc 前缀编码 + MaxSim
+│   ├── doc_chunker.py       # 长文档标题优先语义切片 + Token 剪枝
+│   ├── colbert_store.py     # 三表 LanceDB + 残差量化/流式反量化 + RRF/MaxSim
 │   ├── vector_store.py      # LanceDB 向量存储 + 本地 jina 嵌入 + jina 重排序
 │   ├── kg/                  # 知识图谱：builder / extractor / storage / graph / resolver / retriever
 │   └── deps.py              # 依赖检查与自动安装
@@ -797,6 +815,7 @@ src/agent/
 │   ├── code_run.py       # Python 代码执行（协作式取消 + 泄漏线程追踪）
 │   ├── web.py            # web_scan（含 browser render）
 │   ├── search.py         # search_tool（多引擎并发聚合：适配/去重/过滤/排序）
+│   ├── doc_search.py     # doc_search_tool（长文档 ColBERT 索引/检索）
 │   ├── interact.py       # ask_user
 │   ├── memory.py         # long_memory 门面（graph/search）+ WorkMemory 内部存储
 │   ├── skill_search.py   # skill_tools 门面（search/load/semantic_search/save）
@@ -825,7 +844,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 `tests/test_kernel.py` 覆盖内核专项：三态转移表、L0–L4 五级压缩原语、Session 折叠与
 「无悬挂 tool 消息」不变量、30k 预算配额、**长任务下 prompt 峰值不越过 30k**、
-13 个内置工具（门面 + 独立）的注册、`AliasTool` 委派、`update_working_checkpoint` /
+14 个内置工具（门面 + 独立）的注册、`AliasTool` 委派、`update_working_checkpoint` /
 `start_long_term_update` / `skill_save` 的行为与路径穿越防护。
 
 近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、**`search_tool` 九主引擎 + 50 备用源的解析/去重/过滤/排序/冷却/自动回退**、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**、**`_JsonStore.reload` 不再丢弃防抖窗口内的写入**、**manifest 并发合并与有意删除**、**LPT 分片不产生空片**、**OCR 路由的 CoreML 门控与暗色页反色**。
@@ -834,7 +853,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 停牌后快速失败、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启重建干净 session 等。
 
-当前共收集 1304 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
+当前共收集 1322 个用例；部分需下载模型或可选依赖（如 `python-pptx`）的用例默认跳过或在缺失依赖时报环境错误，不影响其余测试。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 

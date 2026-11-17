@@ -88,7 +88,7 @@ _MIN_SINGLE_GEN_TOKENS = 8192
 # 注意：不放进 update_plan——简单任务本就被规划门豁免，给了反而诱导建计划。
 _LITE_TOOL_NAMES = frozenset({
     "file_tools", "code_run", "shell_run", "web_scan", "search_tool",
-    "ask_user", "rag_tools", "long_memory",
+    "doc_search_tool", "ask_user", "rag_tools", "long_memory",
 })
 # 输入含 URL/域名/明确点名工具时**强制全量工具组**：这类输入是用户在指挥
 # 具体的工具操作，几乎必然是多步（抓取 → 处理 → 输出），需要 update_plan
@@ -98,7 +98,7 @@ _LITE_TOOL_NAMES = frozenset({
 _NEEDS_FULL_TOOLS_RE = re.compile(
     r"(https?://|\b[a-z0-9-]+\.(?:com|cn|net|org|io|dev|app|xyz)\b|"
     r"web_scan|search_tool|code_run|shell_run|file_tools|rag_tools|long_memory|"
-    r"skill_tools)", re.I)
+    r"skill_tools|doc_search_tool|doc_search|长文档|整本书|ColBERT)", re.I)
 
 # 寒暄 / 自我认知（能力、功能、身份）类问答：答案就在系统提示里，不需要
 # 推理也不需要工具。但本地小模型会无视系统提示的软禁令：连发 rag_* 空转

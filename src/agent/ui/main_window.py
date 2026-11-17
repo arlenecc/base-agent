@@ -1138,6 +1138,25 @@ class SyncKnowledgeWorker(QThread):
                 # 窗口夹紧用实际生效的本地模型（local 模式取 local_embedding_model），
                 # 避免 rag_embedding_model 的遗留值（如 bge 目录名）把 800 夹成 510。
                 clamp_model=effective_embedding_model(self._config),
+                # 检索阅读模式：Markdown 之后全部交给 ColBERT 三表。
+                reading_mode=bool(getattr(
+                    self._config, "rag_reading_mode_enabled", False)),
+                reading_quant_bits=int(getattr(
+                    self._config, "rag_reading_quant_bits", 4) or 4),
+                reading_coarse_k=int(getattr(
+                    self._config, "rag_reading_coarse_k", 20) or 20),
+                reading_top_n=int(getattr(
+                    self._config, "rag_reading_top_n", 3) or 3),
+                reading_use_ann=bool(getattr(
+                    self._config, "rag_reading_use_ann", False)),
+                reading_model_dir=str(getattr(
+                    self._config, "rag_reading_model_dir", "") or ""),
+                reading_chunk_max=int(getattr(
+                    self._config, "rag_reading_chunk_max", 8000) or 8000),
+                reading_chunk_min=int(getattr(
+                    self._config, "rag_reading_chunk_min", 7500) or 7500),
+                reading_semantic_threshold=float(getattr(
+                    self._config, "rag_reading_semantic_threshold", 0.55)),
             )
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
@@ -1331,6 +1350,29 @@ class _HostedPanelDialog(QDialog):
                       geo.center().y() - self.height() // 2)
         except Exception:
             pass
+
+
+class ReadingIndexWorker(QThread):
+    """后台构建/续建 ColBERT 中心向量 ANN 索引（不加载 587MB 模型）。"""
+
+    done = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, workspace: str, model_dir: str = "",
+                 parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._workspace = workspace
+        self._model_dir = model_dir
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from ..rag.colbert_store import get_store_for_workspace
+            store = get_store_for_workspace(self._workspace,
+                                            model_dir=self._model_dir)
+            self.done.emit(store.build_ann_index(rebuild=True))
+        except Exception as e:
+            logger.error("ReadingIndexWorker failed: %s", e, exc_info=True)
+            self.failed.emit(f"{type(e).__name__}: {e}")
 
 
 class ConfigDialog(_HostedPanelDialog):
@@ -2667,6 +2709,120 @@ class MainWindow(QMainWindow):
         adv_lay.addLayout(kg_limits_row)
 
         lay.addWidget(adv_box)
+
+        # ==================================================================
+        # 区四：检索阅读模式（ColBERT 长文档旁路）
+        # ==================================================================
+        reading_box = QGroupBox("检索阅读模式（ColBERT 长文档旁路）")
+        rlay = QVBoxLayout(reading_box)
+        rlay.setContentsMargins(10, 8, 10, 8)
+        rlay.setSpacing(8)
+
+        # row1：启用 / 量化残差 / 粗筛候选 / 精选 topN / ANN / 构建索引
+        r = QHBoxLayout(); r.setSpacing(8)
+        self.reading_mode_chk = QCheckBox("启用检索阅读模式")
+        self.reading_mode_chk.setChecked(
+            bool(getattr(self.config, "rag_reading_mode_enabled", False)))
+        self.reading_mode_chk.setToolTip(
+            "开启后，知识库同步在文档解析为 Markdown 之后，跳过原有\n"
+            "「token 切片 → embedding → 向量库 → reranker」链路，改用\n"
+            "Jina ColBERT v2（64 维 INT8）残差量化写 LanceDB 三表。\n"
+            "召回切片体量大（7500~8000 字），不再进入模型上下文，只作为\n"
+            "回复末尾的可点击切片气泡展示。")
+        r.addWidget(self.reading_mode_chk)
+        r.addSpacing(10)
+        r.addWidget(QLabel("量化残差:"))
+        self.reading_quant_combo = _combo(["4bit", "2bit"])
+        self.reading_quant_combo.setToolTip(
+            "每个词向量相对中心向量的残差量化位数：\n"
+            "4bit：两值/字节，精度更高（默认）；\n"
+            "2bit：四值/字节，体积更小、精度略低。")
+        r.addWidget(self.reading_quant_combo)
+        r.addSpacing(8)
+        r.addWidget(QLabel("粗筛候选:"))
+        self.reading_coarse_combo = _combo(["10", "20", "50", "100"])
+        self.reading_coarse_combo.setToolTip(
+            "BM25 + 中心向量经 RRF 融合后进入 MaxSim 精排的候选数（默认 20）。")
+        r.addWidget(self.reading_coarse_combo)
+        r.addSpacing(8)
+        r.addWidget(QLabel("精选 topN:"))
+        self.reading_topn_combo = _combo(["1", "3", "5"])
+        self.reading_topn_combo.setToolTip(
+            "MaxSim 精排后返回、并以气泡展示的切片数（默认 3）。")
+        r.addWidget(self.reading_topn_combo)
+        r.addSpacing(10)
+        self.reading_ann_chk = QCheckBox("使用ANN")
+        self.reading_ann_chk.setChecked(
+            bool(getattr(self.config, "rag_reading_use_ann", False)))
+        self.reading_ann_chk.setToolTip(
+            "勾选：中心向量检索使用 LanceDB ANN 索引（需先构建/续建索引）；\n"
+            "不勾选：强制精确扫描（bypass_vector_index），结果更稳但库大时更慢。")
+        r.addWidget(self.reading_ann_chk)
+        self.reading_index_btn = QPushButton("构建/续建向量索引")
+        self.reading_index_btn.setToolTip(
+            "对 ColBERT 中心向量表构建/续建 LanceDB ANN 索引；\n"
+            "先同步知识库产生切片，再点击本按钮。")
+        self.reading_index_btn.clicked.connect(self._on_build_reading_index)
+        r.addWidget(self.reading_index_btn)
+        self.reading_index_status = QLabel("索引: 未检查")
+        self.reading_index_status.setStyleSheet("color:#6b7280;")
+        r.addWidget(self.reading_index_status)
+        r.addStretch(1)
+        rlay.addLayout(r)
+
+        # row2：模型目录 / 切片长度 / 最小切片 / 语义阈值
+        r2 = QHBoxLayout(); r2.setSpacing(8)
+        r2.addWidget(QLabel("模型目录:"))
+        self.reading_model_edit = QLineEdit(
+            placeholderText="留空=自动使用/下载 "
+                            "arlenecc/jina-colbert-v2-64-onnx-int8")
+        self.reading_model_edit.setToolTip(
+            "ColBERT 模型目录；留空时自动使用 "
+            "~/.base-agent/models/jina-colbert-v2-64-onnx-int8。\n"
+            "缺失时首次使用自动从 hf-mirror.com 下载 "
+            "model_int8.onnx / tokenizer.json / config.json。")
+        r2.addWidget(self.reading_model_edit, 2)
+        self.reading_model_pick = _pick_dir_btn(self.reading_model_edit)
+        r2.addWidget(self.reading_model_pick)
+        r2.addSpacing(8)
+        r2.addWidget(QLabel("切片长度:"))
+        self.reading_chunk_max_edit = _num(
+            str(getattr(self.config, "rag_reading_chunk_max", 8000)), 64)
+        self.reading_chunk_max_edit.setToolTip(
+            "检索阅读模式单个切片的最大字符数（默认 8000）。\n"
+            "目标区间 7500~8000，按标题结构与语义低谷切分。")
+        r2.addWidget(self.reading_chunk_max_edit)
+        r2.addSpacing(6)
+        r2.addWidget(QLabel("最小切片:"))
+        self.reading_chunk_min_edit = _num(
+            str(getattr(self.config, "rag_reading_chunk_min", 7500)), 64)
+        self.reading_chunk_min_edit.setToolTip(
+            "切片目标下限（默认 7500）；过小的碎片会与同章节相邻片合并。")
+        r2.addWidget(self.reading_chunk_min_edit)
+        r2.addSpacing(6)
+        r2.addWidget(QLabel("语义阈值:"))
+        self.reading_threshold_edit = _num(
+            str(getattr(self.config, "rag_reading_semantic_threshold", 0.55)), 56)
+        self.reading_threshold_edit.setToolTip(
+            "章节内语义切分阈值（默认 0.55，按相似度分布自适应，下限 0.15）。\n"
+            "越低越容易切，越高越倾向于保持整段。")
+        r2.addWidget(self.reading_threshold_edit)
+        r2.addStretch(1)
+        rlay.addLayout(r2)
+
+        self.reading_mode_hint = QLabel(
+            "启用后：解析出 Markdown 的全部后续处理（切片 / 词向量 / 入库 / "
+            "检索召回 / MaxSim 精排）由 ColBERT 旁路接管；请重新执行一次"
+            "「开始同步」以生成 ColBERT 索引；首次使用会自动从 hf-mirror.com "
+            "下载模型。")
+        self.reading_mode_hint.setStyleSheet("color:#6b7280;")
+        self.reading_mode_hint.setWordWrap(True)
+        rlay.addWidget(self.reading_mode_hint)
+
+        self.reading_mode_chk.toggled.connect(self._sync_reading_mode_controls)
+        lay.addWidget(reading_box)
+        self._sync_reading_mode_controls(
+            self.reading_mode_chk.isChecked())
         lay.addStretch(1)
 
         # 主模型模式切换 & 加载/卸载按钮
@@ -2721,6 +2877,82 @@ class MainWindow(QMainWindow):
         text = self.rag_mcp_stdio_cmd_edit.text()
         QApplication.clipboard().setText(text)
         self.status_label.setText("已复制 RAG MCP stdio 接入命令")
+
+    # ---- 检索阅读模式（ColBERT）配置区 ----
+
+    def _sync_reading_mode_controls(self, enabled: bool) -> None:
+        """启用开关关闭时，阅读模式参数置灰（避免误以为已生效）。"""
+        for name in (
+            "reading_quant_combo", "reading_coarse_combo",
+            "reading_topn_combo", "reading_ann_chk",
+            "reading_index_btn", "reading_model_edit",
+            "reading_model_pick", "reading_chunk_max_edit",
+            "reading_chunk_min_edit", "reading_threshold_edit",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(bool(enabled))
+        hint = getattr(self, "reading_mode_hint", None)
+        if hint is not None:
+            hint.setStyleSheet(
+                "color:#6b7280;" if enabled else "color:#9ca3af;")
+
+    def _on_build_reading_index(self) -> None:
+        """后台构建/续建 ColBERT 中心向量 ANN 索引。"""
+        self._gather_config_from_widgets()
+        if not self.config.rag_reading_mode_enabled:
+            QMessageBox.information(
+                self, "检索阅读模式",
+                "请先勾选「启用检索阅读模式」，再构建向量索引。")
+            return
+        if getattr(self, "_reading_index_worker", None) is not None and \
+                self._reading_index_worker.isRunning():
+            return
+        self.reading_index_btn.setEnabled(False)
+        self.reading_index_status.setText("索引: 构建中…")
+        self._append_log("[rag] 开始构建/续建 ColBERT 中心向量 ANN 索引…")
+        worker = ReadingIndexWorker(
+            self.config.workspace,
+            model_dir=str(getattr(
+                self.config, "rag_reading_model_dir", "") or ""),
+            parent=self)
+        worker.done.connect(self._on_reading_index_done)
+        worker.failed.connect(self._on_reading_index_failed)
+        worker.finished.connect(
+            lambda: self.reading_index_btn.setEnabled(
+                self.reading_mode_chk.isChecked()))
+        self._reading_index_worker = worker
+        worker.start()
+
+    def _on_reading_index_done(self, result: Dict[str, Any]) -> None:
+        msg = str(result.get("message") or "")
+        self._append_log(f"[rag] {msg}")
+        self.status_label.setText(msg or "索引构建完成")
+        self._refresh_reading_index_status()
+
+    def _on_reading_index_failed(self, error: str) -> None:
+        self._append_log(f"[rag] ❌ ANN 索引构建失败: {error}")
+        self.status_label.setText("ANN 索引构建失败")
+        self.reading_index_status.setText("索引: 构建失败")
+        QMessageBox.warning(self, "检索阅读模式", f"索引构建失败：{error}")
+
+    def _refresh_reading_index_status(self) -> None:
+        """只读统计，不加载 ColBERT 模型。"""
+        label = getattr(self, "reading_index_status", None)
+        if label is None:
+            return
+        try:
+            from ..rag.colbert_store import get_store_for_workspace
+            store = get_store_for_workspace(
+                self.config.workspace,
+                model_dir=str(getattr(
+                    self.config, "rag_reading_model_dir", "") or ""))
+            stats = store.stats()
+            label.setText(
+                f"索引: {stats.get('documents', 0)} 切片 / "
+                f"{stats.get('vectors', 0)} 中心向量")
+        except Exception as e:
+            label.setText(f"索引: 不可用（{e}）")
 
     # ------------------------------------------------------------------
     # 配置窗口：模型路径选择 / 主模型模式切换 / 主·辅助模型加载·卸载
@@ -3440,6 +3672,30 @@ class MainWindow(QMainWindow):
             bool(getattr(self.config, "rag_matryoshka_enabled", True)))
         self.bin_prefilter_chk.setChecked(
             bool(getattr(self.config, "rag_binary_prefilter_enabled", False)))
+        # 检索阅读模式（ColBERT）
+        self.reading_mode_chk.setChecked(
+            bool(getattr(self.config, "rag_reading_mode_enabled", False)))
+        self.reading_quant_combo.setCurrentText(
+            "2bit" if int(getattr(self.config, "rag_reading_quant_bits", 4)) == 2
+            else "4bit")
+        _coarse = str(int(getattr(self.config, "rag_reading_coarse_k", 20)))
+        self.reading_coarse_combo.setCurrentText(
+            _coarse if _coarse in ("10", "20", "50", "100") else "20")
+        _topn = str(int(getattr(self.config, "rag_reading_top_n", 3)))
+        self.reading_topn_combo.setCurrentText(
+            _topn if _topn in ("1", "3", "5") else "3")
+        self.reading_ann_chk.setChecked(
+            bool(getattr(self.config, "rag_reading_use_ann", False)))
+        self.reading_model_edit.setText(
+            str(getattr(self.config, "rag_reading_model_dir", "") or ""))
+        self.reading_chunk_max_edit.setText(
+            str(getattr(self.config, "rag_reading_chunk_max", 8000)))
+        self.reading_chunk_min_edit.setText(
+            str(getattr(self.config, "rag_reading_chunk_min", 7500)))
+        self.reading_threshold_edit.setText(
+            str(getattr(self.config, "rag_reading_semantic_threshold", 0.55)))
+        self._sync_reading_mode_controls(
+            self.reading_mode_chk.isChecked())
         # RAG 检索策略（知识图谱，spec 第八步）：策略名 → 下拉索引。
         _kg_fwd = {"naive": 0, "local": 1, "global": 2, "hybrid": 3, "mix": 4}
         self.kg_strategy_combo.setCurrentIndex(
@@ -3478,6 +3734,7 @@ class MainWindow(QMainWindow):
             else "仅限本机")
         self.rag_mcp_port_edit.setText(str(getattr(self.config, "rag_mcp_port", 8080)))
         self._refresh_rag_mcp_status()
+        self._refresh_reading_index_status()
 
     def _sync_impl_fields(self, combo, name_edit, path_edit) -> None:
         """按实现下拉显隐「模型名 / 本地路径」：fastembed 显示模型名、隐藏路径；
@@ -3611,6 +3868,38 @@ class MainWindow(QMainWindow):
         _num(self.chunk_overlap_edit, "rag_chunk_overlap", 50, int, "重叠")
         self.config.rag_matryoshka_enabled = self.matryoshka_chk.isChecked()
         self.config.rag_binary_prefilter_enabled = self.bin_prefilter_chk.isChecked()
+        # 检索阅读模式（ColBERT）：UI 固定选项，仍夹紧兜底。
+        self.config.rag_reading_mode_enabled = self.reading_mode_chk.isChecked()
+        self.config.rag_reading_quant_bits = (
+            2 if "2" in self.reading_quant_combo.currentText() else 4)
+        try:
+            coarse = int(self.reading_coarse_combo.currentText())
+        except (TypeError, ValueError):
+            coarse = 20
+        self.config.rag_reading_coarse_k = (
+            coarse if coarse in (10, 20, 50, 100) else 20)
+        try:
+            topn = int(self.reading_topn_combo.currentText())
+        except (TypeError, ValueError):
+            topn = 3
+        self.config.rag_reading_top_n = topn if topn in (1, 3, 5) else 3
+        self.config.rag_reading_use_ann = self.reading_ann_chk.isChecked()
+        self.config.rag_reading_model_dir = self.reading_model_edit.text().strip()
+        _num(self.reading_chunk_max_edit, "rag_reading_chunk_max", 8000,
+             int, "阅读模式切片长度")
+        _num(self.reading_chunk_min_edit, "rag_reading_chunk_min", 7500,
+             int, "阅读模式最小切片")
+        if self.config.rag_reading_chunk_max < 500:
+            self.config.rag_reading_chunk_max = 8000
+            self.reading_chunk_max_edit.setText("8000")
+            invalid.append("阅读模式切片长度<500 → 8000")
+        self.config.rag_reading_chunk_min = min(
+            max(100, int(self.config.rag_reading_chunk_min)),
+            int(self.config.rag_reading_chunk_max))
+        _num(self.reading_threshold_edit, "rag_reading_semantic_threshold",
+             0.55, float, "阅读模式语义阈值")
+        self.config.rag_reading_semantic_threshold = min(
+            0.55, max(0.15, float(self.config.rag_reading_semantic_threshold)))
         # RAG 检索策略（知识图谱，spec 第八步）：下拉索引 → 策略名。
         _kg_map_rev = {0: "naive", 1: "local", 2: "global", 3: "hybrid", 4: "mix"}
         self.config.rag_kg_strategy = _kg_map_rev.get(

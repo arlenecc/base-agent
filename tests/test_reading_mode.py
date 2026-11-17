@@ -1,0 +1,137 @@
+"""检索阅读模式：RAGEngine 旁路切片/入库/检索与 rag_tools 气泡分流。"""
+from __future__ import annotations
+
+import hashlib
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from agent.config import AgentConfig  # noqa: E402
+from agent.rag import colbert_store as cs  # noqa: E402
+from agent.rag.engine import RAGEngine  # noqa: E402
+from agent.tools.rag_tool import RagSearchTool  # noqa: E402
+
+
+class FakeRuntime:
+    dim = 8
+
+    def _vec(self, text: str, n: int = 12) -> np.ndarray:
+        seed = int(hashlib.sha1(text.encode("utf-8")).hexdigest()[:8], 16)
+        rng = np.random.default_rng(seed)
+        v = rng.normal(size=(max(1, n), self.dim)).astype(np.float32)
+        return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+
+    def encode_documents(self, texts, batch_size=1):
+        return [self._vec(t, 12) for t in texts]
+
+    def encode_document(self, text):
+        return self._vec(text, 16)
+
+    def encode_query(self, text):
+        return self._vec(text, 4)
+
+
+def _engine(tmp_path) -> RAGEngine:
+    eng = RAGEngine(
+        workspace=str(tmp_path),
+        knowledge_base=str(tmp_path / "kb"),
+        reading_mode=True,
+        reading_quant_bits=4,
+        reading_coarse_k=10,
+        reading_top_n=3,
+        reading_chunk_max=500,
+        reading_chunk_min=300,
+    )
+    store = cs.ColBertDocStore(
+        db_dir=str(tmp_path / ".agent" / "colbert_docs.lancedb"),
+        runtime=FakeRuntime(), dim=8)
+    eng._reading_store = store
+    return eng
+
+
+def test_reading_config_roundtrip_and_clamp(tmp_path):
+    cfg = AgentConfig()
+    cfg.rag_reading_mode_enabled = True
+    cfg.rag_reading_quant_bits = 2
+    cfg.rag_reading_coarse_k = 50
+    cfg.rag_reading_top_n = 5
+    cfg.rag_reading_use_ann = True
+    cfg.rag_reading_model_dir = "/models/colbert"
+    cfg.rag_reading_chunk_max = 9000
+    cfg.rag_reading_chunk_min = 8500
+    cfg.rag_reading_semantic_threshold = 0.42
+    path = str(tmp_path / "config.json")
+    cfg.save(path)
+    loaded = AgentConfig.load(path)
+    assert loaded.rag_reading_mode_enabled is True
+    assert loaded.rag_reading_quant_bits == 2
+    assert loaded.rag_reading_coarse_k == 50
+    assert loaded.rag_reading_top_n == 5
+    assert loaded.rag_reading_use_ann is True
+    assert loaded.rag_reading_model_dir == "/models/colbert"
+    assert loaded.rag_reading_chunk_max == 9000
+    assert loaded.rag_reading_chunk_min == 8500
+    assert abs(loaded.rag_reading_semantic_threshold - 0.42) < 1e-9
+
+
+def test_reading_chunks_add_and_search_returns_source_window(tmp_path):
+    eng = _engine(tmp_path)
+    text = (
+        "# 认证设计\n\n## OAuth2 授权码\n\n"
+        + ("客户端先用 authorization code 换 access_token，"
+           "兑换时必须出示 client_secret。" * 20)
+        + "\n\n## PKCE\n\n"
+        + ("公共客户端生成 code_verifier，授权时提交 challenge，"
+           "兑换时提交 verifier。" * 20)
+    )
+    chunks = eng._reading_chunks(text, "/docs/auth.md", "auth.md")
+    assert chunks and all(c["source"] == "/docs/auth.md" for c in chunks)
+    added = eng._reading_add_streaming(iter(chunks))
+    assert added == len(chunks) == eng._get_reading_store().stats()["documents"]
+
+    hits = eng._reading_search("公共客户端怎么防止授权码被截获？", top_k=3)
+    assert hits
+    assert hits[0]["source"] == "/docs/auth.md"
+    assert isinstance(hits[0]["chunk_index"], int)
+    assert hits[0]["reading_mode"] is True
+
+    window = eng.get_chunk_window("/docs/auth.md", hits[0]["chunk_index"])
+    assert window["current"]["text"]
+    assert set(window) == {"current", "prev", "next"}
+
+    status = eng.status()
+    assert status["reading_mode"] is True
+    assert status["chunks_stored"] == len(chunks)
+    assert status["sources"] == ["/docs/auth.md"]
+
+
+def test_rag_search_tool_reading_mode_sends_all_chunks_to_bubbles():
+    class FakeEngine:
+        def search(self, query, top_k=5, source=None):
+            return [
+                {"source": "/docs/a.md", "chunk_index": 0,
+                 "text": "第一片正文" * 100, "score": 9.0},
+                {"source": "/docs/a.md", "chunk_index": 1,
+                 "text": "第二片正文" * 100, "score": 8.0},
+                {"source": "/docs/a.md", "chunk_index": 2,
+                 "text": "第三片正文" * 100, "score": 7.0},
+            ]
+
+        def search_formatted(self, *args, **kwargs):
+            return "should not be used"
+
+    cfg = AgentConfig()
+    cfg.rag_reading_mode_enabled = True
+    cfg.rag_reading_top_n = 3
+    tool = RagSearchTool(FakeEngine())
+    tool.bind(cfg, None)
+    result = tool.run(query="认证流程")
+    assert result.success
+    assert len(result.attachments) == 3
+    assert all(not a["used"] for a in result.attachments)
+    assert "没有注入上下文" in result.output
+    assert "第一片正文" not in result.output
+    assert "第二片正文" not in result.output

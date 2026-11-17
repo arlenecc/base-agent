@@ -105,6 +105,27 @@ class AgentConfig:
     # 知识图谱的实体/关系仍全量进上下文（它们本身就是摘要形态，体积可控）。
     # 关闭时退回旧行为：全部结果格式化/精简后注入。
     rag_presentation_mode: bool = True
+    # ---- 检索阅读模式（ColBERT 旁路）----
+    # 开启后知识库同步在文档解析为 Markdown 之后，跳过原有「token 切片 →
+    # embedding → 向量库」链路，改用 doc_chunker + Jina ColBERT v2 残差量化
+    # 写 LanceDB 三表；检索用 BM25 + 中心向量 RRF 粗筛 + MaxSim 精排。
+    # 召回切片不进入模型上下文，只作为回复末尾的可点击气泡。
+    rag_reading_mode_enabled: bool = False
+    # 残差量化位数：4（默认，精度更高）或 2（体积更小）。
+    rag_reading_quant_bits: int = 4
+    # RRF 粗筛候选数（10/20/50/100，默认 20）。
+    rag_reading_coarse_k: int = 20
+    # MaxSim 精排后返回的切片数（1/3/5，默认 3）。
+    rag_reading_top_n: int = 3
+    # 是否使用 LanceDB ANN 向量索引；关闭时强制精确扫描（bypass_vector_index）。
+    rag_reading_use_ann: bool = False
+    # 模型目录：空 = 自动使用/下载 ~/.base-agent/models/jina-colbert-v2-64-onnx-int8。
+    rag_reading_model_dir: str = ""
+    # 检索阅读模式切片长度（字符）：默认 7500~8000，1% overlap。
+    rag_reading_chunk_max: int = 8000
+    rag_reading_chunk_min: int = 7500
+    # 章节内语义低谷阈值（默认 0.55，代码会按分布自适应且不低于 0.15）。
+    rag_reading_semantic_threshold: float = 0.55
     # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：
     # 总量落在 [min, max] 区间才调用辅助模型浓缩；低于 min 原样注入（内容少，
     # 精简只会丢细节、白耗一次辅助模型调用）；高于 max 也不送辅助模型（超出
@@ -400,11 +421,15 @@ class AgentConfig:
                    "local_llm_num_draft_tokens", "local_llm_prefill_step_size",
                    "rag_mcp_port",
                    "rag_kg_max_entities", "rag_kg_max_relations",
-                   "rag_kg_max_description_chars")
+                   "rag_kg_max_description_chars",
+                   "rag_reading_quant_bits", "rag_reading_coarse_k",
+                   "rag_reading_top_n", "rag_reading_chunk_max",
+                   "rag_reading_chunk_min")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
                      "rag_rerank_min_similarity",
                      "rag_chunk_overlap_percent",
+                     "rag_reading_semantic_threshold",
                      "aux_temperature", "aux_top_p", "aux_min_p",
                      "aux_repetition_penalty", "aux_request_timeout",
                      # 这些是 float/bool 却被错分进 _STR_FIELDS —— config.json
@@ -424,7 +449,8 @@ class AgentConfig:
                    "aux_local_llm_mmproj_path", "aux_local_llm_tokenizer_path",
                    "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path",
                    "rag_ocr_vision_level",
-                   "rag_mcp_scope", "rag_kg_strategy", "rag_kg_extractor")
+                   "rag_mcp_scope", "rag_kg_strategy", "rag_kg_extractor",
+                   "rag_reading_model_dir")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
                     "rag_ocr_scale_dynamic", "aux_llm_enabled",
@@ -433,7 +459,8 @@ class AgentConfig:
                     "rag_matryoshka_enabled", "rag_binary_prefilter_enabled",
                     "web_allow_private_hosts", "rag_mcp_enabled",
                     "rag_kg_glean_enabled", "rag_kg_llm_raw_json",
-                    "rag_presentation_mode")
+                    "rag_presentation_mode",
+                    "rag_reading_mode_enabled", "rag_reading_use_ann")
 
     @classmethod
     def _coerce(cls, name: str, value):
@@ -641,6 +668,27 @@ class AgentConfig:
                 self.rag_embedding_dims = 128
         else:
             self.rag_embedding_dims = 0
+        # 检索阅读模式参数归一：UI 只提供固定选项，但 config.json 可能被手改。
+        # 非法值回退默认，切片尺寸保证 min <= max 且 max 有安全下限。
+        if self.rag_reading_quant_bits not in (2, 4):
+            self.rag_reading_quant_bits = 4
+        if self.rag_reading_coarse_k not in (10, 20, 50, 100):
+            self.rag_reading_coarse_k = 20
+        if self.rag_reading_top_n not in (1, 3, 5):
+            self.rag_reading_top_n = 3
+        if self.rag_reading_chunk_max < 500:
+            self.rag_reading_chunk_max = 8000
+        if self.rag_reading_chunk_min < 100:
+            self.rag_reading_chunk_min = 7500
+        self.rag_reading_chunk_min = min(
+            self.rag_reading_chunk_min, self.rag_reading_chunk_max)
+        try:
+            threshold = float(self.rag_reading_semantic_threshold)
+        except (TypeError, ValueError):
+            threshold = 0.55
+        # 上限 0.55 是本模式的产品默认；下限 0.15 与 doc_chunker 的自适应下限
+        # 一致，避免手改成 0 让所有句间空隙都成为切点。
+        self.rag_reading_semantic_threshold = min(0.55, max(0.15, threshold))
 
     def save(self, path: str) -> None:
         import json

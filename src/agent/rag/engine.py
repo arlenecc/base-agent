@@ -671,6 +671,16 @@ class RAGEngine:
         kg_max_description_chars: int = 100,
         kg_glean: bool = True,
         kg_raw_json: bool = False,
+        # ---- 检索阅读模式（ColBERT 旁路）----
+        reading_mode: bool = False,
+        reading_quant_bits: int = 4,
+        reading_coarse_k: int = 20,
+        reading_top_n: int = 3,
+        reading_use_ann: bool = False,
+        reading_model_dir: str = "",
+        reading_chunk_max: int = 8000,
+        reading_chunk_min: int = 7500,
+        reading_semantic_threshold: float = 0.55,
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -741,6 +751,30 @@ class RAGEngine:
         self._kg_raw_json = bool(kg_raw_json)
         self._aux_llm: Any = None
         self._kg_retriever: Optional[Any] = None
+        # 检索阅读模式：解析出 Markdown 后旁路原有切片/embedding/向量库/reranker，
+        # 改用 doc_chunker + ColBERT 三表。参数在此夹紧，防止手改 config 越界。
+        self._reading_mode = bool(reading_mode)
+        self._reading_quant_bits = int(reading_quant_bits)
+        if self._reading_quant_bits not in (2, 4):
+            self._reading_quant_bits = 4
+        self._reading_coarse_k = int(reading_coarse_k)
+        if self._reading_coarse_k not in (10, 20, 50, 100):
+            self._reading_coarse_k = 20
+        self._reading_top_n = int(reading_top_n)
+        if self._reading_top_n not in (1, 3, 5):
+            self._reading_top_n = 3
+        self._reading_use_ann = bool(reading_use_ann)
+        self._reading_model_dir = (reading_model_dir or "").strip()
+        self._reading_chunk_max = max(500, int(reading_chunk_max))
+        self._reading_chunk_min = min(
+            max(100, int(reading_chunk_min)), self._reading_chunk_max)
+        try:
+            threshold = float(reading_semantic_threshold)
+        except (TypeError, ValueError):
+            threshold = 0.55
+        self._reading_semantic_threshold = min(0.55, max(0.15, threshold))
+        self._reading_store: Optional[Any] = None
+        self._reading_store_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # properties
@@ -761,6 +795,79 @@ class RAGEngine:
     @knowledge_base.setter
     def knowledge_base(self, value: str) -> None:
         self._knowledge_base = value
+
+    @property
+    def reading_mode(self) -> bool:
+        return self._reading_mode
+
+    def _get_reading_store(self):
+        """检索阅读模式的 ColBERT 三表 store（与 doc_search_tool 共享实例）。"""
+        if not self._reading_mode:
+            return None
+        if self._reading_store is None:
+            with self._reading_store_lock:
+                if self._reading_store is None:
+                    from .colbert_store import get_store_for_workspace
+                    self._reading_store = get_store_for_workspace(
+                        self._workspace, model_dir=self._reading_model_dir)
+        return self._reading_store
+
+    def _reading_chunks(self, text: str, source: str, title: str
+                        ) -> List[Dict[str, Any]]:
+        """用 doc_chunker 生成 7500~8000 字切片（引擎侧已解析出 Markdown）。"""
+        from .doc_chunker import chunk_document
+        store = self._get_reading_store()
+        chunks = chunk_document(
+            text, title=title, encoder=store.runtime,
+            max_chars=self._reading_chunk_max,
+            min_chars=self._reading_chunk_min,
+            overlap_ratio=0.01,
+            semantic_threshold=self._reading_semantic_threshold)
+        return [{"source": source, "chunk_index": i, "text": c.content}
+                for i, c in enumerate(chunks) if c.content.strip()]
+
+    def _reading_add_streaming(self, chunks: Iterator[Dict[str, Any]],
+                               on_batch=None,
+                               is_cancelled=None) -> int:
+        """按文件分组把切片写入 ColBERT 三表（不经过 VectorStore embedding）。"""
+        store = self._get_reading_store()
+        if store is None:
+            raise RuntimeError("检索阅读模式 store 不可用")
+        total_added = 0
+        group: List[Dict[str, Any]] = []
+        source = ""
+        aborted = False
+
+        def _flush() -> None:
+            nonlocal total_added, group, source
+            if not group:
+                return
+            started = time.monotonic()
+            texts = [c.get("text") or "" for c in group]
+            title = os.path.splitext(os.path.basename(source))[0] or "Untitled"
+            n = store.add_chunks(
+                title, source, texts,
+                quant_bits=self._reading_quant_bits, overwrite=True)
+            total_added += n
+            if on_batch is not None:
+                on_batch(n, total_added, {
+                    "embed": time.monotonic() - started, "store": 0.0})
+            group = []
+
+        for chunk in chunks:
+            if is_cancelled is not None and is_cancelled():
+                # 取消时不能 flush 当前 group：它可能只是某文件的一部分，
+                # 写完会让 manifest 误记「整文件已入库」，下次同步跳过缺失片。
+                aborted = True
+                break
+            src = str(chunk.get("source") or "")
+            if src and src != source:
+                _flush()
+                source = src
+            group.append(chunk)
+        if not aborted:
+            _flush()
+        return total_added
 
     # ------------------------------------------------------------------
     # 知识图谱（rag/kg/）
@@ -1508,8 +1615,15 @@ class RAGEngine:
             # HFS+/SMB 挂载的 mtime 粒度只有 1~2 秒，同一秒内改一个字也识别
             # 不出来。指纹只在「本来要跳过」时才读盘算，正常路径零额外开销。
             # 旧记录没有 source_hash 时按旧逻辑判定（不影响已同步的库）。
+            # 处理模式变化必须强制重跑：普通模式写的 manifest 没有 reading_mode
+            # 标记，切到阅读模式后若继续按 mtime/size 跳过，ColBERT 三表会永远
+            # 是空的（反向切回普通模式同理）。标记按文件写入，改模式只需一次全量。
+            same_mode = (prev is not None
+                         and bool(prev.get("reading_mode", False))
+                         == bool(self._reading_mode))
             if (not force
                     and prev is not None
+                    and same_mode
                     and prev.get("mtime") == sig["mtime"]
                     and prev.get("size") == sig["size"]
                     and (not prev_hash
@@ -1547,6 +1661,9 @@ class RAGEngine:
                         # 认出「还有旧向量要删」；从没入库过的副本两项为空。
                         "content_hash": (prev or {}).get("content_hash"),
                         "chunk_count": (prev or {}).get("chunk_count", 0),
+                        # 与处理模式标记保持一致，避免阅读模式下每次同步都把
+                        # 副本当「模式不符」重新走一遍。
+                        "reading_mode": bool(self._reading_mode),
                     }
                     with stats_lock:
                         stats["files_duplicated"] += 1
@@ -1693,30 +1810,35 @@ class RAGEngine:
                                     # 近似：代码/数字/罕见字符密集的章节 800 字可能
                                     # 远超 800 token，直通后只能被 _clamp_chunk_budget
                                     # 硬切（正文被切碎且多一次无谓分片）。
-                                    doc_chunks: List[Dict[str, Any]] = []
-                                    for ch in book["chapters"]:
-                                        if estimate_tokens(ch) <= self._chunk_size:
-                                            doc_chunks.append(
-                                                {"source": filepath, "text": ch})
-                                        else:
-                                            doc_chunks.extend(chunk_documents(
-                                                [{"source": filepath, "text": ch}],
-                                                chunk_size=self._chunk_size,
-                                                chunk_overlap=self._chunk_overlap,
-                                                min_chunk_size=self._min_chunk_size,
-                                                overlap_percent=self._overlap_percent,
-                                                use_semantic=self._use_semantic,
-                                            ))
-                                    # 直通片与各章二次切分混在一起，短章节还必须与
-                                    # 相邻片合并——否则「只有标题/一句话」的章节会
-                                    # 以几个字的碎片进入向量库（RAG 召回全是碎句）。
-                                    doc_chunks = merge_adjacent_chunks(
-                                        doc_chunks, self._chunk_size)
-                                    # chunk_index 必须按整篇文档重排：记录 id 是
-                                    # hash(source)_index，重复索引会让 LanceDB 主键
-                                    # 冲突、整片被覆盖。
-                                    for i, c in enumerate(doc_chunks):
-                                        c["chunk_index"] = i
+                                    if self._reading_mode:
+                                        doc_chunks = self._reading_chunks(
+                                            cleaned, filepath,
+                                            os.path.basename(filepath))
+                                    else:
+                                        doc_chunks: List[Dict[str, Any]] = []
+                                        for ch in book["chapters"]:
+                                            if estimate_tokens(ch) <= self._chunk_size:
+                                                doc_chunks.append(
+                                                    {"source": filepath, "text": ch})
+                                            else:
+                                                doc_chunks.extend(chunk_documents(
+                                                    [{"source": filepath, "text": ch}],
+                                                    chunk_size=self._chunk_size,
+                                                    chunk_overlap=self._chunk_overlap,
+                                                    min_chunk_size=self._min_chunk_size,
+                                                    overlap_percent=self._overlap_percent,
+                                                    use_semantic=self._use_semantic,
+                                                ))
+                                        # 直通片与各章二次切分混在一起，短章节还必须与
+                                        # 相邻片合并——否则「只有标题/一句话」的章节会
+                                        # 以几个字的碎片进入向量库（RAG 召回全是碎句）。
+                                        doc_chunks = merge_adjacent_chunks(
+                                            doc_chunks, self._chunk_size)
+                                        # chunk_index 必须按整篇文档重排：记录 id 是
+                                        # hash(source)_index，重复索引会让 LanceDB 主键
+                                        # 冲突、整片被覆盖。
+                                        for i, c in enumerate(doc_chunks):
+                                            c["chunk_index"] = i
                                     if not doc_chunks:
                                         raise ValueError("no chapters produced")
                                     c_hash = _content_hash(cleaned)
@@ -1915,17 +2037,24 @@ class RAGEngine:
                             _flush_logs(f"切片: {fname}")
                             c_hash = _content_hash(cleaned)
                             cleaned_len = len(cleaned)
-                            doc_chunks = chunk_documents(
-                                [{"source": filepath, "text": cleaned}],
-                                chunk_size=self._chunk_size,
-                                chunk_overlap=self._chunk_overlap,
-                                min_chunk_size=self._min_chunk_size,
-                                overlap_percent=self._overlap_percent,
-                                use_semantic=self._use_semantic,
-                                # 语义切片强制走 model2vec 静态嵌入（见 semantic_chunker）：
-                                # 不把检索用的 nomic EF 透传下去，避免 worker 切片线程与
-                                # 主线程 add_streaming 并发争抢同一 nomic/MLX 模型。
-                            )
+                            if self._reading_mode:
+                                # 检索阅读模式：Markdown 之后全部交给
+                                # doc_chunker + ColBERT 三表，不再走 token 切片。
+                                doc_chunks = self._reading_chunks(
+                                    cleaned, filepath,
+                                    os.path.basename(filepath))
+                            else:
+                                doc_chunks = chunk_documents(
+                                    [{"source": filepath, "text": cleaned}],
+                                    chunk_size=self._chunk_size,
+                                    chunk_overlap=self._chunk_overlap,
+                                    min_chunk_size=self._min_chunk_size,
+                                    overlap_percent=self._overlap_percent,
+                                    use_semantic=self._use_semantic,
+                                    # 语义切片强制走 model2vec 静态嵌入（见 semantic_chunker）：
+                                    # 不把检索用的 nomic EF 透传下去，避免 worker 切片线程与
+                                    # 主线程 add_streaming 并发争抢同一 nomic/MLX 模型。
+                                )
                             t_chunk_end = time.monotonic()
                             # 真实测算每片 token 数（而非打印配置预算，后者会误导：
                             # 此前日志写「每片约 1000 tokens」实际只是 rag_chunk_size，
@@ -2102,6 +2231,8 @@ class RAGEngine:
                                                 filepath, sig_now["size"])),
                             "content_hash": c_hash,
                             "chunk_count": n_chunks,
+                            # 模式标记：切换检索阅读模式后强制重跑一次。
+                            "reading_mode": bool(self._reading_mode),
                         }
                     except OSError as e:
                         logger.warning("RAG: failed to update manifest for %s: %s", filepath, e)
@@ -2248,14 +2379,27 @@ class RAGEngine:
                 # 批量 200（旧值 20）：LanceDB 每次 add 都会产生一个新
                 # fragment，小批量在大库上留下海量碎片，检索要逐段扫描。
                 _log("  开始流式向量化写入 (每批 %d 个切片)", _WRITE_BATCH_SIZE)
-                added = store.add_streaming(
-                    _chunk_iter(),
-                    batch_size=_WRITE_BATCH_SIZE,
-                    on_batch=_on_batch,
-                    is_cancelled=self._is_cancelled,
-                )
+                if self._reading_mode:
+                    # 旁路：切片已由 doc_chunker 生成，直接编码进 ColBERT 三表。
+                    _log("  [检索阅读模式] 使用 ColBERT 三表入库，跳过普通向量化")
+                    added = self._reading_add_streaming(
+                        _chunk_iter(),
+                        on_batch=_on_batch,
+                        is_cancelled=self._is_cancelled,
+                    )
+                else:
+                    added = store.add_streaming(
+                        _chunk_iter(),
+                        batch_size=_WRITE_BATCH_SIZE,
+                        on_batch=_on_batch,
+                        is_cancelled=self._is_cancelled,
+                    )
                 stats["chunks"] = added
-                stats["chunks_total"] = store.count()
+                if self._reading_mode:
+                    stats["chunks_total"] = self._get_reading_store().stats()[
+                        "documents"]
+                else:
+                    stats["chunks_total"] = store.count()
                 _log("  向量化写入完成: 共 %d 个切片已存入向量库", added)
             except Exception as e:
                 logger.error("  向量化写入失败: %s", e, exc_info=True)
@@ -2318,7 +2462,9 @@ class RAGEngine:
             _log("  所有 Worker 线程已结束")
         else:
             # All files skipped — no new chunks written. Report current store count.
-            stats["chunks"] = store.count()
+            stats["chunks"] = (
+                self._get_reading_store().stats()["documents"]
+                if self._reading_mode else store.count())
             _log("  所有 %d 个文件均未修改，无需重新处理", total_files)
 
         cancelled = self._is_cancelled()
@@ -2499,6 +2645,8 @@ class RAGEngine:
         （配合 rag_outline 实现 Targeted RAG——先掌握全局结构，再按需检索
         特定文档的细节）。
         """
+        if self._reading_mode:
+            return self._reading_search(query, top_k=top_k, source=source)
         t0 = time.monotonic()
         store = self._get_store()
         store_count = store.count()
@@ -2549,6 +2697,43 @@ class RAGEngine:
         else:
             logger.info("  └─ ⚠ 检索完成: 无匹配结果 (耗时 %.2fs)", t_total)
         return results
+
+    def _reading_search(self, query: str, top_k: int = 5,
+                        source: Optional[str] = None
+                        ) -> List[Dict[str, Any]]:
+        """检索阅读模式：ColBERT BM25 + 中心向量 RRF 粗筛 + MaxSim 精排。"""
+        store = self._get_reading_store()
+        if store is None:
+            return []
+        try:
+            stats = store.stats()
+        except Exception as e:
+            logger.warning("RAG 阅读模式: 读取 ColBERT store 失败: %s", e)
+            return []
+        if not stats.get("documents"):
+            logger.info("🔍 阅读模式检索: ColBERT 库为空，无结果")
+            return []
+        top_k = max(1, min(int(top_k or self._reading_top_n), 30))
+        logger.info(
+            "🔍 阅读模式检索: query=%r top_k=%d coarse=%d ann=%s",
+            query[:80], top_k, self._reading_coarse_k, self._reading_use_ann)
+        hits = store.search(
+            query, top_k=top_k, coarse_k=self._reading_coarse_k,
+            include_content=True, max_content_chars=10_000_000,
+            source=source or "", use_ann=self._reading_use_ann)
+        out: List[Dict[str, Any]] = []
+        for h in hits:
+            out.append({
+                "text": h.get("content") or "",
+                "source": h.get("source") or "",
+                "chunk_index": h.get("chunk_index", 0),
+                "score": h.get("score", 0.0),
+                "doc_id": h.get("doc_id", ""),
+                "title": h.get("title", ""),
+                "reading_mode": True,
+            })
+        logger.info("  └─ 阅读模式检索完成: 返回 %d 个长切片", len(out))
+        return out
 
     def search_formatted(
         self,
@@ -2616,6 +2801,11 @@ class RAGEngine:
             idx = int(chunk_index)
         except (TypeError, ValueError):
             return {}
+        if getattr(self, "_reading_mode", False):
+            store = self._get_reading_store()
+            if store is None or not source:
+                return {}
+            return store.get_chunk_window(source, idx)
         store = getattr(self, "_store", None)
         if store is None or not source:
             return {}
@@ -2731,6 +2921,14 @@ class RAGEngine:
             logger.debug("KG: 收集待删 chunk 前缀失败（跳过 KG 清理）: %s", e)
         store.delete_document(name)      # 元数据（documents 表）
         store.delete_by_source(name)     # 向量 chunks + 失效 FTS/ANN 索引
+        if self._reading_mode:
+            rs = self._get_reading_store()
+            if rs is not None:
+                for d in rs.list_documents(1000):
+                    src = d.get("source") or ""
+                    title = d.get("title") or ""
+                    if name in src or name in title:
+                        rs.delete(source=src or title)
         if md_path and os.path.isfile(md_path):
             try:
                 os.remove(md_path)
@@ -2932,6 +3130,27 @@ class RAGEngine:
 
     def status(self) -> Dict[str, Any]:
         """Return current status of the knowledge base."""
+        if self._reading_mode:
+            store = self._get_reading_store()
+            stats = store.stats() if store is not None else {}
+            docs = store.list_documents(500) if store is not None else []
+            sources = [d.get("source") or d.get("title") or "" for d in docs]
+            chunk_count = int(stats.get("documents") or 0)
+            logger.info("📊 阅读模式状态: 切片数=%d 文档数=%d",
+                        chunk_count, len(docs))
+            return {
+                "knowledge_base": self._knowledge_base,
+                "rag_dir": self._rag_dir,
+                "chunks_stored": chunk_count,
+                "reading_documents": len(docs),
+                "reading_mode": True,
+                "sources": sources,
+                "has_knowledge_base": bool(
+                    self._knowledge_base and os.path.isdir(self._knowledge_base)),
+                "kg_strategy": self._kg_strategy,
+                "kg_extractor": self._kg_extractor_scheme,
+                "kg_ready": False,
+            }
         store = self._get_store()
         chunk_count = store.count()
         sources = store.list_sources()
@@ -2952,6 +3171,10 @@ class RAGEngine:
         logger.info("🗑 正在清空知识库...")
         store = self._get_store()
         store.clear()
+        if self._reading_mode:
+            rs = self._get_reading_store()
+            if rs is not None:
+                rs.clear()
         # Also clear cached markdown
         if os.path.isdir(self._markdown_dir):
             import shutil

@@ -31,11 +31,11 @@ def _is_graph_item(item: Dict[str, Any]) -> bool:
     return item.get("kind") in _GRAPH_KINDS
 
 
-def _chunk_attachments(items: list) -> list:
+def _chunk_attachments(items: list, mark_first_used: bool = True) -> list:
     """召回切片 → UI 气泡附件（同文档同序号去重，保留重排后的顺序）。
 
-    只有第一条（排名最高、真正进上下文的那片）标记 ``used=True``；所有切片
-    （含 used 的）都会展示给用户。
+    ``mark_first_used`` 为 True 时只有第一条（排名最高、真正进上下文的那片）
+    标记 ``used=True``；检索阅读模式下所有切片都不进上下文，传 False。
     """
     out: list = []
     seen = set()
@@ -50,7 +50,7 @@ def _chunk_attachments(items: list) -> list:
             "chunk_index": r.get("chunk_index"),
             "score": float(r.get("score") or 0.0),
             "text": r.get("text") or "",
-            "used": not out,        # 第一条 = 排名最高、模型参考的那片
+            "used": bool(mark_first_used and not out),
         })
     return out
 
@@ -185,16 +185,26 @@ class RagSearchTool(Tool):
         # 时走配置默认，传了非法值也回退到配置默认。_config 由 bind() 注入，
         # 直接构造（测试/旁路）时可能缺失，一律走 getattr 默认值。
         cfg = getattr(self, "_config", None)
+        reading_mode = bool(getattr(cfg, "rag_reading_mode_enabled", False))
         try:
-            default_top_k = int(getattr(cfg, "rag_search_top_k", 5) or 5)
+            default_top_k = int(
+                getattr(cfg, "rag_reading_top_n", 3) if reading_mode
+                else getattr(cfg, "rag_search_top_k", 5))
         except (TypeError, ValueError):
-            default_top_k = 5  # 配置值非法不能让整个工具崩掉
+            default_top_k = 3 if reading_mode else 5  # 配置值非法不能崩工具
         try:
             top_k = int(top_k)
         except (TypeError, ValueError, OverflowError):
             top_k = default_top_k
         # 限制 top_k 上限，防止模型传入过大值导致返回海量内容撑爆上下文窗口。
         top_k = max(1, min(top_k, 10))
+        if reading_mode:
+            # 检索阅读模式的「精选 topN」是配置项，优先于模型传入的 top_k。
+            try:
+                top_k = max(1, min(
+                    int(getattr(cfg, "rag_reading_top_n", 3) or 3), 30))
+            except (TypeError, ValueError):
+                top_k = 3
 
         source = _as_text(source)
         if source is None:
@@ -206,6 +216,28 @@ class RagSearchTool(Tool):
         try:
             # 先取重排后的原始分片（含完整 text，未截断），供辅助模型通读归纳。
             chunks = self._engine.search(query, top_k=top_k, source=source or None)
+            # 检索阅读模式：切片体量大（7500~8000 字），一律不进模型上下文，
+            # 只作为可点击气泡附在回复末尾；模型只给引导性说明。
+            if reading_mode:
+                attachments = _chunk_attachments(
+                    chunks, mark_first_used=False) if chunks else []
+                if chunks:
+                    output = (
+                        f"检索阅读模式已召回 {len(chunks)} 个长文档切片。"
+                        "这些切片**没有注入上下文**，已作为可点击的「参考切片」"
+                        "气泡附在回复末尾，用户可以点开阅读原文并切换前后切片。"
+                        "请只用一两句话做引导性说明（可提示用户点击阅读、切换前后片），"
+                        "不要复述、概括或猜测切片正文。")
+                else:
+                    output = (
+                        "检索阅读模式未召回匹配切片。请提示用户换一个更具体的"
+                        "问题或先同步/导入对应文档，不要编造内容。")
+                logger.info(
+                    "✅ 阅读模式 RAG 检索 %d 条 → 全部转气泡（0 条进上下文）",
+                    len(chunks))
+                return ToolResult(
+                    success=True, output=_cap_output(output),
+                    attachments=attachments)
             # 检索即展示（Retrieval-as-Presentation）：默认数据分流——只有排名
             # 最高的 1 个切片进上下文，其余切片只作为 UI 附件（气泡）展示，
             # 避免召回多时模型被长上下文拖慢、召回少时又漏信息。图谱实体/关系

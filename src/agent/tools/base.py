@@ -356,6 +356,7 @@ class ToolRegistry:
         from .shell_run import ShellRunTool
         from .web import WebScanTool
         from .search import SearchTool
+        from .doc_search import DocSearchTool
         from .interact import AskUserTool
         from .memory import LongMemoryTool
         from .skill_search import SkillToolsTool
@@ -373,6 +374,8 @@ class ToolRegistry:
             WebScanTool(),            # 唯一 web 抓取工具（含 render=true 浏览器渲染）
             # 多引擎并发聚合搜索：模型没有 URL、需要最新/多来源信息时用
             SearchTool(),
+            # 长文档问答：标题优先语义切片 + ColBERT 残差量化 + MaxSim 召回
+            DocSearchTool(),
             AskUserTool(),
             # 定时任务：对话直接创建/管理 cron/interval/一次性任务
             ScheduleTool(),
@@ -396,6 +399,12 @@ class ToolRegistry:
             web_search._legacy = True  # type: ignore[attr-defined]
             web_search.bind(self.config, self)
             self._tools["web_search"] = web_search
+        if "doc_search_tool" in self._tools:
+            doc_search = AliasTool("doc_search_tool", "doc_search",
+                                   "Alias for doc_search_tool.")
+            doc_search._legacy = True  # type: ignore[attr-defined]
+            doc_search.bind(self.config, self)
+            self._tools["doc_search"] = doc_search
 
         # Register RAG tools（rag_tools 在这里注册，别名要等它就绪）
         self._register_rag_tools()
@@ -625,6 +634,25 @@ class ToolRegistry:
                     self.config, "rag_kg_max_description_chars", 100),
                 kg_glean=bool(getattr(self.config, "rag_kg_glean_enabled", True)),
                 kg_raw_json=bool(getattr(self.config, "rag_kg_llm_raw_json", False)),
+                # 检索阅读模式：解析 Markdown 后旁路普通切片/embedding/向量库。
+                reading_mode=bool(getattr(
+                    self.config, "rag_reading_mode_enabled", False)),
+                reading_quant_bits=int(getattr(
+                    self.config, "rag_reading_quant_bits", 4) or 4),
+                reading_coarse_k=int(getattr(
+                    self.config, "rag_reading_coarse_k", 20) or 20),
+                reading_top_n=int(getattr(
+                    self.config, "rag_reading_top_n", 3) or 3),
+                reading_use_ann=bool(getattr(
+                    self.config, "rag_reading_use_ann", False)),
+                reading_model_dir=str(getattr(
+                    self.config, "rag_reading_model_dir", "") or ""),
+                reading_chunk_max=int(getattr(
+                    self.config, "rag_reading_chunk_max", 8000) or 8000),
+                reading_chunk_min=int(getattr(
+                    self.config, "rag_reading_chunk_min", 7500) or 7500),
+                reading_semantic_threshold=float(getattr(
+                    self.config, "rag_reading_semantic_threshold", 0.55)),
             )
             self._rag_engine = engine
             # KG 查询期关键词抽取用辅助模型：工具注册时已持有 aux_llm_getter，
