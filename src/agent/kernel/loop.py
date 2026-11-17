@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .budget import ContextBudget, estimate_tokens
@@ -72,6 +73,75 @@ _RAG_SEARCH_MAX_PER_RUN = 3
 # 退化复读判定：协议片段在单轮输出里重复超过该次数（如 <summary>×1000）
 # 即视为退化输出，按空回复重试。
 _DEGENERATE_REPEAT_LIMIT = 5
+# 通用复读判定（不只 <summary>）：同一句/同一行在正文里重复 >=5 次且占
+# 可切分片段的比例 >=35%，判定为退化输出。用户实测模型会整段复述
+# 「步骤4已完成 / 直接调用 search_tool」几十次，既不复述工具调用也不收尾。
+_DEGENERATE_PART_MIN = 6
+_DEGENERATE_TOP_COUNT = 5
+_DEGENERATE_TOP_RATIO = 0.35
+_DEGENERATE_PART_MIN_CHARS = 12
+# 复读回滚重试上限；超过后给用户一条可见的终止说明，绝不无限续跑。
+_MAX_REPEAT_RETRY = 2
+# 用户输入极端重复时折叠：唯一行占比低于该值才动手，避免误伤正常日志。
+_INPUT_UNIQUE_RATIO = 0.5
+_INPUT_MIN_LINES = 8
+
+
+def _normalize_repeat_part(text: str) -> str:
+    """去掉空白与 Markdown 装饰，保留可比较的正文。"""
+    return re.sub(r"[\s#>*`\-\u3000]+", "", text or "")
+
+
+def _repetition_stats(text: str) -> Tuple[float, int, int]:
+    """返回 (最高频片段占比, 最高频次数, 有效片段数)。"""
+    raw_parts = re.split(r"[\n。！？!?；;]+", text or "")
+    parts = []
+    for part in raw_parts:
+        normalized = _normalize_repeat_part(part)
+        if len(normalized) >= _DEGENERATE_PART_MIN_CHARS:
+            parts.append(normalized)
+    if len(parts) < _DEGENERATE_PART_MIN:
+        return 0.0, 0, len(parts)
+    counts = Counter(parts)
+    top = counts.most_common(1)[0][1]
+    return top / len(parts), top, len(parts)
+
+
+def _looks_degenerate_text(text: str) -> bool:
+    """正文是否出现成段复读（不依赖 <summary> 等协议标签）。"""
+    if len((text or "").strip()) < 120:
+        return False
+    ratio, top, parts = _repetition_stats(text)
+    return (parts >= _DEGENERATE_PART_MIN
+            and top >= _DEGENERATE_TOP_COUNT
+            and ratio >= _DEGENERATE_TOP_RATIO)
+
+
+def _collapse_degenerate_input(text: str) -> str:
+    """折叠用户输入中的极端重复行。
+
+    用户可能把整段模型复读日志重新贴回来；重复输入会诱导模型继续复读。
+    仅在「行数足够多且唯一行占比很低」时去重，正常代码/日志不受影响。
+    """
+    if not text or len(text) < 300:
+        return text
+    lines = text.splitlines()
+    normalized = [_normalize_repeat_part(line) for line in lines]
+    normalized = [line for line in normalized if line]
+    if len(normalized) < _INPUT_MIN_LINES:
+        return text
+    if len(set(normalized)) / len(normalized) >= _INPUT_UNIQUE_RATIO:
+        return text
+    out: List[str] = []
+    seen = set()
+    for line, key in zip(lines, [_normalize_repeat_part(x) for x in lines]):
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(line)
+    collapsed = "\n".join(out)
+    return collapsed if collapsed.strip() else text
 
 # 单次生成的「无 EOS 熔断」下限（估算 token）。模型偶尔漏 EOS / 退化复读时
 # 会一直生成到 max_tokens（默认 32768，本地 2B 实测单轮吐 4.7 万字、耗时
@@ -392,6 +462,11 @@ class KernelLoop:
         self._tool_parse_retry = 0
         self._shrink_guard = 0
         self._reask_guard = 0
+        # 通用复读防护：同一段正文反复出现且不调用工具时回滚重试，超过上限
+        # 给用户可见的终止说明（见 _looks_degenerate_text）。
+        self._repeat_retry = 0
+        self._last_no_tool_norm = ""
+        self._same_no_tool_streak = 0
         self._turns_used = 0
         self._last_consolidated_turn = -1
         self._total_tokens = 0
@@ -493,6 +568,9 @@ class KernelLoop:
         self._empty_retry = 0
         self._tool_parse_retry = 0
         self._reask_guard = 0
+        self._repeat_retry = 0
+        self._last_no_tool_norm = ""
+        self._same_no_tool_streak = 0
 
     def _emit_ui(self, attr: str, *args) -> None:
         """安全调用 UI 回调。
@@ -528,6 +606,9 @@ class KernelLoop:
         self._tool_parse_retry = 0
         self._shrink_guard = 0
         self._reask_guard = 0
+        self._repeat_retry = 0
+        self._last_no_tool_norm = ""
+        self._same_no_tool_streak = 0
         self._finish_nudge = 0
         self._final_reflect = 0
         self._fail_streak = 0
@@ -587,6 +668,7 @@ class KernelLoop:
             self._empty_retry = int(seed.get("empty_retry", 0) or 0)
             self._tool_parse_retry = int(seed.get("tool_parse_retry", 0) or 0)
             self._reask_guard = int(seed.get("reask_guard", 0) or 0)
+            self._repeat_retry = int(seed.get("repeat_retry", 0) or 0)
             self._plan_nudged = int(seed.get("plan_nudged", 0) or 0)
             self._last_redirect_hint = str(seed.get("last_redirect_hint", "") or "")
             self._same_redirect_streak = int(seed.get("same_redirect_streak", 0) or 0)
@@ -606,6 +688,15 @@ class KernelLoop:
         # 上界会让 Agent 在累计 N 轮之后彻底不再调用 LLM。
         self._turns_used = 0
         self.distill_requested = False
+
+        # 用户可能把整段模型复读日志重新贴回来；极端重复的输入会诱导模型
+        # 继续复读。仅在唯一行占比很低时折叠，正常代码/日志不受影响。
+        collapsed_input = _collapse_degenerate_input(user_input)
+        if collapsed_input != user_input:
+            self.log(
+                "[kernel] 用户输入重复行已折叠: "
+                f"{len(user_input)} → {len(collapsed_input)} 字符")
+            user_input = collapsed_input
 
         pending = user_input
         final_text = ""
@@ -821,6 +912,44 @@ class KernelLoop:
             # 工具），这里只处理网络 API 后端及未命中判定的输入，沿用原有
             # ask_user 硬门禁 / 问候熔断 / 失败熔断，不再额外 rollback。
             if not resp.has_calls:
+                # 通用复读防护：模型把「步骤4已完成 / 直接调用 search_tool」
+                # 整段复述几十次却一次工具都不调，会先被反思门反复提醒；
+                # 这里在进入反思门前直接判定退化输出并回滚，避免复读内容进
+                # 历史后自我强化。重试上限用尽后给用户可见的终止说明。
+                if self._is_degenerate_no_tool(resp):
+                    self._repeat_retry += 1
+                    steps = session.plan_open_steps()
+                    nxt = ""
+                    if steps:
+                        s = next((x for x in steps if x.get("status") == "doing"),
+                                 steps[0])
+                        nxt = f"{s.get('id')}.{s.get('title')}"
+                    self.log(
+                        f"[kernel] 检测到无工具退化复读（第 {self._repeat_retry} 次），"
+                        f"回滚本轮并要求直接调用工具")
+                    if self._repeat_retry <= _MAX_REPEAT_RETRY:
+                        self._rollback_turn(session)
+                        pending = _carry_task(
+                            "[ERROR] 你上一条回复在同一段内容上重复了多次，"
+                            "已被内核丢弃。禁止复述任务、计划或步骤状态，"
+                            "禁止输出「我将调用…」「现在开始…」这类描述。\n"
+                            + (f"当前未完成步骤：{nxt}。\n" if nxt else "")
+                            + "现在必须调用工具推进该步骤；若缺少必要信息，"
+                              "只用一句话说明缺少什么。")
+                        continue
+                    final_text = (
+                        "⚠ 模型连续输出重复内容且没有调用任何工具，"
+                        "已中止以避免空转。请重试，或改用支持 "
+                        "function calling 的模型。")
+                    if steps:
+                        todo = "; ".join(
+                            f"{x.get('id')}.{x.get('title')}" for x in steps[:8])
+                        final_text += f"\n未完成步骤：{todo}"
+                    session.finish_turn(
+                        rec, final_text, [], [], l2_summary(final_text),
+                        raw_content=resp.raw_content)
+                    exit_reason = ExitReason.DONE
+                    break
                 # 反思门：模型想收尾，但计划里还有未完成步骤 —— 不能就这么放它
                 # 走。这正是「半路任务跑丢 / 直接就停了」的主因：模型自认为做完
                 # 了，实际步骤没走完。提醒有限次，超过后尊重决定但在回复里附上
@@ -1065,6 +1194,10 @@ class KernelLoop:
             # ---- ACT ----
             self.state = next_state(KernelState.THINK, "has_calls")
             tool_calls = resp.tool_calls
+            # 真正发起工具调用 → 复读防护清零，避免上一轮的垃圾正文影响后续。
+            self._repeat_retry = 0
+            self._last_no_tool_norm = ""
+            self._same_no_tool_streak = 0
 
             # ---- 规划前置门：先于执行 ----
             # 多步任务必须先 update_plan(create) 写入执行计划，再逐步执行；否则
@@ -1757,6 +1890,7 @@ class KernelLoop:
             "empty_retry": self._empty_retry,
             "reask_guard": self._reask_guard,
             "tool_parse_retry": self._tool_parse_retry,
+            "repeat_retry": self._repeat_retry,
             "plan_nudged": self._plan_nudged,
             # 同 hint 连续拦截计数跨段继承：否则每段各重置，5 段又能各拦 2 次。
             "last_redirect_hint": self._last_redirect_hint,
@@ -2071,6 +2205,25 @@ class KernelLoop:
         except Exception as e:  # 兜底生成失败也不应让整轮变空
             self.log(f"[kernel] 关思考兜底作答失败，退回原始思考: {e}")
         return reasoning
+
+    def _is_degenerate_no_tool(self, resp: LLMResponse) -> bool:
+        """无工具回复是否在成段复读 / 与上一轮完全相同。
+
+        除了单轮内的句子复读，还记录跨轮「同样的长正文」：模型被反思门提醒后
+        可能一字不改地重发同一段计划说明，这种情况同样视为空转。
+        """
+        text = strip_summary_tags(resp.content or "").strip()
+        if not text:
+            text = (resp.reasoning or "").strip()
+        if _looks_degenerate_text(text):
+            return True
+        norm = re.sub(r"\s+", "", text)
+        if len(norm) >= 80 and norm == self._last_no_tool_norm:
+            self._same_no_tool_streak += 1
+        else:
+            self._same_no_tool_streak = 0
+        self._last_no_tool_norm = norm
+        return self._same_no_tool_streak >= 2
 
     def _no_tool_event(self, resp: LLMResponse) -> str:
         content = (resp.content or "").strip()

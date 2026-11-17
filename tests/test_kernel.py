@@ -818,3 +818,39 @@ def test_kernel_rollback_keeps_user_task_in_context():
         assert "example.com/jobs" in joined, (
             f"第 {i + 1} 轮的 user 消息里丢失了原始任务（URL 不见了）——"
             "rollback 覆盖 pending 的回归")
+
+
+def test_degenerate_repetition_helpers():
+    """通用复读检测：整段重复正文要被识别，重复用户输入要被折叠。"""
+    from agent.kernel.loop import (
+        _collapse_degenerate_input, _looks_degenerate_text,
+    )
+
+    repeated = "。".join(
+        ["步骤4已完成，现在可以开始步骤5，综合分析并给出判断"] * 8) + "。"
+    assert _looks_degenerate_text(repeated)
+
+    lines = ["步骤4已完成，现在可以开始步骤5。"] * 10
+    lines += ["步骤4要求搜集市场观点和机构预测，直接调用 search_tool。"] * 10
+    collapsed = _collapse_degenerate_input("\n".join(lines))
+    assert len(collapsed.splitlines()) == 2
+    # 正常多行文本不应被误折叠
+    normal = "\n".join(f"第{i}项：这是互不相同的正常内容。" for i in range(10))
+    assert _collapse_degenerate_input(normal) == normal
+
+
+def test_kernel_stops_degenerate_no_tool_loop(cfg):
+    """模型整段复读且不调工具：回滚重试，超过上限给可见终止说明。"""
+    repeated = "。".join(
+        ["步骤4已完成，现在可以开始步骤5，综合分析并给出判断"] * 8) + "。"
+    mock = MockLLM([
+        [_evt("content", repeated), _evt("done", usage={})],
+        [_evt("content", repeated), _evt("done", usage={})],
+        [_evt("content", repeated), _evt("done", usage={})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    result = agent.kernel.run("继续执行当前任务")
+
+    assert result.reason is ExitReason.DONE
+    assert "已中止以避免空转" in result.text
+    assert len(mock.calls) == 3, "复读只允许回滚重试 2 次，第 3 次必须收尾"
