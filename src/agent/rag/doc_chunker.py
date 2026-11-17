@@ -3,6 +3,7 @@
 约束（与产品需求一致）：
 * 优先按 Markdown / 中文章节标题分块，每个「标题 + 正文」是一个候选分片；
 * 单段过长时才做语义切分，切点落在相邻句子相似度的低谷；
+  句向量由 model2vec 静态嵌入计算（不是 ColBERT）；
 * 切片 7500~8000 字（末尾/短文档除外），1% overlap；
 * 断点必须落在句子结束处；代码块、表格（不超长时）整体保留；
 * 章节结构失效时退回递归切分，禁止把一句话切成两半。
@@ -355,9 +356,14 @@ def _unit_vectors(units: Sequence[_Unit], encoder: Any) -> Optional[np.ndarray]:
     vecs: List[np.ndarray] = []
     for raw in emb_list:
         arr = np.asarray(raw, dtype=np.float32)
-        if arr.ndim != 2 or arr.size == 0:
+        if arr.ndim == 1 and arr.size:
+            # model2vec 等静态句向量：一句一个向量，直接使用。
+            v = arr
+        elif arr.ndim == 2 and arr.size:
+            # ColBERT 等词向量矩阵：对 token 向量做均值池化。
+            v = arr.mean(axis=0)
+        else:
             return None
-        v = arr.mean(axis=0)
         n = float(np.linalg.norm(v))
         vecs.append(v / max(n, 1e-12))
     return np.vstack(vecs)

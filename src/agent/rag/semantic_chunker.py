@@ -513,6 +513,38 @@ def _get_static_embeddings():
     return _STATIC_EMBS
 
 
+class _StaticSentenceEncoder:
+    """把 chonkie model2vec 适配成 doc_chunker 的 ``encode_documents`` 协议。
+
+    model2vec 返回的是句向量 (D,)，不是 ColBERT 的词向量矩阵 (L,D)；
+    doc_chunker 的 ``_unit_vectors`` 同时支持这两种形状。
+    """
+
+    def __init__(self, embeddings):
+        self._embeddings = embeddings
+
+    def encode_documents(self, texts, batch_size: int = 16):
+        out = []
+        texts = list(texts)
+        for start in range(0, len(texts), max(1, batch_size)):
+            batch = texts[start:start + max(1, batch_size)]
+            for vec in self._embeddings.embed_batch(batch):
+                out.append([float(x) for x in vec])
+        return out
+
+
+def get_chunking_encoder():
+    """语义切片专用编码器：model2vec 静态句向量，失败返回 None。
+
+    明确不使用检索/ColBERT 模型做切片决策——切片只需要相邻句向量的相对
+    相似度，静态嵌入更快且不会与后续词向量计算争抢模型。
+    """
+    embeddings = _get_static_embeddings()
+    if embeddings is None:
+        return None
+    return _StaticSentenceEncoder(embeddings)
+
+
 # ---------------------------------------------------------------------------
 # chonkie embedding adapter
 # ---------------------------------------------------------------------------

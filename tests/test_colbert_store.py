@@ -76,6 +76,7 @@ def test_store_index_search_list_delete(tmp_path):
     runtime = FakeRuntime()
     store = cs.ColBertDocStore(db_dir=str(tmp_path / "idx"),
                                runtime=runtime, dim=8)
+    store._chunk_encoder = runtime
     text = (
         "# 产品手册\n\n"
         "## 认证方式\n\n"
@@ -108,6 +109,7 @@ def test_store_reindex_overwrites_same_source(tmp_path):
     runtime = FakeRuntime()
     store = cs.ColBertDocStore(db_dir=str(tmp_path / "idx"),
                                runtime=runtime, dim=8)
+    store._chunk_encoder = runtime
     text = "## 认证\n\n" + ("OAuth2 认证说明。" * 30)
     n1 = store.index_text("手册", text, source="/docs/a.md",
                           max_chars=500, min_chars=300)

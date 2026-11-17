@@ -268,6 +268,8 @@ class ColBertDocStore:
         self._write_lock = threading.RLock()
         self._fts_ready = False
         self._ann_ready = False
+        # 语义切片编码器：默认 model2vec 静态句向量（测试可注入 Fake）。
+        self._chunk_encoder = None
         try:
             import lancedb
         except ImportError as e:
@@ -329,8 +331,15 @@ class ColBertDocStore:
         if not (text or "").strip():
             raise ColBertStoreError("document text is empty")
         title = (title or "Untitled").strip()
+        # 语义低谷用 model2vec 静态句向量，不用 ColBERT；ColBERT 只在
+        # add_chunks() 里计算入库词向量。model2vec 不可用时 chunk_document
+        # 自动退回词面相似度。
+        encoder = self._chunk_encoder
+        if encoder is None:
+            from .semantic_chunker import get_chunking_encoder
+            encoder = get_chunking_encoder()
         chunks = chunk_document(
-            text, title=title, encoder=self.runtime,
+            text, title=title, encoder=encoder,
             max_chars=max_chars, min_chars=min_chars,
             overlap_ratio=overlap_ratio,
             semantic_threshold=semantic_threshold)
@@ -507,22 +516,36 @@ class ColBertDocStore:
         allowed = self._source_ids(source)
         if allowed is not None and not allowed:
             return []
-        # 有 source 过滤时多取候选，过滤后仍能凑满 coarse_k。
-        fetch_k = coarse_k * 4 if allowed is not None else coarse_k
+        # source 过滤在查询层完成：BM25 直接 where source；向量表没有 source
+        # 列，就对允许的 doc_id 精确点积（绕过 ANN，避免全局 top-k 把目标
+        # 文档挤掉）。无 source 时才走 LanceDB 的 ANN/精确扫描。
+        fetch_k = coarse_k if allowed is None else max(coarse_k, len(allowed))
         bm25_ids: List[str] = []
         if self._ensure_fts():
             try:
-                rows = self._doc.search(
-                    fts_text(query), query_type="fts").limit(fetch_k).to_list()
-                bm25_ids = [r["doc_id"] for r in rows
-                            if allowed is None or r["doc_id"] in allowed]
+                q_fts = self._doc.search(
+                    fts_text(query), query_type="fts")
+                if source:
+                    escaped = source.replace("'", "''")
+                    q_fts = q_fts.where(f"source LIKE '%{escaped}%'")
+                rows = q_fts.limit(fetch_k).to_list()
+                bm25_ids = [r["doc_id"] for r in rows]
             except Exception:
                 bm25_ids = []
         vec_ids: List[str] = []
         try:
-            rows = self._vector_search(q_center, fetch_k, use_ann)
-            vec_ids = [r["doc_id"] for r in rows
-                       if allowed is None or r["doc_id"] in allowed]
+            if allowed is not None:
+                scored: List[Tuple[float, str]] = []
+                for doc_id, row in self._fetch(
+                        self._vec, sorted(allowed)).items():
+                    vec = np.asarray(row.get("vector"), dtype=np.float32)
+                    if vec.shape == q_center.shape:
+                        scored.append((float(np.dot(q_center, vec)), doc_id))
+                scored.sort(reverse=True)
+                vec_ids = [doc_id for _, doc_id in scored[:fetch_k]]
+            else:
+                rows = self._vector_search(q_center, fetch_k, use_ann)
+                vec_ids = [r["doc_id"] for r in rows]
         except Exception as e:
             logger.warning("ColBERT 中心向量检索失败: %s", e)
             vec_ids = []
@@ -664,6 +687,26 @@ class ColBertDocStore:
                 logger.warning("ColBERT ANN 索引构建失败: %s", e)
                 return {"built": False, "vectors": rows,
                         "message": f"ANN 索引构建失败（可继续使用精确扫描）：{e}"}
+
+    def delete_matching(self, keyword: str) -> int:
+        """按 source/title 子串删除所有匹配文档（知识遗忘/按名删除）。"""
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return 0
+        escaped = keyword.replace("'", "''")
+        try:
+            rows = self._doc.search().where(
+                f"source LIKE '%{escaped}%' OR title LIKE '%{escaped}%'"
+            ).limit(5000).to_list()
+        except Exception as e:
+            logger.debug("ColBERT 按名查找待删文档失败: %s", e)
+            return 0
+        sources = {r.get("source") or r.get("title") for r in rows}
+        removed = 0
+        for source in sources:
+            if source:
+                removed += self.delete(source=source)
+        return removed
 
     def delete(self, doc_id: str = "", source: str = "",
                title: str = "") -> int:

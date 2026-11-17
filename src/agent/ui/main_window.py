@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
     QMessageBox, QInputDialog, QPlainTextEdit, QProgressBar,
-    QStatusBar, QFileDialog, QDialog, QGroupBox, QCheckBox,
+    QStatusBar, QFileDialog, QDialog, QGroupBox, QCheckBox, QScrollArea,
 )
 
 from ..agent import Agent, AgentCallbacks
@@ -1376,12 +1376,40 @@ class ReadingIndexWorker(QThread):
 
 
 class ConfigDialog(_HostedPanelDialog):
-    """配置窗口：承载原主窗口顶部配置区的全部内容。"""
+    """配置窗口：承载原主窗口顶部配置区的全部内容。
+
+    配置项较多（含检索阅读模式）时面板高度会超过小屏窗口，必须放在
+    QScrollArea 里，否则底部区域会被裁掉、用户看不到也无法操作。
+    """
 
     _host_attr = "_config_host"
 
     def __init__(self, panel: QWidget, parent: Optional[QWidget] = None):
-        super().__init__("配置", 780, 420, panel, parent)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll_added = False
+        super().__init__("配置", 900, 700, panel, parent)
+
+    def attach(self, panel: QWidget) -> None:
+        self._panel = panel
+        self._scroll.setWidget(panel)
+        if not self._scroll_added:
+            self._lay.addWidget(self._scroll, 1)
+            self._scroll_added = True
+        panel.show()
+
+    def detach(self, host: QWidget) -> None:
+        panel = self._panel
+        self._panel = None
+        if panel is not None and self._scroll.widget() is panel:
+            self._scroll.takeWidget()
+        if panel is None:
+            return
+        host_lay = host.layout()
+        if host_lay is not None:
+            host_lay.addWidget(panel)
+        else:
+            panel.setParent(host)
 
 
 class LogWindow(_HostedPanelDialog):

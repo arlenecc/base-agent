@@ -775,6 +775,8 @@ class RAGEngine:
         self._reading_semantic_threshold = min(0.55, max(0.15, threshold))
         self._reading_store: Optional[Any] = None
         self._reading_store_lock = threading.Lock()
+        # 可注入的切片编码器（测试用；生产默认惰性取 model2vec）。
+        self._reading_chunk_encoder: Any = None
 
     # ------------------------------------------------------------------
     # properties
@@ -800,6 +802,14 @@ class RAGEngine:
     def reading_mode(self) -> bool:
         return self._reading_mode
 
+    def _pipeline_signature(self) -> str:
+        """入库管线签名：模式/量化/切片参数变化时强制增量同步重跑。"""
+        if not self._reading_mode:
+            return "normal"
+        return (f"reading:q{self._reading_quant_bits}:"
+                f"{self._reading_chunk_min}-{self._reading_chunk_max}:"
+                f"th{self._reading_semantic_threshold:.4f}")
+
     def _get_reading_store(self):
         """检索阅读模式的 ColBERT 三表 store（与 doc_search_tool 共享实例）。"""
         if not self._reading_mode:
@@ -816,9 +826,14 @@ class RAGEngine:
                         ) -> List[Dict[str, Any]]:
         """用 doc_chunker 生成 7500~8000 字切片（引擎侧已解析出 Markdown）。"""
         from .doc_chunker import chunk_document
-        store = self._get_reading_store()
+        # 语义低谷用 model2vec 静态句向量（与普通 RAG 语义切片同一后端），
+        # 不用 ColBERT：切片只需相对相似度，静态嵌入更快且不加载 587MB 模型。
+        encoder = getattr(self, "_reading_chunk_encoder", None)
+        if encoder is None:
+            from .semantic_chunker import get_chunking_encoder
+            encoder = get_chunking_encoder()
         chunks = chunk_document(
-            text, title=title, encoder=store.runtime,
+            text, title=title, encoder=encoder,
             max_chars=self._reading_chunk_max,
             min_chars=self._reading_chunk_min,
             overlap_ratio=0.01,
@@ -1328,8 +1343,16 @@ class RAGEngine:
                         store.delete_document(
                             os.path.relpath(dup_path, self._knowledge_base))
                         store.delete_document(os.path.basename(dup_path))
+                        # 阅读模式的重复副本同样要从 ColBERT 三表移除。
+                        if getattr(self, "_reading_mode", False):
+                            rs = self._get_reading_store()
+                            if rs is not None:
+                                rs.delete(source=dup_path)
                     except Exception as e:
                         logger.warning("RAG: 清理副本向量失败 %s: %s", dup_path, e)
+                        # 删除失败不要标记 duplicate_of/chunk_count=0，否则
+                        # 下轮会误判「已清理」而留下普通/ColBERT 残留向量。
+                        continue
                     # Markdown 缓存 + digest 行必须一起清：否则紧接着的 Step 7
                     # （ensure_digests_for_cached_documents）看到「有缓存、无
                     # 记录」会用旧缓存重新生成一条 digest → documents 表出现
@@ -1615,15 +1638,19 @@ class RAGEngine:
             # HFS+/SMB 挂载的 mtime 粒度只有 1~2 秒，同一秒内改一个字也识别
             # 不出来。指纹只在「本来要跳过」时才读盘算，正常路径零额外开销。
             # 旧记录没有 source_hash 时按旧逻辑判定（不影响已同步的库）。
-            # 处理模式变化必须强制重跑：普通模式写的 manifest 没有 reading_mode
-            # 标记，切到阅读模式后若继续按 mtime/size 跳过，ColBERT 三表会永远
-            # 是空的（反向切回普通模式同理）。标记按文件写入，改模式只需一次全量。
-            same_mode = (prev is not None
-                         and bool(prev.get("reading_mode", False))
-                         == bool(self._reading_mode))
+            # 处理模式/参数变化必须强制重跑：普通模式写的 manifest 没有
+            # pipeline_signature，切到阅读模式后若继续按 mtime/size 跳过，
+            # ColBERT 三表会永远是空的；阅读模式改量化位数/切片大小/阈值
+            # 同理（不重跑则索引仍是旧参数产物）。legacy 条目按 normal 处理，
+            # 避免普通模式无谓全量重跑。
+            prev_sig = (prev or {}).get("pipeline_signature")
+            if prev_sig is None:
+                prev_sig = "normal"
+            same_pipeline = (prev is not None
+                             and prev_sig == self._pipeline_signature())
             if (not force
                     and prev is not None
-                    and same_mode
+                    and same_pipeline
                     and prev.get("mtime") == sig["mtime"]
                     and prev.get("size") == sig["size"]
                     and (not prev_hash
@@ -1661,9 +1688,10 @@ class RAGEngine:
                         # 认出「还有旧向量要删」；从没入库过的副本两项为空。
                         "content_hash": (prev or {}).get("content_hash"),
                         "chunk_count": (prev or {}).get("chunk_count", 0),
-                        # 与处理模式标记保持一致，避免阅读模式下每次同步都把
-                        # 副本当「模式不符」重新走一遍。
+                        # 与入库管线签名保持一致，避免阅读模式下每次同步都把
+                        # 副本当「参数不符」重新走一遍。
                         "reading_mode": bool(self._reading_mode),
+                        "pipeline_signature": self._pipeline_signature(),
                     }
                     with stats_lock:
                         stats["files_duplicated"] += 1
@@ -2231,8 +2259,9 @@ class RAGEngine:
                                                 filepath, sig_now["size"])),
                             "content_hash": c_hash,
                             "chunk_count": n_chunks,
-                            # 模式标记：切换检索阅读模式后强制重跑一次。
+                            # 模式/参数标记：切换阅读模式或改切片参数后强制重跑。
                             "reading_mode": bool(self._reading_mode),
+                            "pipeline_signature": self._pipeline_signature(),
                         }
                     except OSError as e:
                         logger.warning("RAG: failed to update manifest for %s: %s", filepath, e)
@@ -2596,6 +2625,12 @@ class RAGEngine:
                 # 两个旧版兼容：basename 哈希（最早版本）与完整路径哈希。
                 store.delete_document(os.path.basename(source))
                 store.delete_document(source)
+                # 检索阅读模式的 ColBERT 三表也必须同步清理，否则已删除文件
+                # 仍会出现在 BM25/向量召回里（普通 store 与它相互独立）。
+                if getattr(self, "_reading_mode", False):
+                    rs = self._get_reading_store()
+                    if rs is not None:
+                        rs.delete(source=source)
                 # 缓存的 Markdown 也必须一起删。旧实现只删了向量和元数据，
                 # 而紧接着的 Step 7（ensure_digests_for_cached_documents）会发现
                 # 「有缓存文件、无 digest 记录」，于是用旧缓存重新生成一条 ——
@@ -2921,14 +2956,10 @@ class RAGEngine:
             logger.debug("KG: 收集待删 chunk 前缀失败（跳过 KG 清理）: %s", e)
         store.delete_document(name)      # 元数据（documents 表）
         store.delete_by_source(name)     # 向量 chunks + 失效 FTS/ANN 索引
-        if self._reading_mode:
+        if getattr(self, "_reading_mode", False):
             rs = self._get_reading_store()
             if rs is not None:
-                for d in rs.list_documents(1000):
-                    src = d.get("source") or ""
-                    title = d.get("title") or ""
-                    if name in src or name in title:
-                        rs.delete(source=src or title)
+                rs.delete_matching(name)
         if md_path and os.path.isfile(md_path):
             try:
                 os.remove(md_path)

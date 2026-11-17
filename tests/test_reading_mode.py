@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import threading
 
 import numpy as np
 
@@ -49,6 +50,8 @@ def _engine(tmp_path) -> RAGEngine:
         db_dir=str(tmp_path / ".agent" / "colbert_docs.lancedb"),
         runtime=FakeRuntime(), dim=8)
     eng._reading_store = store
+    # 语义切片编码器用测试 Fake 注入，避免加载真实 model2vec。
+    eng._reading_chunk_encoder = store.runtime
     return eng
 
 
@@ -106,6 +109,53 @@ def test_reading_chunks_add_and_search_returns_source_window(tmp_path):
     assert status["reading_mode"] is True
     assert status["chunks_stored"] == len(chunks)
     assert status["sources"] == ["/docs/auth.md"]
+
+
+def test_reading_cleanup_deletes_colbert_chunks(tmp_path):
+    """删除知识库文件时，普通 store 与 ColBERT 三表都必须清理。"""
+    eng = object.__new__(RAGEngine)
+    eng._reading_mode = True
+    eng._knowledge_base = str(tmp_path)
+    eng._rag_dir = str(tmp_path / "rag")
+    eng._markdown_dir = str(tmp_path / "md")
+    eng._cache_md_path = lambda source: str(tmp_path / "missing.md")
+
+    class NormalStore:
+        def __init__(self):
+            self.deleted = []
+
+        def delete_by_source(self, source):
+            self.deleted.append(source)
+
+        def delete_document(self, name):
+            pass
+
+        def delete_document_by_md_path(self, path):
+            pass
+
+    class ReadingStore:
+        def __init__(self):
+            self.deleted = []
+
+        def delete(self, source="", doc_id="", title=""):
+            self.deleted.append(source)
+            return 1
+
+    normal = NormalStore()
+    reading = ReadingStore()
+    eng._get_store = lambda: normal
+    eng._get_reading_store = lambda: reading
+
+    source = str(tmp_path / "old.md")
+    old = {source: {"mtime": 1, "size": 10, "chunk_count": 3}}
+    new = dict(old)
+    stats = {"files_deleted": 0}
+    deleted = eng._cleanup_deleted_files(
+        [], stats, threading.Lock(), old, new)
+    assert deleted == {source}
+    assert normal.deleted == [source]
+    assert reading.deleted == [source]
+    assert stats["files_deleted"] == 1
 
 
 def test_rag_search_tool_reading_mode_sends_all_chunks_to_bubbles():

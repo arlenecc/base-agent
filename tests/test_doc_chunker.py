@@ -80,6 +80,34 @@ class _ValleyEncoder:
         return out
 
 
+class _SentenceEncoder:
+    """model2vec 风格：一句一个 1D 向量，而不是词向量矩阵。"""
+
+    def encode_documents(self, texts, batch_size=16):
+        out = []
+        for text in texts:
+            if "AAA" in text:
+                out.append(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+            elif "BBB" in text:
+                out.append(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32))
+            else:
+                out.append(np.array([0.7, 0.7, 0.0, 0.0], dtype=np.float32))
+        return out
+
+
+def test_semantic_valley_accepts_sentence_vectors():
+    """model2vec 返回 1D 句向量时也要能识别语义低谷。"""
+    text = "## S\n\n" + "".join(
+        f"AAA sentence number {i}. " for i in range(14)
+    ) + "".join(f"BBB sentence number {i}. " for i in range(14))
+    chunks = chunk_document(text, "Doc", encoder=_SentenceEncoder(),
+                            max_chars=500, min_chars=300,
+                            overlap_ratio=0.0)
+    assert len(chunks) >= 2
+    assert "BBB" not in chunks[0].content
+    assert any("BBB" in c.content for c in chunks[1:])
+
+
 def test_semantic_valley_cut_and_adaptive_threshold():
     text = "## S\n\n" + "".join(
         f"AAA sentence number {i}. " for i in range(14)
