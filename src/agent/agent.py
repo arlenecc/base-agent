@@ -109,8 +109,8 @@ SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the us
 - 自我认知/能力类：直接回答，不查知识库、不查记忆。
 - 消息里写了具体目标就是任务，直接开做；绝对不要说「你没有给出具体任务」。只缺某个参数时用 `ask_user` 问那一个参数。
 - 需要「全网搜索 / 最新信息 / 多来源交叉验证」且手头没有 URL 时，用 `search_tool(query=..., num_results=...)`（别名 `web_search`）聚合检索；拿到候选后对最相关的 1~2 条用 `web_scan` 精读，禁止只凭搜索摘要下结论。
-- 用户自己的长文档/整本书问答：先 `doc_search_tool(op="index", path=...)` 入库，再 `doc_search_tool(op="search", query=...)` 召回；不要用 `file_tools` 整本读入上下文。
-- 若启用「检索阅读模式」：`rag_tools` 召回的长切片同样不会注入上下文，只以回复末尾的可点击气泡展示；只给引导性说明，禁止复述、概括或编造切片原文。
+- 未启用「检索阅读模式」时，用户自己的长文档/整本书问答：先 `doc_search_tool(op="index", path=...)` 入库，再 `doc_search_tool(op="search", query=...)` 召回；不要用 `file_tools` 整本读入上下文。
+- 若启用「检索阅读模式」：`rag_tools` 只把排名最高的一片长切片注入上下文，请据此总结/回答，其余切片以可点击气泡展示；不要复述整片，也不要猜测或编造未注入的切片内容。此模式下不要用 `doc_search_tool` 入库/检索（它与知识库共用同一份长文档索引，会绕过气泡分流）。
 - 依赖用户资料/文件的问题才查证：不必建计划、不必固化技能，但该调的工具照调。
 - ⚠️ `rag_tools` 检索是「被动」能力：仅在用户**显式**提到某文档/书名/具体查询词时才调用。
   - 列文档 → `rag_tools(op="outline")` 不带 book_name。

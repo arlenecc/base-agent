@@ -109,14 +109,21 @@ class AgentConfig:
     # 开启后知识库同步在文档解析为 Markdown 之后，跳过原有「token 切片 →
     # embedding → 向量库」链路，改用 doc_chunker + Jina ColBERT v2 残差量化
     # 写 LanceDB 三表；检索用 BM25 + 中心向量 RRF 粗筛 + MaxSim 精排。
-    # 召回切片不进入模型上下文，只作为回复末尾的可点击气泡。
+    # 召回时最高分切片注入模型上下文供总结，其余切片作为回复末尾气泡。
     rag_reading_mode_enabled: bool = False
     # 残差量化位数：4（默认，精度更高）或 2（体积更小）。
     rag_reading_quant_bits: int = 4
-    # RRF 粗筛候选数（10/20/50/100，默认 20）。
-    rag_reading_coarse_k: int = 20
+    # RRF 粗筛候选数（10/20/50/100，默认 50）。两条通道各取该数量的候选，
+    # 并集（≤2×）进入 MaxSim 精排；50 在保持精排耗时 <20ms 的同时显著提升
+    # 大库召回（126 切片实测：20 → 14/16，50 → 16/16 命中精排最优切片）。
+    rag_reading_coarse_k: int = 50
     # MaxSim 精排后返回的切片数（1/3/5，默认 3）。
     rag_reading_top_n: int = 3
+    # 检索相关度门限：MaxSim ÷ 查询 token 数（每个查询词的平均最优相似度）
+    # 低于该值的切片视为不相关、不返回（0 = 关闭）。实测相关查询落在
+    # 0.62~0.82、不相关查询 0.58~0.60，默认 0.60 可在不误杀的前提下挡掉
+    # 大部分「红烧肉怎么做」这类与知识库无关的查询。
+    rag_reading_min_score: float = 0.6
     # 是否使用 LanceDB ANN 向量索引；关闭时强制精确扫描（bypass_vector_index）。
     rag_reading_use_ann: bool = False
     # 模型目录：空 = 自动使用/下载 ~/.base-agent/models/jina-colbert-v2-64-onnx-int8。
@@ -430,6 +437,7 @@ class AgentConfig:
                      "rag_rerank_min_similarity",
                      "rag_chunk_overlap_percent",
                      "rag_reading_semantic_threshold",
+                     "rag_reading_min_score",
                      "aux_temperature", "aux_top_p", "aux_min_p",
                      "aux_repetition_penalty", "aux_request_timeout",
                      # 这些是 float/bool 却被错分进 _STR_FIELDS —— config.json
@@ -673,7 +681,7 @@ class AgentConfig:
         if self.rag_reading_quant_bits not in (2, 4):
             self.rag_reading_quant_bits = 4
         if self.rag_reading_coarse_k not in (10, 20, 50, 100):
-            self.rag_reading_coarse_k = 20
+            self.rag_reading_coarse_k = 50
         if self.rag_reading_top_n not in (1, 3, 5):
             self.rag_reading_top_n = 3
         if self.rag_reading_chunk_max < 500:
@@ -689,6 +697,12 @@ class AgentConfig:
         # 上限 0.55 是本模式的产品默认；下限 0.15 与 doc_chunker 的自适应下限
         # 一致，避免手改成 0 让所有句间空隙都成为切点。
         self.rag_reading_semantic_threshold = min(0.55, max(0.15, threshold))
+        # 相关度门限：0 = 关闭；上限 0.95 防止手改成 1.0 后永远无结果。
+        try:
+            min_score = float(self.rag_reading_min_score)
+        except (TypeError, ValueError):
+            min_score = 0.6
+        self.rag_reading_min_score = min(0.95, max(0.0, min_score))
 
     def save(self, path: str) -> None:
         import json

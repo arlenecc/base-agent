@@ -119,6 +119,50 @@ def test_store_reindex_overwrites_same_source(tmp_path):
     assert store.stats()["documents"] == n1, "同源重建不能翻倍"
 
 
+class _ChannelRuntime:
+    """中心向量与 BM25 刻意指向不同切片，用于验证并集候选与相关度门限。"""
+
+    dim = 4
+
+    def encode_query(self, text):
+        return np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+
+    def encode_document(self, text):
+        # "alpha" 切片中心与查询同向（向量通道第 1）；"beta" 切片中心正交。
+        if "beta" in text:
+            return np.array([[0.0, 1.0, 0.0, 0.0]], dtype=np.float32)
+        return np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+
+
+def test_search_reranks_union_of_channels(tmp_path):
+    """精排候选必须是两通道并集：BM25 头部不能挤掉中心向量头部。"""
+    store = cs.ColBertDocStore(db_dir=str(tmp_path / "idx"),
+                               runtime=_ChannelRuntime(), dim=4)
+    store.add_chunks("Doc A", "/a.md", ["alpha"])
+    store.add_chunks("Doc B", "/b.md", ["beta"])
+
+    # 查询词 "beta"：BM25 只命中 B，中心向量只命中 A（coarse_k=1）。
+    # 旧实现按 RRF 截断到 1 条时只剩 BM25 的 B；并集后 A（MaxSim 最高）
+    # 仍能进入精排并拿到第 1。
+    hits = store.search("beta", top_k=1, coarse_k=1)
+    assert hits and hits[0]["source"] == "/a.md"
+    assert hits[0]["score_per_token"] == pytest.approx(1.0)
+
+
+def test_search_min_score_filters_irrelevant(tmp_path):
+    store = cs.ColBertDocStore(db_dir=str(tmp_path / "idx"),
+                               runtime=_ChannelRuntime(), dim=4)
+    store.add_chunks("Doc A", "/a.md", ["alpha"])
+    store.add_chunks("Doc B", "/b.md", ["beta"])
+
+    # beta 切片 MaxSim=0 → 每 token 平均分 0，低于门限被丢弃；alpha 保留。
+    hits = store.search("beta", top_k=2, coarse_k=2, min_score=0.5)
+    assert [h["source"] for h in hits] == ["/a.md"]
+    # 门限关闭（0）时两条都返回。
+    assert len(store.search("beta", top_k=2, coarse_k=2)) == 2
+
+
+
 def test_store_stats_without_loading_model(tmp_path, monkeypatch):
     def boom(*args, **kwargs):
         raise AssertionError("stats/list 不应加载 ColBERT 模型")

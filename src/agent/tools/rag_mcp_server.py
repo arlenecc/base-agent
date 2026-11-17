@@ -78,6 +78,11 @@ def _err(msg: str) -> str:
     return json.dumps({"status": "error", "message": msg}, ensure_ascii=False)
 
 
+def _reading_mode(engine: Any) -> bool:
+    """引擎是否运行在检索阅读模式（长切片三表旁路）。"""
+    return bool(getattr(engine, "reading_mode", False))
+
+
 def build_mcp_server() -> "FastMCP":
     """构造（或返回已构造的）FastMCP 实例，注册 6 个 RAG 工具。
 
@@ -181,7 +186,13 @@ def build_mcp_server() -> "FastMCP":
                 return _err("RAG 引擎未就绪")
             try:
                 results = engine.search(query, top_k=top_k)
-                return _ok({"results": results, "count": len(results)})
+                data: Dict[str, Any] = {
+                    "results": results, "count": len(results)}
+                if _reading_mode(engine):
+                    # 阅读模式返回的是 7500~8000 字长切片；明确标注，避免
+                    # 客户端误以为这是普通 rerank 后的小片段。
+                    data["reading_mode"] = True
+                return _ok(data)
             except Exception as e:  # noqa: BLE001
                 return _err(f"检索失败: {e}")
 
@@ -222,6 +233,13 @@ def build_mcp_server() -> "FastMCP":
             engine = _get_engine()
             if engine is None:
                 return _err("RAG 引擎未就绪（请先在应用内启用知识库）")
+            if _reading_mode(engine):
+                # 阅读模式长切片只写入 ColBERT 三表，普通向量库为空；
+                # 直接建图会静默产出 0 切片/空图谱，必须明确拒绝。
+                return _err(
+                    "检索阅读模式未适配知识图谱：长切片未进入普通向量库，"
+                    "无法抽取实体/关系。请在应用配置窗口关闭检索阅读模式、"
+                    "重建知识库后再构建图谱。")
             try:
                 stats = engine.kg_ingest(doc_name=doc_name, rebuild=rebuild)
                 return _ok({"ingest": stats})

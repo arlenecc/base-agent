@@ -640,9 +640,11 @@ class ToolRegistry:
                 reading_quant_bits=int(getattr(
                     self.config, "rag_reading_quant_bits", 4) or 4),
                 reading_coarse_k=int(getattr(
-                    self.config, "rag_reading_coarse_k", 20) or 20),
+                    self.config, "rag_reading_coarse_k", 50) or 50),
                 reading_top_n=int(getattr(
                     self.config, "rag_reading_top_n", 3) or 3),
+                reading_min_score=float(getattr(
+                    self.config, "rag_reading_min_score", 0.0) or 0.0),
                 reading_use_ann=bool(getattr(
                     self.config, "rag_reading_use_ann", False)),
                 reading_model_dir=str(getattr(

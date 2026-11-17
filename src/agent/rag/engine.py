@@ -621,6 +621,19 @@ def _clamp_chunk_size_to_model_window(chunk_size: int, embedding_model: str) -> 
     return chunk_size
 
 
+def _reading_model_signature(model_dir: str = "") -> str:
+    """检索阅读模式 ColBERT 模型身份（目录 + 权重体积）。
+
+    失败时返回固定串而不是抛异常：签名只用于 manifest 的「是否需要重索引」
+    判定，模型暂时缺失也应让同步流程按原有路径给出可读错误。
+    """
+    try:
+        from .colbert_runtime import model_signature
+        return model_signature(model_dir)
+    except Exception:
+        return "unknown"
+
+
 def effective_embedding_model(config) -> str:
     """实际生效的 embedding 模型标识（供切片窗口夹紧使用）。
 
@@ -674,8 +687,9 @@ class RAGEngine:
         # ---- 检索阅读模式（ColBERT 旁路）----
         reading_mode: bool = False,
         reading_quant_bits: int = 4,
-        reading_coarse_k: int = 20,
+        reading_coarse_k: int = 50,
         reading_top_n: int = 3,
+        reading_min_score: float = 0.0,
         reading_use_ann: bool = False,
         reading_model_dir: str = "",
         reading_chunk_max: int = 8000,
@@ -759,10 +773,17 @@ class RAGEngine:
             self._reading_quant_bits = 4
         self._reading_coarse_k = int(reading_coarse_k)
         if self._reading_coarse_k not in (10, 20, 50, 100):
-            self._reading_coarse_k = 20
+            self._reading_coarse_k = 50
         self._reading_top_n = int(reading_top_n)
         if self._reading_top_n not in (1, 3, 5):
             self._reading_top_n = 3
+        # 相关度门限（MaxSim ÷ 查询 token 数）：0 = 不过滤。默认 0 让直接构造
+        # 引擎的测试/旁路不改变行为，应用侧由配置显式传入。
+        try:
+            min_score = float(reading_min_score)
+        except (TypeError, ValueError):
+            min_score = 0.0
+        self._reading_min_score = min(0.95, max(0.0, min_score))
         self._reading_use_ann = bool(reading_use_ann)
         self._reading_model_dir = (reading_model_dir or "").strip()
         self._reading_chunk_max = max(500, int(reading_chunk_max))
@@ -803,12 +824,13 @@ class RAGEngine:
         return self._reading_mode
 
     def _pipeline_signature(self) -> str:
-        """入库管线签名：模式/量化/切片参数变化时强制增量同步重跑。"""
+        """入库管线签名：模式/量化/切片参数/模型/预处理版本变化时强制重跑。"""
         if not self._reading_mode:
             return "normal"
-        return (f"reading:q{self._reading_quant_bits}:"
+        return (f"reading:p2:q{self._reading_quant_bits}:"
                 f"{self._reading_chunk_min}-{self._reading_chunk_max}:"
-                f"th{self._reading_semantic_threshold:.4f}")
+                f"th{self._reading_semantic_threshold:.4f}:"
+                f"m{_reading_model_signature(self._reading_model_dir)}")
 
     def _get_reading_store(self):
         """检索阅读模式的 ColBERT 三表 store（与 doc_search_tool 共享实例）。"""
@@ -2750,12 +2772,18 @@ class RAGEngine:
             return []
         top_k = max(1, min(int(top_k or self._reading_top_n), 30))
         logger.info(
-            "🔍 阅读模式检索: query=%r top_k=%d coarse=%d ann=%s",
-            query[:80], top_k, self._reading_coarse_k, self._reading_use_ann)
+            "🔍 阅读模式检索: query=%r top_k=%d coarse=%d ann=%s min_score=%.2f",
+            query[:80], top_k, self._reading_coarse_k, self._reading_use_ann,
+            self._reading_min_score)
         hits = store.search(
             query, top_k=top_k, coarse_k=self._reading_coarse_k,
             include_content=True, max_content_chars=10_000_000,
-            source=source or "", use_ann=self._reading_use_ann)
+            source=source or "", use_ann=self._reading_use_ann,
+            min_score=self._reading_min_score)
+        if not hits:
+            logger.info(
+                "  └─ 阅读模式检索: 无切片达到相关度门限 %.2f（每查询词平均相似度）",
+                self._reading_min_score)
         out: List[Dict[str, Any]] = []
         for h in hits:
             out.append({
@@ -2763,6 +2791,7 @@ class RAGEngine:
                 "source": h.get("source") or "",
                 "chunk_index": h.get("chunk_index", 0),
                 "score": h.get("score", 0.0),
+                "score_per_token": h.get("score_per_token", 0.0),
                 "doc_id": h.get("doc_id", ""),
                 "title": h.get("title", ""),
                 "reading_mode": True,

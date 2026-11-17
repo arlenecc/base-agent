@@ -499,8 +499,15 @@ class ColBertDocStore:
     def search(self, query: str, top_k: int = 5, coarse_k: int = 20,
                include_content: bool = True,
                max_content_chars: int = 1500,
-               source: str = "", use_ann: bool = False
+               source: str = "", use_ann: bool = False,
+               min_score: float = 0.0
                ) -> List[Dict[str, Any]]:
+        """粗筛 + MaxSim 精排（BM25 + 中心向量并集 → MaxSim）。
+
+        ``min_score`` > 0 时按「MaxSim ÷ 查询 token 数」（每个查询词的平均
+        最优相似度）过滤：低于该值的切片视为不相关，不返回。该阈值与查询
+        长度无关，可直接跨查询比较；0 表示不过滤。
+        """
         query = (query or "").strip()
         if not query:
             raise ColBertStoreError("query is empty")
@@ -509,6 +516,7 @@ class ColBertDocStore:
         q_vectors = self.runtime.encode_query(query)
         if q_vectors.ndim != 2 or q_vectors.size == 0:
             return []
+        q_token_count = max(1, int(q_vectors.shape[0]))
         q_center = q_vectors.astype(np.float32).mean(axis=0)
         norm = float(np.linalg.norm(q_center))
         q_center = q_center / max(norm, 1e-12)
@@ -519,7 +527,9 @@ class ColBertDocStore:
         # source 过滤在查询层完成：BM25 直接 where source；向量表没有 source
         # 列，就对允许的 doc_id 精确点积（绕过 ANN，避免全局 top-k 把目标
         # 文档挤掉）。无 source 时才走 LanceDB 的 ANN/精确扫描。
-        fetch_k = coarse_k if allowed is None else max(coarse_k, len(allowed))
+        # 两条通道各取 top coarse_k 即可：后续精排候选是两通道的并集
+        # （≤2×coarse_k），再按 len(allowed) 放大只会让并集无上界。
+        fetch_k = coarse_k
         bm25_ids: List[str] = []
         if self._ensure_fts():
             try:
@@ -540,7 +550,13 @@ class ColBertDocStore:
                         self._vec, sorted(allowed)).items():
                     vec = np.asarray(row.get("vector"), dtype=np.float32)
                     if vec.shape == q_center.shape:
-                        scored.append((float(np.dot(q_center, vec)), doc_id))
+                        # q_center 已 L2 归一化，中心向量必须同样归一化：
+                        # 存的是「token 向量均值」而非单位向量，直接点积
+                        # 等于把模长更大的切片整体抬高（定向检索时实测会
+                        # 把正确切片从第 1 挤到第 5），必须按余弦比较。
+                        vnorm = float(np.linalg.norm(vec))
+                        scored.append((float(np.dot(
+                            q_center, vec / max(vnorm, 1e-12))), doc_id))
                 scored.sort(reverse=True)
                 vec_ids = [doc_id for _, doc_id in scored[:fetch_k]]
             else:
@@ -550,16 +566,28 @@ class ColBertDocStore:
             logger.warning("ColBERT 中心向量检索失败: %s", e)
             vec_ids = []
 
-        fused = rrf_fuse([bm25_ids, vec_ids], limit=coarse_k)
-        if not fused:
+        # 精排候选 = 两条通道各自 top coarse_k 的**并集**，而不是 RRF 融合后
+        # 截断到 coarse_k：RRF 截断会把只被单通道命中的头部结果挤掉（被
+        # 「双通道都命中但排名靠后」的候选取代）。实测 126 切片、16 条查询，
+        # 精排最优切片能被粗筛召回的比例：RRF 截断 12/16，并集 14/16；而
+        # MaxSim 每候选仅约 0.2ms，扩大候选几乎不增加检索延迟。
+        rrf_scores = dict(rrf_fuse([bm25_ids, vec_ids], limit=len(bm25_ids)
+                                   + len(vec_ids)))
+        ids: List[str] = []
+        seen_ids: set = set()
+        for doc_id in bm25_ids + vec_ids:
+            if doc_id and doc_id not in seen_ids:
+                seen_ids.add(doc_id)
+                ids.append(doc_id)
+        if not ids:
             return []
-        ids = [doc_id for doc_id, _ in fused]
         docs = self._fetch(self._doc, ids)
         vecs = self._fetch(self._vec, ids)
         residuals = self._fetch(self._res, ids)
 
         hits: List[Dict[str, Any]] = []
-        for doc_id, rrf_score in fused:
+        for doc_id in ids:
+            rrf_score = rrf_scores.get(doc_id, 0.0)
             doc = docs.get(doc_id)
             center_row = vecs.get(doc_id)
             res = residuals.get(doc_id)
@@ -573,6 +601,11 @@ class ColBertDocStore:
                     int(res["dim"]), int(res["quant_bits"]),
                     float(res["scale"]), float(res["offset"]), center)
             except Exception:
+                continue
+            per_token = float(score) / q_token_count
+            # 相关度门限：MaxSim 是查询词数决定的绝对分，必须按 token 数
+            # 归一化后才能跨查询比较（长问句的绝对分天然更高）。
+            if min_score > 0.0 and per_token < float(min_score):
                 continue
             content = doc.get("content", "")
             if not include_content:
@@ -592,6 +625,7 @@ class ColBertDocStore:
                 "chunk_index": int(idx),
                 "content": content,
                 "score": float(score),
+                "score_per_token": per_token,
                 "rrf_score": float(rrf_score),
                 "token_count": int(res["token_count"]),
             })

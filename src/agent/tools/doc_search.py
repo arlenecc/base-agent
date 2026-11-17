@@ -36,6 +36,15 @@ class DocSearchTool(Tool):
         "chunks with real doc_id/title/content. Use this instead of stuffing "
         "a whole book into context."
     )
+    _READING_DESCRIPTION = (
+        "Long-document retrieval over the knowledge base (ColBERT + LanceDB). "
+        "Retrieval-reading mode is on: the knowledge base is already indexed "
+        "by the sync pipeline, so use op='search' only. The top-ranked chunk is "
+        "provided to you for summarizing/answering; remaining hits are returned "
+        "as clickable chips for the user. op='index'/'delete' are disabled in "
+        "this mode — use rag_tools(op='ingest') and the knowledge-base sync "
+        "instead."
+    )
     destructive = False
     parameters = {
         "type": "object",
@@ -101,9 +110,31 @@ class DocSearchTool(Tool):
         "required": ["op"],
     }
 
+    def _reading_active(self) -> bool:
+        """是否处于检索阅读模式：优先看共享 RAG 引擎的实际管线。"""
+        reg = getattr(self, "registry", None)
+        get_engine = getattr(reg, "get_rag_engine", None)
+        engine = None
+        if callable(get_engine):
+            try:
+                engine = get_engine()
+            except Exception:
+                engine = None
+        mode = getattr(engine, "reading_mode", None)
+        if mode is not None:
+            return bool(mode)
+        return bool(getattr(
+            getattr(self, "config", None), "rag_reading_mode_enabled", False))
+
     def bind(self, config: Any, registry: Any) -> None:
         self.config = config
         self.registry = registry
+        # 阅读模式下入库/删除由知识库同步统一负责（manifest 去重 + 三表一致），
+        # 工具描述必须同步收窄，否则模型会先尝试 index 再被拒绝。
+        if self._reading_active():
+            self.description = self._READING_DESCRIPTION
+        else:
+            self.description = type(self).description
 
     def run(self, op: str = "search", path: str = "", text: str = "",
             title: str = "", doc_id: str = "", query: str = "",
@@ -111,8 +142,21 @@ class DocSearchTool(Tool):
             max_content_chars: int = 1500, overwrite: bool = True,
             quant_bits: int = 0) -> ToolResult:
         try:
-            store = _get_store(self.config)
             op = str(op or "search").strip().lower()
+            reading = self._reading_active()
+            if reading and op in ("index", "delete"):
+                # 与阅读模式共用同一份三表索引：绕过 manifest 的写入/删除会让
+                # 「已同步」记录与索引内容错位（删掉的不会回来、加的没有记录）。
+                return ToolResult(
+                    False,
+                    error=(
+                        "检索阅读模式已启用：长文档索引由知识库同步统一构建。"
+                        "doc_search_tool 的 index/delete 会绕过 manifest 与三表"
+                        "一致性维护，请改用 rag_tools(op=\"ingest\") 或主窗口"
+                        "「同步知识库」；删除文件请从知识库目录移除后重新同步。"))
+            store = _get_store(self.config)
+            if reading and op == "search":
+                return self._search_reading(store, query, top_k, coarse_k)
             if op == "index":
                 return self._index(store, path, text, title, overwrite,
                                    quant_bits)
@@ -167,6 +211,73 @@ class DocSearchTool(Tool):
             output=f"Indexed {chunks} chunk(s) from '{title}'. "
                    f"stats={store.stats()}",
         )
+
+    def _search_reading(self, store: ColBertDocStore, query: str,
+                        top_k: int, coarse_k: int) -> ToolResult:
+        """阅读模式检索：最高分切片进上下文供总结，其余切片只做气泡附件。
+
+        阅读模式的「精选 topN / 粗筛候选 / ANN」由配置窗口统一控制，
+        与 rag_tools 保持一致，因此忽略模型传入的 top_k/coarse_k。
+        """
+        query = (query or "").strip()
+        if not query:
+            return ToolResult(False, error="search requires query")
+        try:
+            top_k = max(1, min(int(
+                getattr(self.config, "rag_reading_top_n", 3) or 3),
+                _MAX_TOP_K))
+        except (TypeError, ValueError):
+            top_k = 3
+        try:
+            coarse_k = max(top_k, min(int(
+                getattr(self.config, "rag_reading_coarse_k", 50) or 50),
+                _MAX_COARSE))
+        except (TypeError, ValueError):
+            coarse_k = max(top_k, 50)
+        try:
+            min_score = float(getattr(
+                self.config, "rag_reading_min_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            min_score = 0.0
+        hits = store.search(
+            query, top_k=top_k, coarse_k=coarse_k,
+            include_content=True, max_content_chars=10_000_000,
+            use_ann=bool(getattr(
+                self.config, "rag_reading_use_ann", False)),
+            min_score=min_score)
+        attachments: list = []
+        seen = set()
+        for h in hits:
+            key = (h.get("source") or "", h.get("chunk_index"))
+            if key in seen:
+                continue
+            seen.add(key)
+            attachments.append({
+                "kind": "chunk",
+                "source": h.get("source") or h.get("title") or "",
+                "chunk_index": h.get("chunk_index", 0),
+                "score": float(h.get("score") or 0.0),
+                "text": h.get("content") or "",
+                "used": not attachments,  # 只有最高分（首条）注入上下文
+            })
+        if not attachments:
+            return ToolResult(
+                True,
+                output=(f'No long-document chunk matched "{query}" in '
+                        f'retrieval-reading mode. Ask the user to sync the '
+                        f'knowledge base or rephrase the query; do not make up '
+                        f'content.'))
+        top = attachments[0]
+        src = os.path.basename(top["source"]) or "文档"
+        rest = max(0, len(attachments) - 1)
+        output = (
+            f"检索阅读模式已召回 {len(attachments)} 个长文档切片。"
+            "以下是与问题最相关的**一片**原文，已注入上下文，请据此总结或回答；"
+            f"其余 {rest} 片没有注入，已作为可点击的「参考切片」气泡附在回复末尾。"
+            "只基于下面给出的原文作答，不要复述整片，也不要猜测或编造其余切片内容。"
+            f"\n\n### 来源: {src} (相关度: {top['score']:.4f})\n{top['text']}")
+        return ToolResult(
+            True, output=output, attachments=attachments)
 
     def _search(self, store: ColBertDocStore, query: str, top_k: int,
                 coarse_k: int, include_content: bool,

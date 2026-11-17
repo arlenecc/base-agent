@@ -216,6 +216,35 @@ def test_mcp_tools_inmemory(stub_engine):
 
 
 @pytest.mark.skipif(not _HAS_FASTMCP, reason="fastmcp 未安装")
+def test_mcp_reading_mode_flags_search_and_blocks_kg():
+    """阅读模式：检索结果标注 reading_mode，建图工具明确拒绝。"""
+    import asyncio
+
+    class ReadingEngine(StubEngine):
+        reading_mode = True
+
+    set_rag_engine(ReadingEngine())
+    try:
+        mcp = build_mcp_server()
+
+        async def run():
+            client = Client(mcp)
+            async with client:
+                d = _parse(await client.call_tool(
+                    "hybrid_search_with_rerank",
+                    {"query": "测试", "top_k": 3}))
+                assert d["status"] == "ok"
+                assert d["data"]["reading_mode"] is True
+                d = _parse(await client.call_tool("ingest_knowledge", {}))
+                assert d["status"] == "error"
+                assert "检索阅读模式" in d["message"]
+
+        asyncio.run(run())
+    finally:
+        set_rag_engine(None)
+
+
+@pytest.mark.skipif(not _HAS_FASTMCP, reason="fastmcp 未安装")
 def test_mcp_service_http(stub_engine):
     """真实 streamable-HTTP：启动服务 + 远程客户端调用，验证对外可用。"""
     import asyncio

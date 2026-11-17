@@ -1144,9 +1144,11 @@ class SyncKnowledgeWorker(QThread):
                 reading_quant_bits=int(getattr(
                     self._config, "rag_reading_quant_bits", 4) or 4),
                 reading_coarse_k=int(getattr(
-                    self._config, "rag_reading_coarse_k", 20) or 20),
+                    self._config, "rag_reading_coarse_k", 50) or 50),
                 reading_top_n=int(getattr(
                     self._config, "rag_reading_top_n", 3) or 3),
+                reading_min_score=float(getattr(
+                    self._config, "rag_reading_min_score", 0.0) or 0.0),
                 reading_use_ann=bool(getattr(
                     self._config, "rag_reading_use_ann", False)),
                 reading_model_dir=str(getattr(
@@ -2755,8 +2757,8 @@ class MainWindow(QMainWindow):
             "开启后，知识库同步在文档解析为 Markdown 之后，跳过原有\n"
             "「token 切片 → embedding → 向量库 → reranker」链路，改用\n"
             "Jina ColBERT v2（64 维 INT8）残差量化写 LanceDB 三表。\n"
-            "召回切片体量大（7500~8000 字），不再进入模型上下文，只作为\n"
-            "回复末尾的可点击切片气泡展示。")
+            "召回时只把排名最高的一片长切片注入上下文供模型总结，其余\n"
+            "切片作为回复末尾的可点击气泡展示。")
         r.addWidget(self.reading_mode_chk)
         r.addSpacing(10)
         r.addWidget(QLabel("量化残差:"))
@@ -2770,7 +2772,8 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("粗筛候选:"))
         self.reading_coarse_combo = _combo(["10", "20", "50", "100"])
         self.reading_coarse_combo.setToolTip(
-            "BM25 + 中心向量经 RRF 融合后进入 MaxSim 精排的候选数（默认 20）。")
+            "BM25 与中心向量两条通道各取该数量的候选，并集（≤2 倍）进入\n"
+            "MaxSim 精排（默认 50；精排每候选约 0.2ms，加大几乎不增延迟）。")
         r.addWidget(self.reading_coarse_combo)
         r.addSpacing(8)
         r.addWidget(QLabel("精选 topN:"))
@@ -2835,6 +2838,15 @@ class MainWindow(QMainWindow):
             "章节内语义切分阈值（默认 0.55，按相似度分布自适应，下限 0.15）。\n"
             "越低越容易切，越高越倾向于保持整段。")
         r2.addWidget(self.reading_threshold_edit)
+        r2.addSpacing(6)
+        r2.addWidget(QLabel("相关度门限:"))
+        self.reading_min_score_edit = _num(
+            str(getattr(self.config, "rag_reading_min_score", 0.6)), 56)
+        self.reading_min_score_edit.setToolTip(
+            "每个查询词的平均最优相似度门限（MaxSim ÷ 查询 token 数）：\n"
+            "低于该值的切片视为不相关、不返回（默认 0.60，0 = 关闭）。\n"
+            "实测相关查询 0.62~0.82、不相关查询 0.58~0.60；调高更严格。")
+        r2.addWidget(self.reading_min_score_edit)
         r2.addStretch(1)
         rlay.addLayout(r2)
 
@@ -2916,6 +2928,7 @@ class MainWindow(QMainWindow):
             "reading_index_btn", "reading_model_edit",
             "reading_model_pick", "reading_chunk_max_edit",
             "reading_chunk_min_edit", "reading_threshold_edit",
+            "reading_min_score_edit",
         ):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -2927,6 +2940,19 @@ class MainWindow(QMainWindow):
 
     def _on_build_reading_index(self) -> None:
         """后台构建/续建 ColBERT 中心向量 ANN 索引。"""
+        # 索引构建会优化/重建 LanceDB 表，必须避开 ingest 与正在进行的检索，
+        # 否则可能撞上 table modified during query 或长时间等待写锁。
+        if getattr(self, "_busy", False):
+            QMessageBox.warning(
+                self, "检索阅读模式",
+                "Agent 正在执行（可能正在检索知识库）。请先「终止对话」"
+                "再构建/续建索引。")
+            return
+        if self._is_worker_running(getattr(self, "_sync_worker", None)):
+            QMessageBox.information(
+                self, "检索阅读模式",
+                "知识同步正在进行，请完成或停止同步后再构建/续建索引。")
+            return
         self._gather_config_from_widgets()
         if not self.config.rag_reading_mode_enabled:
             QMessageBox.information(
@@ -3706,9 +3732,9 @@ class MainWindow(QMainWindow):
         self.reading_quant_combo.setCurrentText(
             "2bit" if int(getattr(self.config, "rag_reading_quant_bits", 4)) == 2
             else "4bit")
-        _coarse = str(int(getattr(self.config, "rag_reading_coarse_k", 20)))
+        _coarse = str(int(getattr(self.config, "rag_reading_coarse_k", 50)))
         self.reading_coarse_combo.setCurrentText(
-            _coarse if _coarse in ("10", "20", "50", "100") else "20")
+            _coarse if _coarse in ("10", "20", "50", "100") else "50")
         _topn = str(int(getattr(self.config, "rag_reading_top_n", 3)))
         self.reading_topn_combo.setCurrentText(
             _topn if _topn in ("1", "3", "5") else "3")
@@ -3722,6 +3748,8 @@ class MainWindow(QMainWindow):
             str(getattr(self.config, "rag_reading_chunk_min", 7500)))
         self.reading_threshold_edit.setText(
             str(getattr(self.config, "rag_reading_semantic_threshold", 0.55)))
+        self.reading_min_score_edit.setText(
+            str(getattr(self.config, "rag_reading_min_score", 0.6)))
         self._sync_reading_mode_controls(
             self.reading_mode_chk.isChecked())
         # RAG 检索策略（知识图谱，spec 第八步）：策略名 → 下拉索引。
@@ -3903,9 +3931,9 @@ class MainWindow(QMainWindow):
         try:
             coarse = int(self.reading_coarse_combo.currentText())
         except (TypeError, ValueError):
-            coarse = 20
+            coarse = 50
         self.config.rag_reading_coarse_k = (
-            coarse if coarse in (10, 20, 50, 100) else 20)
+            coarse if coarse in (10, 20, 50, 100) else 50)
         try:
             topn = int(self.reading_topn_combo.currentText())
         except (TypeError, ValueError):
@@ -3928,6 +3956,10 @@ class MainWindow(QMainWindow):
              0.55, float, "阅读模式语义阈值")
         self.config.rag_reading_semantic_threshold = min(
             0.55, max(0.15, float(self.config.rag_reading_semantic_threshold)))
+        _num(self.reading_min_score_edit, "rag_reading_min_score",
+             0.6, float, "阅读模式相关度门限")
+        self.config.rag_reading_min_score = min(
+            0.95, max(0.0, float(self.config.rag_reading_min_score)))
         # RAG 检索策略（知识图谱，spec 第八步）：下拉索引 → 策略名。
         _kg_map_rev = {0: "naive", 1: "local", 2: "global", 3: "hybrid", 4: "mix"}
         self.config.rag_kg_strategy = _kg_map_rev.get(
@@ -4181,6 +4213,12 @@ class MainWindow(QMainWindow):
     # 向量去重（清理内容完全相同的重复向量，保留每组最早入库的一份）
     # ------------------------------------------------------------------
     def _on_dedup_vectors(self) -> None:
+        if getattr(self.config, "rag_reading_mode_enabled", False):
+            QMessageBox.information(
+                self, "检索阅读模式",
+                "检索阅读模式使用独立的 ColBERT 三表索引，重复文件已在同步"
+                "阶段按内容去重；「向量去重」按钮只处理普通向量库，当前无需执行。")
+            return
         if self._is_worker_running(self._dedup_worker):
             logger.warning("向量去重正在进行，忽略重复请求")
             return
@@ -4337,6 +4375,12 @@ class MainWindow(QMainWindow):
 
     def _on_build_kg(self) -> None:
         """「构建知识图谱」按钮：后台 KGBuilder（辅助模型抽取实体/关系）。"""
+        if getattr(self.config, "rag_reading_mode_enabled", False):
+            QMessageBox.information(
+                self._front_dialog(), "检索阅读模式",
+                "检索阅读模式使用独立的 ColBERT 三表索引，目前未适配知识图谱"
+                "构建。\n请切换到普通知识库模式并同步后再构建知识图谱。")
+            return
         if getattr(self, "_kg_worker", None) is not None and self._kg_worker.isRunning():
             QMessageBox.information(self._front_dialog(), "构建中", "知识图谱正在构建中，请等待完成或取消。")
             return
@@ -4389,6 +4433,11 @@ class MainWindow(QMainWindow):
 
     def _on_consolidate_kg(self) -> None:
         """「实体消歧」按钮：对库内现有实体做语义向量消歧（无需辅助模型）。"""
+        if getattr(self.config, "rag_reading_mode_enabled", False):
+            QMessageBox.information(
+                self._front_dialog(), "检索阅读模式",
+                "检索阅读模式未适配知识图谱，实体消歧暂不可用。")
+            return
         if getattr(self, "_kg_worker", None) is not None and self._kg_worker.isRunning():
             QMessageBox.information(self._front_dialog(), "操作进行中", "知识图谱操作正在进行中，请等待完成或取消。")
             return
@@ -4683,6 +4732,7 @@ class MainWindow(QMainWindow):
             if stats.get("cancelled"):
                 self.status_label.setText("同步已取消")
                 self._append_log("[rag] 同步已用户取消")
+                self._refresh_reading_index_status()
                 return
             self.status_label.setText("知识库同步完成")
             files = stats.get("files_found", 0)
@@ -4702,7 +4752,11 @@ class MainWindow(QMainWindow):
                 )
                 if deleted > 0:
                     summary += f"已清理删除文件：{deleted} 个\n"
-                summary += f"向量切片：{chunks} 个\n"
+                _reading = bool(getattr(
+                    self.config, "rag_reading_mode_enabled", False))
+                summary += (
+                    f"检索阅读切片：{chunks} 个（最高分切片注入上下文，其余气泡展示）\n"
+                    if _reading else f"向量切片：{chunks} 个\n")
             msg = summary
             if errors:
                 msg += f"\n⚠ {len(errors)} 个文件提取失败：\n"
@@ -4710,7 +4764,12 @@ class MainWindow(QMainWindow):
                     msg += f"  - {e}\n"
                 if len(errors) > 5:
                     msg += f"  …（还有 {len(errors) - 5} 个）\n"
-            msg += "\n后续对话将自动参考知识库内容进行回答。"
+            if getattr(self.config, "rag_reading_mode_enabled", False):
+                msg += ("\n后续对话将在检索阅读模式下把最高分切片注入上下文供总结，"
+                        "其余切片以气泡展示。")
+            else:
+                msg += "\n后续对话将自动参考知识库内容进行回答。"
+            self._refresh_reading_index_status()
             QMessageBox.information(self, "同步完成", msg)
         except Exception as e:
             logger.error("UI: _on_sync_finished error: %s", e, exc_info=True)

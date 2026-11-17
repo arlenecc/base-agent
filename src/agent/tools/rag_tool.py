@@ -26,6 +26,50 @@ _ENGINE_RELEASED_ERROR = (
     "不要重试同一调用，等待新会话或重新同步知识库。"
 )
 
+_DEFAULT_SEARCH_DESCRIPTION = (
+    "在本地知识库中检索**资料内容**。仅当问题依赖用户的资料时使用"
+    "（如查某主题的原文、某本书的细节）；「知识库里有什么/你能做什么」"
+    "这类问题不适用——前者用 rag_tools(op='outline') 列文档，后者直接回答。"
+    "检索只把**最相关的一段原文**提供给你参考，其余召回切片会以气泡形式"
+    "展示给用户（用户可点击查看），据此作答即可，不要声称看不到其余内容。"
+)
+_READING_SEARCH_DESCRIPTION = (
+    "在本地知识库中检索**资料内容**（检索阅读模式）。仅当问题依赖用户的资料时"
+    "使用；「知识库里有什么/你能做什么」这类问题不适用——前者用 "
+    "rag_tools(op='outline') 列文档，后者直接回答。"
+    "只把排名最高的**一片**长切片注入上下文供你总结/回答，其余召回切片以"
+    "可点击的「参考切片」气泡附在回复末尾；不要复述整片原文，也不要猜测或"
+    "编造未提供的切片内容。"
+)
+_DEFAULT_RAG_TOOLS_DESCRIPTION = (
+    "Unified local knowledge-base operations. op one of:\n"
+    "- search(query, top_k?, source?): retrieve material content; only the "
+    "top-ranked excerpt is provided to you, other hits are shown to the user "
+    "as reference chips (do not claim you cannot see them)\n"
+    "- outline(book_name?): list all docs (no arg) or a document's outline\n"
+    "- status(): knowledge-base status (chunks, sources)\n"
+    "- ingest(force?): re-index the knowledge-base directory"
+)
+_READING_RAG_TOOLS_DESCRIPTION = (
+    "Unified local knowledge-base operations (retrieval-reading mode). op one of:\n"
+    "- search(query, top_k?, source?): retrieve long-document chunks. Only the "
+    "top-ranked chunk is injected into your context for summarizing/answering; "
+    "all remaining hits are shown to the user as clickable reference chips at "
+    "the end of the reply. Do not restate the whole chunk, and never guess or "
+    "invent the content of chips you were not given.\n"
+    "- outline(book_name?): list all docs (no arg) or a document's outline\n"
+    "- status(): knowledge-base status (chunks, sources)\n"
+    "- ingest(force?): re-index the knowledge-base directory"
+)
+
+
+def _reading_enabled(engine: Any, config: Any) -> bool:
+    """阅读模式以引擎实际管线为准，config 仅在引擎未提供属性时兜底。"""
+    mode = getattr(engine, "reading_mode", None)
+    if mode is not None:
+        return bool(mode)
+    return bool(getattr(config, "rag_reading_mode_enabled", False))
+
 
 def _is_graph_item(item: Dict[str, Any]) -> bool:
     return item.get("kind") in _GRAPH_KINDS
@@ -35,7 +79,7 @@ def _chunk_attachments(items: list, mark_first_used: bool = True) -> list:
     """召回切片 → UI 气泡附件（同文档同序号去重，保留重排后的顺序）。
 
     ``mark_first_used`` 为 True 时只有第一条（排名最高、真正进上下文的那片）
-    标记 ``used=True``；检索阅读模式下所有切片都不进上下文，传 False。
+    标记 ``used=True``；阅读模式只注入最高分切片，同样传 True。
     """
     out: list = []
     seen = set()
@@ -111,13 +155,7 @@ class RagSearchTool(Tool):
     """Search the local knowledge base for relevant information."""
 
     name = "rag_search"
-    description = (
-        "在本地知识库中检索**资料内容**。仅当问题依赖用户的资料时使用"
-        "（如查某主题的原文、某本书的细节）；「知识库里有什么/你能做什么」"
-        "这类问题不适用——前者用 rag_tools(op='outline') 列文档，后者直接回答。"
-        "检索只把**最相关的一段原文**提供给你参考，其余召回切片会以气泡形式"
-        "展示给用户（用户可点击查看），据此作答即可，不要声称看不到其余内容。"
-    )
+    description = _DEFAULT_SEARCH_DESCRIPTION
     parameters = {
         "type": "object",
         "properties": {
@@ -152,6 +190,12 @@ class RagSearchTool(Tool):
         # 保存 config 引用：默认 top_k 与辅助模型精简阈值都做成可配置项，
         # 运行时从这里读（bind 在工具注册时被调用，早于任何 run）。
         self._config = config
+        # 工具描述随模式切换：阅读模式下只注入最高分一片，其余出气泡；
+        # 描述必须与实际数据分流一致，否则模型会编造未提供的切片正文。
+        self.description = (
+            _READING_SEARCH_DESCRIPTION
+            if _reading_enabled(self._engine, config)
+            else _DEFAULT_SEARCH_DESCRIPTION)
 
     def run(self, query: str = "", top_k: Any = None, source: str = "") -> ToolResult:
         # 参数校验优先于引擎可用性：空参/非法参数无需触碰引擎，且必须拿到
@@ -185,7 +229,9 @@ class RagSearchTool(Tool):
         # 时走配置默认，传了非法值也回退到配置默认。_config 由 bind() 注入，
         # 直接构造（测试/旁路）时可能缺失，一律走 getattr 默认值。
         cfg = getattr(self, "_config", None)
-        reading_mode = bool(getattr(cfg, "rag_reading_mode_enabled", False))
+        # 以引擎实际管线为准：config 与引擎若短暂不一致（配置已改但引擎尚未
+        # 重建），按 config 分流会把阅读模式的长切片当普通召回注入上下文。
+        reading_mode = _reading_enabled(self._engine, cfg)
         try:
             default_top_k = int(
                 getattr(cfg, "rag_reading_top_n", 3) if reading_mode
@@ -216,25 +262,35 @@ class RagSearchTool(Tool):
         try:
             # 先取重排后的原始分片（含完整 text，未截断），供辅助模型通读归纳。
             chunks = self._engine.search(query, top_k=top_k, source=source or None)
-            # 检索阅读模式：切片体量大（7500~8000 字），一律不进模型上下文，
-            # 只作为可点击气泡附在回复末尾；模型只给引导性说明。
+            # 检索阅读模式：切片体量大（7500~8000 字），只把排名最高的一片
+            # 注入上下文供模型总结/回答；其余切片作为可点击气泡附在回复末尾，
+            # 避免一次检索吃满上下文，同时保证模型有真实依据可读。
             if reading_mode:
-                attachments = _chunk_attachments(
-                    chunks, mark_first_used=False) if chunks else []
+                attachments = _chunk_attachments(chunks) if chunks else []
                 if chunks:
+                    top_chunk = chunks[0]
+                    text = top_chunk.get("text") or ""
+                    src = os.path.basename(
+                        top_chunk.get("source") or "") or "文档"
+                    score = float(top_chunk.get("score") or 0.0)
+                    rest = max(0, len(attachments) - 1)
                     output = (
-                        f"检索阅读模式已召回 {len(chunks)} 个长文档切片。"
-                        "这些切片**没有注入上下文**，已作为可点击的「参考切片」"
-                        "气泡附在回复末尾，用户可以点开阅读原文并切换前后切片。"
-                        "请只用一两句话做引导性说明（可提示用户点击阅读、切换前后片），"
-                        "不要复述、概括或猜测切片正文。")
+                        f"检索阅读模式已召回 {len(attachments)} 个长文档切片。"
+                        "以下是与问题最相关的**一片**原文，已注入上下文，请据此"
+                        f"总结或回答；其余 {rest} 片没有注入，已作为可点击的"
+                        "「参考切片」气泡附在回复末尾，可提示用户点开阅读。"
+                        "只基于下面给出的原文作答，不要复述整片，也不要猜测或"
+                        "编造其余切片内容。"
+                    )
+                    output += (
+                        f"\n\n### 来源: {src} (相关度: {score:.4f})\n{text}")
                 else:
                     output = (
                         "检索阅读模式未召回匹配切片。请提示用户换一个更具体的"
                         "问题或先同步/导入对应文档，不要编造内容。")
                 logger.info(
-                    "✅ 阅读模式 RAG 检索 %d 条 → 全部转气泡（0 条进上下文）",
-                    len(chunks))
+                    "✅ 阅读模式 RAG 检索 %d 条 → 上下文注入最高分 1 片，"
+                    "气泡 %d 条", len(chunks), len(attachments))
                 return ToolResult(
                     success=True, output=_cap_output(output),
                     attachments=attachments)
@@ -438,6 +494,9 @@ class RagStatusTool(Tool):
                 f"  已存储切片数: {status['chunks_stored']}",
                 f"  已索引文件数: {len(status['sources'])}",
             ]
+            if status.get("reading_mode"):
+                lines.append(
+                    "  运行模式: 检索阅读模式（最高分 1 片注入上下文，其余仅气泡展示）")
             if status["sources"]:
                 sources = status["sources"]
                 # 大知识库可能索引了成百上千个文件，全量列出既挤占上下文也
@@ -563,15 +622,7 @@ class RagToolsTool(_FanoutTool):
     }
 
     name = "rag_tools"
-    description = (
-        "Unified local knowledge-base operations. op one of:\n"
-        "- search(query, top_k?, source?): retrieve material content; only the "
-        "top-ranked excerpt is provided to you, other hits are shown to the user "
-        "as reference chips (do not claim you cannot see them)\n"
-        "- outline(book_name?): list all docs (no arg) or a document's outline\n"
-        "- status(): knowledge-base status (chunks, sources)\n"
-        "- ingest(force?): re-index the knowledge-base directory"
-    )
+    description = _DEFAULT_RAG_TOOLS_DESCRIPTION
     parameters = {
         "type": "object",
         "properties": {
@@ -592,3 +643,11 @@ class RagToolsTool(_FanoutTool):
             "status": RagStatusTool(engine),
             "ingest": RagIngestTool(engine),
         }
+
+    def bind(self, config: Any, registry: ToolRegistry) -> None:
+        super().bind(config, registry)
+        self.description = (
+            _READING_RAG_TOOLS_DESCRIPTION
+            if _reading_enabled(
+                getattr(self._sub_tools.get("search"), "_engine", None), config)
+            else _DEFAULT_RAG_TOOLS_DESCRIPTION)

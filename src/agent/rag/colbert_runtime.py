@@ -97,6 +97,23 @@ def default_model_dir() -> str:
     return config_dir
 
 
+def model_signature(directory: str = "") -> str:
+    """模型身份的稳定短标识（目录 + 权重体积），用于入库管线签名。
+
+    换模型（换目录或换权重）后，库里旧切片的 token 向量来自另一个向量空间，
+    与新模型的 query 向量不可比，检索相关性会整体崩坏。把该标识写进
+    manifest 的 ``pipeline_signature``，换模型时自动触发全量重索引。
+    """
+    resolved = os.path.abspath(os.path.expanduser(
+        directory or default_model_dir()))
+    weights = _first_existing(resolved, _MODEL_FILES)
+    try:
+        size = os.path.getsize(weights) if weights else 0
+    except OSError:
+        size = 0
+    return f"{resolved}:{size}"
+
+
 def ensure_model_dir(directory: str, progress_cb=None,
                      cancel_event=None) -> str:
     """确保目录内有 ColBERT 模型；缺失时从 hf-mirror.com 自动下载。
