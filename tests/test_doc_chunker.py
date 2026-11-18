@@ -8,7 +8,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agent.rag.doc_chunker import chunk_document, prune_tokens  # noqa: E402
+from agent.rag.doc_chunker import (  # noqa: E402
+    chunk_document, clean_query_tokens, prune_tokens,
+)
 
 
 def _long_para(n=40, sentence="This is a complete sentence. "):
@@ -143,3 +145,16 @@ def test_prune_tokens_removes_stopwords_and_punctuation():
     pruned_code = prune_tokens(code, is_code=True)
     assert "foo" in pruned_code and "return" in pruned_code
     assert "(" not in pruned_code
+
+
+def test_clean_query_tokens_keeps_question_words_and_adjectives():
+    """查询侧轻量清理：只去标点/停用词，形容词与疑问词必须保留。"""
+    q = clean_query_tokens("死亡为什么可怕？")
+    assert "为什么" in q and "可怕" in q
+    assert "？" not in q
+    assert clean_query_tokens("人类与神是一体的") == "人类神一体"
+    en = clean_query_tokens("What does ColBERT do?")
+    assert "What" in en and "ColBERT" in en
+    assert "does" not in en.split() and "do" not in en.split()
+    # 清理后为空时返回空串，由检索侧回退原查询。
+    assert clean_query_tokens("的 是，。") == ""

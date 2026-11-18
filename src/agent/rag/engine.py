@@ -689,7 +689,7 @@ class RAGEngine:
         reading_quant_bits: int = 4,
         reading_coarse_k: int = 50,
         reading_top_n: int = 3,
-        reading_min_score: float = 0.0,
+        reading_min_score: float = 0.61,
         reading_use_ann: bool = False,
         reading_model_dir: str = "",
         reading_chunk_max: int = 8000,

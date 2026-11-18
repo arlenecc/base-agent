@@ -27,7 +27,8 @@ from .colbert_runtime import ColBertRuntime, get_runtime
 logger = logging.getLogger(__name__)
 from .doc_chunker import (
     DEFAULT_MAX_CHARS, DEFAULT_MIN_CHARS, DEFAULT_OVERLAP_RATIO,
-    DEFAULT_SEMANTIC_THRESHOLD, prune_tokens, chunk_document,
+    DEFAULT_SEMANTIC_THRESHOLD, prune_tokens, clean_query_tokens,
+    chunk_document,
 )
 
 _INDEX_SUBDIR = ".agent/colbert_docs.lancedb"
@@ -513,7 +514,12 @@ class ColBertDocStore:
             raise ColBertStoreError("query is empty")
         top_k = max(1, min(int(top_k), _MAX_TOP_K))
         coarse_k = max(top_k, min(int(coarse_k), _MAX_COARSE))
-        q_vectors = self.runtime.encode_query(query)
+        # 查询侧轻量清理（只去标点/空白/停用词，保留形容词与疑问词）：
+        # 文档侧入库做了词性剪枝，查询侧若完全原样会带入无法匹配的标点与
+        # 停用词噪声；而做词性剪枝又会误删「为什么/可怕」等语义核心。
+        # 清理后为空（如纯标点）时回退原查询，避免编码空串。
+        q_text = clean_query_tokens(query) or query
+        q_vectors = self.runtime.encode_query(q_text)
         if q_vectors.ndim != 2 or q_vectors.size == 0:
             return []
         q_token_count = max(1, int(q_vectors.shape[0]))

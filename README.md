@@ -284,12 +284,12 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 - **入库**：`doc_search_tool(op="index", path="/path/to/book.md")`（也支持目录批量、或 `text` + `title` 直接传原文），索引默认落在 `<workspace>/.agent/colbert_docs.lancedb`。
 - **切片**：优先按标题结构分片；章节内过长时在相邻句相似度的语义低谷处切；句向量使用 model2vec 静态嵌入（与普通 RAG 语义切片同一快路径），ColBERT 只负责入库词向量和 MaxSim；阈值默认 0.55，按分布自适应（下限 0.15）；单片 7500–8000 字、1% overlap、断点必须是句末；表格/代码块不超长时整块保留；过小切片与同章节相邻片合并，结构/语义都失效才递归兜底。
 - **量化**：切片先做 Token 剪枝（去标点/空白/停用词/低信息词，保留名词、动词、专名、数词），再用 ColBERT 编码；长切片按 512 token 局部窗口编码，避免长上下文导致 MaxSim 退化。每个切片的 token 中心向量以 fp16 存 `doc_summary_vec`，残差按 `scale=2*maxAbs/(2^bits-1)`、`offset=-maxAbs` 量化后打包进 `doc_residuals.residual_blob`（4bit 两值/字节，2bit 四值/字节）。
-- **检索**：问句按 `[QueryMarker]`、文档按 `[DocumentMarker]` 编码；BM25 与中心向量各召回 `coarse_k` 条（默认 50），两通道**并集**进入 MaxSim 精排（RRF 截断会挤掉单通道头部结果）；命中切片流式解压残差、反量化还原 token 向量，用 BLAS 矩阵乘做 MaxSim 精排，再按 `MaxSim ÷ 查询 token 数` 的相关度门限（默认 0.60）过滤，返回 topN（默认 5）。
+- **检索**：问句按 `[QueryMarker]`、文档按 `[DocumentMarker]` 编码（查询侧先做轻量清理：只去标点/空白/停用词，保留形容词与疑问词）；BM25 与中心向量各召回 `coarse_k` 条（默认 50），两通道**并集**进入 MaxSim 精排（RRF 截断会挤掉单通道头部结果）；命中切片流式解压残差、反量化还原 token 向量，用 BLAS 矩阵乘做 MaxSim 精排，再按 `MaxSim ÷ 查询 token 数` 的相关度门限（默认 0.61）过滤，返回 topN（默认 5）。
 - 三张表：`document`（doc_id/title/content + 内部 `content_fts` / `source` / `chunk_index`）、`doc_summary_vec`（doc_id + float16 中心向量）、`doc_residuals`（doc_id/token_count/dim/quant_bits/scale/offset/residual_blob）。
 
 **主应用「检索阅读模式」**
 
-配置窗口「高级配置」下方新增「检索阅读模式」区域：启用后，知识库同步在文档解析为 Markdown 之后直接使用上述 ColBERT 链路，跳过原有 token 切片、embedding、普通向量库和 reranker；`rag_tools` 只把排名最高的一片长切片注入上下文供模型总结，其余切片转为回复末尾的可点击气泡。可配置残差位数（2/4bit）、粗筛候选（10/20/50/100，默认 50）、精选 topN（1/3/5）、相关度门限（MaxSim÷查询 token 数，默认 0.60，0=关闭，低于门限的切片不返回并提示未召回）、是否使用 ANN，以及模型目录 / 切片长度 / 最小切片 / 语义阈值；「构建/续建向量索引」会对中心向量表建立 LanceDB ANN 索引。模型目录留空时自动使用 `~/.base-agent/models/jina-colbert-v2-64-onnx-int8`，缺失则从 `hf-mirror.com` 下载 `arlenecc/jina-colbert-v2-64-onnx-int8`。
+配置窗口「高级配置」下方新增「检索阅读模式」区域：启用后，知识库同步在文档解析为 Markdown 之后直接使用上述 ColBERT 链路，跳过原有 token 切片、embedding、普通向量库和 reranker；`rag_tools` 只把排名最高的一片长切片注入上下文供模型总结，其余切片转为回复末尾的可点击气泡。可配置残差位数（2/4bit）、粗筛候选（10/20/50/100，默认 50）、精选 topN（1/3/5）、相关度门限（MaxSim÷查询 token 数，默认 0.61，0=关闭，低于门限的切片不返回并提示未召回）、是否使用 ANN，以及模型目录 / 切片长度 / 最小切片 / 语义阈值；「构建/续建向量索引」会对中心向量表建立 LanceDB ANN 索引。模型目录留空时自动使用 `~/.base-agent/models/jina-colbert-v2-64-onnx-int8`，缺失则从 `hf-mirror.com` 下载 `arlenecc/jina-colbert-v2-64-onnx-int8`。
 
 ### 能力进化闭环
 

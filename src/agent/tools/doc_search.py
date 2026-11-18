@@ -236,7 +236,7 @@ class DocSearchTool(Tool):
             coarse_k = max(top_k, 50)
         try:
             min_score = float(getattr(
-                self.config, "rag_reading_min_score", 0.0) or 0.0)
+                self.config, "rag_reading_min_score", 0.61) or 0.0)
         except (TypeError, ValueError):
             min_score = 0.0
         hits = store.search(

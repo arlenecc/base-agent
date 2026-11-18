@@ -1148,7 +1148,7 @@ class SyncKnowledgeWorker(QThread):
                 reading_top_n=int(getattr(
                     self._config, "rag_reading_top_n", 3) or 3),
                 reading_min_score=float(getattr(
-                    self._config, "rag_reading_min_score", 0.0) or 0.0),
+                    self._config, "rag_reading_min_score", 0.61) or 0.0),
                 reading_use_ann=bool(getattr(
                     self._config, "rag_reading_use_ann", False)),
                 reading_model_dir=str(getattr(
@@ -2841,11 +2841,11 @@ class MainWindow(QMainWindow):
         r2.addSpacing(6)
         r2.addWidget(QLabel("相关度门限:"))
         self.reading_min_score_edit = _num(
-            str(getattr(self.config, "rag_reading_min_score", 0.6)), 56)
+            str(getattr(self.config, "rag_reading_min_score", 0.61)), 56)
         self.reading_min_score_edit.setToolTip(
             "每个查询词的平均最优相似度门限（MaxSim ÷ 查询 token 数）：\n"
-            "低于该值的切片视为不相关、不返回（默认 0.60，0 = 关闭）。\n"
-            "实测相关查询 0.62~0.82、不相关查询 0.58~0.60；调高更严格。")
+            "低于该值的切片视为不相关、不返回（默认 0.61，0 = 关闭）。\n"
+            "实测相关查询最低 0.615、无关查询中位数 0.590；调高更严格。")
         r2.addWidget(self.reading_min_score_edit)
         r2.addStretch(1)
         rlay.addLayout(r2)
@@ -3749,7 +3749,7 @@ class MainWindow(QMainWindow):
         self.reading_threshold_edit.setText(
             str(getattr(self.config, "rag_reading_semantic_threshold", 0.55)))
         self.reading_min_score_edit.setText(
-            str(getattr(self.config, "rag_reading_min_score", 0.6)))
+            str(getattr(self.config, "rag_reading_min_score", 0.61)))
         self._sync_reading_mode_controls(
             self.reading_mode_chk.isChecked())
         # RAG 检索策略（知识图谱，spec 第八步）：策略名 → 下拉索引。
@@ -3957,7 +3957,7 @@ class MainWindow(QMainWindow):
         self.config.rag_reading_semantic_threshold = min(
             0.55, max(0.15, float(self.config.rag_reading_semantic_threshold)))
         _num(self.reading_min_score_edit, "rag_reading_min_score",
-             0.6, float, "阅读模式相关度门限")
+             0.61, float, "阅读模式相关度门限")
         self.config.rag_reading_min_score = min(
             0.95, max(0.0, float(self.config.rag_reading_min_score)))
         # RAG 检索策略（知识图谱，spec 第八步）：下拉索引 → 策略名。

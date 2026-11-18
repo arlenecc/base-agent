@@ -343,6 +343,36 @@ def prune_tokens(text: str, is_code: bool = False) -> str:
     return _join_pruned([t for t in tokens if t.lower() not in _STOPWORDS])
 
 
+_HAS_CONTENT_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
+
+
+def clean_query_tokens(text: str) -> str:
+    """查询侧轻量清理：只去标点/空白/停用词，保留形容词与疑问词。
+
+    与文档侧的 ``prune_tokens``（按词性过滤）不同：查询不能做词性过滤，
+    否则「为什么/可怕/重要」等语义核心会被一并删掉（实测会显著掉点）。
+    这里仅剔除无法参与语义匹配的标点/空白和低信息停用词；清理后为空时
+    返回空串，由调用方回退到原查询。
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    try:
+        import jieba
+        tokens = [w.strip() for w in jieba.cut(body)]
+    except Exception:
+        tokens = re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", body)
+    kept: List[str] = []
+    for word in tokens:
+        w = word.strip()
+        if not w or not _HAS_CONTENT_RE.search(w):
+            continue          # 纯标点/空白 token
+        if w.lower() in _STOPWORDS:
+            continue          # 低信息停用词；疑问词（什么/为什么/怎么…）不在表内
+        kept.append(w)
+    return _join_pruned(kept)
+
+
 # ---------------------------------------------------------------------------
 # 语义低谷
 # ---------------------------------------------------------------------------

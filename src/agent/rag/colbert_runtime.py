@@ -215,6 +215,16 @@ class ColBertRuntime:
         # BOS/EOS 参与 JinaBERT 的上下文编码；去掉后模型输出会退化成
         # 近各向同性向量，MaxSim 失去区分度（实测两两余弦 ≈0.99）。
         ids = [tid for tid in encoded.ids if tid != PAD_ID]
+        # marker 约定（artifact.metadata 的 query_token_id / doc_token_id）：
+        # 标记必须紧跟 <s> 且只占 1 个 token（250002 / 250003）。tokenizer.json
+        # 未把标记注册为 added token 时，"[QueryMarker]" 会被拆成多个子词，
+        # 检索向量会静默偏离训练空间——必须 fail fast，不能带着错误向量继续。
+        marker_id = QUERY_MARKER_ID if kind == "query" else DOC_MARKER_ID
+        if len(ids) < 2 or ids[0] != BOS_ID or ids[1] != marker_id:
+            raise ColBertUnavailable(
+                f"ColBERT tokenizer 未按约定编码 {'[QueryMarker]' if kind == 'query' else '[DocumentMarker]'}："
+                f"期望 [BOS={BOS_ID}, marker={marker_id}, ...]，实际 {ids[:3]}；"
+                f"请使用配套 tokenizer.json（{self.dir}）")
         if kind == "query" and self.query_augmentation and ids:
             target = max(self.query_maxlen, len(ids))
             ids = ids + [MASK_ID] * (target - len(ids))

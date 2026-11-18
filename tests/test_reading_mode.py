@@ -58,7 +58,7 @@ def _engine(tmp_path) -> RAGEngine:
 def test_reading_config_roundtrip_and_clamp(tmp_path):
     cfg = AgentConfig()
     assert cfg.rag_reading_coarse_k == 50          # 粗筛候选默认 50
-    assert abs(cfg.rag_reading_min_score - 0.6) < 1e-9
+    assert abs(cfg.rag_reading_min_score - 0.61) < 1e-9
     cfg.rag_reading_mode_enabled = True
     cfg.rag_reading_quant_bits = 2
     cfg.rag_reading_coarse_k = 100

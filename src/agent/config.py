@@ -120,10 +120,10 @@ class AgentConfig:
     # MaxSim 精排后返回的切片数（1/3/5，默认 3）。
     rag_reading_top_n: int = 3
     # 检索相关度门限：MaxSim ÷ 查询 token 数（每个查询词的平均最优相似度）
-    # 低于该值的切片视为不相关、不返回（0 = 关闭）。实测相关查询落在
-    # 0.62~0.82、不相关查询 0.58~0.60，默认 0.60 可在不误杀的前提下挡掉
-    # 大部分「红烧肉怎么做」这类与知识库无关的查询。
-    rag_reading_min_score: float = 0.6
+    # 低于该值的切片视为不相关、不返回（0 = 关闭）。查询侧做了轻量清理
+    # （只去标点/停用词），实测 20 条相关查询最低 0.615、20 条无关查询
+    # 中位数 0.590；默认 0.61 在样本内不误杀相关查询，并挡掉约 80% 无关查询。
+    rag_reading_min_score: float = 0.61
     # 是否使用 LanceDB ANN 向量索引；关闭时强制精确扫描（bypass_vector_index）。
     rag_reading_use_ann: bool = False
     # 模型目录：空 = 自动使用/下载 ~/.base-agent/models/jina-colbert-v2-64-onnx-int8。
@@ -701,7 +701,7 @@ class AgentConfig:
         try:
             min_score = float(self.rag_reading_min_score)
         except (TypeError, ValueError):
-            min_score = 0.6
+            min_score = 0.61
         self.rag_reading_min_score = min(0.95, max(0.0, min_score))
 
     def save(self, path: str) -> None:

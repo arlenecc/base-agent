@@ -124,7 +124,11 @@ class _ChannelRuntime:
 
     dim = 4
 
+    def __init__(self):
+        self.seen_queries = []
+
     def encode_query(self, text):
+        self.seen_queries.append(text)
         return np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
 
     def encode_document(self, text):
@@ -160,6 +164,16 @@ def test_search_min_score_filters_irrelevant(tmp_path):
     assert [h["source"] for h in hits] == ["/a.md"]
     # 门限关闭（0）时两条都返回。
     assert len(store.search("beta", top_k=2, coarse_k=2)) == 2
+
+
+def test_search_cleans_query_tokens_before_encoding(tmp_path):
+    """查询进 ColBERT 前只做轻量清理（去标点/停用词，保留疑问词与形容词）。"""
+    runtime = _ChannelRuntime()
+    store = cs.ColBertDocStore(db_dir=str(tmp_path / "idx"),
+                               runtime=runtime, dim=4)
+    store.add_chunks("Doc A", "/a.md", ["alpha"])
+    store.search("alpha 的 是？", top_k=1, coarse_k=1)
+    assert runtime.seen_queries[-1] == "alpha"
 
 
 

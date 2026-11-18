@@ -644,7 +644,7 @@ class ToolRegistry:
                 reading_top_n=int(getattr(
                     self.config, "rag_reading_top_n", 3) or 3),
                 reading_min_score=float(getattr(
-                    self.config, "rag_reading_min_score", 0.0) or 0.0),
+                    self.config, "rag_reading_min_score", 0.61) or 0.0),
                 reading_use_ann=bool(getattr(
                     self.config, "rag_reading_use_ann", False)),
                 reading_model_dir=str(getattr(
