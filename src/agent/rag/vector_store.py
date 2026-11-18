@@ -3270,6 +3270,10 @@ class VectorStore:
         if min_similarity is None:
             min_similarity = _RERANK_MIN_SIMILARITY
         n_candidates = top_k * candidate_multiplier
+        # 分阶段耗时打点：向量 / BM25 / 两段式 / 重排，返回前输出一行汇总；
+        # 各阶段累计之和与总耗时之差即合并去重 / RRF 融合 / 缓存读写等开销。
+        _t_all = time.monotonic()
+        _dt_vec = _dt_fts = _dt_two = _dt_rerank = 0.0
 
         # 二值粗筛模式判定（决定缓存 kind：两段式与原流程结果可能不同，
         # 分开缓存避免运行时切换开关后命中另一模式的旧结果）。
@@ -3286,11 +3290,14 @@ class VectorStore:
         cached = self._query_cache_get(kind, query, top_k, where)
         if cached is not None:
             logger.info(
-                "VectorStore.search_with_rerank: 查询缓存命中 (%d 条)", len(cached))
+                "VectorStore.search_with_rerank: 查询缓存命中 (%d 条, 耗时 %.3fs)",
+                len(cached), time.monotonic() - _t_all)
             return cached
 
         if bin_mode:
+            _t = time.monotonic()
             two = self._search_two_stage(table, query, n_candidates, where)
+            _dt_two = time.monotonic() - _t
             if two is not None:
                 vec_candidates, fts_candidates = two
                 logger.info(
@@ -3302,15 +3309,19 @@ class VectorStore:
                 bin_mode = False
         if not bin_mode:
             # 1. Vector similarity search.
+            _t = time.monotonic()
             vec_candidates = self.search(query, top_k=n_candidates, where=where)
+            _dt_vec = time.monotonic() - _t
             logger.info(
                 "VectorStore.search_with_rerank: 向量检索 %d 条候选",
                 len(vec_candidates),
             )
 
             # 2. BM25 keyword search (同样的 where 过滤，保证定向检索一致)。
+            _t = time.monotonic()
             fts_candidates = self.search_fts(
                 query, top_k=n_candidates, where=where)
+            _dt_fts = time.monotonic() - _t
         logger.info(
             "VectorStore.search_with_rerank: BM25 检索 %d 条候选", len(fts_candidates),
         )
@@ -3327,7 +3338,9 @@ class VectorStore:
             merged.append(c)
 
         if not merged:
-            logger.info("VectorStore.search_with_rerank: 混合检索无候选")
+            logger.info(
+                "VectorStore.search_with_rerank: 混合检索无候选 (耗时 %.3fs)",
+                time.monotonic() - _t_all)
             return []
 
         logger.info(
@@ -3348,8 +3361,10 @@ class VectorStore:
         results: List[Dict[str, Any]] = []
         all_below = False
         if use_reranker:
+            _t = time.monotonic()
             results = self.rerank(query, rerank_input, top_k=top_k,
                                   min_similarity=min_similarity)
+            _dt_rerank = time.monotonic() - _t
             logger.info(
                 "VectorStore.search_with_rerank: %d 候选 → %d 条 (rerank + 相似度≥%.2f 过滤)",
                 len(rerank_input), len(results), min_similarity,
@@ -3380,6 +3395,11 @@ class VectorStore:
         # （否则 reranker 恢复后仍会命中 10 分钟前的降级结果）。
         if not used_fallback:
             self._query_cache_put(kind, query, top_k, where, results)
+        logger.info(
+            "⏱ 检索耗时: 总 %.3fs | 向量 %.3fs | BM25 %.3fs | 两段式 %.3fs | "
+            "重排 %.3fs (候选 %d → 返回 %d)",
+            time.monotonic() - _t_all, _dt_vec, _dt_fts, _dt_two, _dt_rerank,
+            len(rerank_input), len(results))
         return results
 
     def _clear_locked(self) -> None:

@@ -2762,6 +2762,7 @@ class RAGEngine:
         store = self._get_reading_store()
         if store is None:
             return []
+        t0 = time.monotonic()
         try:
             stats = store.stats()
         except Exception as e:
@@ -2782,8 +2783,8 @@ class RAGEngine:
             min_score=self._reading_min_score)
         if not hits:
             logger.info(
-                "  └─ 阅读模式检索: 无切片达到相关度门限 %.2f（每查询词平均相似度）",
-                self._reading_min_score)
+                "  └─ 阅读模式检索: 无切片达到相关度门限 %.2f（每查询词平均相似度, 总耗时 %.3fs）",
+                self._reading_min_score, time.monotonic() - t0)
         out: List[Dict[str, Any]] = []
         for h in hits:
             out.append({
@@ -2796,7 +2797,9 @@ class RAGEngine:
                 "title": h.get("title", ""),
                 "reading_mode": True,
             })
-        logger.info("  └─ 阅读模式检索完成: 返回 %d 个长切片", len(out))
+        logger.info(
+            "  └─ 阅读模式检索完成: 返回 %d 个长切片 (总耗时 %.3fs, 分阶段明细见 ⏱ 行)",
+            len(out), time.monotonic() - t0)
         return out
 
     def search_formatted(

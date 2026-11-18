@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -514,13 +515,31 @@ class ColBertDocStore:
             raise ColBertStoreError("query is empty")
         top_k = max(1, min(int(top_k), _MAX_TOP_K))
         coarse_k = max(top_k, min(int(coarse_k), _MAX_COARSE))
+        # 分阶段耗时打点：每次检索返回前打印一行汇总（整体 + 各阶段），
+        # 便于定位召回慢的环节。各阶段累计之和与总耗时之差即 source
+        # 预取 / 门限过滤 / 排序等零碎开销。
+        t_all = time.monotonic()
+        timing = {"encode": 0.0, "bm25": 0.0, "vec": 0.0,
+                  "fetch": 0.0, "maxsim": 0.0}
+
+        def _log_timing(hits_count: int, cand_count: int = 0) -> None:
+            logger.info(
+                "⏱ 阅读模式检索耗时: 总 %.3fs | 查询编码 %.3fs | BM25 %.3fs | "
+                "中心向量 %.3fs | 候选读取 %.3fs | MaxSim 精排 %.3fs "
+                "(候选 %d → 返回 %d)",
+                time.monotonic() - t_all, timing["encode"], timing["bm25"],
+                timing["vec"], timing["fetch"], timing["maxsim"],
+                cand_count, hits_count)
+        _t = time.monotonic()
         # 查询侧轻量清理（只去标点/空白/停用词，保留形容词与疑问词）：
         # 文档侧入库做了词性剪枝，查询侧若完全原样会带入无法匹配的标点与
         # 停用词噪声；而做词性剪枝又会误删「为什么/可怕」等语义核心。
         # 清理后为空（如纯标点）时回退原查询，避免编码空串。
         q_text = clean_query_tokens(query) or query
         q_vectors = self.runtime.encode_query(q_text)
+        timing["encode"] = time.monotonic() - _t
         if q_vectors.ndim != 2 or q_vectors.size == 0:
+            _log_timing(0)
             return []
         q_token_count = max(1, int(q_vectors.shape[0]))
         q_center = q_vectors.astype(np.float32).mean(axis=0)
@@ -537,6 +556,7 @@ class ColBertDocStore:
         # （≤2×coarse_k），再按 len(allowed) 放大只会让并集无上界。
         fetch_k = coarse_k
         bm25_ids: List[str] = []
+        _t = time.monotonic()
         if self._ensure_fts():
             try:
                 q_fts = self._doc.search(
@@ -548,7 +568,9 @@ class ColBertDocStore:
                 bm25_ids = [r["doc_id"] for r in rows]
             except Exception:
                 bm25_ids = []
+        timing["bm25"] = time.monotonic() - _t
         vec_ids: List[str] = []
+        _t = time.monotonic()
         try:
             if allowed is not None:
                 scored: List[Tuple[float, str]] = []
@@ -571,6 +593,7 @@ class ColBertDocStore:
         except Exception as e:
             logger.warning("ColBERT 中心向量检索失败: %s", e)
             vec_ids = []
+        timing["vec"] = time.monotonic() - _t
 
         # 精排候选 = 两条通道各自 top coarse_k 的**并集**，而不是 RRF 融合后
         # 截断到 coarse_k：RRF 截断会把只被单通道命中的头部结果挤掉（被
@@ -586,12 +609,16 @@ class ColBertDocStore:
                 seen_ids.add(doc_id)
                 ids.append(doc_id)
         if not ids:
+            _log_timing(0)
             return []
+        _t = time.monotonic()
         docs = self._fetch(self._doc, ids)
         vecs = self._fetch(self._vec, ids)
         residuals = self._fetch(self._res, ids)
+        timing["fetch"] = time.monotonic() - _t
 
         hits: List[Dict[str, Any]] = []
+        _t = time.monotonic()
         for doc_id in ids:
             rrf_score = rrf_scores.get(doc_id, 0.0)
             doc = docs.get(doc_id)
@@ -635,7 +662,9 @@ class ColBertDocStore:
                 "rrf_score": float(rrf_score),
                 "token_count": int(res["token_count"]),
             })
+        timing["maxsim"] = time.monotonic() - _t
         hits.sort(key=lambda h: h["score"], reverse=True)
+        _log_timing(len(hits), len(ids))
         return hits[:top_k]
 
     # ------------------------------------------------------------------ admin
