@@ -343,6 +343,7 @@ class ChapterSummaryScheduler:
                     doc_name, markdown="", md_path=md_path,
                     digest=info.get("digest") or "",
                     chapters=toc_actual,
+                    source=info.get("source") or "",
                 )
                 book["toc_fixed"] = True
                 # 目录结构变化（章节增删 / 顺序调整）会让「按 idx 记录」的逐章

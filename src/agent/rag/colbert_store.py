@@ -251,6 +251,20 @@ _RES_SCHEMA = pa.schema([
     ("residual_blob", pa.binary()),
 ])
 
+# 文档元数据（目录结构/章节标题 digest）：阅读模式自己的元数据表，
+# 与普通 VectorStore 的 documents 表同语义（见 get_doc_meta），但归属
+# 本 store——两模式的 digest 互不混写。doc_id 必须与 document 表的
+# doc_id 前缀同源（sha1(source)[:16]），否则 _delete_prefix 清不到。
+_META_SCHEMA = pa.schema([
+    ("doc_id", pa.string()),
+    ("doc_name", pa.string()),
+    ("source", pa.string()),
+    ("digest", pa.string()),
+    ("chapters", pa.string()),      # JSON：[{title, level}]
+    ("md_path", pa.string()),
+    ("updated_at", pa.float64()),
+])
+
 
 class ColBertDocStore:
     def __init__(self, db_dir: Optional[str] = None,
@@ -280,6 +294,7 @@ class ColBertDocStore:
         self._doc = self._open("document", _DOC_SCHEMA)
         self._vec = self._open("doc_summary_vec", _vec_schema(self.dim))
         self._res = self._open("doc_residuals", _RES_SCHEMA)
+        self._meta = self._open("doc_meta", _META_SCHEMA)
 
     def _open(self, name: str, schema: pa.Schema):
         try:
@@ -316,7 +331,7 @@ class ColBertDocStore:
     # ------------------------------------------------------------------ index
     def _delete_prefix(self, prefix: str) -> None:
         expr = f"doc_id LIKE '{prefix}%'"
-        for table in (self._doc, self._vec, self._res):
+        for table in (self._doc, self._vec, self._res, self._meta):
             try:
                 table.delete(expr)
             except Exception:
@@ -789,9 +804,12 @@ class ColBertDocStore:
             raise ColBertStoreError("doc_id or source/title is required")
         with self._write_lock:
             before = self._doc.count_rows()
+            # meta 行的 doc_id 是裸 hash（无冒号），切片行是 "hash:NNNNN"；
+            # LIKE 必须去掉尾部冒号才能同时覆盖两类行（否则 doc_meta 残留）。
+            like_prefix = prefix[:-1] if prefix.endswith(":") else prefix
             expr = (f"doc_id = '{prefix}'" if ":" in prefix
-                    and not prefix.endswith(":") else f"doc_id LIKE '{prefix}%'")
-            for table in (self._doc, self._vec, self._res):
+                    and not prefix.endswith(":") else f"doc_id LIKE '{like_prefix}%'")
+            for table in (self._doc, self._vec, self._res, self._meta):
                 try:
                     table.delete(expr)
                 except Exception:
@@ -800,9 +818,10 @@ class ColBertDocStore:
             return max(0, before - self._doc.count_rows())
 
     def clear(self) -> None:
-        """清空三表（知识库清空/重建时调用）。"""
+        """清空全部表（知识库清空/重建时调用）。"""
         with self._write_lock:
-            for name in ("document", "doc_summary_vec", "doc_residuals"):
+            for name in ("document", "doc_summary_vec", "doc_residuals",
+                         "doc_meta"):
                 try:
                     self._db.drop_table(name, ignore_missing=True)
                 except Exception as e:
@@ -810,6 +829,7 @@ class ColBertDocStore:
             self._doc = self._open("document", _DOC_SCHEMA)
             self._vec = self._open("doc_summary_vec", _vec_schema(self.dim))
             self._res = self._open("doc_residuals", _RES_SCHEMA)
+            self._meta = self._open("doc_meta", _META_SCHEMA)
             self._fts_ready = False
             self._ann_ready = False
 
@@ -818,7 +838,89 @@ class ColBertDocStore:
             "documents": self._doc.count_rows(),
             "vectors": self._vec.count_rows(),
             "residuals": self._res.count_rows(),
+            "meta": self._meta.count_rows(),
         }
+
+    # ------------------------------------------------------------- doc meta
+    def upsert_doc_meta(self, doc_name: str, digest: str,
+                        chapters: str = "", md_path: str = "",
+                        source: str = "") -> None:
+        """写入/覆盖文档元数据（digest + 章节列表）。
+
+        ``doc_id`` 与切片表同源（sha1(source)[:16]），因此按 source 的
+        前缀删除（``_delete_prefix`` / ``delete(source=)``）会连带清掉
+        本表的行。``source`` 缺省时退化为 sha1(doc_name)[:16]——按名
+        删除（``delete_doc_meta``）仍可命中。
+        """
+        doc_name = (doc_name or "").strip()
+        if not doc_name:
+            raise ColBertStoreError("doc_name is required for doc_meta")
+        key = source or doc_name
+        doc_id = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+        import time as _time
+        row = {
+            "doc_id": doc_id,
+            "doc_name": doc_name,
+            "source": source or "",
+            "digest": digest or "",
+            "chapters": chapters or "",
+            "md_path": md_path or "",
+            "updated_at": float(_time.time()),
+        }
+        with self._write_lock:
+            self._meta.delete(f"doc_id = '{doc_id}'")
+            self._meta.add([row])
+
+    def _meta_rows(self) -> List[Dict[str, Any]]:
+        try:
+            return self._meta.search().limit(5000).to_list()
+        except Exception:
+            return []
+
+    def all_meta_rows(self) -> List[Dict[str, Any]]:
+        """doc_meta 表全部行的浅拷贝（供批量对账一次性快照）。"""
+        return [dict(r) for r in self._meta_rows()]
+
+    def get_doc_meta(self, doc_name: str) -> Optional[Dict[str, Any]]:
+        """按名返回 {doc_name, digest, chapters, md_path}；语义对齐
+        ``VectorStore.get_document_digest``：精确/doc_name/basename 大小写
+        不敏感 → 双向子串。找不到返回 None。"""
+        rows = self._meta_rows()
+        if not rows:
+            return None
+        target = (doc_name or "").strip().lower()
+        if not target:
+            return None
+        out = lambda r: {  # noqa: E731
+            "doc_name": r.get("doc_name", ""),
+            "digest": r.get("digest", ""),
+            "chapters": r.get("chapters", ""),
+            "md_path": r.get("md_path", ""),
+        }
+        for r in rows:
+            name = (r.get("doc_name") or "").lower()
+            if name == target or os.path.basename(name) == target:
+                return out(r)
+        for r in rows:
+            name = (r.get("doc_name") or "").lower()
+            if target in name or name in target:
+                return out(r)
+        return None
+
+    def list_doc_names(self) -> List[str]:
+        """列出有元数据的文档名（对齐 ``VectorStore.list_documents``）。"""
+        rows = self._meta_rows()
+        return sorted({r.get("doc_name", "") for r in rows
+                       if r.get("doc_name")})
+
+    def delete_doc_meta(self, doc_name: str) -> None:
+        """按 doc_name 字面量删除元数据行（普通表 delete_document 的对应物）。"""
+        safe = (doc_name or "").replace("'", "''")
+        with self._write_lock:
+            try:
+                self._meta.delete(f"doc_name = '{safe}'")
+            except Exception as e:
+                logger.warning("删除 ColBERT doc_meta 失败 %s: %s", doc_name, e)
 
 
 # ---------------------------------------------------------------------------

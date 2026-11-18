@@ -650,9 +650,9 @@ class ToolRegistry:
                 reading_model_dir=str(getattr(
                     self.config, "rag_reading_model_dir", "") or ""),
                 reading_chunk_max=int(getattr(
-                    self.config, "rag_reading_chunk_max", 8000) or 8000),
+                    self.config, "rag_reading_chunk_max", 3000) or 3000),
                 reading_chunk_min=int(getattr(
-                    self.config, "rag_reading_chunk_min", 7500) or 7500),
+                    self.config, "rag_reading_chunk_min", 2500) or 2500),
                 reading_semantic_threshold=float(getattr(
                     self.config, "rag_reading_semantic_threshold", 0.55)),
             )

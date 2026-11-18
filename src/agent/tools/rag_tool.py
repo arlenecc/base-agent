@@ -262,7 +262,7 @@ class RagSearchTool(Tool):
         try:
             # 先取重排后的原始分片（含完整 text，未截断），供辅助模型通读归纳。
             chunks = self._engine.search(query, top_k=top_k, source=source or None)
-            # 检索阅读模式：切片体量大（7500~8000 字），只把排名最高的一片
+            # 检索阅读模式：切片体量大（2500~3000 字），只把排名最高的一片
             # 注入上下文供模型总结/回答；其余切片作为可点击气泡附在回复末尾，
             # 避免一次检索吃满上下文，同时保证模型有真实依据可读。
             if reading_mode:

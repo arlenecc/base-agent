@@ -46,7 +46,7 @@
 - **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计（仅计输出 token，不含 prompt）；结构化 read 超时（流式 chunk 间隔上限 60s），本地模型生成中途卡住时自动报错而非永久卡死
 - **工具调用** — 内置 14 个工具（`file_tools` / `long_memory` / `skill_tools` / `rag_tools` 四个门面 + `code_run` / `shell_run` / `web_scan` / `search_tool` / `doc_search_tool` / `ask_user` / `schedule_tools` / `update_working_checkpoint` / `start_long_term_update` / `update_plan`）；旧原子工具名（`file_read` / `rag_search` / `memory_search` / `skill_load` 等）保留兼容别名但不进 schema，支持模型自主决策和工具链式调用
 - **联网搜索** — `search_tool`（别名 `web_search`）并发聚合 9 个主引擎 + 50 个实测可达的备用源；随机桌面 UA、逐引擎适配请求与解析，统一去重、广告/导航过滤、相关性校验与加权排序；主引擎不可用时自动回退，支持 `backup` / `all` 预设，本地知识库缺失信息时可主动补缺
-- **长文档问句检索** — `doc_search_tool` 面向用户自己的 Markdown/TXT 长文档：标题优先语义切片（7500–8000 字、1% overlap，语义低谷由 model2vec 静态句向量计算）+ ColBERT 词向量残差量化（2/4bit）写入 LanceDB 三表；问句用 BM25 + 中心向量 RRF 粗筛 20 条，再流式反量化 + MaxSim 精排返回 topN，不必把整本书塞进上下文
+- **长文档问句检索** — `doc_search_tool` 面向用户自己的 Markdown/TXT 长文档：章节优先语义切片（2500–3000 字、小节尽量不切分，超长章节内按小节整体装箱；语义低谷由 model2vec 静态句向量计算）+ ColBERT 词向量残差量化（2/4bit）写入 LanceDB 三表；问句用 BM25 + 中心向量并集粗筛，再流式反量化 + MaxSim 精排返回 topN，不必把整本书塞进上下文
 - **检索阅读模式** — 配置窗口「高级配置 → 检索阅读模式」：文档解析为 Markdown 后，由 ColBERT 三表旁路接管切片 / 词向量 / 入库 / 召回 / MaxSim 精排；可配 2/4bit 残差、粗筛 10/20/50/100、精选 topN 1/3/5、ANN 索引；召回时最高分切片注入上下文供模型总结，其余切片作为回复末尾气泡展示；模型缺失自动从 hf-mirror.com 下载
 - **内核控制流** — 三态自动机（THINK / ACT / CONSOLIDATE）+ 五级信息压缩，上下文硬性控制在 30k 以内
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过本地 embedding 模型（默认 `jina-embeddings-v5`）+ LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
@@ -282,7 +282,7 @@ RAG 相关配置（写在同一个 `config.json` 里；标 🌐 的项在配置�
 **长文档检索（`doc_search_tool`）**
 
 - **入库**：`doc_search_tool(op="index", path="/path/to/book.md")`（也支持目录批量、或 `text` + `title` 直接传原文），索引默认落在 `<workspace>/.agent/colbert_docs.lancedb`。
-- **切片**：优先按标题结构分片；章节内过长时在相邻句相似度的语义低谷处切；句向量使用 model2vec 静态嵌入（与普通 RAG 语义切片同一快路径），ColBERT 只负责入库词向量和 MaxSim；阈值默认 0.55，按分布自适应（下限 0.15）；单片 7500–8000 字、1% overlap、断点必须是句末；表格/代码块不超长时整块保留；过小切片与同章节相邻片合并，结构/语义都失效才递归兜底。
+- **切片**：章节优先——1~2 级标题（# / ## / 第X章·节·篇）是首选切点，小节（3 级及以下）整体归属所属章节、尽量不切分；章节超长（默认上限 3000）时在内部按小节整体装箱，单个小节仍超长才在相邻句相似度的语义低谷处切。句向量使用 model2vec 静态嵌入（与普通 RAG 语义切片同一快路径），ColBERT 只负责入库词向量和 MaxSim；阈值默认 0.55，按分布自适应（下限 0.15）；单片 2500–3000 字、句子级切分 1% overlap、断点必须是句末；表格/代码块不超长时整块保留；过小切片与同章节相邻片合并，结构/语义都失效才递归兜底。
 - **量化**：切片先做 Token 剪枝（去标点/空白/停用词/低信息词，保留名词、动词、专名、数词），再用 ColBERT 编码；长切片按 512 token 局部窗口编码，避免长上下文导致 MaxSim 退化。每个切片的 token 中心向量以 fp16 存 `doc_summary_vec`，残差按 `scale=2*maxAbs/(2^bits-1)`、`offset=-maxAbs` 量化后打包进 `doc_residuals.residual_blob`（4bit 两值/字节，2bit 四值/字节）。
 - **检索**：问句按 `[QueryMarker]`、文档按 `[DocumentMarker]` 编码（查询侧先做轻量清理：只去标点/空白/停用词，保留形容词与疑问词）；BM25 与中心向量各召回 `coarse_k` 条（默认 50），两通道**并集**进入 MaxSim 精排（RRF 截断会挤掉单通道头部结果）；命中切片流式解压残差、反量化还原 token 向量，用 BLAS 矩阵乘做 MaxSim 精排，再按 `MaxSim ÷ 查询 token 数` 的相关度门限（默认 0.61）过滤，返回 topN（默认 5）。
 - 三张表：`document`（doc_id/title/content + 内部 `content_fts` / `source` / `chunk_index`）、`doc_summary_vec`（doc_id + float16 中心向量）、`doc_residuals`（doc_id/token_count/dim/quant_bits/scale/offset/residual_blob）。

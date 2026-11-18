@@ -128,9 +128,10 @@ class AgentConfig:
     rag_reading_use_ann: bool = False
     # 模型目录：空 = 自动使用/下载 ~/.base-agent/models/jina-colbert-v2-64-onnx-int8。
     rag_reading_model_dir: str = ""
-    # 检索阅读模式切片长度（字符）：默认 7500~8000，1% overlap。
-    rag_reading_chunk_max: int = 8000
-    rag_reading_chunk_min: int = 7500
+    # 检索阅读模式切片长度（字符）：默认 2500~3000，章节优先、小节尽量
+    # 不切分，句子级切分才有 1% overlap。
+    rag_reading_chunk_max: int = 3000
+    rag_reading_chunk_min: int = 2500
     # 章节内语义低谷阈值（默认 0.55，代码会按分布自适应且不低于 0.15）。
     rag_reading_semantic_threshold: float = 0.55
     # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：
@@ -685,9 +686,9 @@ class AgentConfig:
         if self.rag_reading_top_n not in (1, 3, 5):
             self.rag_reading_top_n = 3
         if self.rag_reading_chunk_max < 500:
-            self.rag_reading_chunk_max = 8000
+            self.rag_reading_chunk_max = 3000
         if self.rag_reading_chunk_min < 100:
-            self.rag_reading_chunk_min = 7500
+            self.rag_reading_chunk_min = 2500
         self.rag_reading_chunk_min = min(
             self.rag_reading_chunk_min, self.rag_reading_chunk_max)
         try:

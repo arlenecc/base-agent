@@ -158,3 +158,34 @@ def test_clean_query_tokens_keeps_question_words_and_adjectives():
     assert "does" not in en.split() and "do" not in en.split()
     # 清理后为空时返回空串，由检索侧回退原查询。
     assert clean_query_tokens("的 是，。") == ""
+
+
+def test_chunk_document_prefers_chapter_and_keeps_subsections():
+    """章节优先：小节整体归属所属章节，不单独成片。"""
+    small = "这是小节里的正文内容，讲述基础概念与细节。" * 10
+    doc = (
+        "## 第一章\n\n### 1.1 背景\n\n" + small
+        + "\n\n### 1.2 方法\n\n" + small
+        + "\n\n## 第二章\n\n" + ("第二章整体内容，篇幅较短同样成片。" * 8)
+    )
+    chunks = chunk_document(doc, "Book", max_chars=3000, min_chars=2500)
+    c1 = next(c for c in chunks if "第一章" in c.title)
+    # 两个小节都留在第一章整片里，小节标题仍是内容的一部分
+    assert "### 1.1 背景" in c1.content and "### 1.2 方法" in c1.content
+    assert len(c1.content) <= 3000
+
+
+def test_oversized_chapter_packs_whole_subsections():
+    """超长章节按小节整体装箱：小节正文绝不拦腰切断。"""
+    body = "小节正文内容，完整保留不切分。" * 30          # ~450 字/小节
+    doc = "## 大章\n\n" + "".join(
+        f"### 小节{i}\n\n{body}\n\n" for i in range(10))
+    chunks = chunk_document(doc, "Doc", max_chars=3000, min_chars=2500)
+    assert chunks
+    joined = "\n".join(c.content for c in chunks)
+    for c in chunks:
+        assert len(c.content) <= 3000
+    # 10 个小节全部以完整块存在（若小节被拦腰切开会少于 10）
+    assert joined.count(body) == 10
+    # 每片都以某个小节标题开头（装箱从结构边界起片）
+    assert all("### 小节" in c.content for c in chunks)

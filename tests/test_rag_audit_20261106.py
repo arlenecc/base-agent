@@ -193,8 +193,16 @@ def test_search_formatted_never_exceeds_total_cap(cfg, monkeypatch):
 # 6. 全书摘要匹配不得串书
 # ---------------------------------------------------------------------------
 
-def test_book_summary_short_keyword_does_not_crossmatch(cfg):
+def test_book_summary_short_keyword_does_not_crossmatch(cfg, monkeypatch):
     eng = RAGEngine(workspace=cfg.workspace, knowledge_base=cfg.knowledge_base)
+    # 模式门控需要文档存在于当前模式库；本测试只验证串书防护，
+    # 用放行任意名字的 fake store 隔离该前置条件。
+    class _AnyDocStore:
+        def get_document_digest(self, name):
+            return {"doc_name": name, "digest": "", "chapters": "",
+                    "md_path": ""}
+
+    monkeypatch.setattr(eng, "_get_store", lambda: _AnyDocStore())
     state = {"books": {
         "薄伽梵歌.epub": {"book_summary": "A 书摘要"},
         "神之所欲.epub": {"book_summary": "B 书摘要"},

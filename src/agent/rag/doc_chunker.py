@@ -1,10 +1,12 @@
-"""长文档语义切片：标题优先、语义低谷、句子边界、代码/表格原子块。
+"""长文档语义切片：章节优先、小节整体装箱、语义低谷、代码/表格原子块。
 
 约束（与产品需求一致）：
-* 优先按 Markdown / 中文章节标题分块，每个「标题 + 正文」是一个候选分片；
-* 单段过长时才做语义切分，切点落在相邻句子相似度的低谷；
+* 优先按 Markdown / 中文章节标题分块：1~2 级标题（# / ## / 第X章·节·篇·部）
+  是首选切点，每个「章节 + 全部小节」整体成片；
+* 小节（3 级及以下标题）尽量不切分：章节超长时才在内部按小节整体装箱，
+  单个小节仍超长才退回句子级语义切分，切点落在相邻句子相似度的低谷；
   句向量由 model2vec 静态嵌入计算（不是 ColBERT）；
-* 切片 7500~8000 字（末尾/短文档除外），1% overlap；
+* 切片 2500~3000 字（末尾/短文档除外），1% overlap（仅句子级切分）；
 * 断点必须落在句子结束处；代码块、表格（不超长时）整体保留；
 * 章节结构失效时退回递归切分，禁止把一句话切成两半。
 """
@@ -16,8 +18,8 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-DEFAULT_MAX_CHARS = 8000
-DEFAULT_MIN_CHARS = 7500
+DEFAULT_MAX_CHARS = 3000
+DEFAULT_MIN_CHARS = 2500
 DEFAULT_OVERLAP_RATIO = 0.01
 DEFAULT_SEMANTIC_THRESHOLD = 0.55
 MIN_SEMANTIC_THRESHOLD = 0.15
@@ -88,8 +90,13 @@ def _looks_like_heading(line: str) -> Optional[Tuple[int, str]]:
     return None
 
 
-def _split_sections(text: str, doc_title: str) -> List[_Section]:
-    """按标题切段；代码围栏内的 # 不当作标题。"""
+def _split_sections(text: str, doc_title: str,
+                    max_level: Optional[int] = None) -> List[_Section]:
+    """按标题切段；代码围栏内的 # 不当作标题。
+
+    ``max_level`` 只把不超过该层级的标题作为切点（更深的小节标题留在
+    内容里）——章节优先切分用 ``max_level=2``，全层级用默认 None。
+    """
     lines = text.splitlines(keepends=True)
     offsets: List[int] = []
     pos = 0
@@ -115,12 +122,16 @@ def _split_sections(text: str, doc_title: str) -> List[_Section]:
             continue
         if not in_fence:
             head = _looks_like_heading(raw)
+            if (head is not None and max_level is not None
+                    and head[0] > max_level):
+                head = None        # 小节标题不作为切点，留在内容里
             # Setext 标题：下一行是 === 或 ---
             if head is None and i + 1 < len(lines) and stripped:
                 under = _SETEXT_RE.match(lines[i + 1].strip())
                 if under and len(stripped) <= 80:
                     level = 1 if under.group(1).startswith("=") else 2
-                    heading_rows.append((i, level, stripped))
+                    if max_level is None or level <= max_level:
+                        heading_rows.append((i, level, stripped))
                     i += 2
                     continue
             if head is not None:
@@ -561,26 +572,70 @@ def _dedupe_overlap(prev: str, nxt: str) -> str:
     return nxt
 
 
+def _pack_subsections(section: _Section, max_chars: int) -> List[TextChunk]:
+    """超长章节内部按小节整体装箱：小节尽量不切开。
+
+    每个小节（章节内任意层级的标题段）作为整体装进箱子，达到 max_chars
+    即封箱；小节自带标题层级路径，章节标题行归属第一个非空小节。
+    任一小节自身超长时返回空列表——整体装箱失效，交回句子级语义切分兜底。
+    """
+    subs = _split_sections(section.text, section.title)
+    if len(subs) <= 1:
+        return []
+    if any(len(sub.text) > max_chars for sub in subs):
+        return []
+    chunks: List[TextChunk] = []
+    buf: List[str] = []
+    buf_start = buf_end = 0
+    buf_title = ""
+    for sub in subs:
+        if not sub.text.strip():
+            continue
+        if buf and sum(len(b) for b in buf) + len(sub.text) > max_chars:
+            chunks.append(TextChunk(buf_title, "".join(buf).strip(),
+                                    buf_start, buf_end))
+            buf = []
+        if not buf:
+            buf_title = sub.title
+            buf_start = section.start + sub.start
+        buf.append(sub.text)
+        buf_end = section.start + sub.end
+    if buf:
+        chunks.append(TextChunk(buf_title, "".join(buf).strip(),
+                                buf_start, buf_end))
+    return chunks
+
+
 def chunk_document(text: str, title: str = "", encoder: Any = None,
                    max_chars: int = DEFAULT_MAX_CHARS,
                    min_chars: int = DEFAULT_MIN_CHARS,
                    overlap_ratio: float = DEFAULT_OVERLAP_RATIO,
                    semantic_threshold: float = DEFAULT_SEMANTIC_THRESHOLD
                    ) -> List[TextChunk]:
-    """把长文档切成 7500~8000 字、句子边界完整的分片。"""
+    """按章节结构把长文档切成 2500~3000 字、句子边界完整的分片。
+
+    章节优先（1~2 级标题为切点，小节整体归属所属章节）→ 超长章节内部
+    按小节整体装箱 → 单个小节仍超长才退回句子级语义切分。
+    """
     if not (text or "").strip():
         return []
     max_chars = max(500, int(max_chars))
     min_chars = max(100, min(int(min_chars), max_chars))
-    sections = _split_sections(text, title)
     chunks: List[TextChunk] = []
-    for section in sections:
-        if len(section.text) <= max_chars:
-            chunks.append(TextChunk(section.title, section.text.strip(),
-                                    section.start, section.end))
+    for sec in _split_sections(text, title, max_level=2):
+        body = sec.text.strip()
+        if not body:
+            continue
+        if len(sec.text) <= max_chars:
+            chunks.append(TextChunk(sec.title, body, sec.start, sec.end))
+            continue
+        # 超长章节：小节整体装箱（小节尽量不切）；装不了再句子级切分。
+        sub_chunks = _pack_subsections(sec, max_chars)
+        if sub_chunks:
+            chunks.extend(sub_chunks)
         else:
             chunks.extend(_split_long_section(
-                section, encoder, max_chars, min_chars, overlap_ratio,
+                sec, encoder, max_chars, min_chars, overlap_ratio,
                 semantic_threshold))
 
     # 跨章节合并碎片；保留第一个标题，内容去重 overlap。

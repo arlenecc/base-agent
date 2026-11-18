@@ -102,7 +102,8 @@ def test_store_index_search_list_delete(tmp_path):
 
     removed = store.delete(source="/docs/manual.md")
     assert removed == n
-    assert store.stats() == {"documents": 0, "vectors": 0, "residuals": 0}
+    assert store.stats() == {"documents": 0, "vectors": 0, "residuals": 0,
+                             "meta": 0}
 
 
 def test_store_reindex_overwrites_same_source(tmp_path):
@@ -185,3 +186,40 @@ def test_store_stats_without_loading_model(tmp_path, monkeypatch):
     store = cs.ColBertDocStore(db_dir=str(tmp_path / "idx"), runtime=None)
     assert store.stats()["documents"] == 0
     assert store.list_documents() == []
+
+
+def test_doc_meta_upsert_get_list_and_delete_cascade(tmp_path):
+    """doc_meta 第四表：upsert/模糊匹配/list，删除时与三表连带清理。"""
+    runtime = FakeRuntime()
+    store = cs.ColBertDocStore(db_dir=str(tmp_path / "idx"),
+                               runtime=runtime, dim=8)
+    store._chunk_encoder = runtime
+    text = "## 认证\n\n" + ("OAuth2 认证说明。" * 30)
+    store.index_text("手册", text, source="/docs/a.md",
+                     max_chars=500, min_chars=300)
+    store.upsert_doc_meta(
+        "docs/a.md", "# 目录\n\n手册",
+        chapters='[{"level": 2, "title": "认证"}]',
+        md_path="/cache/a.md", source="/docs/a.md")
+    assert store.list_doc_names() == ["docs/a.md"]
+    assert store.stats()["meta"] == 1
+
+    meta = store.get_doc_meta("docs/a.md")
+    assert meta["digest"].startswith("# 目录")
+    assert meta["md_path"] == "/cache/a.md"
+    assert "认证" in meta["chapters"]
+    # 模糊匹配语义对齐 VectorStore.get_document_digest：basename / 双向子串
+    assert store.get_doc_meta("a.md")["doc_name"] == "docs/a.md"
+    assert store.get_doc_meta("a")["doc_name"] == "docs/a.md"
+    assert store.get_doc_meta("不存在") is None
+
+    # 重复 upsert 覆盖不翻倍
+    store.upsert_doc_meta("docs/a.md", "# 目录 v2", source="/docs/a.md")
+    assert store.stats()["meta"] == 1
+    assert store.get_doc_meta("docs/a.md")["digest"] == "# 目录 v2"
+
+    # delete(source=) 连带清理：三表 + doc_meta 一起删
+    store.delete(source="/docs/a.md")
+    assert store.list_doc_names() == []
+    assert store.stats() == {"documents": 0, "vectors": 0, "residuals": 0,
+                             "meta": 0}

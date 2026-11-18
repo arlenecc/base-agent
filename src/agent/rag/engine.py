@@ -692,8 +692,8 @@ class RAGEngine:
         reading_min_score: float = 0.61,
         reading_use_ann: bool = False,
         reading_model_dir: str = "",
-        reading_chunk_max: int = 8000,
-        reading_chunk_min: int = 7500,
+        reading_chunk_max: int = 3000,
+        reading_chunk_min: int = 2500,
         reading_semantic_threshold: float = 0.55,
     ):
         self._workspace = workspace
@@ -832,9 +832,13 @@ class RAGEngine:
                 f"th{self._reading_semantic_threshold:.4f}:"
                 f"m{_reading_model_signature(self._reading_model_dir)}")
 
-    def _get_reading_store(self):
-        """检索阅读模式的 ColBERT 三表 store（与 doc_search_tool 共享实例）。"""
-        if not self._reading_mode:
+    def _get_reading_store(self, force: bool = False):
+        """检索阅读模式的 ColBERT 三表 store（与 doc_search_tool 共享实例）。
+
+        ``force=True`` 供模式切换迁移使用：普通模式下也要拿到 store 以
+        清理旧数据（删除/迁移不清 ColBERT 会永久残留可检索的旧副本）。
+        """
+        if not self._reading_mode and not force:
             return None
         if self._reading_store is None:
             with self._reading_store_lock:
@@ -846,7 +850,8 @@ class RAGEngine:
 
     def _reading_chunks(self, text: str, source: str, title: str
                         ) -> List[Dict[str, Any]]:
-        """用 doc_chunker 生成 7500~8000 字切片（引擎侧已解析出 Markdown）。"""
+        """用 doc_chunker 生成 2500~3000 字切片（章节优先、小节尽量不切，
+        引擎侧已解析出 Markdown）。"""
         from .doc_chunker import chunk_document
         # 语义低谷用 model2vec 静态句向量（与普通 RAG 语义切片同一后端），
         # 不用 ColBERT：切片只需相对相似度，静态嵌入更快且不加载 587MB 模型。
@@ -905,6 +910,31 @@ class RAGEngine:
         if not aborted:
             _flush()
         return total_added
+
+    def _migrate_stale_mode_data(self, filepath: str,
+                                 prev_mode: Any = None) -> None:
+        """模式切换迁移：文件改按当前模式重索引前，清掉旧模式 store 的旧数据。
+
+        ``add_chunks`` / ``add_streaming`` 的 overwrite 只清**本库**；换模式
+        重索引不清旧库会永久残留一份可检索的旧副本（向量+digest 元数据）。
+        放在写入前执行：若同步中途取消，该文件签名仍失配、下次同步会再次
+        重跑补齐，不会出现「两库都无数据」的永久丢失。
+        """
+        if prev_mode is None or bool(prev_mode) == bool(self._reading_mode):
+            return
+        try:
+            if prev_mode:      # 旧条目 = 阅读模式 → 清 ColBERT 三表
+                rs = self._get_reading_store(force=True)
+                if rs is not None:
+                    rs.delete(source=filepath)
+                old_kind = "ColBERT"
+            else:              # 旧条目 = 普通模式 → 清普通向量库
+                self._get_store().delete_by_source(filepath)
+                old_kind = "普通向量"
+            logger.info("RAG: 模式切换迁移 %s: 已清理%s库旧数据",
+                        os.path.basename(filepath), old_kind)
+        except Exception as e:
+            logger.warning("RAG: 模式切换迁移清理失败 %s: %s", filepath, e)
 
     # ------------------------------------------------------------------
     # 知识图谱（rag/kg/）
@@ -1366,10 +1396,11 @@ class RAGEngine:
                             os.path.relpath(dup_path, self._knowledge_base))
                         store.delete_document(os.path.basename(dup_path))
                         # 阅读模式的重复副本同样要从 ColBERT 三表移除。
-                        if getattr(self, "_reading_mode", False):
-                            rs = self._get_reading_store()
-                            if rs is not None:
-                                rs.delete(source=dup_path)
+                        # 无条件双删：普通模式下也可能有此前以阅读模式入库
+                        # 的残留，不删会跨模式遗留可检索的旧副本。
+                        rs = self._get_reading_store(force=True)
+                        if rs is not None:
+                            rs.delete(source=dup_path)
                     except Exception as e:
                         logger.warning("RAG: 清理副本向量失败 %s: %s", dup_path, e)
                         # 删除失败不要标记 duplicate_of/chunk_count=0，否则
@@ -1610,6 +1641,10 @@ class RAGEngine:
         # 预扫描已算出的采样指纹，消费端直接复用（大文件每次 192KB 读盘，
         # 同一文件算两遍纯属浪费）。
         fp_by_path: Dict[str, str] = {}
+        # 模式切换迁移：待处理文件中「上次以另一种模式入库」的清单
+        # （filepath → 旧条目的 reading_mode）。worker 重索引该文件前
+        # 据此清掉旧模式 store 里的向量+元数据（见 _migrate_stale_mode_data）。
+        _mode_switch_prev: Dict[str, bool] = {}
         # 预播种：**已入库**文件的指纹先进 seen 表。新副本（新建文件夹拷贝
         # 进来的）遇到它们时把 owner 让给「已在库」的文件——复用现成向量，
         # 而不是按路径排序把新副本当成 owner 白解析一遍（2026-10-22 用户
@@ -1725,6 +1760,9 @@ class RAGEngine:
                 if fp:
                     seen_fp.setdefault(fp, filepath)
                     fp_by_path[filepath] = fp
+                prev_mode = (prev or {}).get("reading_mode")
+                if prev is not None and bool(prev_mode) != bool(self._reading_mode):
+                    _mode_switch_prev[filepath] = bool(prev_mode)
                 reason = "新增" if prev is None else "已修改"
                 new_detail.append(f"  → 待处理({reason}): {os.path.basename(filepath)}")
         # 汇总输出
@@ -1742,6 +1780,14 @@ class RAGEngine:
             total_files, len(files_to_process), stats["files_skipped"],
             stats["files_duplicated"],
         )
+        if _mode_switch_prev:
+            _log(
+                "  ⚠ 检索模式已切换（%s → %s）: %d 个文件将按新模式重索引，"
+                "旧库数据随写入迁移清理",
+                "阅读" if not self._reading_mode else "普通",
+                "阅读" if self._reading_mode else "普通",
+                len(_mode_switch_prev),
+            )
         if progress_callback is not None:
             try:
                 progress_callback(-1, 0,
@@ -1844,12 +1890,16 @@ class RAGEngine:
                                         "doc_name": os.path.basename(filepath),
                                         "source": rel_path,
                                     })
+                                    # 模式切换迁移：先清旧模式库，再写新模式
+                                    self._migrate_stale_mode_data(
+                                        filepath, _mode_switch_prev.get(filepath))
                                     # 目录缩略版：直接采用 ebooklib 目录树
                                     try:
                                         self.build_and_store_digest(
                                             rel_path, cleaned, md_path=md_path,
                                             digest=book["toc_digest"],
                                             chapters=book["toc_chapters"],
+                                            source=filepath,
                                         )
                                         _log("    ├─ 目录缩略版已生成 (ebooklib 目录树, %d 章)", len(book["toc_chapters"]))
                                     except Exception as e:
@@ -2065,6 +2115,9 @@ class RAGEngine:
                                     _MIN_DOC_CHARS_FOR_INGEST, fname)
                                 continue
 
+                            # 模式切换迁移：先清旧模式库，再写新模式
+                            self._migrate_stale_mode_data(
+                                filepath, _mode_switch_prev.get(filepath))
                             # ---- 构建文档缩略版本（目录结构 + 标题）----
                             # 只存目录结构（标题层级），不做逐章摘要。
                             # 放在空文本检查之后：空内容不该生成一份
@@ -2077,6 +2130,7 @@ class RAGEngine:
                                     rel_path,
                                     cleaned,
                                     md_path=md_path,
+                                    source=filepath,
                                 )
                                 _log("    ├─ 文档缩略版本已生成: %s", fname)
                             except Exception as e:
@@ -2648,11 +2702,11 @@ class RAGEngine:
                 store.delete_document(os.path.basename(source))
                 store.delete_document(source)
                 # 检索阅读模式的 ColBERT 三表也必须同步清理，否则已删除文件
-                # 仍会出现在 BM25/向量召回里（普通 store 与它相互独立）。
-                if getattr(self, "_reading_mode", False):
-                    rs = self._get_reading_store()
-                    if rs is not None:
-                        rs.delete(source=source)
+                # 仍会出现在 BM25/向量召回里。无条件双删：普通模式下同样可能
+                # 有阅读模式时代的残留（含 doc_meta 元数据）。
+                rs = self._get_reading_store(force=True)
+                if rs is not None:
+                    rs.delete(source=source)
                 # 缓存的 Markdown 也必须一起删。旧实现只删了向量和元数据，
                 # 而紧接着的 Step 7（ensure_digests_for_cached_documents）会发现
                 # 「有缓存文件、无 digest 记录」，于是用旧缓存重新生成一条 ——
@@ -2911,6 +2965,8 @@ class RAGEngine:
         md_path: str = "",
         digest: Optional[str] = None,
         chapters: Optional[list] = None,
+        source: str = "",
+        mode: Optional[bool] = None,
     ) -> str:
         """Build a document's digest (缩略版本) and store it in the metadata table.
 
@@ -2941,17 +2997,30 @@ class RAGEngine:
             [_chapter_to_dict(c) for c in chapters],
             ensure_ascii=False,
         )
-        store = self._get_store()
-        # 存完整 doc_name（通常是相对路径）：basename 会让不同目录下的同名
-        # 文件在 documents 表里共用 doc_id 互相覆盖。doc_name 列同时承担
-        # rag_outline 的展示与按名检索（含 basename/子串匹配），存相对路径
-        # 不影响这两种用法。
-        store.upsert_document(
-            doc_name=doc_name,
-            digest=digest,
-            chapters=chapters_json,
-            md_path=md_path,
-        )
+        # digest 归属当前同步模式：阅读模式写 ColBERT doc_meta 表，普通模式
+        # 写 VectorStore documents 表——两模式各存各读，阅读模式同步不再往
+        # 普通表写「有目录、无向量」的孤儿行。``mode`` 供批量对账场景显式
+        # 指定归属（ensure_digests 按 manifest 条目的历史模式写入）。
+        reading = self._reading_mode if mode is None else bool(mode)
+        if reading:
+            rs = self._get_reading_store()
+            if rs is None:
+                raise RuntimeError("检索阅读模式 store 不可用")
+            rs.upsert_doc_meta(
+                doc_name=doc_name, digest=digest, chapters=chapters_json,
+                md_path=md_path, source=source)
+        else:
+            store = self._get_store()
+            # 存完整 doc_name（通常是相对路径）：basename 会让不同目录下的同名
+            # 文件在 documents 表里共用 doc_id 互相覆盖。doc_name 列同时承担
+            # rag_outline 的展示与按名检索（含 basename/子串匹配），存相对路径
+            # 不影响这两种用法。
+            store.upsert_document(
+                doc_name=doc_name,
+                digest=digest,
+                chapters=chapters_json,
+                md_path=md_path,
+            )
         return digest
 
     def get_document_outline(self, doc_name: str) -> Optional[Dict[str, Any]]:
@@ -2959,7 +3028,13 @@ class RAGEngine:
 
         The full markdown is no longer persisted in the metadata table; use
         the returned ``md_path`` (or the on-disk ingest cache) to read it.
+
+        按模式分流：阅读模式读 ColBERT doc_meta 表，普通模式读 VectorStore
+        documents 表。
         """
+        if self._reading_mode:
+            rs = self._get_reading_store()
+            return rs.get_doc_meta(doc_name) if rs is not None else None
         store = self._get_store()
         return store.get_document_digest(doc_name)
 
@@ -2969,7 +3044,24 @@ class RAGEngine:
         供 MCP 工具 ``delete_document`` / ``forget_context`` 复用，实现「知识遗忘」：
         彻底移除文档在向量库、倒排索引与磁盘缓存中的全部痕迹，使后续检索不再
         召回该文档内容。返回是否确有记录被删除。
+
+        按模式分流 + 无条件双删：本模式的库必定删；另一模式的库有残留也
+        一并清（防跨模式遗留可检索的旧副本）。阅读模式没有普通 chunks，
+        KG 证据清理自然为空操作。
         """
+        rs = self._get_reading_store(force=True)
+        if self._reading_mode:
+            info = rs.get_doc_meta(name) if rs is not None else None
+            md_path = info.get("md_path") if info else None
+            if rs is not None:
+                rs.delete_matching(name)    # 三表 + doc_meta 一并删
+            if md_path and os.path.isfile(md_path):
+                try:
+                    os.remove(md_path)
+                except OSError as e:
+                    logger.warning("删除文档 markdown 缓存失败: %s", e)
+            logger.info("🗑 已删除文档（知识遗忘, 阅读模式）: %s", name)
+            return info is not None
         store = self._get_store()
         info = store.get_document_digest(name)
         md_path = info.get("md_path") if info else None
@@ -2988,10 +3080,10 @@ class RAGEngine:
             logger.debug("KG: 收集待删 chunk 前缀失败（跳过 KG 清理）: %s", e)
         store.delete_document(name)      # 元数据（documents 表）
         store.delete_by_source(name)     # 向量 chunks + 失效 FTS/ANN 索引
-        if getattr(self, "_reading_mode", False):
-            rs = self._get_reading_store()
-            if rs is not None:
-                rs.delete_matching(name)
+        # 无条件双删：普通模式下 ColBERT 里的残留（此前以阅读模式入库）
+        # 也一并清掉，防止知识遗忘后仍被阅读模式检索召回。
+        if rs is not None:
+            rs.delete_matching(name)
         if md_path and os.path.isfile(md_path):
             try:
                 os.remove(md_path)
@@ -3047,7 +3139,14 @@ class RAGEngine:
             return None
 
     def list_documents(self) -> List[str]:
-        """Return stored document names that have a digest."""
+        """Return stored document names that have a digest.
+
+        按模式分流：阅读模式读 ColBERT doc_meta，普通模式读 VectorStore
+        documents 表——各模式只列出自己同步入库的文档。
+        """
+        if self._reading_mode:
+            rs = self._get_reading_store()
+            return rs.list_doc_names() if rs is not None else []
         store = self._get_store()
         return store.list_documents()
 
@@ -3057,7 +3156,18 @@ class RAGEngine:
         数据源是 ``{workspace}/rag/chapter_summaries.json``——由
         ``rag/chapter_summarizer.py`` 的闲时后台调度器增量写入。这里只读，
         与调度器（单写者）无锁竞争。
+
+        模式门控：文档必须存在于**当前模式**的库（有切片/向量）才返回，
+        否则跨模式引用会展示不属于本模式的文档摘要。
         """
+        # 门控先行：两处匹配逻辑都会走完，提前拦截可省一次 JSON 读取。
+        if self._reading_mode:
+            rs = self._get_reading_store()
+            if rs is None or rs.get_doc_meta(doc_name) is None:
+                return ""
+        else:
+            if self._get_store().get_document_digest(doc_name) is None:
+                return ""
         try:
             from .chapter_summarizer import load_summaries_state
             state = load_summaries_state(self._workspace)
@@ -3102,21 +3212,36 @@ class RAGEngine:
             return 0
 
         store = self._get_store()
-        # 一次性快照 documents 表，在内存里建索引。
-        # 旧实现逐个文件调 get_document_by_md_path/get_document_digest ——
-        # 每次 build_and_store_digest 都会让 _documents_cache 失效，于是下一轮
-        # 迭代重新从磁盘全表加载：N 篇文档 = N 次全表物化 + O(N²) 次线性扫描
-        # （每行还要 abspath）。这里读一次，之后全部走内存 dict。
-        rows = store.all_document_rows()
-        by_md_path: Dict[str, Dict[str, Any]] = {}
-        by_doc_name: Dict[str, Dict[str, Any]] = {}
-        for r in rows:
-            mp = r.get("md_path") or ""
-            if mp:
-                by_md_path[os.path.abspath(mp)] = r
-            dn = r.get("doc_name") or ""
-            if dn:
-                by_doc_name.setdefault(dn, r)
+        rs = self._get_reading_store() if self._reading_mode else None
+        # 一次性快照两张元数据表（普通 documents + ColBERT doc_meta），在
+        # 内存里建索引。旧实现逐个文件调 get_document_by_md_path/
+        # get_document_digest —— 每次 build_and_store_digest 都会让缓存
+        # 失效，下一轮迭代重新从磁盘全表加载：N 篇文档 = N 次全表物化 +
+        # O(N²) 次线性扫描。这里各读一次，之后全部走内存 dict。
+        def _index_rows(rows):
+            bmd: Dict[str, Dict[str, Any]] = {}
+            bdn: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                mp = r.get("md_path") or ""
+                if mp:
+                    bmd[os.path.abspath(mp)] = r
+                dn = r.get("doc_name") or ""
+                if dn:
+                    bdn.setdefault(dn, r)
+            return bmd, bdn
+
+        norm_md, norm_dn = _index_rows(store.all_document_rows())
+        read_md: Dict[str, Dict[str, Any]] = {}
+        read_dn: Dict[str, Dict[str, Any]] = {}
+        if rs is not None:
+            read_md, read_dn = _index_rows(rs.all_meta_rows())
+        # manifest 用于判定缓存文件的历史归属模式（取消的同步等边界下，
+        # 缓存文件的归属可能仍是另一模式——digest 必须写回它自己的库）。
+        manifest_for_digest: Dict[str, Dict[str, Any]] = {}
+        try:
+            manifest_for_digest = _load_manifest(self._rag_dir)
+        except Exception:
+            manifest_for_digest = {}
 
         created = 0
         for fn in sorted(os.listdir(self._markdown_dir)):
@@ -3152,12 +3277,38 @@ class RAGEngine:
                         if all(c in "0123456789abcdef" for c in suffix):
                             doc_name = stem[:-13]
                 # 统一用内存快照判定「记录是否存在」，不再逐文件查表。
-                existing = by_md_path.get(os.path.abspath(md_path))
-                if existing is None:
-                    # 廉价预检：先查记录再决定要不要读全文。绝大多数缓存文件的
-                    # digest 记录已是最新——旧实现无条件全文读入 + build_digest，
-                    # 大知识库下每次同步都白跑一遍全文 IO 和解析。
-                    existing = by_doc_name.get(doc_name)
+                # 归属模式：manifest 条目的 reading_mode 优先；无条目（旧缓存/
+                # 取消的同步）按当前模式兜底——正常流程 Step 7 前重跑已完成
+                # 归属迁移，快照与当前模式一致。
+                src_abs = ""
+                if meta:
+                    cand = str(meta.get("source") or "").strip()
+                    if cand:
+                        src_abs = (cand if os.path.isabs(cand)
+                                   else os.path.join(self._knowledge_base, cand))
+                entry = manifest_for_digest.get(src_abs) if src_abs else None
+                owning_reading = self._reading_mode
+                if entry is not None and entry.get("reading_mode") is not None:
+                    owning_reading = bool(entry.get("reading_mode"))
+                if owning_reading == self._reading_mode:
+                    existing = (read_md if owning_reading else norm_md).get(
+                        os.path.abspath(md_path))
+                    if existing is None:
+                        # 廉价预检：先查记录再决定要不要读全文。绝大多数缓存
+                        # 文件的 digest 记录已是最新——旧实现无条件全文读入 +
+                        # build_digest，大知识库下每次同步都白跑一遍全文 IO。
+                        existing = (read_dn if owning_reading else norm_dn).get(
+                            doc_name)
+                else:
+                    # 罕见边界（同步中途取消）：按历史归属直接查对应表，
+                    # digest 写回它自己的库而不是当前模式。
+                    if owning_reading:
+                        rs_x = self._get_reading_store(force=True)
+                        if rs_x is None:
+                            continue
+                        existing = rs_x.get_doc_meta(doc_name)
+                    else:
+                        existing = store.get_document_digest(doc_name)
                 if existing is not None:
                     if not refresh_stale:
                         continue
@@ -3180,6 +3331,8 @@ class RAGEngine:
                     doc_name, markdown,
                     digest=digest, chapters=chapters,
                     md_path=md_path,
+                    source=src_abs,
+                    mode=owning_reading,
                 )
                 created += 1
                 logger.info("  ├─ 补做/重刷缩略版本: %s (%d 字符)", doc_name, len(markdown))

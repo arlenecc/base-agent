@@ -189,7 +189,7 @@ def build_mcp_server() -> "FastMCP":
                 data: Dict[str, Any] = {
                     "results": results, "count": len(results)}
                 if _reading_mode(engine):
-                    # 阅读模式返回的是 7500~8000 字长切片；明确标注，避免
+                    # 阅读模式返回的是 2500~3000 字长切片；明确标注，避免
                     # 客户端误以为这是普通 rerank 后的小片段。
                     data["reading_mode"] = True
                 return _ok(data)

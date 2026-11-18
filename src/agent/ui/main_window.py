@@ -1154,9 +1154,9 @@ class SyncKnowledgeWorker(QThread):
                 reading_model_dir=str(getattr(
                     self._config, "rag_reading_model_dir", "") or ""),
                 reading_chunk_max=int(getattr(
-                    self._config, "rag_reading_chunk_max", 8000) or 8000),
+                    self._config, "rag_reading_chunk_max", 3000) or 3000),
                 reading_chunk_min=int(getattr(
-                    self._config, "rag_reading_chunk_min", 7500) or 7500),
+                    self._config, "rag_reading_chunk_min", 2500) or 2500),
                 reading_semantic_threshold=float(getattr(
                     self._config, "rag_reading_semantic_threshold", 0.55)),
             )
@@ -2758,7 +2758,10 @@ class MainWindow(QMainWindow):
             "「token 切片 → embedding → 向量库 → reranker」链路，改用\n"
             "Jina ColBERT v2（64 维 INT8）残差量化写 LanceDB 三表。\n"
             "召回时只把排名最高的一片长切片注入上下文供模型总结，其余\n"
-            "切片作为回复末尾的可点击气泡展示。")
+            "切片作为回复末尾的可点击气泡展示。\n\n"
+            "注意：目录/摘要等元数据按模式各存一份，两种模式的文档互相\n"
+            "独立——切换本开关后需重新同步知识库，文件归属会随同步迁移\n"
+            "（旧模式库中的对应数据自动清理）。")
         r.addWidget(self.reading_mode_chk)
         r.addSpacing(10)
         r.addWidget(QLabel("量化残差:"))
@@ -2818,17 +2821,17 @@ class MainWindow(QMainWindow):
         r2.addSpacing(8)
         r2.addWidget(QLabel("切片长度:"))
         self.reading_chunk_max_edit = _num(
-            str(getattr(self.config, "rag_reading_chunk_max", 8000)), 64)
+            str(getattr(self.config, "rag_reading_chunk_max", 3000)), 64)
         self.reading_chunk_max_edit.setToolTip(
-            "检索阅读模式单个切片的最大字符数（默认 8000）。\n"
-            "目标区间 7500~8000，按标题结构与语义低谷切分。")
+            "检索阅读模式单个切片的最大字符数（默认 3000）。\n"
+            "目标区间 2500~3000，章节优先、小节尽量不切分。")
         r2.addWidget(self.reading_chunk_max_edit)
         r2.addSpacing(6)
         r2.addWidget(QLabel("最小切片:"))
         self.reading_chunk_min_edit = _num(
-            str(getattr(self.config, "rag_reading_chunk_min", 7500)), 64)
+            str(getattr(self.config, "rag_reading_chunk_min", 2500)), 64)
         self.reading_chunk_min_edit.setToolTip(
-            "切片目标下限（默认 7500）；过小的碎片会与同章节相邻片合并。")
+            "切片目标下限（默认 2500）；过小的碎片会与同章节相邻片合并。")
         r2.addWidget(self.reading_chunk_min_edit)
         r2.addSpacing(6)
         r2.addWidget(QLabel("语义阈值:"))
@@ -3941,14 +3944,14 @@ class MainWindow(QMainWindow):
         self.config.rag_reading_top_n = topn if topn in (1, 3, 5) else 3
         self.config.rag_reading_use_ann = self.reading_ann_chk.isChecked()
         self.config.rag_reading_model_dir = self.reading_model_edit.text().strip()
-        _num(self.reading_chunk_max_edit, "rag_reading_chunk_max", 8000,
+        _num(self.reading_chunk_max_edit, "rag_reading_chunk_max", 3000,
              int, "阅读模式切片长度")
-        _num(self.reading_chunk_min_edit, "rag_reading_chunk_min", 7500,
+        _num(self.reading_chunk_min_edit, "rag_reading_chunk_min", 2500,
              int, "阅读模式最小切片")
         if self.config.rag_reading_chunk_max < 500:
-            self.config.rag_reading_chunk_max = 8000
-            self.reading_chunk_max_edit.setText("8000")
-            invalid.append("阅读模式切片长度<500 → 8000")
+            self.config.rag_reading_chunk_max = 3000
+            self.reading_chunk_max_edit.setText("3000")
+            invalid.append("阅读模式切片长度<500 → 3000")
         self.config.rag_reading_chunk_min = min(
             max(100, int(self.config.rag_reading_chunk_min)),
             int(self.config.rag_reading_chunk_max))

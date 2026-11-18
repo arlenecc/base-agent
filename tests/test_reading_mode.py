@@ -172,7 +172,7 @@ def test_reading_cleanup_deletes_colbert_chunks(tmp_path):
     normal = NormalStore()
     reading = ReadingStore()
     eng._get_store = lambda: normal
-    eng._get_reading_store = lambda: reading
+    eng._get_reading_store = lambda force=False: reading
 
     source = str(tmp_path / "old.md")
     old = {source: {"mtime": 1, "size": 10, "chunk_count": 3}}
@@ -275,3 +275,177 @@ def test_doc_search_tool_reading_mode_bubbles_and_blocks_mutation(monkeypatch):
     assert not r.success and "rag_tools(op=\"ingest\")" in r.error
     r = tool.run(op="delete", doc_id="abc:00000")
     assert not r.success
+
+
+class _FakeNormalDocuments:
+    """VectorStore documents 表的最小 Fake（digest/outline/list 语义）。"""
+
+    def __init__(self):
+        self.upserts = []
+
+    def upsert_document(self, doc_name, digest, markdown="",
+                        chapters="", md_path=""):
+        self.upserts.append({"doc_name": doc_name, "digest": digest,
+                             "chapters": chapters, "md_path": md_path})
+
+    def list_documents(self):
+        return sorted({u["doc_name"] for u in self.upserts})
+
+    def get_document_digest(self, name):
+        for u in self.upserts:
+            if name and (name in u["doc_name"] or u["doc_name"] in name):
+                return {"doc_name": u["doc_name"], "digest": u["digest"],
+                        "chapters": u["chapters"], "md_path": u["md_path"]}
+        return None
+
+
+def test_build_and_store_digest_routes_by_mode(tmp_path):
+    """digest 写入按模式分流：阅读模式写 ColBERT doc_meta，不碰普通表。"""
+    eng = _engine(tmp_path)
+    normal = _FakeNormalDocuments()
+    eng._get_store = lambda: normal
+    eng.build_and_store_digest(
+        "docs/auth.md", "# 认证设计\n\n## OAuth2\n\n" + "正文" * 50,
+        md_path="/cache/auth.md", source="/docs/auth.md")
+    assert normal.upserts == [], "阅读模式不得写普通 documents 表"
+    meta = eng._get_reading_store().get_doc_meta("docs/auth.md")
+    assert meta is not None and meta["md_path"] == "/cache/auth.md"
+    assert meta["digest"].startswith("# 目录")
+    # 读取接口分流：outline/list 只反映本模式的文档
+    assert eng.list_documents() == ["docs/auth.md"]
+    assert eng.get_document_outline("auth")["doc_name"] == "docs/auth.md"
+    # 全书摘要门控：文档不在库时直接拦截（未生成摘要时返回空串）
+    assert eng.get_book_summary("不存在") == ""
+    assert eng.get_book_summary("auth") == ""
+
+
+def test_build_and_store_digest_normal_mode_writes_documents_table(tmp_path):
+    """普通模式 digest 写普通 documents 表，不触碰 ColBERT。"""
+    eng = object.__new__(RAGEngine)
+    eng._reading_mode = False
+    normal = _FakeNormalDocuments()
+    eng._get_store = lambda: normal
+    eng._get_reading_store = lambda force=False: (_ for _ in ()).throw(
+        AssertionError("普通模式不应触碰 ColBERT"))
+    eng.build_and_store_digest("docs/b.md", "# 标题\n\n## 章\n\n正文")
+    assert len(normal.upserts) == 1
+    assert normal.upserts[0]["doc_name"] == "docs/b.md"
+    assert eng.list_documents() == ["docs/b.md"]
+    assert eng.get_document_outline("b")["doc_name"] == "docs/b.md"
+
+
+def test_migrate_stale_mode_data_clears_other_store(tmp_path):
+    """模式切换迁移：重索引前无条件清掉旧模式 store 的向量。"""
+
+    class NormalStore:
+        def __init__(self):
+            self.deleted = []
+
+        def delete_by_source(self, s):
+            self.deleted.append(s)
+
+    class ReadingStore:
+        def __init__(self):
+            self.deleted = []
+
+        def delete(self, source="", doc_id="", title=""):
+            self.deleted.append(source or doc_id or title)
+            return 1
+
+    eng = object.__new__(RAGEngine)
+    normal = NormalStore()
+    reading = ReadingStore()
+    eng._get_store = lambda: normal
+    eng._reading_store = reading
+
+    # 普通模式重跑「原为阅读模式」的文件 → 清 ColBERT
+    eng._reading_mode = False
+    eng._migrate_stale_mode_data("/docs/a.md", True)
+    assert reading.deleted == ["/docs/a.md"]
+    assert normal.deleted == []
+    # 阅读模式重跑「原为普通模式」的文件 → 清普通库
+    eng._reading_mode = True
+    eng._migrate_stale_mode_data("/docs/a.md", False)
+    assert normal.deleted == ["/docs/a.md"]
+    # 同模式 / 无历史条目：不动
+    eng._migrate_stale_mode_data("/docs/a.md", True)
+    eng._migrate_stale_mode_data("/docs/a.md", None)
+    assert normal.deleted == ["/docs/a.md"]
+    assert reading.deleted == ["/docs/a.md"]
+
+
+def test_delete_document_routes_by_mode_and_dual_deletes(tmp_path):
+    """知识遗忘按模式分流，另一模式库的残留（向量+元数据）一并删除。"""
+
+    class NormalStore:
+        def __init__(self):
+            self.deleted_meta = []
+            self.deleted_src = []
+
+        def get_document_digest(self, name):
+            return {"doc_name": name, "digest": "", "chapters": "",
+                    "md_path": ""}
+
+        def iter_all_chunks(self):
+            return []
+
+        def delete_document(self, name):
+            self.deleted_meta.append(name)
+
+        def delete_by_source(self, name):
+            self.deleted_src.append(name)
+
+    class ReadingStore:
+        def __init__(self):
+            self.deleted = []
+            self.meta_deleted = []
+
+        def get_doc_meta(self, name):
+            return {"doc_name": name, "digest": "", "chapters": "",
+                    "md_path": ""}
+
+        def delete_matching(self, keyword):
+            self.deleted.append(keyword)
+            return 1
+
+        def delete_doc_meta(self, name):
+            self.meta_deleted.append(name)
+
+    normal = NormalStore()
+    reading = ReadingStore()
+
+    # 阅读模式：只走 ColBERT（delete_matching 连带清 doc_meta）
+    eng = object.__new__(RAGEngine)
+    eng._reading_mode = True
+    eng._reading_store = reading
+    eng._get_reading_store = lambda force=False: reading
+    eng._get_store = lambda: (_ for _ in ()).throw(
+        AssertionError("阅读模式删除不应触碰普通库"))
+    assert eng.delete_document("docs/a.md") is True
+    assert reading.deleted == ["docs/a.md"]
+
+    # 普通模式：删普通库 + 无条件双删 ColBERT 残留
+    eng2 = object.__new__(RAGEngine)
+    eng2._reading_mode = False
+    eng2._reading_store = reading
+    eng2._get_store = lambda: normal
+    eng2._get_reading_store = lambda force=False: reading
+    assert eng2.delete_document("docs/a.md") is True
+    assert normal.deleted_meta == ["docs/a.md"]
+    assert normal.deleted_src == ["docs/a.md"]
+    assert reading.deleted == ["docs/a.md", "docs/a.md"]
+
+
+def test_get_reading_store_force_semantics(tmp_path):
+    """_get_reading_store：普通模式默认 None，force=True 可取 store 用于迁移清理。"""
+    eng = object.__new__(RAGEngine)
+    eng._reading_mode = False
+    eng._reading_store = None
+    eng._reading_store_lock = threading.Lock()
+    eng._reading_model_dir = ""
+    eng._workspace = str(tmp_path)
+    assert eng._get_reading_store() is None
+    store = eng._get_reading_store(force=True)
+    assert store is not None
+    assert eng._get_reading_store() is None      # 不污染默认路径
+    assert eng._get_reading_store(force=True) is store
