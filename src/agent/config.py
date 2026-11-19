@@ -111,6 +111,10 @@ class AgentConfig:
     # 写 LanceDB 三表；检索用 BM25 + 中心向量 RRF 粗筛 + MaxSim 精排。
     # 召回时最高分切片注入模型上下文供总结，其余切片作为回复末尾气泡。
     rag_reading_mode_enabled: bool = False
+    # 普通向量模式异步填充：同步时切片文本先行入库（无向量），同步立即
+    # 完成、BM25 立即可用；后台 daemon 线程分批回填 embedding，向量检索
+    # 随填充逐步生效。关闭则回退原同步嵌入行为。
+    rag_embed_background: bool = True
     # 残差量化位数：4（默认，精度更高）或 2（体积更小）。
     rag_reading_quant_bits: int = 4
     # RRF 粗筛候选数（10/20/50/100，默认 50）。两条通道各取该数量的候选，
@@ -132,6 +136,31 @@ class AgentConfig:
     # 不切分，句子级切分才有 1% overlap。
     rag_reading_chunk_max: int = 3000
     rag_reading_chunk_min: int = 2500
+    # ---- RAG 检索模式（三选一，UI 下拉驱动）----
+    # vector（默认）= 原向量+BM25+reranker 流程；fast = 极速检索（强制开启
+    # 二值量化粗筛两段式）；decision = 决策判定模式（BM25 粗筛 → 字符级
+    # BM25 选核心句 → 本地决策模型逐片判定相关性，返回 TopN）。
+    rag_mode: str = "vector"
+    # 决策判定模式的模型后端：mlx-vlm（默认，Meteor readout 头协议）、
+    # mlx-lm / gguf（生成式输出 0-100 相关性数字）。
+    rag_decision_model_backend: str = "mlx-vlm"
+    # 决策模型目录：留空 = 自动解析 models/PKU-KCL-Meteor-0.8B-mlx-int4
+    # （仓库自带优先，其次 ~/.base-agent/models/）。
+    rag_decision_model_path: str = ""
+    # BM25 粗筛候选数（20/50/100，默认 50）：从普通向量库切片表的全文
+    # 索引召回的候选切片数量。
+    rag_decision_coarse_k: int = 50
+    # 是否用字符级 BM25 从切片中选核心句代表整片参与判定；关闭则整片送判。
+    rag_decision_use_core_sentences: bool = True
+    # 核心句数量（3/5，默认 3）：按字符级 BM25 分数取 top N，按原文顺序拼接。
+    rag_decision_core_top: int = 3
+    # 判定后返回的相关切片数（3/5/10，默认 5）。
+    rag_decision_top_n: int = 5
+    # 多知识分区配置（JSON 数组字符串）：每分区 = {"name": 领域名,
+    # "path": 源目录, "enabled": 是否启用, "default": 是否默认分区}。
+    # 默认分区沿用 workspace/rag 旧布局（老用户零迁移）；其余分区数据存于
+    # workspace/rag/partitions/<slug>/。空串 = 单知识库（现行为）。
+    rag_partitions: str = ""
     # 章节内语义低谷阈值（默认 0.55，代码会按分布自适应且不低于 0.15）。
     rag_reading_semantic_threshold: float = 0.55
     # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：
@@ -432,7 +461,9 @@ class AgentConfig:
                    "rag_kg_max_description_chars",
                    "rag_reading_quant_bits", "rag_reading_coarse_k",
                    "rag_reading_top_n", "rag_reading_chunk_max",
-                   "rag_reading_chunk_min")
+                   "rag_reading_chunk_min",
+                   "rag_decision_coarse_k", "rag_decision_core_top",
+                   "rag_decision_top_n")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
                      "rag_rerank_min_similarity",
@@ -459,7 +490,9 @@ class AgentConfig:
                    "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path",
                    "rag_ocr_vision_level",
                    "rag_mcp_scope", "rag_kg_strategy", "rag_kg_extractor",
-                   "rag_reading_model_dir")
+                   "rag_reading_model_dir",
+                   "rag_mode", "rag_decision_model_backend",
+                   "rag_decision_model_path", "rag_partitions")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code",
                     "rag_ocr_coreml", "rag_ocr_preprocess", "rag_ocr_binarize",
                     "rag_ocr_scale_dynamic", "aux_llm_enabled",
@@ -469,7 +502,13 @@ class AgentConfig:
                     "web_allow_private_hosts", "rag_mcp_enabled",
                     "rag_kg_glean_enabled", "rag_kg_llm_raw_json",
                     "rag_presentation_mode",
-                    "rag_reading_mode_enabled", "rag_reading_use_ann")
+                    "rag_reading_mode_enabled", "rag_reading_use_ann",
+                    "rag_embed_background",
+                    "rag_decision_use_core_sentences")
+
+    def __post_init__(self) -> None:
+        """构造期即归一多知识分区（_migrate 只在 load() 路径触发）。"""
+        self._normalize_partitions()
 
     @classmethod
     def _coerce(cls, name: str, value):
@@ -543,6 +582,12 @@ class AgentConfig:
             coerced = cls._coerce(k, v)
             if coerced is not None:
                 kwargs[k] = coerced
+        # 一次性迁移：旧配置没有 rag_mode 键，但勾选了「快速粗筛」→ 迁移为
+        # 极速检索模式（rag_mode="fast"）。仅在旧配置（无 rag_mode 键）时生效，
+        # 新配置里 rag_mode 是显式保存的，快速粗筛勾选不再反向驱动模式。
+        if ("rag_mode" not in data
+                and kwargs.get("rag_binary_prefilter_enabled")):
+            kwargs["rag_mode"] = "fast"
         cfg = cls(**kwargs)
         cfg._migrate()
         return cfg
@@ -704,6 +749,96 @@ class AgentConfig:
         except (TypeError, ValueError):
             min_score = 0.61
         self.rag_reading_min_score = min(0.95, max(0.0, min_score))
+        # RAG 检索模式归一：手改 config.json 写非法值时回退向量检索模式。
+        if self.rag_mode not in ("vector", "fast", "decision"):
+            self.rag_mode = "vector"
+        # 决策判定模式参数归一：UI 只提供固定选项，非法值回退默认。
+        if self.rag_decision_model_backend not in ("mlx-vlm", "mlx-lm", "gguf"):
+            self.rag_decision_model_backend = "mlx-vlm"
+        if self.rag_decision_coarse_k not in (20, 50, 100):
+            self.rag_decision_coarse_k = 50
+        if self.rag_decision_core_top not in (3, 5):
+            self.rag_decision_core_top = 3
+        if self.rag_decision_top_n not in (3, 5, 10):
+            self.rag_decision_top_n = 5
+        # 多知识分区归一：非法 JSON / 结构错误时回退空串（单知识库模式）。
+        self._normalize_partitions()
+
+    def _normalize_partitions(self) -> None:
+        """校验并归一 rag_partitions；空/非法时按旧 knowledge_base 合成默认分区。"""
+        import json
+
+        raw = (self.rag_partitions or "").strip()
+        parts = []
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        name = str(item.get("name") or "").strip()
+                        path = str(item.get("path") or "").strip()
+                        if not name or not path:
+                            continue
+                        parts.append({
+                            "name": name,
+                            "path": path,
+                            "enabled": bool(item.get("enabled", True)),
+                            "default": bool(item.get("default", False)),
+                        })
+            except (ValueError, TypeError):
+                parts = []
+        if not parts:
+            # 老配置兼容：无分区但有 knowledge_base → 合成唯一默认分区
+            kb = (self.knowledge_base or "").strip()
+            if kb:
+                parts = [{"name": "默认知识库", "path": kb,
+                          "enabled": True, "default": True}]
+            self.rag_partitions = json.dumps(parts, ensure_ascii=False) if parts else ""
+            return
+        # 名字去重（后者加后缀）；有且仅一个 default；default 必须 enabled。
+        seen: set = set()
+        has_default = False
+        for i, p in enumerate(parts):
+            base, n = p["name"], 2
+            while p["name"] in seen:
+                p["name"] = f"{base}_{n}"
+                n += 1
+            seen.add(p["name"])
+            if p["default"] and p["enabled"] and not has_default:
+                has_default = True
+            else:
+                p["default"] = False
+        if not has_default:
+            first_enabled = next((p for p in parts if p["enabled"]), None)
+            if first_enabled is not None:
+                first_enabled["default"] = True
+            else:
+                parts[0]["enabled"] = True
+                parts[0]["default"] = True
+        self.rag_partitions = json.dumps(parts, ensure_ascii=False)
+
+    def get_partitions(self) -> List[dict]:
+        """解析后的分区列表（已归一）。"""
+        import json
+
+        try:
+            data = json.loads(self.rag_partitions or "[]")
+            return data if isinstance(data, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    def get_default_partition(self) -> Optional[dict]:
+        """默认分区（必须 enabled）；无则取第一个启用分区，再无则 None。"""
+        parts = self.get_partitions()
+        for p in parts:
+            if p.get("default") and p.get("enabled"):
+                return p
+        for p in parts:
+            if p.get("enabled"):
+                return p
+        return None
 
     def save(self, path: str) -> None:
         import json

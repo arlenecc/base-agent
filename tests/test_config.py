@@ -273,3 +273,71 @@ def test_migrate_keeps_explicitly_small_budget(tmp_path):
     cfg = AgentConfig.load(str(p))
     assert cfg.max_tokens == 2048
     assert cfg.max_context_tokens == 2048
+
+
+# ---------------------------------------------------------------------------
+# RAG 检索模式（三选一）+ 决策判定参数
+# ---------------------------------------------------------------------------
+
+def test_rag_mode_defaults_to_vector():
+    cfg = AgentConfig()
+    assert cfg.rag_mode == "vector"
+    assert cfg.rag_decision_model_backend == "mlx-vlm"
+    assert cfg.rag_decision_model_path == ""
+    assert cfg.rag_decision_coarse_k == 50
+    assert cfg.rag_decision_use_core_sentences is True
+    assert cfg.rag_decision_core_top == 3
+    assert cfg.rag_decision_top_n == 5
+
+
+def test_rag_mode_roundtrip_persists(tmp_path):
+    p = tmp_path / "c.json"
+    cfg = AgentConfig(rag_mode="decision", rag_decision_coarse_k=20,
+                      rag_decision_core_top=5, rag_decision_top_n=10,
+                      rag_decision_model_backend="gguf",
+                      rag_decision_model_path="/models/m",
+                      rag_decision_use_core_sentences=False)
+    cfg.save(str(p))
+    cfg2 = AgentConfig.load(str(p))
+    assert cfg2.rag_mode == "decision"
+    assert cfg2.rag_decision_coarse_k == 20
+    assert cfg2.rag_decision_core_top == 5
+    assert cfg2.rag_decision_top_n == 10
+    assert cfg2.rag_decision_model_backend == "gguf"
+    assert cfg2.rag_decision_model_path == "/models/m"
+    assert cfg2.rag_decision_use_core_sentences is False
+
+
+def test_rag_mode_migration_from_binary_prefilter(tmp_path):
+    """旧配置（无 rag_mode 键）勾选了快速粗筛 → 迁移为极速检索模式。"""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"rag_binary_prefilter_enabled": True}))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.rag_mode == "fast"
+
+
+def test_rag_mode_migration_not_triggered_when_explicit(tmp_path):
+    """新配置显式保存了 rag_mode：快速粗筛勾选不再反向驱动模式。"""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"rag_mode": "vector",
+                             "rag_binary_prefilter_enabled": True}))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.rag_mode == "vector"
+
+
+def test_rag_mode_invalid_values_fall_back(tmp_path):
+    """手改 config.json 写非法值：回退默认，不崩。"""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({
+        "rag_mode": "hyperjump",
+        "rag_decision_model_backend": "warp",
+        "rag_decision_coarse_k": 33,
+        "rag_decision_core_top": 7,
+        "rag_decision_top_n": 99,
+    }))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.rag_mode == "vector"
+    assert cfg.rag_decision_model_backend == "mlx-vlm"
+    assert cfg.rag_decision_coarse_k == 50
+    assert cfg.rag_decision_core_top == 3
+    assert cfg.rag_decision_top_n == 5

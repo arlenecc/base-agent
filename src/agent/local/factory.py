@@ -156,8 +156,12 @@ def configure_local_models(config) -> None:
         float(getattr(config, "rag_rerank_min_similarity", 0.5))
     )
     # 两段式检索第一阶段（二值量化粗筛）开关与候选数。
+    # 极速检索模式（rag_mode="fast"）= 该开关的产品化形态：强制开启，
+    # 用户的勾选值仅在向量/决策模式下生效。
+    _prefilter_on = (bool(getattr(config, "rag_binary_prefilter_enabled", False))
+                     or str(getattr(config, "rag_mode", "vector") or "vector") == "fast")
     vs.set_binary_prefilter(
-        bool(getattr(config, "rag_binary_prefilter_enabled", False)),
+        _prefilter_on,
         int(getattr(config, "rag_binary_prefilter_top", 200)),
     )
 

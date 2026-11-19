@@ -69,6 +69,22 @@ _OCR_VISION_VALUE_TO_DISPLAY = {
     "fast": "快速 (fast)",
 }
 
+# RAG 检索模式（三选一）与决策模型后端：显示标签 ↔ 内部值。
+_RAG_MODE_DISPLAY_TO_VALUE = {
+    "向量检索模式": "vector",
+    "极速检索模式": "fast",
+    "决策判定模式": "decision",
+}
+_RAG_MODE_VALUE_TO_DISPLAY = {
+    "vector": "向量检索模式",
+    "fast": "极速检索模式",
+    "decision": "决策判定模式",
+}
+_DECISION_BACKEND_DISPLAY_TO_VALUE = {
+    "MLX-VLM": "mlx-vlm", "MLX-LM": "mlx-lm", "GGUF": "gguf"}
+_DECISION_BACKEND_TO_DISPLAY = {
+    "mlx-vlm": "MLX-VLM", "mlx-lm": "MLX-LM", "gguf": "GGUF"}
+
 # KG 三元组抽取方案下拉标签 ↔ 内部标识（rag_kg_extractor：llm_raw/llm_pydantic/gliner）。
 _KG_EXTRACTOR_DISPLAY = {
     "llm_raw": "LLM 行解析（自实现）",
@@ -796,9 +812,10 @@ class VectorDedupWorker(QThread):
     dedup_finished = pyqtSignal(dict)            # {"scanned","groups","removed"}
     dedup_failed = pyqtSignal(str)
 
-    def __init__(self, config, parent=None):
+    def __init__(self, config, parent=None, partition: str = ""):
         super().__init__(parent)
         self._config = config
+        self._partition = partition or ""
 
     def run(self):
         try:
@@ -808,9 +825,13 @@ class VectorDedupWorker(QThread):
                 knowledge_base=self._config.knowledge_base,
                 embedding_model=getattr(self._config, "rag_embedding_model",
                                         DEFAULT_EMBEDDING_MODEL),
+                rag_partitions=str(getattr(self._config, "rag_partitions", "") or ""),
             )
-            self.dedup_log.emit("[dedup] 开始扫描向量库（只读文本列，不加载向量）…")
-            stats = eng.dedup_vectors(progress_callback=self._on_progress)
+            scope = self._partition or "所有启用分区"
+            self.dedup_log.emit(f"[dedup] 开始扫描向量库（{scope}，只读文本列，不加载向量）…")
+            # partition 非空 → 仅该分区；空 → 遍历所有启用分区
+            stats = eng.dedup_vectors(progress_callback=self._on_progress,
+                                      partition=self._partition)
             self.dedup_finished.emit(stats)
         except Exception as e:
             logger.warning("VectorDedupWorker failed: %s", e)
@@ -1045,13 +1066,16 @@ class SyncKnowledgeWorker(QThread):
     sync_progress = pyqtSignal(int, int, str)  # done, total, current_file
 
     def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = "",
-                 force: bool = False, config=None):
+                 force: bool = False, config=None, partition: str = ""):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._embedding_model = embedding_model
         self._force = force
         self._config = config
+        # 多知识分区："" = 同步所有启用分区（主按钮）；分区名 = 仅同步该分区
+        # （分区行「同步」按钮）。引擎侧 rag_partitions 携带分区定义。
+        self._partition = partition
         self._engine: Optional[RAGEngine] = None
         # 日志缓冲区：子线程写入，主线程在 _poll_sync_logs 中消费。
         # 用 Lock 保护，避免多 worker 线程 append 与主线程清空之间的竞态。
@@ -1159,12 +1183,31 @@ class SyncKnowledgeWorker(QThread):
                     self._config, "rag_reading_chunk_min", 2500) or 2500),
                 reading_semantic_threshold=float(getattr(
                     self._config, "rag_reading_semantic_threshold", 0.55)),
+                embed_background=bool(getattr(
+                    self._config, "rag_embed_background", True)),
+                # RAG 检索模式三选一 + 决策判定参数（检索期消费；同步管线与
+                # normal 一致，签名沿用，不触发重建）。
+                rag_mode=str(getattr(self._config, "rag_mode", "vector") or "vector"),
+                rag_decision_model_backend=str(getattr(
+                    self._config, "rag_decision_model_backend", "mlx-vlm") or "mlx-vlm"),
+                rag_decision_model_path=str(getattr(
+                    self._config, "rag_decision_model_path", "") or ""),
+                rag_decision_coarse_k=int(getattr(
+                    self._config, "rag_decision_coarse_k", 50) or 50),
+                rag_decision_use_core_sentences=bool(getattr(
+                    self._config, "rag_decision_use_core_sentences", True)),
+                rag_decision_core_top=int(getattr(
+                    self._config, "rag_decision_core_top", 3) or 3),
+                rag_decision_top_n=int(getattr(
+                    self._config, "rag_decision_top_n", 5) or 5),
+                rag_partitions=str(getattr(self._config, "rag_partitions", "") or ""),
             )
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
                 force=self._force,
                 progress_callback=self._on_progress,
                 log_callback=self._emit_log,
+                partition=self._partition or "",
             )
             logger.info(
                 "SyncKnowledgeWorker done: found=%d extracted=%d skipped=%d deleted=%d duplicated=%d chunks=%d errors=%d cancelled=%s",
@@ -1391,6 +1434,24 @@ class ConfigDialog(_HostedPanelDialog):
         self._scroll.setWidgetResizable(True)
         self._scroll_added = False
         super().__init__("配置", 900, 700, panel, parent)
+
+    def _build_footer(self, lay: QVBoxLayout) -> None:
+        """底部按钮行：关闭前增加「应用配置」，避免改动未保存直接退出。"""
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        apply_btn = QPushButton("应用配置")
+        apply_btn.setFixedWidth(96)
+        apply_btn.setStyleSheet("font-weight:600;")
+        apply_btn.setToolTip("保存当前全部配置（含知识分区行）并重建 Agent")
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_on_apply_config"):
+            apply_btn.clicked.connect(parent._on_apply_config)
+        btn_row.addWidget(apply_btn)
+        close_btn = QPushButton("关闭")
+        close_btn.setFixedWidth(96)
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
 
     def attach(self, panel: QWidget) -> None:
         self._panel = panel
@@ -1986,6 +2047,7 @@ class MainWindow(QMainWindow):
         name = getattr(self.config, "rag_ocr_model_name",
                       "OvisOCR2-0.8B-MLX-4bit")
         try:
+            self._gather_partitions()   # 防止陈旧 rag_partitions 覆盖新增分区行
             self.config.save(CONFIG_PATH)
         except Exception as e:
             logger.warning("保存 OCR 配置失败: %s", e)
@@ -2312,35 +2374,26 @@ class MainWindow(QMainWindow):
         lay.addWidget(agent_box)
 
         # ==================================================================
-        # 区二：知识同步配置（工作/知识目录 + Embedding + Reranker）
+        # 区一·五：工作目录配置区（从知识同步配置区移入）
         # ==================================================================
-        kb_box = QGroupBox("知识同步配置")
-        klay = QVBoxLayout(kb_box)
-        klay.setContentsMargins(10, 8, 10, 8)
-        klay.setSpacing(8)
+        ws_box = QGroupBox("工作目录配置区")
+        wslay = QVBoxLayout(ws_box)
+        wslay.setContentsMargins(10, 8, 10, 8)
+        wslay.setSpacing(8)
 
-        # row1: 工作目录 + 知识库目录
+        # row1: 工作目录 + 多知识分区行（按钮连接见 _wire_signals，勿在此重复连接）
         self.workspace_edit = QLineEdit()
         self.workspace_btn = QPushButton("…"); self.workspace_btn.setFixedWidth(28)
-        self.knowledge_base_edit = QLineEdit(placeholderText="（可选）知识库目录")
-        self.knowledge_base_btn = QPushButton("…"); self.knowledge_base_btn.setFixedWidth(28)
         r = QHBoxLayout(); r.setSpacing(8)
         r.addWidget(QLabel("工作目录")); r.addWidget(self.workspace_edit, 1); r.addWidget(self.workspace_btn)
-        r.addWidget(QLabel("源知识库")); r.addWidget(self.knowledge_base_edit, 1); r.addWidget(self.knowledge_base_btn)
-        klay.addLayout(r)
+        wslay.addLayout(r)
 
-        # row1.2: 知识同步动作行（紧跟「工作目录配置行」）。按需求，在「应用配置」
-        # 之后依次排列：开始同步 / 停止同步 / 向量去重。
-        self.kb_apply_btn = QPushButton("应用配置")
-        self.kb_apply_btn.setStyleSheet("font-weight:600;")
-        self.kb_apply_btn.setToolTip(
-            "保存当前所有设置并重新注入 RAG 解析层 / 重建 Agent（含知识同步区的\n"
-            "Embedding / Reranker 选择），使新建向量库立即采用所选实现。")
-        self.kb_apply_btn.clicked.connect(self._on_apply_config)
-
-        self.sync_knowledge_btn = QPushButton("开始同步")
+        # 全局知识库操作行：每个分区行自带单库操作，这里统一提供「所有库」
+        # 语义。去掉了原「应用配置」（行内「应用」+ 配置窗口底部已有入口）。
+        # 控件属性名保留（大量状态/信号代码引用），仅改文案与语义。
+        self.sync_knowledge_btn = QPushButton("同步所有")
         self.sync_knowledge_btn.setToolTip(
-            "解析知识库文档、建立向量索引，支持 RAG 检索\n"
+            "同步所有启用的知识分区（解析→切片→入库→向量回填）\n"
             "左键：增量同步（只处理新增/修改的文件）\n"
             "右键：强制全量重新处理"
         )
@@ -2348,137 +2401,88 @@ class MainWindow(QMainWindow):
         self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
         self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
 
-        self.stop_sync_btn = QPushButton("停止同步")
+        self.stop_sync_btn = QPushButton("停止所有")
         self.stop_sync_btn.setEnabled(False)
-        self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
+        self.stop_sync_btn.setToolTip("停止当前正在进行的知识同步任务（所有库）")
         self.stop_sync_btn.clicked.connect(self._on_stop_sync)
 
-        self.dedup_vectors_btn = QPushButton("向量去重")
+        self.dedup_vectors_btn = QPushButton("所有库去重")
         self.dedup_vectors_btn.setToolTip(
-            "扫描向量库，清理内容完全相同的重复向量\n"
+            "扫描所有启用分区的向量库，清理内容完全相同的重复向量\n"
             "（每组只保留最早入库的一份，降低检索噪声）"
         )
         self.dedup_vectors_btn.clicked.connect(self._on_dedup_vectors)
 
         r = QHBoxLayout(); r.setSpacing(8); r.setContentsMargins(0, 0, 0, 0)
         r.addStretch(1)
-        r.addWidget(self.kb_apply_btn)
         r.addWidget(self.sync_knowledge_btn)
         r.addWidget(self.stop_sync_btn)
         r.addWidget(self.dedup_vectors_btn)
-        klay.addLayout(r)
+        wslay.addLayout(r)
 
-        # row1.5: PDF 解析引擎 + 自定义 OCR 模型（#133 统一引擎回退链）
-        self.pdf_engine_combo = _combo(["docling", "marker", "OvisOCR"], 110)
-        self.pdf_engine_combo.setToolTip(
-            "PDF/Office 统一解析引擎（rag_pdf_engine）：\n"
-            "· docling（默认）：docling 统一管线，版面/表格良好\n"
-            "· marker：marker-pdf 优先（需 pip install marker-pdf；未装静默回退 docling）\n"
-            "· OvisOCR：OvisOCR2 VLM 转 Markdown（docling/marker 之外的兜底）"
-        )
-        # 并发实例：docling 转换器池大小（rag_docling_pool_size）。可选 1-6，默认 1。
-        # 控制 docling 解析器同时 convert 几个文件；⚠️ docling 的 MPS 推理非线程安全，
-        # 进程内多实例在 16GB 机器上会触发 GPU 重置硬崩——默认 1 最稳，≥32GB 可试 2-6。
-        self.parse_concurrency_combo = _combo(["1", "2", "3", "4", "5", "6"], 56)
-        self.parse_concurrency_combo.setToolTip(
-            "docling 解析器的并发实例数（rag_docling_pool_size）：\n"
-            "1 = 单实例串行（最省内存，默认，16GB 机器最稳）；\n"
-            "2-6 = 多实例并发解析，吞吐更高但常驻显存/内存同比上升。\n"
-            "⚠️ docling 的 MPS 推理非线程安全，进程内多实例在 16GB 机器上\n"
-            "可能触发 GPU 重置硬崩；仅 ≥32GB 内存时建议尝试 2 及以上。")
-        # OCR并发：RapidOCR 引擎池大小（rag_ocr_pool_size）。可选 1-6，默认 1。
-        # 控制 ocrmac 透传页的 RapidOCR 并发识别数；纯 CPU EP，多实例安全。
-        self.ocr_concurrency_combo = _combo(["1", "2", "3", "4", "5", "6"], 56)
-        self.ocr_concurrency_combo.setToolTip(
-            "OCR 并发数（rag_ocr_pool_size，RapidOCR 引擎池）：\n"
-            "1 = 单实例串行（最省内存，默认）；\n"
-            "2-6 = 多实例并发识别，吞吐更高但常驻内存同比上升。\n"
-            "对扫描件/图片型 PDF 的 OCR 阶段收益最明显，纯文本 PDF 基本无感。")
-        # Apple Vision 识别级别（rag_ocr_vision_level）：精确模式质量最好，
-        # 快速模式更快但复杂版式/小字识别率略低。
-        self.ocr_vision_combo = _combo(["精确 (accurate)", "快速 (fast)"], 116)
-        self.ocr_vision_combo.setToolTip(
-            "Apple Vision（ocrmac）识别级别（rag_ocr_vision_level）：\n"
-            "· accurate（默认）：精确模式，中文/复杂版式质量最好；\n"
-            "· fast：快速模式，速度更快，但小字/竖排/复杂表格识别率略低。\n"
-            "同时作用于 docling 主解析链路和 ocrmac 兜底识别；"
-            "切换后下一次同步/转换生效（已构建的 docling converter 会自动重建）。")
-        self.ocr_impl_combo = _combo(["mlx-vlm", "onnx", "gguf"], 110)
-        # 仅「类型 + 本地路径」：OCR 始终本地 VLM，模型名由 config 默认值
-        # （rag_ocr_model_name=OvisOCR2-0.8B-MLX-4bit）决定，留空自动从
-        # models/ 下解析；暴露可编辑的「模型名」只会制造拼写错误（同 reranker 旧
-        # 的 -mx-fp8 笔误事故），故不显示在设置区。
-        self.ocr_path_edit = _path("本地路径（留空自动用 models/ 下的模型名）", 160)
-        # 「识别测试」：就地试跑各 OCR 引擎并左右对照原件与结果，避免每次验证
-        # 效果都要走一遍完整知识库同步。打开的窗口直接用本行当前填写的配置。
-        self.ocr_test_btn = QPushButton("识别测试")
-        self.ocr_test_btn.setFixedWidth(84)
-        self.ocr_test_btn.setToolTip(
-            "打开 OCR 识别测试窗口：\n"
-            "选一个图片/PDF，用 Apple OCR / OvisOCR2 / 混合（Vision+Ovis 表格）/"
-            "自定义 OCR 试识别；\n左侧原件、右侧结果，多页 PDF 可逐页联动对照；"
-            "确认可用后保存为 Markdown。")
-        self.ocr_test_btn.clicked.connect(self._on_open_ocr_test)
+        # 兼容镜像：旧代码 7 处读取 knowledge_base_edit（同步/去重/outline 的
+        # kb 路径）。真实 UI 是分区行，此隐藏控件由分区序列化回写（= 默认分区
+        # 源目录），保证既有读取点零改动。
+        self.knowledge_base_edit = QLineEdit()
+        self.knowledge_base_edit.setVisible(False)
+        self.knowledge_base_btn = QPushButton("…"); self.knowledge_base_btn.setFixedWidth(28)
+        self.knowledge_base_btn.setVisible(False)
+
+        # 多知识分区行：每行 = [启用框][设为默认][知识库名][源目录][…][同步]
+        self._partitions_lay = QVBoxLayout()
+        self._partitions_lay.setContentsMargins(0, 0, 0, 0)
+        self._partitions_lay.setSpacing(6)
+        wslay.addLayout(self._partitions_lay)
+        self._partition_rows: List[Dict[str, Any]] = []
+
+        # 「添加新知识库」：复制最后一行配置块生成新行（名称留空待用户填写）
+        self.add_partition_btn = QPushButton("添加新知识库")
+        self.add_partition_btn.setToolTip(
+            "新增一个知识分区：每分区指向一个源目录，数据存储相互独立，\n"
+            "可单独同步；检索时由决策模型按领域名路由到相关分区联合检索。")
+        self.add_partition_btn.clicked.connect(self._on_add_partition_row)
+
+        lay.addWidget(ws_box)
+
+        # ==================================================================
+        # 区二：RAG模式配置（三选一：向量检索 / 极速检索 / 决策判定）
+        # ==================================================================
+        kb_box = QGroupBox("RAG模式配置")
+        klay = QVBoxLayout(kb_box)
+        klay.setContentsMargins(10, 8, 10, 8)
+        klay.setSpacing(8)
+
+        # row0: 检索模式下拉（默认向量检索模式）
         r = QHBoxLayout(); r.setSpacing(8)
-        r.addWidget(QLabel("PDF解析引擎")); r.addWidget(self.pdf_engine_combo)
-        r.addWidget(QLabel("并发实例")); r.addWidget(self.parse_concurrency_combo)
-        r.addWidget(QLabel("自定义OCR")); r.addWidget(self.ocr_impl_combo)
-        r.addWidget(QLabel("OCR并发")); r.addWidget(self.ocr_concurrency_combo)
-        r.addWidget(QLabel("Vision级别")); r.addWidget(self.ocr_vision_combo)
-        r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
-        # 「保存设置」：把当前「自定义OCR」行的设置落盘，并让识别测试下拉框
-        # 出现这个自定义模型（下拉第四项名字取自路径）。不重建整个 RAG。
-        self.save_ocr_settings_btn = QPushButton("保存设置")
-        self.save_ocr_settings_btn.setFixedWidth(84)
-        self.save_ocr_settings_btn.setToolTip(
-            "保存当前「自定义OCR」行的设置（后端/路径/mmproj/tokenizer）。\n"
-            "保存后，识别测试窗口下拉框的「自定义OCR」项即显示为该模型，可立即用它识别。")
-        self.save_ocr_settings_btn.clicked.connect(self._on_save_ocr_settings)
-        r.addWidget(self.save_ocr_settings_btn)
-        r.addWidget(self.ocr_test_btn)
-        # 「转换工具」：打开独立的「文件转 Markdown」窗口，单独把各类文件批量
-        # 提取转换成 Markdown 并保存到指定目录（解析/提取/图片识别/清洗/MD
-        # 转换均复用 RAG 入库链路同一套处理逻辑）。
-        self.convert_tool_btn = QPushButton("转换工具")
-        self.convert_tool_btn.setFixedWidth(84)
-        self.convert_tool_btn.setToolTip(
-            "打开「文件转 Markdown 转换工具」：\n"
-            "选单个文件或指定目录（支持 PDF/EPUB/Word/Excel/PPT/HTML/图片/TXT 等），"
-            "设置保存目录后一键批量转换成 Markdown；\n"
-            "自动采用当前配置面板里的 PDF 引擎 / OCR 模型等设置，进度条实时显示当前"
-            "文件、处理环节与总进度。")
-        self.convert_tool_btn.clicked.connect(self._on_open_convert_tool)
-        r.addWidget(self.convert_tool_btn)
+        r.addWidget(QLabel("检索模式"))
+        r.addSpacing(8)
+        self.rag_mode_combo = _combo(
+            ["向量检索模式", "极速检索模式", "决策判定模式"], 150)
+        self.rag_mode_combo.setCurrentText(_RAG_MODE_VALUE_TO_DISPLAY.get(
+            str(getattr(self.config, "rag_mode", "vector") or "vector"),
+            "向量检索模式"))
+        self.rag_mode_combo.setToolTip(
+            "RAG 检索召回路径三选一：\n"
+            "· 向量检索模式（默认）：Embedding 向量 + BM25 混合召回 + Reranker 精排；\n"
+            "· 极速检索模式：强制开启二值量化粗筛两段式（汉明距离极速选候选），大库显著更快；\n"
+            "· 决策判定模式：BM25 粗筛 → 字符级 BM25 选核心句 → 本地决策模型逐片\n"
+            "  判定相关性，返回 TopN 相关切片（不走向量检索与 Reranker）。\n"
+            "切换模式后点「应用配置」生效。")
+        r.addWidget(self.rag_mode_combo)
+        r.addStretch(1)
         klay.addLayout(r)
 
-        # OCR 第二路径（gguf→mmproj 视觉塔 / onnx→tokenizer），按类型显隐
-        self.ocr_second_label = QLabel("mmproj 路径")
-        self.ocr_mmproj_edit = _path("mmproj 视觉塔路径（可选，多模态才需要）")
-        self.ocr_mmproj_pick = _pick_btn(self.ocr_mmproj_edit, self.ocr_impl_combo)
-        self.ocr_tokenizer_edit = _path("tokenizer 路径（可选）")
-        self.ocr_tokenizer_pick = _pick_dir_btn(self.ocr_tokenizer_edit)
-        self.ocr_second_w = QWidget()
-        r2 = QHBoxLayout(self.ocr_second_w); r2.setContentsMargins(0, 0, 0, 0); r2.setSpacing(8)
-        r2.addWidget(self.ocr_second_label)
-        r2.addWidget(self.ocr_mmproj_edit, 1); r2.addWidget(self.ocr_mmproj_pick)
-        r2.addWidget(self.ocr_tokenizer_edit, 1); r2.addWidget(self.ocr_tokenizer_pick)
-        # 注意：r2 已在上面通过 QHBoxLayout(self.ocr_second_w) 设为该容器的布局，
-        # 这里必须 addWidget（添加容器控件），不能 addLayout(r2)——后者会把已有
-        # 父对象的布局再挂到 klay，触发 "QHBoxLayout already has a parent" 警告，
-        # 且会让 ocr_second_w 变成没有布局的孤儿控件（显隐切换失效）。
-        klay.addWidget(self.ocr_second_w)
-        self.ocr_impl_combo.currentTextChanged.connect(
-            lambda _: self._sync_second_path(
-                self.ocr_second_w, self.ocr_impl_combo, self.ocr_second_label,
-                self.ocr_mmproj_edit, self.ocr_mmproj_pick,
-                self.ocr_tokenizer_edit, self.ocr_tokenizer_pick))
-        self.ocr_impl_combo.setToolTip(
-            "OvisOCR2 VLM 后端：\n"
-            "· mlx-vlm：目录含 model.safetensors（Apple Silicon 推荐）\n"
-            "· gguf：目录含 主模型.gguf + mmproj*.gguf（llama-cpp 多模态）\n"
-            "· onnx：目录含 genai_config.json（onnxruntime-genai 导出，"
-            "需 pip install onnxruntime-genai）"
-        )
+        # 向量检索模式组：Embedding 行 + Reranker 行（原样保留）。
+        self.rag_vector_w = QWidget()
+        vlay = QVBoxLayout(self.rag_vector_w)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(8)
+
+        # 知识同步动作行（应用配置 / 开始同步 / 停止同步 / 向量去重）已移入
+        # 「工作目录配置区」，见区一·五；按钮的 clicked 连接仍在 _wire_signals
+        # 与创建处，控件属性引用不变。
+
+        # PDF 解析引擎 + 自定义 OCR 配置行已整体移入「高级配置区」。
 
         # row2: Embedding（实现下拉 + 模型名 + 本地路径选择 + 同步知识）
         self.embedding_impl_combo = _combo(["fastembed", "mlx", "onnx", "gguf"], 110)
@@ -2548,9 +2552,9 @@ class MainWindow(QMainWindow):
             "设置后自动完成 L2 归一化 + int8 量化，入库与查询同步。\n"
             "改动后旧向量库需清空重建。")
         r.addWidget(self.embedding_dims_combo)
-        klay.addLayout(r)
+        vlay.addLayout(r)
 
-        # row3: Reranker（实现下拉 + 模型名 + 本地路径选择 + 停止同步）
+        # row3: Reranker（实现下拉 + 模型名 + 本地路径选择）——向量检索模式组
         self.reranker_impl_combo = _combo(["fastembed", "mlx", "onnx", "gguf"], 110)
         self.reranker_model_name_edit = _path("模型名（fastembed 模型 id）", 200)
         self.reranker_path_edit = _path("本地路径（mlx/onnx/gguf 时选用）", 160)
@@ -2574,19 +2578,109 @@ class MainWindow(QMainWindow):
             "取值 1~10（引擎在检索时会夹紧到该范围）。")
         r.addWidget(self.reranker_topn_edit)
         r.addSpacing(8)
-        # 快速粗筛（两段式检索第一阶段 · 二值量化）：置于 reranker 行、TopN 之后。
-        self.bin_prefilter_chk = QCheckBox("快速粗筛")
+        # 快速粗筛（二值量化两段式）+ 粗筛候选数——从极速检索模式组移回本行末尾。
+        self.bin_prefilter_chk = QCheckBox("快速粗筛（二值量化两段式）")
         self.bin_prefilter_chk.setChecked(
             bool(getattr(self.config, "rag_binary_prefilter_enabled", False)))
         self.bin_prefilter_chk.setToolTip(
-            "快速粗筛（两段式检索第一阶段 · 二值量化）：开启后知识检索先用查询向量的\n"
-            "二进制表示（sign 量化 + 位打包）对全表做 XOR+Popcount 汉明距离\n"
-            "扫描，极速选出 top 200 候选，再在候选集内重算余弦相似度 + BM25，\n"
-            "交给 reranker 精排。大向量库（数十万行+）下显著更快。\n"
-            "关闭则维持原 ANN + 全表 BM25 流程。旧向量库首次检索前会自动\n"
-            "迁移补二进制列（从已存向量派生，无需重嵌入）。")
+            "先用查询向量的二进制表示（sign 量化 + 位打包）对全表做 XOR+Popcount\n"
+            "汉明距离扫描，极速选出 top 候选，再在候选集内重算余弦相似度 + BM25\n"
+            "交给 reranker 精排。大向量库（数十万行+）显著更快。\n"
+            "极速检索模式下强制开启；向量检索模式下仍可按此勾选启用。\n"
+            "旧向量库首次检索前会自动迁移补二进制列（从已存向量派生，无需重嵌入）。")
         r.addWidget(self.bin_prefilter_chk)
-        klay.addLayout(r)
+        r.addSpacing(8)
+        r.addWidget(QLabel("粗筛候选数"))
+        self.bin_prefilter_top_combo = _combo(["100", "200", "500"], 80)
+        _bin_top = str(int(getattr(self.config, "rag_binary_prefilter_top", 200) or 200))
+        self.bin_prefilter_top_combo.setCurrentText(
+            _bin_top if _bin_top in ("100", "200", "500") else "200")
+        self.bin_prefilter_top_combo.setToolTip(
+            "二值粗筛第一阶段汉明距离保留的候选数（rag_binary_prefilter_top，默认 200）。")
+        r.addWidget(self.bin_prefilter_top_combo)
+        vlay.addLayout(r)
+        klay.addWidget(self.rag_vector_w)
+
+        # ---- 极速检索模式组：检索阅读模式（ColBERT）子分组 ----
+        # 快速粗筛（二值量化两段式）与粗筛候选数已移回向量检索模式的 Reranker 行。
+        self.rag_fast_w = QWidget()
+        flay = QVBoxLayout(self.rag_fast_w)
+        flay.setContentsMargins(0, 0, 0, 0)
+        flay.setSpacing(8)
+        klay.addWidget(self.rag_fast_w)
+
+        # ---- 决策判定模式组：决策模型 / 粗筛数量 / 核心句 / TopN ----
+        self.rag_decision_w = QWidget()
+        dlay = QVBoxLayout(self.rag_decision_w)
+        dlay.setContentsMargins(0, 0, 0, 0)
+        dlay.setSpacing(8)
+        # 行1：决策模型（后端下拉 + 模型路径 + 选择）
+        self.decision_backend_combo = _combo(["MLX-VLM", "MLX-LM", "GGUF"], 110)
+        self.decision_backend_combo.setToolTip(
+            "决策模型后端（rag_decision_model_backend）：\n"
+            "· MLX-VLM（默认）：PKU-KCL-Meteor-0.8B 带 readout 判定头，"
+            "readout 协议直接出相关性概率，最快最准；\n"
+            "· MLX-LM：生成式判定（输出 0-100 相关性数字）；\n"
+            "· GGUF：同上，走 llama.cpp（需 .gguf 权重）。")
+        self.decision_backend_combo.setCurrentText(
+            _DECISION_BACKEND_TO_DISPLAY.get(
+                str(getattr(self.config, "rag_decision_model_backend",
+                            "mlx-vlm") or "mlx-vlm"), "MLX-VLM"))
+        self.decision_path_edit = _path(
+            "留空=自动使用 models/PKU-KCL-Meteor-0.8B-mlx-int4", 200)
+        self.decision_path_edit.setText(
+            str(getattr(self.config, "rag_decision_model_path", "") or ""))
+        r = QHBoxLayout(); r.setSpacing(8)
+        r.addWidget(QLabel("决策模型")); r.addWidget(self.decision_backend_combo)
+        r.addWidget(QLabel("模型路径")); r.addWidget(self.decision_path_edit, 1)
+        r.addWidget(_pick_btn(self.decision_path_edit, self.decision_backend_combo))
+        dlay.addLayout(r)
+        # 行2：粗筛数量（BM25 粗筛候选切片数）
+        r = QHBoxLayout(); r.setSpacing(8)
+        r.addWidget(QLabel("粗筛数量"))
+        self.decision_coarse_combo = _combo(["20", "50", "100"], 70)
+        self.decision_coarse_combo.setToolTip(
+            "决策判定模式第一阶段：对普通向量库切片表做 BM25 全文检索，\n"
+            "召回该数量的候选切片（rag_decision_coarse_k，默认 50）。")
+        _dcoarse = str(int(getattr(self.config, "rag_decision_coarse_k", 50) or 50))
+        self.decision_coarse_combo.setCurrentText(
+            _dcoarse if _dcoarse in ("20", "50", "100") else "50")
+        r.addWidget(self.decision_coarse_combo)
+        r.addSpacing(12)
+        # 行2b：使用核心句判定 + 核心句数量
+        self.decision_core_chk = QCheckBox("使用核心句判定")
+        self.decision_core_chk.setChecked(bool(getattr(
+            self.config, "rag_decision_use_core_sentences", True)))
+        self.decision_core_chk.setToolTip(
+            "开启（默认）：用字符级 BM25（3 字滑窗、K1=1.6、b=0.4）给切片内每个\n"
+            "句子打分，取最高分句子代表整片送决策模型——截短输入，判定更快更聚焦。\n"
+            "关闭：整片文本直接送判定。")
+        r.addWidget(self.decision_core_chk)
+        r.addWidget(QLabel("核心句数量"))
+        self.decision_core_top_combo = _combo(["3", "5"], 60)
+        self.decision_core_top_combo.setToolTip(
+            "每片参与判定的核心句数（rag_decision_core_top，默认 3）；\n"
+            "核心句按切片内出现顺序拼接。")
+        _dcore = str(int(getattr(self.config, "rag_decision_core_top", 3) or 3))
+        self.decision_core_top_combo.setCurrentText(
+            _dcore if _dcore in ("3", "5") else "3")
+        r.addWidget(self.decision_core_top_combo)
+        r.addSpacing(12)
+        # 判定返回 TopN（并入本行末尾）
+        r.addWidget(QLabel("判定返回TopN"))
+        self.decision_topn_combo = _combo(["3", "5", "10"], 70)
+        self.decision_topn_combo.setToolTip(
+            "决策模型判定后返回的相关切片数（rag_decision_top_n，默认 5）。")
+        _dtopn = str(int(getattr(self.config, "rag_decision_top_n", 5) or 5))
+        self.decision_topn_combo.setCurrentText(
+            _dtopn if _dtopn in ("3", "5", "10") else "5")
+        r.addWidget(self.decision_topn_combo)
+        r.addStretch(1)
+        dlay.addLayout(r)
+        klay.addWidget(self.rag_decision_w)
+        self.rag_mode_combo.currentTextChanged.connect(
+            lambda _t: self._sync_rag_mode_controls())
+        self._sync_rag_mode_controls()
 
         lay.addWidget(kb_box)
 
@@ -2659,9 +2753,27 @@ class MainWindow(QMainWindow):
             "local/global/hybrid/mix 需要「构建知识图谱」完成后才生效；\n"
             "图谱未构建时检索自动回退 naive。")
         kg_row.addWidget(self.kg_strategy_combo)
-        kg_row.addSpacing(8)
-        # 三元组抽取方案（构建期 + 检索期关键词抽取共用，可随时切换重建）。
-        kg_row.addWidget(QLabel("抽取方案:"))
+        kg_row.addSpacing(12)
+        # 后台异步填充向量（对向量检索模式与极速检索模式均适用：两者都走
+        # 普通向量库 add_streaming(defer_embeddings=...)；仅 ColBERT 阅读模式不走）。
+        self.embed_bg_chk = QCheckBox("后台异步填充向量")
+        self.embed_bg_chk.setChecked(
+            bool(getattr(self.config, "rag_embed_background", True)))
+        self.embed_bg_chk.setToolTip(
+            "向量检索模式 / 极速检索模式同步时，切片文本先行入库（无向量），\n"
+            "同步立即完成：BM25/全文检索立即可用；后台线程分批回填 embedding，\n"
+            "向量检索随填充逐步生效，全部填充完毕后完全生效。关闭则回退同步嵌入。\n"
+            "（检索阅读模式走 ColBERT 三表，不受此开关影响。）")
+        kg_row.addWidget(self.embed_bg_chk)
+        kg_row.addStretch(1)
+        adv_lay.addLayout(kg_row)
+        # 抽取方案 / 构建知识图谱 / 实体消歧 / 状态已并入下一行 kg_limits_row。
+
+        # 单片抽取上限（rag_kg_max_*）：既写入抽取 prompt 的约束，也在入库时
+        # 兜底截断。默认 20 实体 / 50 关系 / 描述 100 字。
+        kg_limits_row = QHBoxLayout()
+        # 行首：三元组抽取方案（构建期 + 检索期关键词抽取共用，可随时切换重建）。
+        kg_limits_row.addWidget(QLabel("抽取方案:"))
         self.kg_extractor_combo = _combo(list(_KG_EXTRACTOR_DISPLAY.values()))
         _kg_ext_fwd = {k: i for i, k in enumerate(_KG_EXTRACTOR_DISPLAY)}
         self.kg_extractor_combo.setCurrentIndex(
@@ -2673,35 +2785,9 @@ class MainWindow(QMainWindow):
             "• GLiNER（本地 NER）：不基于 LLM，本地模型抽实体 + 同句共现连边，\n"
             "  无需启用辅助模型（需 pip install gliner，首次使用下载模型权重）。\n"
             "切换方案后需重新「构建知识图谱」才会以新方案重建图谱数据。")
-        kg_row.addWidget(self.kg_extractor_combo)
-        kg_row.addSpacing(8)
-        self.kg_build_btn = QPushButton("构建知识图谱")
-        self.kg_build_btn.setToolTip(
-            "按当前「抽取方案」**清空重建**知识图谱（实体表 + 关系表 + 向量 +\n"
-            "内存图快照）：旧图谱数据先清空，可修复切换方案后的残留数据。\n"
-            "需要先：① 同步知识库；② LLM 方案需在「辅助模型」启用并加载\n"
-            "（不占用主模型；实测建议 ≥4B：0.8B 零产出、2B 超量且关系恒 0；\n"
-            "GLiNER 方案不依赖 LLM）。按文档增量构建走 MCP ingest_knowledge。")
-        self.kg_build_btn.clicked.connect(self._on_build_kg)
-        kg_row.addWidget(self.kg_build_btn)
-        # 实体消歧：后期手动触发，对库内现有实体做语义向量消歧（对齐/合并）。
-        self.kg_dedup_btn = QPushButton("实体消歧")
-        self.kg_dedup_btn.setToolTip(
-            "对库内现有实体做语义向量消歧（构建期只做规则消歧，这里补做深层对齐）：\n"
-            "复用构建期算好的实体向量（实体名+描述），余弦相似度找出\n"
-            "「写法不同但语义同一」的实体（如中英文/全称简称），自动合并实体、\n"
-            "改写关系端点并重建图快照。不依赖 LLM/辅助模型。\n"
-            "建议「构建知识图谱」完成后运行；可重复执行（幂等续跑）。")
-        self.kg_dedup_btn.clicked.connect(self._on_consolidate_kg)
-        kg_row.addWidget(self.kg_dedup_btn)
-        self.kg_status_label = QLabel("状态: 未构建")
-        kg_row.addWidget(self.kg_status_label)
-        kg_row.addStretch(1)
-        adv_lay.addLayout(kg_row)
-
-        # 单片抽取上限（rag_kg_max_*）：既写入抽取 prompt 的约束，也在入库时
-        # 兜底截断。默认 20 实体 / 50 关系 / 描述 100 字。
-        kg_limits_row = QHBoxLayout()
+        kg_limits_row.addWidget(self.kg_extractor_combo)
+        kg_limits_row.addSpacing(10)
+        # 单片上限
         kg_limits_row.addWidget(QLabel("单片上限"))
         kg_limits_row.addSpacing(8)
         self.kg_max_entities_edit = _num(
@@ -2735,15 +2821,154 @@ class MainWindow(QMainWindow):
             "结果再抽一次，只取新增或修正项。提升召回，代价是触发时每片\n"
             "多一次 LLM 调用（构建时间增加）。仅对两个 LLM 方案生效。")
         kg_limits_row.addWidget(self.kg_glean_chk)
+        kg_limits_row.addSpacing(10)
+        # 行尾：构建知识图谱 / 实体消歧 / 状态
+        self.kg_build_btn = QPushButton("构建知识图谱")
+        self.kg_build_btn.setToolTip(
+            "按当前「抽取方案」**清空重建**知识图谱（实体表 + 关系表 + 向量 +\n"
+            "内存图快照）：旧图谱数据先清空，可修复切换方案后的残留数据。\n"
+            "需要先：① 同步知识库；② LLM 方案需在「辅助模型」启用并加载\n"
+            "（不占用主模型；实测建议 ≥4B：0.8B 零产出、2B 超量且关系恒 0；\n"
+            "GLiNER 方案不依赖 LLM）。按文档增量构建走 MCP ingest_knowledge。")
+        self.kg_build_btn.clicked.connect(self._on_build_kg)
+        kg_limits_row.addWidget(self.kg_build_btn)
+        # 实体消歧：后期手动触发，对库内现有实体做语义向量消歧（对齐/合并）。
+        self.kg_dedup_btn = QPushButton("实体消歧")
+        self.kg_dedup_btn.setToolTip(
+            "对库内现有实体做语义向量消歧（构建期只做规则消歧，这里补做深层对齐）：\n"
+            "复用构建期算好的实体向量（实体名+描述），余弦相似度找出\n"
+            "「写法不同但语义同一」的实体（如中英文/全称简称），自动合并实体、\n"
+            "改写关系端点并重建图快照。不依赖 LLM/辅助模型。\n"
+            "建议「构建知识图谱」完成后运行；可重复执行（幂等续跑）。")
+        self.kg_dedup_btn.clicked.connect(self._on_consolidate_kg)
+        kg_limits_row.addWidget(self.kg_dedup_btn)
+        self.kg_status_label = QLabel("状态: 未构建")
+        kg_limits_row.addWidget(self.kg_status_label)
         kg_limits_row.addStretch(1)
         adv_lay.addLayout(kg_limits_row)
+
+        # PDF 解析引擎 + 自定义 OCR 模型（#133 统一引擎回退链）——从 RAG 模式
+        # 配置区整体移入高级配置区；控件名 / 信号连接 / 配置读写均不变。
+        self.pdf_engine_combo = _combo(["docling", "marker", "OvisOCR"], 110)
+        self.pdf_engine_combo.setToolTip(
+            "PDF/Office 统一解析引擎（rag_pdf_engine）：\n"
+            "· docling（默认）：docling 统一管线，版面/表格良好\n"
+            "· marker：marker-pdf 优先（需 pip install marker-pdf；未装静默回退 docling）\n"
+            "· OvisOCR：OvisOCR2 VLM 转 Markdown（docling/marker 之外的兜底）"
+        )
+        # 并发实例：docling 转换器池大小（rag_docling_pool_size）。可选 1-6，默认 1。
+        # 控制 docling 解析器同时 convert 几个文件；⚠️ docling 的 MPS 推理非线程安全，
+        # 进程内多实例在 16GB 机器上会触发 GPU 重置硬崩——默认 1 最稳，≥32GB 可试 2-6。
+        self.parse_concurrency_combo = _combo(["1", "2", "3", "4", "5", "6"], 56)
+        self.parse_concurrency_combo.setToolTip(
+            "docling 解析器的并发实例数（rag_docling_pool_size）：\n"
+            "1 = 单实例串行（最省内存，默认，16GB 机器最稳）；\n"
+            "2-6 = 多实例并发解析，吞吐更高但常驻显存/内存同比上升。\n"
+            "⚠️ docling 的 MPS 推理非线程安全，进程内多实例在 16GB 机器上\n"
+            "可能触发 GPU 重置硬崩；仅 ≥32GB 内存时建议尝试 2 及以上。")
+        # OCR并发：RapidOCR 引擎池大小（rag_ocr_pool_size）。可选 1-6，默认 1。
+        # 控制 ocrmac 透传页的 RapidOCR 并发识别数；纯 CPU EP，多实例安全。
+        self.ocr_concurrency_combo = _combo(["1", "2", "3", "4", "5", "6"], 56)
+        self.ocr_concurrency_combo.setToolTip(
+            "OCR 并发数（rag_ocr_pool_size，RapidOCR 引擎池）：\n"
+            "1 = 单实例串行（最省内存，默认）；\n"
+            "2-6 = 多实例并发识别，吞吐更高但常驻内存同比上升。\n"
+            "对扫描件/图片型 PDF 的 OCR 阶段收益最明显，纯文本 PDF 基本无感。")
+        # Apple Vision 识别级别（rag_ocr_vision_level）：精确模式质量最好，
+        # 快速模式更快但复杂版式/小字识别率略低。
+        self.ocr_vision_combo = _combo(["精确 (accurate)", "快速 (fast)"], 116)
+        self.ocr_vision_combo.setToolTip(
+            "Apple Vision（ocrmac）识别级别（rag_ocr_vision_level）：\n"
+            "· accurate（默认）：精确模式，中文/复杂版式质量最好；\n"
+            "· fast：快速模式，速度更快，但小字/竖排/复杂表格识别率略低。\n"
+            "同时作用于 docling 主解析链路和 ocrmac 兜底识别；"
+            "切换后下一次同步/转换生效（已构建的 docling converter 会自动重建）。")
+        self.ocr_impl_combo = _combo(["mlx-vlm", "onnx", "gguf"], 110)
+        # 仅「类型 + 本地路径」：OCR 始终本地 VLM，模型名由 config 默认值
+        # （rag_ocr_model_name=OvisOCR2-0.8B-MLX-4bit）决定，留空自动从
+        # models/ 下解析；暴露可编辑的「模型名」只会制造拼写错误（同 reranker 旧
+        # 的 -mx-fp8 笔误事故），故不显示在设置区。
+        self.ocr_path_edit = _path("本地路径（留空自动用 models/ 下的模型名）", 160)
+        # 「识别测试」：就地试跑各 OCR 引擎并左右对照原件与结果，避免每次验证
+        # 效果都要走一遍完整知识库同步。打开的窗口直接用本行当前填写的配置。
+        self.ocr_test_btn = QPushButton("识别测试")
+        self.ocr_test_btn.setFixedWidth(84)
+        self.ocr_test_btn.setToolTip(
+            "打开 OCR 识别测试窗口：\n"
+            "选一个图片/PDF，用 Apple OCR / OvisOCR2 / 混合（Vision+Ovis 表格）/"
+            "自定义 OCR 试识别；\n左侧原件、右侧结果，多页 PDF 可逐页联动对照；"
+            "确认可用后保存为 Markdown。")
+        self.ocr_test_btn.clicked.connect(self._on_open_ocr_test)
+        r = QHBoxLayout(); r.setSpacing(8)
+        r.addWidget(QLabel("PDF解析引擎")); r.addWidget(self.pdf_engine_combo)
+        r.addWidget(QLabel("并发实例")); r.addWidget(self.parse_concurrency_combo)
+        r.addWidget(QLabel("OCR并发")); r.addWidget(self.ocr_concurrency_combo)
+        r.addWidget(QLabel("Vision级别")); r.addWidget(self.ocr_vision_combo)
+        r.addWidget(QLabel("自定义OCR")); r.addWidget(self.ocr_impl_combo)
+        r.addWidget(self.ocr_path_edit, 2); r.addWidget(_pick_btn(self.ocr_path_edit, self.ocr_impl_combo))
+        # 「保存设置」：把当前「自定义OCR」行的设置落盘，并让识别测试下拉框
+        # 出现这个自定义模型（下拉第四项名字取自路径）。不重建整个 RAG。
+        self.save_ocr_settings_btn = QPushButton("保存设置")
+        self.save_ocr_settings_btn.setFixedWidth(84)
+        self.save_ocr_settings_btn.setToolTip(
+            "保存当前「自定义OCR」行的设置（后端/路径/mmproj/tokenizer）。\n"
+            "保存后，识别测试窗口下拉框的「自定义OCR」项即显示为该模型，可立即用它识别。")
+        self.save_ocr_settings_btn.clicked.connect(self._on_save_ocr_settings)
+        r.addWidget(self.save_ocr_settings_btn)
+        r.addWidget(self.ocr_test_btn)
+        # 「转换工具」：打开独立的「文件转 Markdown」窗口，单独把各类文件批量
+        # 提取转换成 Markdown 并保存到指定目录（解析/提取/图片识别/清洗/MD
+        # 转换均复用 RAG 入库链路同一套处理逻辑）。
+        self.convert_tool_btn = QPushButton("转换工具")
+        self.convert_tool_btn.setFixedWidth(84)
+        self.convert_tool_btn.setToolTip(
+            "打开「文件转 Markdown 转换工具」：\n"
+            "选单个文件或指定目录（支持 PDF/EPUB/Word/Excel/PPT/HTML/图片/TXT 等），"
+            "设置保存目录后一键批量转换成 Markdown；\n"
+            "自动采用当前配置面板里的 PDF 引擎 / OCR 模型等设置，进度条实时显示当前"
+            "文件、处理环节与总进度。")
+        self.convert_tool_btn.clicked.connect(self._on_open_convert_tool)
+        r.addWidget(self.convert_tool_btn)
+        adv_lay.addLayout(r)
+
+        # OCR 第二路径（gguf→mmproj 视觉塔 / onnx→tokenizer），按类型显隐
+        self.ocr_second_label = QLabel("mmproj 路径")
+        self.ocr_mmproj_edit = _path("mmproj 视觉塔路径（可选，多模态才需要）")
+        self.ocr_mmproj_pick = _pick_btn(self.ocr_mmproj_edit, self.ocr_impl_combo)
+        self.ocr_tokenizer_edit = _path("tokenizer 路径（可选）")
+        self.ocr_tokenizer_pick = _pick_dir_btn(self.ocr_tokenizer_edit)
+        self.ocr_second_w = QWidget()
+        r2 = QHBoxLayout(self.ocr_second_w); r2.setContentsMargins(0, 0, 0, 0); r2.setSpacing(8)
+        r2.addWidget(self.ocr_second_label)
+        r2.addWidget(self.ocr_mmproj_edit, 1); r2.addWidget(self.ocr_mmproj_pick)
+        r2.addWidget(self.ocr_tokenizer_edit, 1); r2.addWidget(self.ocr_tokenizer_pick)
+        # 注意：r2 已在上面通过 QHBoxLayout(self.ocr_second_w) 设为该容器的布局，
+        # 这里必须 addWidget（添加容器控件），不能 addLayout(r2)——后者会把已有
+        # 父对象的布局再挂到 adv_lay，触发 "QHBoxLayout already has a parent" 警告，
+        # 且会让 ocr_second_w 变成没有布局的孤儿控件（显隐切换失效）。
+        adv_lay.addWidget(self.ocr_second_w)
+        self.ocr_impl_combo.currentTextChanged.connect(
+            lambda _: self._sync_second_path(
+                self.ocr_second_w, self.ocr_impl_combo, self.ocr_second_label,
+                self.ocr_mmproj_edit, self.ocr_mmproj_pick,
+                self.ocr_tokenizer_edit, self.ocr_tokenizer_pick))
+        self.ocr_impl_combo.setToolTip(
+            "OvisOCR2 VLM 后端：\n"
+            "· mlx-vlm：目录含 model.safetensors（Apple Silicon 推荐）\n"
+            "· gguf：目录含 主模型.gguf + mmproj*.gguf（llama-cpp 多模态）\n"
+            "· onnx：目录含 genai_config.json（onnxruntime-genai 导出，"
+            "需 pip install onnxruntime-genai）"
+        )
 
         lay.addWidget(adv_box)
 
         # ==================================================================
-        # 区四：检索阅读模式（ColBERT 长文档旁路）
+        # 检索阅读模式（ColBERT 长文档旁路）
+        # 并入「极速检索模式」组：仅选中「极速检索模式」时随 rag_fast_w 一起
+        # 显示，其余两种检索模式下隐藏。已去掉原分组标题文字/边框（QWidget），
+        # 控件直接平铺在极速模式组内；控件名/读写逻辑不变。
         # ==================================================================
-        reading_box = QGroupBox("检索阅读模式（ColBERT 长文档旁路）")
+        reading_box = QWidget()
         rlay = QVBoxLayout(reading_box)
         rlay.setContentsMargins(10, 8, 10, 8)
         rlay.setSpacing(8)
@@ -2804,6 +3029,9 @@ class MainWindow(QMainWindow):
         r.addStretch(1)
         rlay.addLayout(r)
 
+        # 后台异步填充向量开关已移入高级配置区 RAG 检索策略行
+        # （它对向量检索模式与极速检索模式均适用，与 ColBERT 阅读模式无关）。
+
         # row2：模型目录 / 切片长度 / 最小切片 / 语义阈值
         r2 = QHBoxLayout(); r2.setSpacing(8)
         r2.addWidget(QLabel("模型目录:"))
@@ -2863,7 +3091,8 @@ class MainWindow(QMainWindow):
         rlay.addWidget(self.reading_mode_hint)
 
         self.reading_mode_chk.toggled.connect(self._sync_reading_mode_controls)
-        lay.addWidget(reading_box)
+        # 阅读模式分组并入「极速检索模式」组：随 rag_fast_w 一起显隐。
+        flay.addWidget(reading_box)
         self._sync_reading_mode_controls(
             self.reading_mode_chk.isChecked())
         lay.addStretch(1)
@@ -2896,6 +3125,7 @@ class MainWindow(QMainWindow):
         self.config.rag_mcp_scope = scope
         self.config.rag_mcp_port = port
         self.config.rag_mcp_enabled = True
+        self._gather_partitions()   # 防止陈旧 rag_partitions 覆盖新增分区行
         self.config.save(CONFIG_PATH)
         self._refresh_rag_mcp_status()
         host = "0.0.0.0" if scope == "lan" else "127.0.0.1"
@@ -2904,6 +3134,7 @@ class MainWindow(QMainWindow):
     def _on_rag_mcp_stop(self) -> None:
         self._rag_mcp_service.stop()
         self.config.rag_mcp_enabled = False
+        self._gather_partitions()   # 防止陈旧 rag_partitions 覆盖新增分区行
         self.config.save(CONFIG_PATH)
         self._refresh_rag_mcp_status()
 
@@ -2940,6 +3171,19 @@ class MainWindow(QMainWindow):
         if hint is not None:
             hint.setStyleSheet(
                 "color:#6b7280;" if enabled else "color:#9ca3af;")
+
+    def _sync_rag_mode_controls(self) -> None:
+        """RAG 检索模式三选一联动：只显示当前模式对应的配置行。"""
+        mode = _RAG_MODE_DISPLAY_TO_VALUE.get(
+            self.rag_mode_combo.currentText(), "vector")
+        groups = {
+            "vector": getattr(self, "rag_vector_w", None),
+            "fast": getattr(self, "rag_fast_w", None),
+            "decision": getattr(self, "rag_decision_w", None),
+        }
+        for key, widget in groups.items():
+            if widget is not None:
+                widget.setVisible(key == mode)
 
     def _on_build_reading_index(self) -> None:
         """后台构建/续建 ColBERT 中心向量 ANN 索引。"""
@@ -3644,6 +3888,7 @@ class MainWindow(QMainWindow):
         self.flash_attn_check.setChecked(bool(getattr(self.config, "local_llm_flash_attn", True)))
         self.workspace_edit.setText(self.config.workspace)
         self.knowledge_base_edit.setText(self.config.knowledge_base)
+        self._apply_partitions()
         # 主模型模式（本地 / OpenAI 兼容接口）+ 本地类型与路径
         self.main_mode_combo.setCurrentText(
             "本地模式" if self.config.llm_provider == "local" else "OpenAI兼容接口")
@@ -3729,6 +3974,32 @@ class MainWindow(QMainWindow):
             bool(getattr(self.config, "rag_matryoshka_enabled", True)))
         self.bin_prefilter_chk.setChecked(
             bool(getattr(self.config, "rag_binary_prefilter_enabled", False)))
+        _bin_top = str(int(getattr(
+            self.config, "rag_binary_prefilter_top", 200) or 200))
+        self.bin_prefilter_top_combo.setCurrentText(
+            _bin_top if _bin_top in ("100", "200", "500") else "200")
+        # RAG 检索模式（三选一）+ 决策判定模式参数
+        self.rag_mode_combo.setCurrentText(_RAG_MODE_VALUE_TO_DISPLAY.get(
+            str(getattr(self.config, "rag_mode", "vector") or "vector"),
+            "向量检索模式"))
+        self.decision_backend_combo.setCurrentText(
+            _DECISION_BACKEND_TO_DISPLAY.get(
+                str(getattr(self.config, "rag_decision_model_backend",
+                            "mlx-vlm") or "mlx-vlm"), "MLX-VLM"))
+        self.decision_path_edit.setText(
+            str(getattr(self.config, "rag_decision_model_path", "") or ""))
+        _dcoarse = str(int(getattr(self.config, "rag_decision_coarse_k", 50) or 50))
+        self.decision_coarse_combo.setCurrentText(
+            _dcoarse if _dcoarse in ("20", "50", "100") else "50")
+        self.decision_core_chk.setChecked(bool(getattr(
+            self.config, "rag_decision_use_core_sentences", True)))
+        _dcore = str(int(getattr(self.config, "rag_decision_core_top", 3) or 3))
+        self.decision_core_top_combo.setCurrentText(
+            _dcore if _dcore in ("3", "5") else "3")
+        _dtopn = str(int(getattr(self.config, "rag_decision_top_n", 5) or 5))
+        self.decision_topn_combo.setCurrentText(
+            _dtopn if _dtopn in ("3", "5", "10") else "5")
+        self._sync_rag_mode_controls()
         # 检索阅读模式（ColBERT）
         self.reading_mode_chk.setChecked(
             bool(getattr(self.config, "rag_reading_mode_enabled", False)))
@@ -3795,6 +4066,225 @@ class MainWindow(QMainWindow):
         self._refresh_rag_mcp_status()
         self._refresh_reading_index_status()
 
+    # ------------------------------------------------------------------
+    # 多知识分区行（工作目录配置区）
+    # ------------------------------------------------------------------
+
+    def _make_partition_row(
+        self,
+        name: str = "",
+        path: str = "",
+        enabled: bool = True,
+        default: bool = False,
+    ) -> Dict[str, Any]:
+        """构建一行分区配置控件：
+        [启用][设为默认][知识库名][源目录][…][应用][同步][停止][去重]。
+        每个新增知识库都是完整的一行（含全部操作按钮），停止/去重对接本行
+        对应的分区处理。"""
+        row_w = QWidget()
+        r = QHBoxLayout(row_w)
+        r.setContentsMargins(0, 0, 0, 0)
+        r.setSpacing(6)
+        enabled_chk = QCheckBox()
+        enabled_chk.setChecked(bool(enabled))
+        enabled_chk.setToolTip("启用该知识分区参与检索与同步")
+        default_btn = QPushButton("设为默认")
+        default_btn.setCheckable(True)
+        default_btn.setChecked(bool(default))
+        default_btn.setToolTip(
+            "设为默认使用的知识库：单库检索（未启用其它分区或路由未命中时）\n"
+            "使用的分区；分区列表至少保留一个启用分区作为默认。")
+        name_edit = QLineEdit(name)
+        name_edit.setPlaceholderText("知识库名（领域，如：法律）")
+        name_edit.setFixedWidth(110)
+        path_edit = QLineEdit(path)
+        path_edit.setPlaceholderText("（可选）源知识库目录")
+        browse_btn = QPushButton("…")
+        browse_btn.setFixedWidth(28)
+        sync_btn = QPushButton("同步")
+        sync_btn.setFixedWidth(52)
+        sync_btn.setToolTip("仅同步本分区（解析→切片→入库→向量回填）")
+        apply_btn = QPushButton("应用")
+        apply_btn.setFixedWidth(48)
+        apply_btn.setToolTip("保存当前所有配置（含本分区行）并重建 Agent")
+        stop_btn = QPushButton("停止")
+        stop_btn.setFixedWidth(48)
+        stop_btn.setToolTip("停止当前正在进行的知识同步任务")
+        stop_btn.setEnabled(False)
+        dedup_btn = QPushButton("去重")
+        dedup_btn.setFixedWidth(48)
+        dedup_btn.setToolTip("仅对本知识分区的向量库做去重（清理重复向量）")
+        r.addWidget(QLabel("启用"))
+        r.addWidget(enabled_chk)
+        r.addWidget(default_btn)
+        r.addWidget(QLabel("源知识库"))
+        r.addWidget(name_edit)
+        r.addWidget(path_edit, 1)
+        r.addWidget(browse_btn)
+        r.addWidget(apply_btn)   # 「应用」置于「同步」前
+        r.addWidget(sync_btn)
+        r.addWidget(stop_btn)
+        r.addWidget(dedup_btn)
+        row = {
+            "widget": row_w, "enabled_chk": enabled_chk,
+            "default_btn": default_btn, "name_edit": name_edit,
+            "path_edit": path_edit, "browse_btn": browse_btn,
+            "sync_btn": sync_btn, "apply_btn": apply_btn,
+            "stop_btn": stop_btn, "dedup_btn": dedup_btn,
+        }
+        # 动态行的信号就地连接（静态行的连接集中在 _wire_signals）
+        browse_btn.clicked.connect(lambda: self._on_pick_partition_path(row))
+        sync_btn.clicked.connect(lambda: self._on_sync_partition(row))
+        apply_btn.clicked.connect(self._on_apply_config)
+        stop_btn.clicked.connect(self._on_stop_sync)
+        dedup_btn.clicked.connect(lambda: self._on_dedup_partition(row))
+        enabled_chk.toggled.connect(lambda _on: self._enforce_partition_constraints(row))
+        default_btn.toggled.connect(lambda _on: self._enforce_partition_constraints(row))
+        self._partitions_lay.addWidget(row_w)
+        self._partition_rows.append(row)
+        return row
+
+    def _enforce_partition_constraints(
+        self, changed: Dict[str, Any]) -> None:
+        """分区行约束：有且仅一个默认；默认必须启用。"""
+        rows = self._partition_rows
+        if not any(r["default_btn"].isChecked() for r in rows
+                   if r["enabled_chk"].isChecked()):
+            # 没有任何「启用中的默认」→ 把第一个启用的行设为默认
+            first_enabled = next(
+                (r for r in rows if r["enabled_chk"].isChecked()), None)
+            if first_enabled is not None:
+                first_enabled["default_btn"].setChecked(True)
+        if changed["default_btn"].isChecked():
+            if not changed["enabled_chk"].isChecked():
+                changed["enabled_chk"].setChecked(True)  # 默认必须启用
+            for r in rows:
+                if r is not changed:
+                    if r["default_btn"].isChecked():
+                        r["default_btn"].blockSignals(True)
+                        r["default_btn"].setChecked(False)
+                        r["default_btn"].blockSignals(False)
+        if changed["enabled_chk"].isChecked() is False \
+                and changed["default_btn"].isChecked():
+            # 取消默认行的启用 → 把默认让给下一个启用行
+            changed["default_btn"].blockSignals(True)
+            changed["default_btn"].setChecked(False)
+            changed["default_btn"].blockSignals(False)
+            first_enabled = next(
+                (r for r in rows if r["enabled_chk"].isChecked()
+                 and r is not changed), None)
+            if first_enabled is not None:
+                first_enabled["default_btn"].setChecked(True)
+
+    def _on_add_partition_row(self) -> None:
+        """复制最后一行配置块生成新行（名称留空待用户修改）。"""
+        last = self._partition_rows[-1] if self._partition_rows else None
+        if last is not None:
+            self._make_partition_row(
+                name="",
+                path=last["path_edit"].text().strip(),
+                enabled=True,
+                default=False)
+        else:
+            self._make_partition_row()
+        self._enforce_partition_constraints(self._partition_rows[-1])
+        # 新增行后立即落盘：旧实现只改 UI 不写 config.rag_partitions，
+        # 用户加完行直接关闭/重启时新行丢失。名称保持留空（用户可见待填），
+        # _gather_partitions 会对「有路径无名称」的行自动用目录名兜底持久化。
+        self._gather_partitions()
+        self.config.save(CONFIG_PATH)
+
+    def _on_pick_partition_path(self, row: Dict[str, Any]) -> None:
+        d = QFileDialog.getExistingDirectory(
+            self, "选择知识分区源目录",
+            row["path_edit"].text().strip() or self.workspace_edit.text().strip())
+        if d:
+            row["path_edit"].setText(d)
+            # 名称留空时以目录名作为默认领域名
+            if not row["name_edit"].text().strip():
+                row["name_edit"].setText(os.path.basename(d) or "")
+
+    def _on_sync_partition(self, row: Dict[str, Any]) -> None:
+        """行内同步按钮：仅同步该分区（走 SyncKnowledgeWorker，带分区参数）。"""
+        name = row["name_edit"].text().strip()
+        path = row["path_edit"].text().strip()
+        if not path:
+            self._append_log("⚠ 请先填写该知识分区的源目录")
+            return
+        if not os.path.isdir(path):
+            self._append_log(f"⚠ 源目录不存在：{path}")
+            return
+        # 行内同步前先落盘分区配置：新增/改名后立即同步也不会在重启后丢失
+        self._gather_partitions()
+        self.config.save(CONFIG_PATH)
+        self._on_sync_knowledge(force=False, partition=name or None,
+                                partition_path=path)
+
+    def _apply_partitions(self) -> None:
+        """配置 → 分区行（清空重建）。"""
+        for row in self._partition_rows:
+            row["widget"].setParent(None)
+        self._partition_rows.clear()
+        # 分区行与「添加新知识库」按钮在同一垂直容器：先拆出按钮再放回，
+        # 保证按钮始终在行区末尾。
+        # 行构建可能早于 knowledge_base 默认值落位（ensure_workspace 在
+        # _gather_config_from_widgets 里才跑）：这里先确保默认 kb 存在，
+        # 否则首行会出现「默认但未启用且路径为空」的不一致状态。
+        kb_default = str(getattr(self.config, "knowledge_base", "") or "")
+        if not kb_default:
+            try:
+                self.config.ensure_workspace()
+                kb_default = os.path.join(self.config.workspace, "knowledge_base")
+                self.config.knowledge_base = kb_default
+                self.knowledge_base_edit.setText(kb_default)
+            except Exception:
+                kb_default = ""
+        parts = self.config.get_partitions() if hasattr(self.config, "get_partitions") else []
+        for p in parts:
+            self._make_partition_row(
+                name=str(p.get("name") or ""),
+                path=str(p.get("path") or ""),
+                enabled=bool(p.get("enabled", True)),
+                default=bool(p.get("default", False)))
+        if not parts:
+            # 无分区配置（老用户）→ 单行 = 旧 knowledge_base
+            self._make_partition_row(
+                name="默认知识库",
+                path=kb_default,
+                enabled=bool(kb_default),
+                default=True)
+        # 行尾追加「添加新知识库」按钮（每次重建移动一次）
+        self._partitions_lay.addWidget(self.add_partition_btn)
+
+    def _gather_partitions(self) -> str:
+        """分区行 → config.rag_partitions JSON + 同步 knowledge_base 镜像。"""
+        import json as _json
+        parts = []
+        for row in self._partition_rows:
+            name = row["name_edit"].text().strip()
+            path = row["path_edit"].text().strip()
+            if not name and not path:
+                continue  # 空行跳过
+            if not name:
+                name = os.path.basename(path) or "未命名知识库"
+            parts.append({
+                "name": name,
+                "path": path,
+                "enabled": bool(row["enabled_chk"].isChecked()),
+                "default": bool(row["default_btn"].isChecked()),
+            })
+        self.config.rag_partitions = _json.dumps(parts, ensure_ascii=False)
+        # 归一（默认分区唯一、名字去重）后把默认分区路径回写镜像，
+        # 供既有 7 处 knowledge_base_edit 读取点使用。
+        self.config._normalize_partitions()
+        parts = self.config.get_partitions()
+        for p in parts:
+            if p.get("default") and p.get("enabled"):
+                self.config.knowledge_base = str(p.get("path") or "")
+                self.knowledge_base_edit.setText(self.config.knowledge_base)
+                break
+        return self.config.rag_partitions
+
     def _sync_impl_fields(self, combo, name_edit, path_edit) -> None:
         """按实现下拉显隐「模型名 / 本地路径」：fastembed 显示模型名、隐藏路径；
         本地实现（mlx/onnx/gguf）显示路径、隐藏模型名。
@@ -3807,6 +4297,9 @@ class MainWindow(QMainWindow):
         path_edit.setVisible(not is_fastembed)
 
     def _gather_config_from_widgets(self) -> None:
+        # 分区行最先收集：会回写 knowledge_base 镜像（= 默认分区源目录），
+        # 后续所有 knowledge_base_edit 读取点拿到的是最新分区状态。
+        self._gather_partitions()
         self.config.base_url = self.base_url_edit.text().strip()
         self.config.api_key = self.api_key_edit.text().strip()
         self.config.model = self.model_combo.currentText().strip()
@@ -3927,8 +4420,43 @@ class MainWindow(QMainWindow):
         _num(self.chunk_overlap_edit, "rag_chunk_overlap", 50, int, "重叠")
         self.config.rag_matryoshka_enabled = self.matryoshka_chk.isChecked()
         self.config.rag_binary_prefilter_enabled = self.bin_prefilter_chk.isChecked()
+        try:
+            _bin_top_save = int(self.bin_prefilter_top_combo.currentText())
+        except (TypeError, ValueError):
+            _bin_top_save = 200
+        self.config.rag_binary_prefilter_top = (
+            _bin_top_save if _bin_top_save in (100, 200, 500) else 200)
+        # RAG 检索模式（三选一）+ 决策判定模式参数：显示标签 → 内部值，
+        # 数值项夹紧到下拉允许的选项（与 config._migrate 归一一致）。
+        self.config.rag_mode = _RAG_MODE_DISPLAY_TO_VALUE.get(
+            self.rag_mode_combo.currentText().strip(), "vector")
+        self.config.rag_decision_model_backend = (
+            _DECISION_BACKEND_DISPLAY_TO_VALUE.get(
+                self.decision_backend_combo.currentText().strip(), "mlx-vlm"))
+        self.config.rag_decision_model_path = self.decision_path_edit.text().strip()
+        try:
+            _dcoarse_save = int(self.decision_coarse_combo.currentText())
+        except (TypeError, ValueError):
+            _dcoarse_save = 50
+        self.config.rag_decision_coarse_k = (
+            _dcoarse_save if _dcoarse_save in (20, 50, 100) else 50)
+        self.config.rag_decision_use_core_sentences = \
+            self.decision_core_chk.isChecked()
+        try:
+            _dcore_save = int(self.decision_core_top_combo.currentText())
+        except (TypeError, ValueError):
+            _dcore_save = 3
+        self.config.rag_decision_core_top = (
+            _dcore_save if _dcore_save in (3, 5) else 3)
+        try:
+            _dtopn_save = int(self.decision_topn_combo.currentText())
+        except (TypeError, ValueError):
+            _dtopn_save = 5
+        self.config.rag_decision_top_n = (
+            _dtopn_save if _dtopn_save in (3, 5, 10) else 5)
         # 检索阅读模式（ColBERT）：UI 固定选项，仍夹紧兜底。
         self.config.rag_reading_mode_enabled = self.reading_mode_chk.isChecked()
+        self.config.rag_embed_background = self.embed_bg_chk.isChecked()
         self.config.rag_reading_quant_bits = (
             2 if "2" in self.reading_quant_combo.currentText() else 4)
         try:
@@ -4216,6 +4744,18 @@ class MainWindow(QMainWindow):
     # 向量去重（清理内容完全相同的重复向量，保留每组最早入库的一份）
     # ------------------------------------------------------------------
     def _on_dedup_vectors(self) -> None:
+        """全局向量去重（所有启用分区）。"""
+        self._dedup_vectors_impl(partition="")
+
+    def _on_dedup_partition(self, row: Dict[str, Any]) -> None:
+        """分区行向量去重：先落盘分区配置，再仅对该分区去重。"""
+        name = (row.get("name_edit").text().strip()
+                if row.get("name_edit") is not None else "")
+        self._gather_partitions()
+        self.config.save(CONFIG_PATH)
+        self._dedup_vectors_impl(partition=name or None)
+
+    def _dedup_vectors_impl(self, partition: Optional[str] = None) -> None:
         if getattr(self.config, "rag_reading_mode_enabled", False):
             QMessageBox.information(
                 self, "检索阅读模式",
@@ -4228,9 +4768,10 @@ class MainWindow(QMainWindow):
         if self._is_worker_running(self._sync_worker):
             QMessageBox.information(self, "提示", "知识同步正在进行，请先完成或停止同步再执行向量去重。")
             return
+        scope = partition or "所有启用分区"
         ret = QMessageBox.question(
             self, "向量去重",
-            "将扫描向量库中内容完全相同的向量，每组只保留最早入库的一份，"
+            f"将扫描【{scope}】向量库中内容完全相同的向量，每组只保留最早入库的一份，"
             "其余删除。\n\n用于清理不同目录下同一本书等原因造成的重复向量，"
             "降低检索噪声。\n\n此操作不可撤销，确定继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -4238,7 +4779,7 @@ class MainWindow(QMainWindow):
         )
         if ret != QMessageBox.StandardButton.Yes:
             return
-        self._dedup_worker = VectorDedupWorker(self.config)
+        self._dedup_worker = VectorDedupWorker(self.config, partition=partition or "")
         self._dedup_worker.dedup_log.connect(self._on_dedup_log)
         self._dedup_worker.dedup_progress.connect(self._on_dedup_progress)
         self._dedup_worker.dedup_finished.connect(self._on_dedup_finished)
@@ -4251,7 +4792,8 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 0)      # busy 态（总数未知）
         self.progress.setFormat("向量去重扫描中…")
         self._dedup_worker.start()
-        logger.info("向量去重已启动: kb=%s", self.config.knowledge_base)
+        logger.info("向量去重已启动: kb=%s partition=%s",
+                    self.config.knowledge_base, scope)
 
     def _on_dedup_log(self, line: str) -> None:
         self._append_log(line)
@@ -4299,21 +4841,36 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "向量去重失败", error[:500])
 
     def _set_kb_sync_state(self, text=None, enabled=None) -> None:
-        """刷新「开始同步」按钮状态：顶栏快捷按钮 + 设置区按钮两处保持一致。
+        """刷新「同步所有」按钮状态：顶栏快捷按钮 + 设置区按钮两处保持一致。
 
-        两处默认文案不同（顶栏「知识同步」/ 设置区「开始同步」），故恢复时
+        两处默认文案不同（顶栏「知识同步」/ 设置区「同步所有」），故恢复时
         各自回到自己的默认标签；进行中的临时文案（检查依赖…/同步中…）一致。
-        按钮尚未创建时（初始化早期）安全跳过。
+        同时联动各分区行的「同步 / 停止 / 去重」按钮。按钮尚未创建时安全跳过。
         """
-        for btn, default in ((getattr(self, "sync_knowledge_btn", None), "开始同步"),
+        for btn, default in ((getattr(self, "sync_knowledge_btn", None), "同步所有"),
                              (getattr(self, "kb_sync_btn", None), "知识同步")):
             if btn is None:
                 continue
             if enabled is not None:
                 btn.setEnabled(enabled)
             btn.setText(default if text is None else text)
+        # 分区行内的「同步 / 停止同步 / 向量去重」随全局同步状态联动：
+        # 同步进行中 → 行内同步/去重禁用、停止同步启用；结束后反之。
+        for row in getattr(self, "_partition_rows", []):
+            sb = row.get("sync_btn")
+            if sb is not None:
+                sb.setEnabled(bool(enabled) if enabled is not None else True)
+            db = row.get("dedup_btn")
+            if db is not None:
+                db.setEnabled(bool(enabled) if enabled is not None else True)
+            xb = row.get("stop_btn")
+            if xb is not None:
+                xb.setEnabled(not bool(enabled) if enabled is not None else False)
 
-    def _on_sync_knowledge(self, force: bool = False) -> None:
+    def _on_sync_knowledge(self, force: bool = False,
+                           partition: Optional[str] = None,
+                           partition_path: Optional[str] = None) -> None:
+        """同步知识：主按钮 = 全部启用分区；分区行「同步」= 仅该分区。"""
         if self._is_worker_running(self._sync_worker):
             logger.warning("Sync already running, ignoring duplicate request")
             return
@@ -4330,11 +4887,16 @@ class MainWindow(QMainWindow):
                 "Agent 正在执行（可能正在检索知识库）。请先「终止对话」后再"
                 "同步，避免 ingest 与检索同时操作向量表。")
             return
-        kb = self.knowledge_base_edit.text().strip()
+        # 分区行同步：分区名/源目录以行内值为准（config 可能尚未保存）
+        if partition is not None:
+            self._gather_partitions()
+            kb = partition_path or partition
+        else:
+            kb = self.knowledge_base_edit.text().strip()
+            if not kb:
+                QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
+                return
         ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
-        if not kb:
-            QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
-            return
         # 让知识同步区的 Embedding / Reranker 选择即时生效：把当前下拉与路径
         # 收敛进 config 并同步到 vector_store 的 provider 开关（否则需先点
         # 「应用配置/加载模型」才能让新建向量库用上所选实现）。
@@ -4344,7 +4906,8 @@ class MainWindow(QMainWindow):
             configure_local_models(self.config)
         except Exception as e:
             logger.warning("同步前应用 Embedding/Reranker 设置失败: %s", e)
-        logger.info("Knowledge sync triggered: kb=%s workspace=%s force=%s", kb, ws, force)
+        logger.info("Knowledge sync triggered: kb=%s workspace=%s force=%s "
+                    "partition=%s", kb, ws, force, partition)
         self._sync_active = True
         # Step 1: check dependencies before starting sync
         self._set_kb_sync_state("检查依赖…", False)
@@ -4356,8 +4919,11 @@ class MainWindow(QMainWindow):
         self._pending_sync_ws = ws
         self._pending_sync_kb = kb
         self._pending_sync_force = force
-        logger.info("UI: starting sync — kb=%s force=%s", kb, force)
-        self._append_log("[rag] ────────── 开始知识库同步 ──────────")
+        self._pending_sync_partition = partition
+        logger.info("UI: starting sync — kb=%s force=%s partition=%s",
+                    kb, force, partition)
+        label = f"[{partition}] " if partition else ""
+        self._append_log(f"[rag] ────────── 开始知识库同步{label}──────────")
         self._deps_worker = InstallDepsWorker(kb)
         self._deps_worker.progress.connect(self._on_deps_progress)
         self._deps_worker.deps_finished.connect(self._on_deps_finished)
@@ -4636,9 +5202,11 @@ class MainWindow(QMainWindow):
         ws = getattr(self, "_pending_sync_ws", "")
         kb = getattr(self, "_pending_sync_kb", "")
         force = getattr(self, "_pending_sync_force", False)
+        partition = getattr(self, "_pending_sync_partition", "") or ""
         self._pending_sync_ws = ""
         self._pending_sync_kb = ""
         self._pending_sync_force = False
+        self._pending_sync_partition = ""
         if not ws or not kb:
             self._set_kb_sync_state(enabled=True)
             self.stop_sync_btn.setEnabled(False)
@@ -4683,6 +5251,7 @@ class MainWindow(QMainWindow):
             embedding_model=self.config.rag_embedding_model,
             force=force,
             config=self.config,
+            partition=partition,
         )
         self._sync_worker.sync_finished.connect(self._on_sync_finished)
         self._sync_worker.sync_failed.connect(self._on_sync_failed)

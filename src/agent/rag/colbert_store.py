@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import os
@@ -41,6 +42,15 @@ _MAX_TOP_K = 30
 
 class ColBertStoreError(RuntimeError):
     pass
+
+
+def _needs_open(fn):
+    """公共入口装饰器：close() 后复用单例时自动重连（自愈）。"""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        self._require_open()
+        return fn(self, *args, **kwargs)
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -164,15 +174,28 @@ def maxsim_stream(query_vectors: np.ndarray, blob: bytes, token_count: int,
 # ---------------------------------------------------------------------------
 
 
+# Weighted RRF 通道权重：与 vector_store.search_with_rerank 保持一致——
+# 语义主通道（ColBERT 向量）0.7、BM25 关键词补通道 0.3。
+_RRF_VEC_WEIGHT = 0.7
+_RRF_FTS_WEIGHT = 0.3
+
+
 def rrf_fuse(rankings: Sequence[Sequence[str]], k: float = _RRF_K,
-             limit: int = 20) -> List[Tuple[str, float]]:
-    """Reciprocal Rank Fusion：score = Σ 1/(k + rank)。"""
+             limit: int = 20,
+             weights: Optional[Sequence[float]] = None,
+             ) -> List[Tuple[str, float]]:
+    """Weighted Reciprocal Rank Fusion：score = Σ w_i / (k + rank)。
+
+    ``weights`` 为每路的通道权重（缺省全 1 = 标准 RRF）。
+    """
+    if weights is None:
+        weights = [1.0] * len(rankings)
     scores: Dict[str, float] = {}
-    for ranking in rankings:
+    for ranking, weight in zip(rankings, weights):
         for rank, doc_id in enumerate(ranking):
             if not doc_id:
                 continue
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1.0)
+            scores[doc_id] = scores.get(doc_id, 0.0) + weight / (k + rank + 1.0)
     return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:limit]
 
 
@@ -286,6 +309,10 @@ class ColBertDocStore:
         self._ann_ready = False
         # 语义切片编码器：默认 model2vec 静态句向量（测试可注入 Fake）。
         self._chunk_encoder = None
+        self._connect()
+
+    def _connect(self) -> None:
+        """打开 LanceDB 连接与四表（close 后由 _require_open 惰性重连）。"""
         try:
             import lancedb
         except ImportError as e:
@@ -296,6 +323,30 @@ class ColBertDocStore:
         self._res = self._open("doc_residuals", _RES_SCHEMA)
         self._meta = self._open("doc_meta", _META_SCHEMA)
 
+    def close(self) -> None:
+        """释放 LanceDB 连接与表引用。
+
+        ColBERT runtime（ONNX 会话）是进程级单例（``get_runtime``），被普通
+        模式引擎与多次 store 重建共享，**不**在此释放；只断开本 store 持有的
+        LanceDB 句柄——引擎 ``close()``/ToolRegistry ``shutdown()`` 调用，
+        下次操作惰性重建。
+        """
+        self._db = None
+        self._doc = self._vec = self._res = self._meta = None
+        self._fts_ready = False
+        self._ann_ready = False
+
+    def _require_open(self) -> None:
+        """close() 后惰性重连（连接与表引用被清空时重新打开）。
+
+        store 经 ``get_store_for_workspace`` 以模块级单例共享：引擎 close()
+        丢弃引用后，注册表里的同一对象可能被下一个引擎继续使用——公共入口
+        统一经 ``@_needs_open`` 自愈重连，避免静默空结果。
+        """
+        if self._db is None:
+            with self._write_lock:
+                if self._db is None:
+                    self._connect()
     def _open(self, name: str, schema: pa.Schema):
         try:
             table = self._db.open_table(name)
@@ -337,6 +388,7 @@ class ColBertDocStore:
             except Exception:
                 pass
 
+    @_needs_open
     def index_text(self, title: str, text: str, source: str = "",
                    overwrite: bool = True,
                    max_chars: int = DEFAULT_MAX_CHARS,
@@ -366,6 +418,7 @@ class ColBertDocStore:
             title, source or title, [c.content for c in chunks],
             quant_bits=quant_bits, overwrite=overwrite)
 
+    @_needs_open
     def add_chunks(self, title: str, source: str, texts: Sequence[str],
                    quant_bits: int = 4, overwrite: bool = True) -> int:
         """对**已切好的**切片做剪枝/编码/量化并写入三表。
@@ -428,6 +481,7 @@ class ColBertDocStore:
             self._ensure_fts()
         return len(doc_rows)
 
+    @_needs_open
     def index_path(self, path: str, overwrite: bool = True,
                    quant_bits: int = 4) -> Dict[str, Any]:
         path = os.path.abspath(os.path.expanduser(path))
@@ -513,6 +567,7 @@ class ColBertDocStore:
             pass
         return q.limit(limit).to_list()
 
+    @_needs_open
     def search(self, query: str, top_k: int = 5, coarse_k: int = 20,
                include_content: bool = True,
                max_content_chars: int = 1500,
@@ -615,8 +670,12 @@ class ColBertDocStore:
         # 「双通道都命中但排名靠后」的候选取代）。实测 126 切片、16 条查询，
         # 精排最优切片能被粗筛召回的比例：RRF 截断 12/16，并集 14/16；而
         # MaxSim 每候选仅约 0.2ms，扩大候选几乎不增加检索延迟。
+        # Weighted RRF（通道顺序 [BM25, ColBERT向量]）：ColBERT 语义是主通道
+        # 0.7、BM25 关键词补通道 0.3，与普通模式 search_with_rerank 的加权一致。
         rrf_scores = dict(rrf_fuse([bm25_ids, vec_ids], limit=len(bm25_ids)
-                                   + len(vec_ids)))
+                                   + len(vec_ids),
+                                   weights=[_RRF_FTS_WEIGHT,
+                                            _RRF_VEC_WEIGHT]))
         ids: List[str] = []
         seen_ids: set = set()
         for doc_id in bm25_ids + vec_ids:
@@ -683,6 +742,7 @@ class ColBertDocStore:
         return hits[:top_k]
 
     # ------------------------------------------------------------------ admin
+    @_needs_open
     def list_documents(self, limit: int = 50) -> List[Dict[str, Any]]:
         """按来源去重列出文档（同一文档的多个切片只出现一次）。"""
         try:
@@ -705,6 +765,7 @@ class ColBertDocStore:
                 break
         return out
 
+    @_needs_open
     def get_chunk_window(self, source: str,
                          chunk_index: Any) -> Dict[str, Any]:
         """返回当前切片 + 同文档前/后片（供切片阅读器翻页）。"""
@@ -744,6 +805,7 @@ class ColBertDocStore:
                 "prev": _to_chunk(by_idx.get(idx - 1)),
                 "next": _to_chunk(by_idx.get(idx + 1))}
 
+    @_needs_open
     def build_ann_index(self, rebuild: bool = True) -> Dict[str, Any]:
         """构建/续建 LanceDB 中心向量 ANN 索引。
 
@@ -772,6 +834,7 @@ class ColBertDocStore:
                 return {"built": False, "vectors": rows,
                         "message": f"ANN 索引构建失败（可继续使用精确扫描）：{e}"}
 
+    @_needs_open
     def delete_matching(self, keyword: str) -> int:
         """按 source/title 子串删除所有匹配文档（知识遗忘/按名删除）。"""
         keyword = (keyword or "").strip()
@@ -792,6 +855,7 @@ class ColBertDocStore:
                 removed += self.delete(source=source)
         return removed
 
+    @_needs_open
     def delete(self, doc_id: str = "", source: str = "",
                title: str = "") -> int:
         prefix = ""
@@ -817,6 +881,7 @@ class ColBertDocStore:
             self._fts_ready = False
             return max(0, before - self._doc.count_rows())
 
+    @_needs_open
     def clear(self) -> None:
         """清空全部表（知识库清空/重建时调用）。"""
         with self._write_lock:
@@ -833,6 +898,7 @@ class ColBertDocStore:
             self._fts_ready = False
             self._ann_ready = False
 
+    @_needs_open
     def stats(self) -> Dict[str, int]:
         return {
             "documents": self._doc.count_rows(),
@@ -842,6 +908,35 @@ class ColBertDocStore:
         }
 
     # ------------------------------------------------------------- doc meta
+    @_needs_open
+    def resolve_source(self, doc_name: str) -> str:
+        """按 doc_name（相对路径 / basename / 标题）反查切片表的真实 source。
+
+        doc_meta 的 doc_id = sha1(source)，必须与切片行同源，否则
+        ``delete(source=)`` / ``_delete_prefix`` 清不掉 → 孤儿 meta 行在
+        删除/迁移后仍被 list_doc_names 列出。doc_name 侧的名字（documents
+        表展示名）与切片 source 可能不同（目录同名文件、清洗差异），这里
+        按精确路径 → basename → 标题三级匹配取任一行的 source。
+        """
+        name = (doc_name or "").strip()
+        if not name:
+            return ""
+        base = os.path.basename(name).replace("'", "''")
+        name_esc = name.replace("'", "''")
+        conds = (f"source = '{name_esc}'", f"source LIKE '%/{base}'",
+                 f"title = '{name_esc}'")
+        for cond in conds:
+            try:
+                rows = self._doc.search().where(cond).limit(1).to_list()
+            except Exception:
+                rows = []
+            for r in rows:
+                s = (r.get("source") or "").strip()
+                if s:
+                    return s
+        return ""
+
+    @_needs_open
     def upsert_doc_meta(self, doc_name: str, digest: str,
                         chapters: str = "", md_path: str = "",
                         source: str = "") -> None:
@@ -873,14 +968,18 @@ class ColBertDocStore:
 
     def _meta_rows(self) -> List[Dict[str, Any]]:
         try:
-            return self._meta.search().limit(5000).to_list()
+            # 上限 50000：每文档一行，超过 5000 本的库也会被静默截断（旧值
+            # 5000）；单次全量读 meta 行（digest/chapters JSON）内存可承受。
+            return self._meta.search().limit(50000).to_list()
         except Exception:
             return []
 
+    @_needs_open
     def all_meta_rows(self) -> List[Dict[str, Any]]:
         """doc_meta 表全部行的浅拷贝（供批量对账一次性快照）。"""
         return [dict(r) for r in self._meta_rows()]
 
+    @_needs_open
     def get_doc_meta(self, doc_name: str) -> Optional[Dict[str, Any]]:
         """按名返回 {doc_name, digest, chapters, md_path}；语义对齐
         ``VectorStore.get_document_digest``：精确/doc_name/basename 大小写
@@ -907,12 +1006,14 @@ class ColBertDocStore:
                 return out(r)
         return None
 
+    @_needs_open
     def list_doc_names(self) -> List[str]:
         """列出有元数据的文档名（对齐 ``VectorStore.list_documents``）。"""
         rows = self._meta_rows()
         return sorted({r.get("doc_name", "") for r in rows
                        if r.get("doc_name")})
 
+    @_needs_open
     def delete_doc_meta(self, doc_name: str) -> None:
         """按 doc_name 字面量删除元数据行（普通表 delete_document 的对应物）。"""
         safe = (doc_name or "").replace("'", "''")

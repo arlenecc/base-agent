@@ -19,12 +19,24 @@ sys.path.insert(0, str(ROOT / "tests"))
 from conftest import FakeEmbeddingFunction  # noqa: E402
 
 
+_TOPICS = {
+    0: "海洋生态观测记录了珊瑚礁区域的物种丰度、水温变化与酸化趋势，样本覆盖近海三个典型观测站。",
+    1: "行星地质勘探分析了陨石坑分布规律与表面矿物光谱特征，着陆点选址依赖高分辨率轨道影像。",
+    2: "古典音乐分析比较了奏鸣曲式的调性布局、主题变形与和声进行，乐谱版本考据佐证了风格演变。",
+}
+
+
 def _make_kb(tmp_path, n_files: int = 3):
     kb = tmp_path / "kb"
     kb.mkdir()
+    # 注意：各册正文主题必须**实质不同**。SimHash 相似去重（转 Markdown 后、
+    # 切片入库前）会把近重复文档整篇跳过——旧 fixture 三册只差「第X章」的
+    # 数字，指纹海明距离 ≤3，除 book_0 外全被判相似重复跳过，不再产生
+    # 分阶段耗时日志行。
     for i in range(n_files):
         body = " ".join(
-            f"第{i}章第{s}段：这是用于同步耗时验证的正文内容，包含足够长度以便切分。" * 6
+            f"第{i}章第{s}段：{_TOPICS[i % len(_TOPICS)]}"
+            f"（用于同步耗时验证，包含足够长度以便切分。）" * 6
             for s in range(30)
         )
         (kb / f"book_{i}.txt").write_text(body)

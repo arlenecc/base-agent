@@ -54,9 +54,14 @@ def fake_ef():
 
 @pytest.fixture(scope="session")
 def rag_engine_factory(fake_ef):
-    """Factory that creates RAGEngine instances with the fake embedding function."""
+    """Factory that creates RAGEngine instances with the fake embedding function.
+
+    默认 embed_background=False（同步嵌入）：存量引擎测试断言「同步完成后
+    向量立即可检索」，异步填充由 test_vector_backfill.py 专项覆盖。
+    """
     def _make(workspace, knowledge_base="", **kwargs):
         from agent.rag.engine import RAGEngine
+        kwargs.setdefault("embed_background", False)
         return RAGEngine(
             workspace=workspace,
             knowledge_base=knowledge_base,

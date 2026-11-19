@@ -156,6 +156,43 @@ def test_engine_dedup_without_cache_falls_back_to_source_order(dedup_engine):
     assert rows[0]["source"] == a                 # 字典序小者胜出
 
 
+def test_engine_dedup_partition_scope(tmp_path, rag_engine_factory):
+    """dedup_vectors(partition=) 只清目标分区；不存在的分区返回 error。"""
+    parts = [
+        {"name": "法律", "path": str(tmp_path / "law"), "enabled": True, "default": True},
+        {"name": "医学", "path": str(tmp_path / "med"), "enabled": True, "default": False},
+    ]
+    import json as _json
+    eng = rag_engine_factory(workspace=str(tmp_path / "ws"),
+                             knowledge_base=parts[0]["path"],
+                             rag_partitions=_json.dumps(parts, ensure_ascii=False))
+    # 两个分区各造一组重复（两源同文本）
+    for part in parts:
+        eng._set_active_partition(part)
+        try:
+            store = eng._get_store()
+            for src in ("a.pdf", "b.pdf"):
+                store.add([{"source": src, "chunk_index": 0, "text": "分区内重复内容"}])
+        finally:
+            eng._reset_active_partition()
+
+    # 只清「法律」：目标分区 removed=1，统计带 partition:法律 明细
+    scoped = eng.dedup_vectors(partition="法律")
+    assert scoped.get("removed") == 1
+    assert any(k.startswith("partition:") and "法律" in k for k in scoped)
+
+    # 未知分区名按既有 slug 语义回退到默认分区（与 ingest 一致），不清别的分区
+    err = eng.dedup_vectors(partition="不存在")
+    assert "error" not in err  # 回退默认分区，不报错
+
+    # 医学分区仍保留重复（未被误清）
+    eng._set_active_partition(parts[1])
+    try:
+        assert eng._get_store().count() == 2
+    finally:
+        eng._reset_active_partition()
+
+
 # ---------------------------------------------------------------------------
 # VectorDedupWorker（UI 线程壳）——直接同步调 run()，不起真线程
 # ---------------------------------------------------------------------------
@@ -173,7 +210,8 @@ def test_vector_dedup_worker_run_emits_stats(qtbot, tmp_path, monkeypatch):
         def __init__(self, **kw):
             captured["init"] = kw
 
-        def dedup_vectors(self, progress_callback=None):
+        def dedup_vectors(self, progress_callback=None, partition=""):
+            captured["partition"] = partition
             if progress_callback is not None:
                 progress_callback(5, 10, "已扫描 5/10 条向量")
             return {"scanned": 10, "groups": 2, "removed": 3}
@@ -183,13 +221,14 @@ def test_vector_dedup_worker_run_emits_stats(qtbot, tmp_path, monkeypatch):
     cfg = AgentConfig()
     cfg.workspace = str(tmp_path)
     cfg.knowledge_base = str(tmp_path / "kb")
-    worker = VectorDedupWorker(cfg)
+    worker = VectorDedupWorker(cfg, partition="法律")
     got = {}
     worker.dedup_finished.connect(lambda s: got.update(stats=s))
     worker.dedup_progress.connect(lambda c, t, m: got.update(prog=(c, t, m)))
     worker.run()
     assert got["stats"] == {"scanned": 10, "groups": 2, "removed": 3}
     assert got["prog"] == (5, 10, "已扫描 5/10 条向量")
+    assert captured["partition"] == "法律"   # worker 透传分区参数给引擎
     # embedding_model 回退值必须解析成非空（DEFAULT_EMBEDDING_MODEL）
     assert captured["init"]["embedding_model"]
     assert captured["init"]["workspace"] == str(tmp_path)

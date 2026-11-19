@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 
 import pytest
 
@@ -40,6 +41,11 @@ def _make_window(tmp_path, monkeypatch):
     import agent.ui.main_window as mw
 
     monkeypatch.setattr(mw, "CONFIG_PATH", str(tmp_path / "cfg.json"))
+    # AgentConfig 默认 llm_provider="local"：本地 MLX 权重加载 + 系统 KV 预热
+    # 会让每次 _on_apply_config 卡在 preload_kv 数分钟（GB 级权重预热）。
+    # 测试统一预写 API provider 配置（API 客户端无 preload_system_kv，即点即用）。
+    (tmp_path / "cfg.json").write_text(json.dumps(
+        {"llm_provider": "api", "aux_llm_provider": "api"}))
     win = mw.MainWindow()
     # Isolate the workspace + skill history so the agent never touches the
     # user's real ~/base-agent-workspace (which could trigger a skill-suggestion
@@ -211,6 +217,11 @@ def test_load_model_button_shows_ready_state(qtbot, tmp_path, monkeypatch):
     # 类级替换：避免真实加载权重（仅验证 UI 按钮态切换逻辑）。
     monkeypatch.setattr(LocalLLMClient, "_ensure_model", lambda self: None)
     monkeypatch.setattr(mw, "CONFIG_PATH", str(tmp_path / "cfg.json"))
+    # 显式写 local provider 配置；并禁用启动自动预加载——否则 MainWindow()
+    # 启动即后台预热（_warming=True），点击「加载模型」会命中「正在预热」
+    # 模态警告框，offscreen 模式下没人点确定 → 测试永久挂起。
+    (tmp_path / "cfg.json").write_text(json.dumps({"llm_provider": "local"}))
+    monkeypatch.setattr(mw.MainWindow, "_auto_load_startup", lambda self: None)
     win = mw.MainWindow()
     win.workspace_edit.setText(str(tmp_path / "ws"))
     qtbot.addWidget(win)
@@ -220,13 +231,15 @@ def test_load_model_button_shows_ready_state(qtbot, tmp_path, monkeypatch):
     assert win.load_main_btn.text() == "加载模型"
     assert GREEN not in win.load_main_btn.styleSheet()
     # 点击加载 → 后台预加载成功 → 置绿 + 「重新加载」
+    # （窗口放宽到 10s：全量套件批量跑时机器繁忙，daemon 预热线程可能
+    # 错过 3s 窗口——等待的是线程调度，不是真实权重加载，放宽无副作用）
     win._on_load_main_model()
-    qtbot.waitUntil(lambda: GREEN in win.load_main_btn.styleSheet(), timeout=3000)
+    qtbot.waitUntil(lambda: GREEN in win.load_main_btn.styleSheet(), timeout=10000)
     assert win.load_main_btn.text() == "重新加载"
     # 后台 worker 加载完会紧接着做预热，状态栏会短暂经过「预热中」再回到
     # 最终态；等最终态而不是断言某一瞬时值，避免与 worker 线程竞态。
     qtbot.waitUntil(
-        lambda: win.status_label.text() == "主模型已就绪，可对话", timeout=3000)
+        lambda: win.status_label.text() == "主模型已就绪，可对话", timeout=10000)
     assert win.status_label.text() == "主模型已就绪，可对话"
     # 卸载 → 复位
     win._on_unload_main_model()
@@ -805,3 +818,160 @@ def test_pick_model_path_onnx_file_mode(qtbot, monkeypatch):
     assert seen["mode"] == "file"
     assert "onnx" in seen["filt"].lower()
     assert edit.text() == "/x/model.onnx"
+
+
+# ---------------------------------------------------------------------------
+# RAG 模式三选一配置区（向量 / 极速 / 决策判定）
+# ---------------------------------------------------------------------------
+
+def test_rag_mode_combo_switches_group_visibility(qtbot, tmp_path, monkeypatch):
+    """切换检索模式下拉：只显示当前模式对应的配置行组。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    # offscreen 下面板宿主 _config_host 是 hide 的，isVisible/isVisibleTo 恒为
+    # False——用 isHidden() 判断控件自身的显式显隐状态（setVisible 直接驱动）。
+    vis = lambda w: not w.isHidden()  # noqa: E731
+    # 默认向量检索模式：向量组可见、极速/决策组隐藏
+    assert vis(win.rag_vector_w)
+    assert not vis(win.rag_fast_w)
+    assert not vis(win.rag_decision_w)
+    # 切到决策判定模式
+    win.rag_mode_combo.setCurrentText("决策判定模式")
+    assert not vis(win.rag_vector_w)
+    assert not vis(win.rag_fast_w)
+    assert vis(win.rag_decision_w)
+    # 切到极速检索模式
+    win.rag_mode_combo.setCurrentText("极速检索模式")
+    assert not vis(win.rag_vector_w)
+    assert vis(win.rag_fast_w)
+    assert not vis(win.rag_decision_w)
+
+
+def test_partition_rows_add_copy_mutex_roundtrip(qtbot, tmp_path, monkeypatch):
+    """分区行：添加复制上一行、默认互斥、保存/回填 roundtrip。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    # 初始单行（默认知识库）：启用 + 默认
+    assert len(win._partition_rows) == 1
+    r0 = win._partition_rows[0]
+    assert r0["enabled_chk"].isChecked() and r0["default_btn"].isChecked()
+    # 添加新知识库 → 复制上一行源目录，名称留空
+    win.add_partition_btn.click()
+    assert len(win._partition_rows) == 2
+    r1 = win._partition_rows[1]
+    assert r1["path_edit"].text() == r0["path_edit"].text()
+    assert r1["name_edit"].text() == ""
+    r1["name_edit"].setText("法律")
+    # 默认互斥：r1 设默认 → r0 取消默认
+    r1["default_btn"].setChecked(True)
+    assert not r0["default_btn"].isChecked()
+    assert r1["enabled_chk"].isChecked()  # 默认必须启用
+    # 保存 → config.rag_partitions；knowledge_base 镜像 = 默认分区
+    win._gather_config_from_widgets()
+    import json as _json
+    parts = _json.loads(win.config.rag_partitions)
+    assert len(parts) == 2 and parts[1]["name"] == "法律"
+    assert win.config.knowledge_base == parts[0]["path"]
+    # 回填 → 行重建且状态保持
+    win._apply_config_to_widgets()
+    assert len(win._partition_rows) == 2
+    names = [r["name_edit"].text() for r in win._partition_rows]
+    assert "法律" in names
+    defaults = [r for r in win._partition_rows if r["default_btn"].isChecked()]
+    assert len(defaults) == 1 and defaults[0]["name_edit"].text() == "法律"
+
+
+def test_partition_rows_empty_row_skipped_in_gather(qtbot, tmp_path, monkeypatch):
+    """名称与路径全空的行在保存时被跳过。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    win.add_partition_btn.click()  # 复制了一行（有路径）→ 清空成空行
+    r1 = win._partition_rows[1]
+    r1["path_edit"].setText("")
+    win._gather_config_from_widgets()
+    import json as _json
+    parts = _json.loads(win.config.rag_partitions)
+    assert len(parts) == 1
+
+
+def test_rag_partitions_config_field_in_whitelist():
+    """rag_partitions 在 _STR_FIELDS 白名单（可保存/加载）。"""
+    from agent.config import AgentConfig
+    import json as _json
+    cfg = AgentConfig(rag_partitions=_json.dumps(
+        [{"name": "法律", "path": "/l", "enabled": True, "default": True}]))
+    p = tmp_cfg_path = os.path.join(tempfile.mkdtemp(), "cfg.json")
+    cfg.save(p)
+    cfg2 = AgentConfig.load(p)
+    parts = cfg2.get_partitions()
+    assert parts and parts[0]["name"] == "法律"
+
+
+def test_rag_decision_config_roundtrip(qtbot, tmp_path, monkeypatch):
+    """决策模式配置：UI → config → 落盘 → 重载回填保持一致。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    win.rag_mode_combo.setCurrentText("决策判定模式")
+    win.decision_backend_combo.setCurrentText("MLX-LM")
+    win.decision_path_edit.setText("/models/my-judge")
+    win.decision_coarse_combo.setCurrentText("100")
+    win.decision_core_chk.setChecked(False)
+    win.decision_core_top_combo.setCurrentText("5")
+    win.decision_topn_combo.setCurrentText("10")
+    win._gather_config_from_widgets()
+    assert win.config.rag_mode == "decision"
+    assert win.config.rag_decision_model_backend == "mlx-lm"
+    assert win.config.rag_decision_model_path == "/models/my-judge"
+    assert win.config.rag_decision_coarse_k == 100
+    assert win.config.rag_decision_use_core_sentences is False
+    assert win.config.rag_decision_core_top == 5
+    assert win.config.rag_decision_top_n == 10
+    # 落盘 → 重载 → 回填（_make_window 会预写 api provider 隔离配置，
+    # 这里直接把 cfg2 注入 win2.config 再回填，专测回填逻辑本身）
+    win.config.save(tmp_path / "rt.json")
+    from agent.config import AgentConfig
+    cfg2 = AgentConfig.load(str(tmp_path / "rt.json"))
+    assert cfg2.rag_mode == "decision"
+    assert cfg2.rag_decision_top_n == 10
+    win2 = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win2)
+    win2.config = cfg2
+    win2._apply_config_to_widgets()
+    assert win2.rag_mode_combo.currentText() == "决策判定模式"
+    assert win2.decision_backend_combo.currentText() == "MLX-LM"
+    assert win2.decision_path_edit.text() == "/models/my-judge"
+    assert win2.decision_coarse_combo.currentText() == "100"
+    assert win2.decision_core_chk.isChecked() is False
+    assert win2.decision_core_top_combo.currentText() == "5"
+    assert win2.decision_topn_combo.currentText() == "10"
+
+
+def test_workspace_row_lives_in_new_group(qtbot, tmp_path, monkeypatch):
+    """工作目录/源目录行已迁入「工作目录配置区」：控件与保存逻辑不变。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    ws = str(tmp_path / "ws2")
+    win.workspace_edit.setText(ws)
+    win._gather_config_from_widgets()
+    assert win.config.workspace == ws
+    # 源知识库可选，留空回退默认
+    win.knowledge_base_edit.setText("")
+    win._gather_config_from_widgets()
+    assert win.config.knowledge_base.endswith("knowledge_base")
+
+
+def test_fast_mode_forces_binary_prefilter(tmp_path):
+    """极速检索模式：configure_local_models 强制开启二值粗筛，勾选值只在其它模式生效。"""
+    from agent.local import factory
+    from agent.rag import vector_store as vs
+    try:
+        cfg = AgentConfig(rag_mode="fast", rag_binary_prefilter_enabled=False,
+                          rag_binary_prefilter_top=500)
+        factory.configure_local_models(cfg)
+        assert vs._BINARY_PREFILTER_ENABLED is True
+        assert vs._BINARY_PREFILTER_TOP == 500
+        cfg2 = AgentConfig(rag_mode="vector", rag_binary_prefilter_enabled=False)
+        factory.configure_local_models(cfg2)
+        assert vs._BINARY_PREFILTER_ENABLED is False
+    finally:
+        vs.reset_local_providers()

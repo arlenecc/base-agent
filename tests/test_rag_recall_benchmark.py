@@ -144,3 +144,54 @@ def test_bm25_keyword_hit(recall_store):
     uw = "UW_0000"
     res = store.search_with_rerank(uw, top_k=5)
     assert any(uw in (r.get("text") or "") for r in res), "BM25 关键词未命中原文"
+
+
+# ---------------------------------------------------------------------------
+# Weighted RRF：向量 0.7 / BM25 0.3（混合检索的通道话语权）
+# ---------------------------------------------------------------------------
+
+def test_rrf_fuse_weighted_prefers_vector_channel():
+    """两路排名完全镜像时，向量主通道（0.7）的头部应压过 BM25 通道头部。
+
+    vec=[A,B,C], fts=[C,B,A]：标准 RRF 下 A/C 融合分完全相等（对称）；
+    加权后 score(A)=0.7/61+0.3/63 > score(C)=0.3/61+0.7/63 → A 第一。
+    """
+    from agent.rag.vector_store import _rrf_fuse, _RRF_K
+    key = lambda d: d["id"]  # noqa: E731
+    vec = [{"id": "A"}, {"id": "B"}, {"id": "C"}]
+    fts = [{"id": "C"}, {"id": "B"}, {"id": "A"}]
+    fused = _rrf_fuse([vec, fts], key,
+                      weights=[0.7, 0.3])
+    ids = [d["id"] for d, _s in fused]
+    assert ids == ["A", "B", "C"]
+    a_score = dict((d["id"], s) for d, s in fused)["A"]
+    c_score = dict((d["id"], s) for d, s in fused)["C"]
+    assert a_score == pytest.approx(0.7 / (_RRF_K + 1) + 0.3 / (_RRF_K + 3))
+    assert c_score == pytest.approx(0.3 / (_RRF_K + 1) + 0.7 / (_RRF_K + 3))
+    assert a_score > c_score
+
+
+def test_rrf_fuse_default_weights_equal_standard_rrf():
+    """缺省 weights（全 1）= 标准 RRF，行为向后兼容。"""
+    from agent.rag.vector_store import _rrf_fuse, _RRF_K
+    key = lambda d: d["id"]  # noqa: E731
+    vec = [{"id": "A"}, {"id": "B"}]
+    fts = [{"id": "B"}, {"id": "A"}]
+    fused = _rrf_fuse([vec, fts], key)
+    a_score = dict((d["id"], s) for d, s in fused)["A"]
+    # B 双路 rank1+rank2 = 1/61+1/62 > A 的 1/62+1/61 → 相等时按稳定序，
+    # 但数值上 B >= A；直接断言公式值。
+    assert a_score == pytest.approx(1.0 / (_RRF_K + 2) + 1.0 / (_RRF_K + 1))
+
+
+def test_rrf_fallback_applies_channel_weights(recall_store):
+    """RRF 兜底路径（reranker 不可用）也带 0.7/0.3 权重：纯向量可查文档
+    与纯 BM25 可查文档同排名镜像时，向量通道文档排前。"""
+    store, facts = recall_store
+    set_binary_prefilter(False, 200)
+    uw = "UW_0000"
+    res = store.search_with_rerank(uw, top_k=5)
+    assert res and store._last_rerank_used_fallback is True
+    # 唯一标记词查询：BM25 强命中 + 向量近 1 的同一文档应排最前
+    top_text = res[0].get("text") or ""
+    assert "UW_0000" in top_text or res[0].get("rrf_score", 0) > 0

@@ -28,7 +28,7 @@ import threading
 import time
 import warnings
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -947,6 +947,11 @@ def _table_vector_dim(table: Any) -> Optional[int]:
 
 # RRF 常数：工业界默认 60（rank 越靠前贡献越大，但单一通道的头部不垄断排序）。
 _RRF_K = 60
+# Weighted RRF 通道权重：score = Σ w_i / (k + rank)。语义召回（向量）是混合
+# 检索的主通道（同义改写/跨语言），BM25 只补关键词精确命中（专名/书名/错误码），
+# 故向量 0.7、BM25 0.3——避免关键词字面巧合把弱语义候选抬进头部。
+_RRF_VEC_WEIGHT = 0.7
+_RRF_FTS_WEIGHT = 0.3
 # 送入 cross-encoder 精排的候选上限（RRF 粗排后截断）。默认池 = 2 × top_k × 4，
 # top_k=5 时仅 40 条不会触发；top_k 调大或候选倍率调大时防止精排候选爆炸。
 _RERANK_MAX_CANDIDATES = 60
@@ -956,20 +961,24 @@ def _rrf_fuse(
     rankings: List[List[Dict[str, Any]]],
     key_fn: Any,
     k: int = _RRF_K,
+    weights: Optional[List[float]] = None,
 ) -> List[Tuple[Dict[str, Any], float]]:
-    """Reciprocal Rank Fusion：score = Σ 1/(k + rank)。
+    """Weighted Reciprocal Rank Fusion：score = Σ w_i / (k + rank)。
 
     ``rankings`` 为多路「已按相关度降序」的候选列表（rank 从 1 计）；
-    同一候选（``key_fn`` 相同）在多路出现时分数累加——这正是 RRF 的价值：
-    两路都靠前的候选显著胜出，单路头部不会垄断。返回 ``[(候选, 融合分)]``
-    按融合分降序。
+    ``weights`` 为每路的通道权重（缺省全 1 = 标准 RRF）。同一候选
+    （``key_fn`` 相同）在多路出现时加权分数累加——这正是 RRF 的价值：
+    两路都靠前的候选显著胜出，权重则控制各路的相对话语权。返回
+    ``[(候选, 融合分)]`` 按融合分降序。
     """
+    if weights is None:
+        weights = [1.0] * len(rankings)
     scores: Dict[Any, float] = {}
     items: Dict[Any, Dict[str, Any]] = {}
-    for ranking in rankings:
+    for ranking, weight in zip(rankings, weights):
         for rank, item in enumerate(ranking, start=1):
             kk = key_fn(item)
-            scores[kk] = scores.get(kk, 0.0) + 1.0 / (k + rank)
+            scores[kk] = scores.get(kk, 0.0) + weight / (k + rank)
             if kk not in items:
                 items[kk] = item
     ordered = sorted(scores.keys(), key=lambda kk: scores[kk], reverse=True)
@@ -1231,6 +1240,11 @@ class VectorStore:
         self._documents_cache: Optional[List[Dict[str, Any]]] = None
         self._ef = None  # embedding function
         self._subbatch_tuner = _SubBatchTuner()  # 自适应子批大小（#125）
+        # 后台向量回填线程状态必须在 __init__ 就绪：engine 启动恢复钩子在
+        # 懒初始化（_initialize_locked）之前就会调 start_backfill()。
+        self._backfill_thread: Optional[threading.Thread] = None
+        self._backfill_stop = threading.Event()
+        self._backfill_lock = threading.Lock()
         self._initialized = False
         self._table_checked = False  # 是否已检查过 table_names（避免重复磁盘扫描）
         self._fts_ready = False  # BM25 全文索引是否已就绪
@@ -1353,6 +1367,12 @@ class VectorStore:
         # 两段式检索的「内存矩阵缓存」（二值/int8 向量/分词/原文等），按表行数
         # 失效；add/delete/clear/迁移会复位。避免每查询走 LanceDB 扫盘/回读。
         self._bin_cache = None
+        # 后台向量回填线程（defer 异步填充模式）：单写者 daemon，stop Event
+        # 由 close()/stop_backfill() 置位；恢复（重启/同步后）由
+        # start_backfill() 幂等拉起。
+        self._backfill_thread: Optional[threading.Thread] = None
+        self._backfill_stop = threading.Event()
+        self._backfill_lock = threading.Lock()
 
         # Use injected embedding function (for testing) or create FastEmbed one
         if self._custom_ef is not None:
@@ -1390,7 +1410,8 @@ class VectorStore:
         try:
             schema = self._table.schema
             names = schema.names
-            missing = [c for c in (_FTS_COLUMN, _BIN_COLUMN) if c not in names]
+            missing = [c for c in (_FTS_COLUMN, _BIN_COLUMN, "embedded")
+                       if c not in names]
             if not missing:
                 return
         except Exception:
@@ -1421,6 +1442,9 @@ class VectorStore:
                     # 二进制向量从已存的量化向量派生（sign 位打包）——与新增行
                     # 的派生来源一致（见 _binarize_quantized），无需重嵌。
                     rec[_BIN_COLUMN] = _binarize_quantized(rec["vector"])
+                if "embedded" in missing:
+                    # 存量行的向量都是真实嵌入结果（defer 是新特性），默认 True。
+                    rec["embedded"] = True
                 records.append(rec)
 
             # LanceDB OSS 无 rename_table，只能 drop 后重建。数据已在内存
@@ -1714,6 +1738,7 @@ class VectorStore:
                     "source": source,
                     "chunk_index": chunk_idx,
                     _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
+                    "embedded": True,
                 })
 
         created = False
@@ -1926,17 +1951,24 @@ class VectorStore:
         batch_size: int = 100,
         on_batch: Optional[Any] = None,
         is_cancelled: Optional[Any] = None,
+        defer_embeddings: bool = False,
     ) -> int:
         """流式增量写入：接受 chunk 迭代器，每批 embed 完立即写入并释放。
 
         用于大知识库 ingest，避免 H3 隐患（全部 records 含 vector 同时在内存）。
         内存占用 = O(batch_size) 而非 O(总 chunks 数)。
 
+        ``defer_embeddings=True``（异步填充模式）：跳过同步嵌入，切片文本立即
+        写库（vector/vector_bin 全零占位、embedded=False），BM25/FTS 立即可
+        用；调用方在写完后再 ``start_backfill()`` 由后台线程分批回填向量。
+        ANN 索引不在写入时建（pending 行会毒化 IVF_PQ 质心），回填结束重建。
+
         Args:
             chunk_iter: 产出 chunk dict 的迭代器（必须有 source / chunk_index / text）
             batch_size: 每批 embed + 写入的 chunk 数
             on_batch: 可选回调 (batch_added, total_added) -> None
             is_cancelled: 可选回调 () -> bool，返回 True 时中断写入并返回当前计数
+            defer_embeddings: 文本先行入库，嵌入交给后台回填线程
 
         Returns:
             成功写入的 chunk 总数（取消时返回已写入数）
@@ -1966,6 +1998,10 @@ class VectorStore:
         table = self._ensure_table()
         if table is not None:
             self._check_embedding_compat(table)
+        if defer_embeddings:
+            return self._add_streaming_deferred(
+                chunk_iter, first_batch, exhausted, batch_size, on_batch,
+                is_cancelled, table)
 
         # Embed 第一批
         logger.info("  ├─ 向量化: 首批 %d 个切片正在嵌入...", len(first_batch))
@@ -2327,8 +2363,297 @@ class VectorStore:
                 "source": source,
                 "chunk_index": chunk_idx,
                 _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
+                "embedded": True,
             })
         return records
+
+    def _make_pending_records(self, chunks: List[Dict[str, Any]],
+                              start_idx: int, dim: int
+                              ) -> List[Dict[str, Any]]:
+        """构造「待嵌入」占位行（defer 异步填充模式）。
+
+        文本/分词/指纹/id 与正式行完全同构（BM25、删除、按 source 替换
+        全部立即可用），vector/vector_bin 为全零占位、embedded=False。
+        维度由调用方提供：已有表取 schema，新表先嵌入 1 条样本探测。
+        """
+        dim = int(dim)
+        zero_vec = [0.0] * dim
+        zero_bin = [0] * _bin_bytes_for_dim(dim)
+        records: List[Dict[str, Any]] = []
+        _hash_cache: Dict[str, str] = {}
+        for j, chunk in enumerate(chunks):
+            idx = start_idx + j
+            source = chunk.get("source", "unknown")
+            chunk_idx = chunk.get("chunk_index", idx)
+            h = _hash_cache.get(source)
+            if h is None:
+                h = _hash_source(source)
+                _hash_cache[source] = h
+            records.append({
+                "id": f"{h}_{chunk_idx}",
+                "text": chunk["text"],
+                "vector": zero_vec,
+                _BIN_COLUMN: zero_bin,
+                "source": source,
+                "chunk_index": chunk_idx,
+                _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
+                "embedded": False,
+            })
+        return records
+
+    def _add_streaming_deferred(self, chunk_iter, first_batch, exhausted,
+                                batch_size, on_batch, is_cancelled,
+                                table) -> int:
+        """defer 模式写入循环：切片文本占位行直接入库，嵌入交后台回填线程。
+
+        与同步嵌入路径同构（按 source 替换旧数据、分批写入、进度回调、
+        取消检查），唯一区别是不做任何嵌入、不建 ANN。FTS 索引照常重建——
+        文本已在库中，BM25/混合检索的全文通道立即可用。
+        """
+        _t0 = time.monotonic()
+        dim = _table_vector_dim(table) if table is not None else 0
+        if not dim:
+            # 新表（或维度未知）：先嵌入 1 条样本探测维度（顺带预热模型）。
+            # 嵌入失败直接抛错——没有维度无法建表，宁可不写也不写坏。
+            probe = self._ef([first_batch[0]["text"]])[0]
+            dim = len(self._prepare_stored_vector(probe))
+        records = self._make_pending_records(first_batch, 0, dim)
+
+        sources_seen = {r["source"] for r in records}
+        created = False
+        if table is None:
+            table, created = self._create_or_open_table(records)
+        if not created and table is not None:
+            # 已有表：先按 source 删除旧记录（与同步嵌入路径一致）。
+            for source in sources_seen:
+                h = _hash_source(source)
+                try:
+                    table.delete(f"id LIKE '{h}_%'")
+                except Exception as e:
+                    logger.debug(
+                        "VectorStore: delete by source '%s' failed: %s",
+                        source, e)
+        total = 0
+        if created:
+            # _create_or_open_table 建表时已随首批记录写入，不能重复 add。
+            total = len(records)
+        else:
+            try:
+                table.add(records)
+                total = len(records)
+            except Exception as e:
+                logger.error("  向量库写入失败(defer 首批): %s", e)
+                self._fts_ready = False
+                raise
+        if on_batch:
+            _call_on_batch(on_batch, len(records), total, 0.0,
+                           time.monotonic() - _t0)
+
+        chunk_idx = len(first_batch)
+        while not exhausted:
+            if is_cancelled is not None and is_cancelled():
+                break
+            batch: List[Dict[str, Any]] = []
+            for _ in range(batch_size):
+                try:
+                    batch.append(next(chunk_iter))
+                except StopIteration:
+                    exhausted = True
+                    break
+            if not batch:
+                break
+            recs = self._make_pending_records(batch, chunk_idx, dim)
+            chunk_idx += len(batch)
+            new_sources = {r["source"] for r in recs} - sources_seen
+            sources_seen |= new_sources
+            for source in new_sources:
+                h = _hash_source(source)
+                try:
+                    table.delete(f"id LIKE '{h}_%'")
+                except Exception as e:
+                    logger.debug(
+                        "VectorStore: delete by source '%s' failed: %s",
+                        source, e)
+            try:
+                table.add(recs)
+            except Exception as e:
+                logger.error("  向量库写入失败(defer 批次): %s", e)
+                raise
+            total += len(recs)
+            if on_batch:
+                _call_on_batch(on_batch, len(recs), total, 0.0,
+                               time.monotonic() - _t0)
+
+        self._invalidate_bin_cache()
+        self._fts_ready = False
+        self._ensure_fts_index(table)
+        # 不建 ANN：pending 行是全零占位向量，会毒化 IVF_PQ 质心；
+        # 由后台回填线程在全部填充结束后统一重建。
+        logger.info(
+            "  └─ 异步填充写入完成: 共 %d 个切片入库（向量由后台线程回填）",
+            total)
+        return total
+
+    # ------------------------------------------------------------------
+    # 后台向量回填（defer 异步填充模式的消费端）
+    # ------------------------------------------------------------------
+
+    def count_pending(self, table: Any = None) -> int:
+        """尚未嵌入的占位行数（embedded=false）。表不存在返回 0。
+
+        恢复钩子在引擎 ``__init__`` 期间就会调到这里——store 尚未懒初始化
+        （``_db`` 为 None），必须先 ``_ensure_initialized()`` 再取表，否则
+        ``_ensure_table`` 撞上 None 连接抛 AttributeError 被 except 吞成 0，
+        pending 永远检不出来。
+        """
+        try:
+            if table is None:
+                self._ensure_initialized()
+                table = self._ensure_table()
+        except Exception:
+            return 0
+        if table is None:
+            return 0
+        try:
+            return int(table.count_rows(filter="embedded = false"))
+        except Exception:
+            # count_rows(filter=) 旧版不支持时兜底：全表列投影数一遍。
+            try:
+                arrow = (table.search().select(["id"])
+                         .where("embedded = false", prefilter=True)
+                         .to_arrow())
+                return arrow.num_rows
+            except Exception:
+                return 0
+
+    def has_pending(self) -> bool:
+        return self.count_pending() > 0
+
+    def start_backfill(self, log_cb: Optional[Any] = None) -> bool:
+        """启动后台向量回填线程（幂等：已有线程在跑或无 pending 时跳过）。
+
+        Returns:
+            是否真正启动了新线程。
+        """
+        with self._backfill_lock:
+            if (self._backfill_thread is not None
+                    and self._backfill_thread.is_alive()):
+                return False
+            if not self.has_pending():
+                return False
+            self._backfill_stop = threading.Event()
+            self._backfill_thread = threading.Thread(
+                target=self._backfill_loop,
+                kwargs={"log_cb": log_cb, "stop": self._backfill_stop},
+                daemon=True, name="rag-vector-backfill")
+            self._backfill_thread.start()
+            return True
+
+    def stop_backfill(self, join_timeout: float = 1.0) -> None:
+        """请求停止回填线程（协作式：当前批完成后退出，不等待重置）。
+
+        停止后剩余 pending 行保持 embedded=false，下次同步结束或引擎
+        启动（恢复钩子）时由 start_backfill 续填——向量列全零占位不影响
+        正确性，检索侧始终过滤 embedded=true。
+        """
+        self._backfill_stop.set()
+        thread = self._backfill_thread
+        if thread is not None and thread.is_alive() and join_timeout > 0:
+            thread.join(timeout=join_timeout)
+
+    def _fetch_pending_rows(self, table: Any, batch: int) -> List[Dict[str, Any]]:
+        """取一批待嵌入的占位行（仅文本类列，不加载向量列）。"""
+        arrow = (table.search()
+                 .select(["id", "text", "source", "chunk_index"])
+                 .where("embedded = false", prefilter=True)
+                 .limit(batch)
+                 .to_arrow())
+        return arrow.to_pylist()
+
+    def _backfill_loop(self, log_cb: Optional[Any] = None,
+                       stop: Optional[threading.Event] = None) -> None:
+        """后台回填主循环：分批嵌入占位行并重写（embedded=true）。
+
+        每批经 ``_begin_op``/``_end_op`` 登记在途操作——close()/clear() 排空
+        时会等到本批完成或拒绝进入，避免对已释放连接/已删表继续写。
+        写入顺序是「先 add 已嵌入副本、后删 pending 占位行」：占位行与副本
+        同 id 共存期间检索侧只看 embedded=true（不可见）；若先删后写，两步
+        之间崩溃会整批丢文本。此顺序下崩溃最多残留占位行，下一轮幂等重做。
+        全部完成后重建 FTS + ANN 索引。异常时安全中止：剩余 pending 行保留，
+        恢复钩子或下次同步续填。
+        """
+        _BACKFILL_BATCH = 500   # 偏大：每批失效 bin cache，批越大检索侧重建矩阵越少
+
+        def _log(msg: str, *args: Any) -> None:
+            logger.info(msg, *args)
+            if log_cb:
+                try:
+                    log_cb(msg % args if args else msg)
+                except Exception:
+                    pass
+
+        try:
+            table = self._ensure_table()
+            if table is None:
+                return
+            total = self.count_pending(table)
+            if total <= 0:
+                return
+            _log("⏳ 后台向量填充启动: %d 个切片待嵌入", total)
+            done = 0
+            while True:
+                if stop is not None and stop.is_set():
+                    _log("⏳ 后台向量填充暂停: 已填充 %d/%d（剩余下次续填）",
+                         done, total)
+                    return
+                rows = self._fetch_pending_rows(table, _BACKFILL_BATCH)
+                if not rows:
+                    break
+                chunks = [{"text": r["text"], "source": r["source"],
+                           "chunk_index": r["chunk_index"]} for r in rows]
+                records = self._embed_chunks(chunks, 0)
+                ids = [r["id"] for r in rows]
+                try:
+                    self._begin_op()
+                except RuntimeError:
+                    # close()/clear() 正在排空——安静退出，剩余 pending 留给
+                    # 恢复钩子续填。
+                    _log("⏳ 后台向量填充中止: store 正在关闭（已填充 %d/%d）",
+                         done, total)
+                    return
+                try:
+                    table.add(records)
+                    self._delete_pending_ids(table, ids)
+                except Exception as e:
+                    logger.warning("后台向量填充批次失败（保留 pending 下轮重试）: %s", e)
+                    break
+                finally:
+                    self._end_op()
+                self._invalidate_bin_cache()
+                done += len(rows)
+                _log("⏳ 后台向量填充进度: %d/%d", done, total)
+            # 全部填充完成：重建 BM25 与 ANN 索引（写入期间被 guard 跳过）。
+            self._fts_ready = False
+            self._ensure_fts_index(table)
+            self._vec_index_ready = False
+            self._ensure_vector_index(table)
+            _log("✅ 后台向量填充完成: 共 %d 个切片，向量检索完全生效", done)
+        except Exception as e:
+            logger.warning("后台向量填充异常中止（剩余 pending 下次续填）: %s", e)
+
+    def _delete_pending_ids(self, table: Any, ids: Sequence[str]) -> None:
+        """按 id 删除 pending 占位行（embedded=false 限定）。
+
+        同 id 的已嵌入副本共存是回填的正常中间态，删除表达式必须带
+        ``embedded = false``，否则会把刚写入的真向量一并删掉。
+        """
+        quoted = ",".join(f"'{i}'" for i in ids)
+        try:
+            table.delete(f"embedded = false AND id IN ({quoted})")
+        except Exception:
+            # IN 语法不被支持时逐条删（低频路径）。
+            for i in ids:
+                table.delete(f"embedded = false AND id = '{i}'")
 
     # ------------------------------------------------------------------
     # BM25 full-text search (hybrid retrieval)
@@ -2452,6 +2777,16 @@ class VectorStore:
             return False
         dim = _table_vector_dim(table) or 0
         if dim <= 0:
+            return False
+        # defer 异步填充：未嵌入行是全零占位向量，拿去训 IVF_PQ 质心会把
+        # 索引整体毒化——pending>0 时暂缓，由回填线程在结束后统一重建。
+        # 放在行数/维度的廉价短路之后：count_pending(filter=) 是一次全表
+        # 过滤扫描，小库每次写入都付一次不划算（行数 < 建索引下限时根本
+        # 不会建 ANN）。
+        pending = self.count_pending(table)
+        if pending > 0:
+            logger.info(
+                "  ⚠ 仍有 %d 条切片待后台嵌入，暂缓 ANN 索引重建", pending)
             return False
         if row_count < _VECTOR_INDEX_MIN_ROWS:
             # 行太少：不建索引；若磁盘上残留旧索引（例如表被删减后变小），清掉它，
@@ -2657,6 +2992,12 @@ class VectorStore:
 
         # Vector search
         logger.info("  ├─ 向量相似度搜索: 在 %d 条向量中检索 top %d...", row_count, top_k)
+        # defer 异步填充模式下未嵌入行是全零占位向量，必须排除——否则
+        # 余弦换算出的假相似度会混进结果。
+        if where:
+            where = f"({where}) AND embedded = true"
+        else:
+            where = "embedded = true"
         search = table.search(query_vec).limit(top_k)
         if where:
             # prefilter=True：先按条件过滤再做 ANN。默认的后置过滤是「先取
@@ -2874,7 +3215,8 @@ class VectorStore:
         ``rrf_score``；不做 0.5 阈值过滤（阈值仅对 reranker 语义分有意义）。
         """
         key_fn = lambda c: (c.get("source", ""), c.get("chunk_index", 0))  # noqa: E731
-        fused = _rrf_fuse([vec_candidates, fts_candidates], key_fn)
+        fused = _rrf_fuse([vec_candidates, fts_candidates], key_fn,
+                          weights=[_RRF_VEC_WEIGHT, _RRF_FTS_WEIGHT])
         out: List[Dict[str, Any]] = []
         for c, rrf in fused[:top_k]:
             d = dict(c)
@@ -3095,12 +3437,17 @@ class VectorStore:
         按表行数缓存整表矩阵于内存：粗筛（汉明扫描）与精筛（候选集内余弦 /
         BM25）全程纯 numpy，彻底去掉每查询的 LanceDB 扫盘与回读——否则两段式
         会比走 ANN 索引的原流程更慢。行数变化（add/delete）即失效重建。
+
+        仅加载 embedded=true 的行：defer 异步填充模式的占位行是全零向量，
+        混进粗筛矩阵会以假汉明距离挤掉真实候选；回填线程每批显式调
+        _invalidate_bin_cache()，避免 delete+add（行数不变）时缓存 stale。
         """
         if self._bin_cache is not None and self._bin_cache[0] == table.count_rows():
             return self._bin_cache[1:]
         arrow = (table.search()
                  .select(["id", "vector", _BIN_COLUMN, _FTS_COLUMN,
                           "text", "source", "chunk_index"])
+                 .where("embedded = true", prefilter=True)
                  .to_arrow())
         self._bin_cache = (table.count_rows(),) + self._decode_bin_arrow(arrow)
         return self._bin_cache[1:]
@@ -3154,10 +3501,14 @@ class VectorStore:
                     (ids, bin_mat, vec_mat, tokens, texts, sources,
                      chunk_indices) = ram
                 else:
+                    # _src_filter_where 未识别的 where：兜底直接取数，但必须
+                    # 合并 embedded=true——pending 占位行的全零向量会以假汉明
+                    # 距离挤占粗筛 top、以假相似度混进精筛（defer 异步填充）。
+                    merged = f"({where}) AND embedded = true"
                     arrow = (table.search()
                              .select(["id", "vector", _BIN_COLUMN, _FTS_COLUMN,
                                       "text", "source", "chunk_index"])
-                             .where(where, prefilter=True)
+                             .where(merged, prefilter=True)
                              .to_arrow())
                     (ids, bin_mat, vec_mat, tokens, texts, sources,
                      chunk_indices) = self._decode_bin_arrow(arrow)
@@ -3348,11 +3699,13 @@ class VectorStore:
             len(merged), len(vec_candidates), len(fts_candidates), len(merged),
         )
 
-        # 3.5 RRF 粗排：按「向量排名 + BM25 排名」融合（score = Σ 1/(60+rank)），
-        #    两路都靠前的候选显著胜出，单路头部不垄断；取前 _RERANK_MAX_CANDIDATES
-        #    条送精排——top_k/候选倍率调大时防止 cross-encoder 候选爆炸。
+        # 3.5 Weighted RRF 粗排：按「向量排名×0.7 + BM25 排名×0.3」融合
+        #    （score = Σ w_i/(60+rank)），两路都靠前的候选显著胜出，语义主通道
+        #    权重更高；取前 _RERANK_MAX_CANDIDATES 条送精排——top_k/候选倍率
+        #    调大时防止 cross-encoder 候选爆炸。
         key_fn = lambda c: (c.get("source", ""), c.get("chunk_index", 0))  # noqa: E731
-        fused = _rrf_fuse([vec_candidates, fts_candidates], key_fn)
+        fused = _rrf_fuse([vec_candidates, fts_candidates], key_fn,
+                          weights=[_RRF_VEC_WEIGHT, _RRF_FTS_WEIGHT])
         rerank_input = [it for it, _s in fused[:_RERANK_MAX_CANDIDATES]]
 
         # 4. BGE rerank + 5. min_similarity filter.
@@ -3594,6 +3947,9 @@ class VectorStore:
         tearing down the LanceDB connection underneath them produces random
         AttributeErrors (``self._db`` is None) or silently wrong results.
         """
+        # 先停后台回填线程（协作式，短暂 join 当前批），再排空 I/O——
+        # 否则回填线程会在 _db 被置 None 后继续写库。
+        self.stop_backfill(join_timeout=2.0)
         # 先排空并**保持**排空态：若此时正有 add/search 在跑，它们会撞上被置
         # None 的 _db 或已被 drop 的表。这里不能像 clear() 那样 _resume_ops()——
         # close() 之后本实例永久不可用，_closing 保持 True 正好与
@@ -4173,4 +4529,9 @@ def _vector_table_schema(dim: int):
         pa.field("chunk_index", pa.int64()),
         pa.field(_FTS_COLUMN, pa.string()),
         pa.field(_BIN_COLUMN, pa.list_(pa.uint8(), _bin_bytes_for_dim(dim))),
+        # 异步填充标志：defer 模式下文本先行入库（vector/vector_bin 全零占位、
+        # embedded=False），后台回填线程算完向量后 delete+重写置 True。检索
+        # 侧（向量通道/两段式粗筛）一律过滤 embedded=true，未填充行只参与
+        # BM25/FTS 与文本类操作。
+        pa.field("embedded", pa.bool_()),
     ])

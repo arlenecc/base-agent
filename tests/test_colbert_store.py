@@ -72,6 +72,21 @@ def test_rrf_fuse_prefers_documents_in_both_lists():
     assert len(fused) == 3
 
 
+def test_rrf_fuse_weighted_prefers_vector_channel():
+    """阅读模式加权 RRF：通道顺序 [BM25, ColBERT向量]，向量 0.7 主导。
+
+    bm25=[A,B], vec=[B,A]：score(B)=0.3/61+0.7/62 > score(A)=0.7/61+0.3/62
+    → B（双路靠前）第一；且 A、B 分数均按公式可复算。
+    """
+    fused = cs.rrf_fuse([["A", "B"], ["B", "A"]], limit=10,
+                        weights=[cs._RRF_FTS_WEIGHT, cs._RRF_VEC_WEIGHT])
+    scores = dict(fused)
+    # B：bm25 rank1(0.3/62) + vec rank0(0.7/61)；A：bm25 rank0(0.3/61) + vec rank1(0.7/62)
+    assert scores["B"] > scores["A"]
+    assert scores["B"] == pytest.approx(0.3 / 62.0 + 0.7 / 61.0)
+    assert scores["A"] == pytest.approx(0.3 / 61.0 + 0.7 / 62.0)
+
+
 def test_store_index_search_list_delete(tmp_path):
     runtime = FakeRuntime()
     store = cs.ColBertDocStore(db_dir=str(tmp_path / "idx"),

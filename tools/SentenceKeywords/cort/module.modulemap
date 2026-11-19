@@ -1,0 +1,4 @@
+module COrt {
+    header "onnxruntime_c_api.h"
+    export *
+}

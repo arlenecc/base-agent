@@ -9,7 +9,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, clean_docling_markdown, normalize_markdown
@@ -22,6 +22,8 @@ from .document_outline import (
     plain_text_to_markdown,
 )
 from .vector_store import DEFAULT_RERANK_MODEL, VectorStore
+from .decision_search import decision_search
+from .simhash import SimHashIndex
 from ..atomic_io import atomic_write_json
 
 logger = logging.getLogger(__name__)
@@ -695,12 +697,38 @@ class RAGEngine:
         reading_chunk_max: int = 3000,
         reading_chunk_min: int = 2500,
         reading_semantic_threshold: float = 0.55,
+        embed_background: bool = True,
+        # ---- 决策判定模式（rag_mode="decision" 时生效）----
+        rag_mode: str = "vector",
+        rag_decision_model_backend: str = "mlx-vlm",
+        rag_decision_model_path: str = "",
+        rag_decision_coarse_k: int = 50,
+        rag_decision_use_core_sentences: bool = True,
+        rag_decision_core_top: int = 3,
+        rag_decision_top_n: int = 5,
+        # ---- 多知识分区（JSON 数组字符串，见 config.rag_partitions）----
+        rag_partitions: str = "",
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._rag_dir = os.path.join(workspace, "rag")
         self._markdown_dir = os.path.join(self._rag_dir, "documents")
         self._vector_dir = os.path.join(self._rag_dir, "vectors")
+        # ---- 多知识分区 ----
+        # 默认分区沿用 workspace/rag 旧布局（老数据零迁移）；其余分区各自
+        # 独立于 workspace/rag/partitions/<slug>/（manifest/markdown/向量全隔离）。
+        # self._rag_dir/_markdown_dir/_vector_dir/_knowledge_base 指向「当前活动
+        # 分区」（ingest/dedup 循环时重绑，结束恢复默认），全部既有管线代码
+        # 无需感知分区。
+        self._partitions = self._parse_partitions(rag_partitions)
+        self._default_rag_dir = self._rag_dir
+        self._default_markdown_dir = self._markdown_dir
+        self._default_vector_dir = self._vector_dir
+        self._default_knowledge_base = self._knowledge_base
+        self._active_partition: Optional[Dict[str, Any]] = None
+        self._stores: Dict[str, VectorStore] = {}  # slug → 独立 VectorStore
+        # SimHash 全局相似去重索引（ingest 期间指向活动分区的索引实例）
+        self._simhash_index: Optional[SimHashIndex] = None
         self._embedding_model = embedding_model or "nomic-ai/nomic-embed-text-v1.5-Q"
         self._custom_ef = embedding_function  # for testing injection
         # 模型窗口硬上限：切片预算超过 embedding 模型上下文窗口时，切片会在嵌入
@@ -723,6 +751,9 @@ class RAGEngine:
         # 语义切片总开关：False 时 chunk_documents 直接走确定性递归分片，不加载
         # 任何嵌入模型（离线 / 追求确定性 / 不希望语义切片场景）。
         self._use_semantic = bool(use_semantic)
+        # 异步填充开关（普通向量模式）：True 时同步只写切片文本占位行，嵌入
+        # 由 VectorStore 后台线程回填；False 回退同步嵌入。
+        self._embed_background = bool(embed_background)
         self._rerank_model = rerank_model
         # 重排序总开关。config.rag_rerank_enabled 此前从未被读取——用户在配置里
         # 关掉重排序或换模型都完全无效（README / 设计文档却宣称可用）。这里接线：
@@ -798,6 +829,31 @@ class RAGEngine:
         self._reading_store_lock = threading.Lock()
         # 可注入的切片编码器（测试用；生产默认惰性取 model2vec）。
         self._reading_chunk_encoder: Any = None
+        # 决策判定模式参数（rag_mode="decision" 时 search 走 BM25 粗筛 + 核心
+        # 句 + 决策模型判定）。在此夹紧，防止手改 config 越界。
+        self._rag_mode = str(rag_mode or "vector").strip().lower()
+        if self._rag_mode not in ("vector", "fast", "decision"):
+            self._rag_mode = "vector"
+        self._decision_backend = str(rag_decision_model_backend or "mlx-vlm")
+        self._decision_model_path = (rag_decision_model_path or "").strip()
+        self._decision_coarse_k = int(rag_decision_coarse_k)
+        if self._decision_coarse_k not in (20, 50, 100):
+            self._decision_coarse_k = 50
+        self._decision_use_core = bool(rag_decision_use_core_sentences)
+        self._decision_core_top = int(rag_decision_core_top)
+        if self._decision_core_top not in (3, 5):
+            self._decision_core_top = 3
+        self._decision_top_n = int(rag_decision_top_n)
+        if self._decision_top_n not in (3, 5, 10):
+            self._decision_top_n = 5
+        # 崩溃/停止恢复：defer 异步填充模式下库中若有未嵌入占位行（上次
+        # 同步后应用退出/回填被停），启动引擎时自动续填。幂等：无 pending
+        # 或线程已运行时不动作。
+        if not self._reading_mode and self._embed_background:
+            try:
+                self._get_store().start_backfill()
+            except Exception as e:
+                logger.debug("RAG: 后台向量填充恢复检查失败: %s", e)
 
     # ------------------------------------------------------------------
     # properties
@@ -824,7 +880,11 @@ class RAGEngine:
         return self._reading_mode
 
     def _pipeline_signature(self) -> str:
-        """入库管线签名：模式/量化/切片参数/模型/预处理版本变化时强制重跑。"""
+        """入库管线签名：模式/量化/切片参数/模型/预处理版本变化时强制重跑。
+
+        决策判定模式的入库管线与 normal 完全一致（token 切片 + FTS 索引，
+        不需要向量列），签名沿用 "normal"，不触发向量库重建。
+        """
         if not self._reading_mode:
             return "normal"
         return (f"reading:p2:q{self._reading_quant_bits}:"
@@ -1438,6 +1498,40 @@ class RAGEngine:
     def dedup_vectors(
         self,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        partition: str = "",
+    ) -> Dict[str, int]:
+        """对启用分区清理重复向量（各分区库相互独立）。
+
+        ``partition`` 非空时只处理该分区（名称或 slug，找不到返回 error）；
+        为空则遍历所有启用分区。无分区配置时等价于原单库行为。返回原统计
+        dict；多分区时各分区计数累加并附 per-partition 明细。"""
+        partitions = self._enabled_partitions()
+        if partition:
+            slug = self._partition_slug_of(partition)
+            partitions = [p for p in partitions
+                          if self._partition_slug(p["name"]) == slug]
+            if not partitions:
+                return {"error": f"分区不存在或未启用: {partition}"}
+        if not partitions:
+            return self._dedup_vectors_one(progress_callback)
+        total_removed, detail = 0, {}
+        for p in partitions:
+            self._set_active_partition(p)
+            try:
+                part_stats = self._dedup_vectors_one(progress_callback)
+            finally:
+                self._reset_active_partition()
+            name = p.get("name") or ""
+            detail[f"partition:{name}"] = part_stats
+            # _dedup_vectors_one 返回 {"scanned","groups","removed"} dict，
+            # 旧实现直接 `total_removed += removed` 会在多分区时 TypeError。
+            total_removed += int(part_stats.get("removed", 0) or 0)
+        detail["removed"] = total_removed
+        return detail
+
+    def _dedup_vectors_one(
+        self,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Dict[str, int]:
         """排查并清理向量库内内容完全相同的重复向量（保留每组最早入库的一份）。
 
@@ -1467,6 +1561,14 @@ class RAGEngine:
             return (ts, src, rec.get("chunk_index") or 0)
 
         store = self._get_store()
+        # defer 异步填充进行中（pending 占位行）跳过去重：回填线程 delete+重写
+        # 会复活去重已删除的行，等填充完成后的下次同步再做。
+        try:
+            if store.has_pending():
+                logger.info("RAG: 后台向量填充进行中，本次跳过去重")
+                return 0
+        except Exception:
+            pass
         return store.deduplicate_vectors(order_key=_order_key,
                                          progress_callback=progress_callback)
 
@@ -1475,11 +1577,14 @@ class RAGEngine:
         force: bool = False,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         log_callback: Optional[Callable[[str], None]] = None,
+        partition: str = "",
     ) -> Dict[str, Any]:
         """Ingest entry point — mutually exclusive (see ``_ingest_lock``).
 
-        Returns:
-            统计 dict，或 ``{"error": ...}`` 表示本次请求被拒绝（已有同步在跑）。
+        多知识分区：无 ``partition`` 参数时按顺序同步**所有启用分区**（每分区
+        独立 manifest/markdown/向量库）；传分区名（或 slug）只同步该分区。
+        返回统计 dict（多分区时附 ``partitions`` 明细），或 ``{"error": ...}``
+        表示本次请求被拒绝（已有同步在跑）。
         """
         if not self._ingest_lock.acquire(blocking=False):
             # 不阻塞等待：UI 同步与 agent 的 rag_ingest 是两条独立线程，排队
@@ -1487,7 +1592,38 @@ class RAGEngine:
             logger.info("RAG ingest: another sync is already running; ignoring request")
             return {"error": "另一次同步正在进行，已忽略本次请求"}
         try:
-            return self._ingest_locked(force, progress_callback, log_callback)
+            partitions = self._enabled_partitions()
+            if partition:
+                slug = self._partition_slug_of(partition)
+                partitions = [p for p in partitions
+                              if self._partition_slug(p["name"]) == slug]
+                if not partitions:
+                    return {"error": f"分区不存在或未启用: {partition}"}
+            if not partitions:
+                return self._ingest_locked(force, progress_callback, log_callback)
+            # 多分区：逐分区切换活动目录后复用同一套管线；单分区时也走此
+            # 循环（只有 1 个元素），行为与旧单库路径一致。
+            aggregate: Dict[str, Any] = {}
+            details: Dict[str, Any] = {}
+            for p in partitions:
+                name = p.get("name") or ""
+                self._set_active_partition(p)
+                try:
+                    if log_callback is not None:
+                        log_callback(f"[{name}] 开始同步分区（源: {p.get('path')}）")
+                    stat = self._ingest_locked(force, progress_callback,
+                                               log_callback)
+                finally:
+                    self._reset_active_partition()
+                details[name] = stat
+                if stat.get("error"):
+                    aggregate.setdefault("errors", []).append({name: stat["error"]})
+                    continue
+                for k, v in stat.items():
+                    if isinstance(v, (int, float)):
+                        aggregate[k] = aggregate.get(k, 0) + v
+            aggregate["partitions"] = details
+            return aggregate
         finally:
             # 无论正常结束/取消/异常/提前 return 都要释放解析单例：agent 的
             # rag_ingest 工具路径不会调 close()（引擎长期持有），不释放会让
@@ -1563,6 +1699,16 @@ class RAGEngine:
         os.makedirs(self._rag_dir, exist_ok=True)
         os.makedirs(self._markdown_dir, exist_ok=True)
 
+        # SimHash 全局相似去重索引（按分区持久化：<rag_dir>/simhash_index.json）。
+        # worker 在「转 Markdown 后、切片入库前」调用 check_and_insert（线程安全）；
+        # 删除清理用它移除已删文件的指纹。simhash_dups 收集本轮判重的文件，
+        # Step 6 统一按 duplicate_of 语义记入 manifest。
+        simhash_index = SimHashIndex.load(
+            os.path.join(self._rag_dir, "simhash_index.json"),
+            md_dir=self._markdown_dir)
+        self._simhash_index = simhash_index
+        simhash_dups: List[Tuple[str, str, int]] = []  # (filepath, owner, dist)
+
         stats: Dict[str, Any] = {
             "knowledge_base": self._knowledge_base,
             "files_found": 0,
@@ -1595,6 +1741,15 @@ class RAGEngine:
         # 排序让全管线确定性：内容去重的 owner（首个副本）、worker 分片、
         # 日志顺序都不再随文件系统 inode 顺序波动。
         all_files.sort()
+        # 指纹索引修剪：已不在知识库的文件（被删除/移走）的指纹条目必须在
+        # worker 判重**之前**移除——判重发生在 Step 5 删除清理之前，若不修剪，
+        # 与已删文件近重复的内容会被判为「已删文件的副本」而永不入库。
+        if len(simhash_index) > 0:
+            _current_paths = set(all_files)
+            for _doc in list(simhash_index.docs):
+                _dp = str(_doc.get("path") or "")
+                if _dp and _dp not in _current_paths:
+                    simhash_index.remove_path(_dp)
         ext_summary = ", ".join(f"{ext}({cnt})" for ext, cnt in sorted(ext_counts.items()))
         _log("  扫描完成: 共发现 %d 个文件 [%s]", total_files, ext_summary if ext_summary else "无")
         if progress_callback is not None:
@@ -1617,6 +1772,9 @@ class RAGEngine:
                 _save_manifest(self._rag_dir, new_manifest, removed=removed)
             except OSError as e:
                 logger.warning("RAG: failed to save manifest: %s", e)
+            # 删除清理可能移除了指纹条目：索引有变化就落盘
+            if simhash_index.dirty:
+                simhash_index.save()
             return stats
         if self._is_cancelled():
             stats["cancelled"] = True
@@ -1881,6 +2039,26 @@ class RAGEngine:
                                             len(cleaned.strip()),
                                             _MIN_DOC_CHARS_FOR_INGEST, fname)
                                         continue
+                                    # SimHash 全局相似去重（转 Markdown 后、切片前）：
+                                    # 与库内已有文档判为近重复的整篇跳过——不写
+                                    # 缓存、不建 digest、不切片入库。
+                                    if simhash_index is not None:
+                                        try:
+                                            is_dup, dup_owner, dup_dist = simhash_index.check_and_insert(
+                                                cleaned, filepath, md_name=md_name)
+                                        except Exception as e:
+                                            logger.warning(
+                                                "    ├─ ⚠ 相似去重检查失败（放行入库）: %s: %s",
+                                                fname, e)
+                                            is_dup, dup_owner, dup_dist = False, "", 0
+                                        if is_dup:
+                                            with stats_lock:
+                                                stats["files_duplicated"] += 1
+                                                simhash_dups.append(
+                                                    (filepath, dup_owner, dup_dist))
+                                            _log("    └─ ⧗ 跳过(相似重复, 海明距离 %d): %s ≈ %s",
+                                                 dup_dist, fname, os.path.basename(dup_owner))
+                                            continue
                                     try:
                                         with open(md_path, "w", encoding="utf-8") as f:
                                             f.write(cleaned)
@@ -2114,6 +2292,38 @@ class RAGEngine:
                                     len(cleaned.strip()),
                                     _MIN_DOC_CHARS_FOR_INGEST, fname)
                                 continue
+
+                            # SimHash 全局相似去重（转 Markdown 后、切片前）：
+                            # 与库内已有文档判为近重复的整篇跳过——不建 digest、
+                            # 不切片、不入库；刚写入的 Markdown 缓存与 sidecar
+                            # 一并清掉，保持 documents/ 只留真正入库的文档。
+                            if simhash_index is not None:
+                                try:
+                                    is_dup, dup_owner, dup_dist = simhash_index.check_and_insert(
+                                        cleaned, filepath, md_name=md_name)
+                                except Exception as e:
+                                    logger.warning(
+                                        "    ├─ ⚠ 相似去重检查失败（放行入库）: %s: %s",
+                                        fname, e)
+                                    is_dup, dup_owner, dup_dist = False, "", 0
+                                if is_dup:
+                                    with stats_lock:
+                                        stats["files_duplicated"] += 1
+                                        simhash_dups.append(
+                                            (filepath, dup_owner, dup_dist))
+                                    _log("    └─ ⧗ 跳过(相似重复, 海明距离 %d): %s ≈ %s",
+                                         dup_dist, fname, os.path.basename(dup_owner))
+                                    try:
+                                        if os.path.isfile(md_path):
+                                            os.remove(md_path)
+                                        _sidecar = _md_meta_path(md_path)
+                                        if os.path.isfile(_sidecar):
+                                            os.remove(_sidecar)
+                                    except OSError as e:
+                                        logger.warning(
+                                            "    ├─ ⚠ 清理重复文档 Markdown 缓存失败: %s: %s",
+                                            fname, e)
+                                    continue
 
                             # 模式切换迁移：先清旧模式库，再写新模式
                             self._migrate_stale_mode_data(
@@ -2493,11 +2703,15 @@ class RAGEngine:
                         is_cancelled=self._is_cancelled,
                     )
                 else:
+                    # 异步填充模式：切片文本占位行直接入库，嵌入交后台线程；
+                    # 同步立即完成，BM25 立即可用，向量检索随回填逐步生效。
+                    deferred = bool(getattr(self, "_embed_background", True))
                     added = store.add_streaming(
                         _chunk_iter(),
                         batch_size=_WRITE_BATCH_SIZE,
                         on_batch=_on_batch,
                         is_cancelled=self._is_cancelled,
+                        defer_embeddings=deferred,
                     )
                 stats["chunks"] = added
                 if self._reading_mode:
@@ -2506,6 +2720,16 @@ class RAGEngine:
                 else:
                     stats["chunks_total"] = store.count()
                 _log("  向量化写入完成: 共 %d 个切片已存入向量库", added)
+                if deferred:
+                    pending = store.count_pending()
+                    if pending > 0:
+                        _log(
+                            "  ⏳ 后台向量填充已启动: %d 个切片待嵌入，"
+                            "BM25/全文检索立即可用，向量检索随填充逐步生效",
+                            pending)
+                        store.start_backfill()
+                    else:
+                        _log("  向量已全部就绪（无待填充切片）")
             except Exception as e:
                 logger.error("  向量化写入失败: %s", e, exc_info=True)
                 # 注意：这里不能调用 self.cancel()——向量化写入异常（如模型下载
@@ -2591,6 +2815,35 @@ class RAGEngine:
 
         # Step 6: 保存 manifest
         _log("━━━ Step 6/6: 保存同步记录 ━━━")
+        # 相似重复（SimHash）收尾：worker 里判重的文件按预扫描精确去重同一套
+        # duplicate_of 语义记入 manifest——下次同步 mtime/size/指纹未变走
+        # 「未修改」跳过路径，不再解析/切片；owner 被删除时僵尸副本提升逻辑
+        # 会让它整条丢掉历史、重新走完整管线（此时指纹索引里的 owner 条目已
+        # 被 Step 5 清理移除，判重自然放行，内容不会丢失）。
+        if simhash_dups:
+            for dup_path, _owner, _dist in simhash_dups:
+                if dup_path in new_manifest:
+                    continue
+                sig_now = _file_signature(dup_path)
+                if sig_now is None:
+                    continue
+                _prev = manifest.get(dup_path) or {}
+                new_manifest[dup_path] = {
+                    **sig_now,
+                    "source_hash": (fp_by_path.get(dup_path)
+                                    or _source_fingerprint(dup_path, sig_now["size"])),
+                    "duplicate_of": _owner,
+                    # 带上旧条目的 content_hash/chunk_count：该副本此前若真
+                    # 入过库（force 场景），收尾清理靠它们认出「还有旧向量要
+                    # 删」；从没入库过的副本两项为空。
+                    "content_hash": _prev.get("content_hash"),
+                    "chunk_count": _prev.get("chunk_count", 0),
+                    "reading_mode": bool(self._reading_mode),
+                    "pipeline_signature": self._pipeline_signature(),
+                    "simhash_dup": True,
+                }
+            _log("  ⧗ 相似重复(SimHash): %d 个近重复文件已记入同步记录（跳过切片入库）",
+                 len(simhash_dups))
         # 内容去重收尾（B 方案后半程）：清理存量重复副本的向量 + 标记
         # duplicate_of，避免检索时同段内容双倍召回。
         try:
@@ -2608,6 +2861,12 @@ class RAGEngine:
                         len(new_manifest), _manifest_path(self._rag_dir))
         except OSError as e:
             logger.warning("  同步记录保存失败: %s", e)
+
+        # SimHash 相似去重指纹索引落盘（本轮有新增/删除才写）
+        if simhash_index.dirty:
+            simhash_index.save()
+            _log("  相似去重指纹索引已保存: %d 篇 → %s",
+                 len(simhash_index), simhash_index.path)
 
         # Step 7: 补做/重刷文档目录结构（缩略版本）。
         # 这一步不依赖「文件是否修改」——即使所有文件都被增量跳过（未修改），
@@ -2643,6 +2902,9 @@ class RAGEngine:
         _log("   总字符数: %d | 向量切片: %d | 错误: %d",
             stats["total_chars"], stats["chunks"], len(stats.get("errors", [])),
         )
+        if simhash_dups:
+            _log("   相似重复跳过(SimHash): %d 个文件（海明 ≤ %d，内容复核 Jaccard ≥ %.2f）",
+                 len(simhash_dups), simhash_index.ham, simhash_index.verify_jaccard)
         if stats.get("errors"):
             _log("   错误详情:")
             for err in stats["errors"][:10]:
@@ -2723,6 +2985,11 @@ class RAGEngine:
                         os.remove(sidecar)
                 except OSError as e:
                     logger.warning("  ⚠ 删除 Markdown 缓存失败 %s: %s", md_path, e)
+                # SimHash 相似去重索引同步移除该文件的指纹条目：否则它作为
+                # 近重复 owner 的判定材料残留，新同名/同内容文件会被判为
+                # 「已删文件的副本」而永不入库。
+                if getattr(self, "_simhash_index", None) is not None:
+                    self._simhash_index.remove_path(source)
                 new_manifest.pop(source, None)
                 deleted_ok.add(source)
                 with stats_lock:
@@ -2758,6 +3025,13 @@ class RAGEngine:
         """
         if self._reading_mode:
             return self._reading_search(query, top_k=top_k, source=source)
+        if self._rag_mode == "decision":
+            return self._decision_search(query, source=source)
+        # 多知识分区联合检索（启用分区 ≥2）：决策模型路由 → 各库混合检索
+        # （屏蔽 reranker，避免 N 库 × cross-encoder 长停顿）→ 按路由得分
+        # 加权 RRF 融合。单分区/无分区时走原单库路径，行为不变。
+        if len(self._enabled_partitions()) >= 2:
+            return self._multi_partition_search(query, top_k=top_k, source=source)
         t0 = time.monotonic()
         store = self._get_store()
         store_count = store.count()
@@ -2809,6 +3083,97 @@ class RAGEngine:
             logger.info("  └─ ⚠ 检索完成: 无匹配结果 (耗时 %.2fs)", t_total)
         return results
 
+    def _multi_partition_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """多分区联合检索（vector/fast 模式）：路由 → 各库混合检索 → 加权融合。
+
+        多库联合时屏蔽 reranker（use_reranker=False，保留各库向量 + BM25 的
+        RRF 融合），跨库按路由得分加权融合后取 top_k。
+        """
+        from .decision_model import get_decision_model
+        from .multi_search import fuse_partition_results, route_partitions
+
+        t0 = time.monotonic()
+        partitions = self._enabled_partitions()
+        model = get_decision_model(self._decision_backend,
+                                   self._decision_model_path)
+        routed = route_partitions(
+            query, partitions, model,
+            hit_probe=lambda p: bool(self._get_store(p["name"]).search_fts(
+                query, top_k=1)))
+        route_scores = {str(p.get("name") or ""): s for p, s in routed}
+        logger.info("🌐 多分区联合检索 (%s): 查询=%r 命中库 %d/%d",
+                    self._rag_mode, query[:60], len(routed), len(partitions))
+        where = None
+        if source:
+            where = f"source LIKE '%{_escape_like(source)}%' ESCAPE '\\'"
+        per_partition: Dict[str, List[Dict[str, Any]]] = {}
+        for p, _score in routed:
+            name = str(p.get("name") or "")
+            store = self._get_store(name)
+            try:
+                results = store.search_with_rerank(
+                    query, top_k=top_k, where=where,
+                    min_similarity=self._min_similarity,
+                    use_reranker=False,  # 多库联合屏蔽精排
+                ) or []
+            except Exception as e:
+                logger.warning("  └─ ⚠ 分区 %r 检索失败: %s", name, e)
+                results = []
+            for r in results:
+                r["_partition"] = name
+            per_partition[name] = results
+        fused = fuse_partition_results(per_partition, route_scores,
+                                       top_k=top_k)
+        logger.info("  └─ ✅ 多分区检索完成: 返回 %d 条 (耗时 %.2fs)",
+                    len(fused), time.monotonic() - t0)
+        for i, r in enumerate(fused, 1):
+            logger.info("      [%d] %s@%s (融合分: %.4f) | %s...", i,
+                        r.get("partition", "?"),
+                        os.path.basename(r.get("source") or ""),
+                        r.get("fusion_score") or 0,
+                        (r.get("text") or "")[:60].replace("\n", " "))
+        return fused
+
+    def _multi_decision_search(
+        self,
+        query: str,
+        partitions: List[Dict[str, Any]],
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """多库联合判定检索：路由 → 各库 BM25 粗筛 → 融合 → 判定 → Top3。
+
+        实现委托 multi_search.multi_decision_search（先融合后判定）。
+        """
+        from .decision_model import get_decision_model
+        from .multi_search import multi_decision_search, route_partitions
+
+        model = None
+        try:
+            model = get_decision_model(self._decision_backend,
+                                       self._decision_model_path)
+        except Exception as e:
+            logger.warning("  └─ ⚠ 决策模型获取失败: %s", e)
+            model = None
+        routed = route_partitions(
+            query, partitions, model,
+            hit_probe=lambda p: bool(self._get_store(p["name"]).search_fts(
+                query, top_k=1)))
+        where = None
+        if source:
+            where = f"source LIKE '%{_escape_like(source)}%' ESCAPE '\\'"
+            logger.info("  ├─ 定向检索: 限定来源包含 %r", source)
+        return multi_decision_search(
+            self, query, routed, model,
+            coarse_k=self._decision_coarse_k,
+            use_core_sentences=self._decision_use_core,
+            core_top=self._decision_core_top,
+            where=where)
+
     def _reading_search(self, query: str, top_k: int = 5,
                         source: Optional[str] = None
                         ) -> List[Dict[str, Any]]:
@@ -2855,6 +3220,62 @@ class RAGEngine:
             "  └─ 阅读模式检索完成: 返回 %d 个长切片 (总耗时 %.3fs, 分阶段明细见 ⏱ 行)",
             len(out), time.monotonic() - t0)
         return out
+
+    def _decision_search(self, query: str,
+                         source: Optional[str] = None
+                         ) -> List[Dict[str, Any]]:
+        """决策判定模式：BM25 粗筛 → 字符级 BM25 核心句 → 决策模型判定。"""
+        # 多分区联合：各库 BM25 粗筛 → 加权 RRF 融合取前 20 → 判定模型对
+        # 核心句一次批量评判 → 取最高 3（multi_search.multi_decision_search）。
+        partitions = self._enabled_partitions()
+        if len(partitions) >= 2:
+            return self._multi_decision_search(query, partitions, source=source)
+        t0 = time.monotonic()
+        store = self._get_store()
+        try:
+            store_count = store.count()
+        except Exception as e:
+            logger.warning("RAG 决策判定模式: 读取向量库失败: %s", e)
+            return []
+        if store_count == 0:
+            logger.info("🔍 决策判定模式检索: 向量库为空，无结果返回")
+            return []
+        logger.info(
+            "🔍 决策判定模式检索: query=%r coarse_k=%d 核心句=%s(%d) "
+            "TopN=%d 模型=%s/%s",
+            query[:80], self._decision_coarse_k,
+            "开" if self._decision_use_core else "关", self._decision_core_top,
+            self._decision_top_n, self._decision_backend,
+            self._decision_model_path or "(默认 Meteor-0.8B)")
+        # 定向检索（source 过滤）与向量路径同款 SQL：source 字段存完整路径，
+        # 用 LIKE 匹配文档名（配合 rag_outline 的 Targeted RAG）。
+        where = None
+        if source:
+            where = f"source LIKE '%{_escape_like(source)}%' ESCAPE '\\'"
+            logger.info("  ├─ 定向检索: 限定来源包含 %r", source)
+        # 模型不可用（加载失败）时传 None：decision_search 自动回退字符 BM25
+        # 句分聚合排序，检索不崩、精度降级。
+        model = None
+        if self._rag_mode == "decision":
+            try:
+                from .decision_model import get_decision_model
+                model = get_decision_model(
+                    self._decision_backend, self._decision_model_path)
+            except Exception as e:
+                logger.warning("  └─ ⚠ 决策模型获取失败: %s", e)
+                model = None
+
+        class _Cfg:  # 轻量参数对象，对齐 decision_search 的 dot-access 契约
+            coarse_k = self._decision_coarse_k
+            use_core_sentences = self._decision_use_core
+            core_top = self._decision_core_top
+            top_n = self._decision_top_n
+
+        results = decision_search(store, query, _Cfg, model, where=where)
+        logger.info(
+            "  └─ ✅ 决策判定检索完成: 返回 %d 条结果 (总耗时 %.3fs)",
+            len(results), time.monotonic() - t0)
+        return results
 
     def search_formatted(
         self,
@@ -3003,9 +3424,21 @@ class RAGEngine:
         # 指定归属（ensure_digests 按 manifest 条目的历史模式写入）。
         reading = self._reading_mode if mode is None else bool(mode)
         if reading:
-            rs = self._get_reading_store()
+            # 跨模式补做（普通模式引擎为历史阅读条目写回归属库）必须 force：
+            # _get_reading_store() 默认在普通模式返回 None，会在这里抛
+            # RuntimeError 被逐文件 except 吞掉，digest 永远写不回。副作用仅
+            # 是建出空 ColBERT 库/空表（不加载 587MB 模型），可接受。
+            rs = self._get_reading_store(force=True)
             if rs is None:
                 raise RuntimeError("检索阅读模式 store 不可用")
+            if not source:
+                # doc_meta.doc_id = sha1(source) 必须与切片表同源；调用方
+                # （chapter_summarizer 的对账路径）拿不到 source 时按 doc_name
+                # 反查，否则会产生删除/迁移清不掉的孤儿 meta 行。
+                try:
+                    source = rs.resolve_source(doc_name)
+                except Exception:
+                    source = ""
             rs.upsert_doc_meta(
                 doc_name=doc_name, digest=digest, chapters=chapters_json,
                 md_path=md_path, source=source)
@@ -3265,7 +3698,7 @@ class RAGEngine:
                     # 中文标点都被丢掉），从文件名反推 doc_name 必然失真，会把
                     # "Chapter 1.pdf" 认成 "Chapter1.pdf"，于是每轮同步都判定
                     # 缺记录并写入一条重复行。md_path 是入库时原样记录的。
-                    existing = by_md_path.get(os.path.abspath(md_path))
+                    existing = norm_md.get(os.path.abspath(md_path))
                     doc_name = existing["doc_name"] if existing else ""
                 if not doc_name:
                     # 兜底：老缓存没有 md_path 记录时才退回按文件名猜。
@@ -3411,6 +3844,14 @@ class RAGEngine:
                     logger.info("  已清除同步记录文件")
                 except OSError as e:
                     logger.warning("  同步记录文件删除失败: %s", e)
+        # SimHash 相似去重指纹索引随知识库一起清空
+        simhash_idx_path = os.path.join(self._rag_dir, "simhash_index.json")
+        try:
+            if os.path.exists(simhash_idx_path):
+                os.remove(simhash_idx_path)
+                logger.info("  已清除相似去重指纹索引")
+        except OSError as e:
+            logger.warning("  相似去重指纹索引删除失败: %s", e)
         # 知识图谱随知识库清空（三张表 + 快照），下次需重新构建。
         try:
             import shutil
@@ -3439,6 +3880,9 @@ class RAGEngine:
         # 不先撤 worker 的话，它们随后会对着已关闭的 LanceDB/ONNX 会话报错，
         # 并把大文档的切片内存继续占着（线程是 daemon，不会阻止进程退出）。
         self._cancelled.set()
+        # 决策判定模型是进程级单例（decision_model.get_decision_model），
+        # 引擎重建后还要用——只丢引擎侧引用，不卸载权重（与 ColBERT runtime
+        # 同策略）。
         # 释放 KG 检索器（SQLite 连接）。
         if self._kg_retriever is not None:
             try:
@@ -3459,7 +3903,7 @@ class RAGEngine:
             logger.warning(
                 "RAG: close() 等待在途 ingest 退出超时 5s，仍继续释放资源；"
                 "本次同步可能丢弃尚未写入的切片")
-        if self._store is not None:
+        if self._store is not None or self._stores:
             with self._store_lock:
                 if self._store is not None:
                     try:
@@ -3467,6 +3911,20 @@ class RAGEngine:
                     except Exception as e:
                         logger.debug("RAG: VectorStore close error: %s", e)
                     self._store = None
+                for slug, store in self._stores.items():
+                    try:
+                        store.close()
+                    except Exception as e:
+                        logger.debug("RAG: VectorStore[%s] close error: %s",
+                                     slug, e)
+                self._stores.clear()
+        # 释放检索阅读模式库引用。注意：store 是 get_store_for_workspace 的
+        # 进程级单例（注册表共享，模型 runtime 也是单例），不能 close()——
+        # 引擎重建后还要用；这里只丢弃引擎持有的引用，表句柄由单例继续持有，
+        # 进程退出统一回收（与 embedding 单例同策略）。
+        if self._reading_store is not None:
+            with self._reading_store_lock:
+                self._reading_store = None
         self.release_parsers()
 
     def release_parsers(self) -> None:
@@ -3518,29 +3976,141 @@ class RAGEngine:
         written rows until the table is re-opened.
         """
         with self._store_lock:
-            if self._store is not None:
-                try:
-                    self._store.reload()
-                    logger.info("RAG: VectorStore reloaded (table handle refreshed)")
-                except Exception as e:
-                    logger.warning("RAG: VectorStore reload error: %s", e)
+            stores = [("default", self._store)] + list(self._stores.items())
+            for label, store in stores:
+                if store is not None:
+                    try:
+                        store.reload()
+                        logger.info("RAG: VectorStore[%s] reloaded", label)
+                    except Exception as e:
+                        logger.warning("RAG: VectorStore[%s] reload error: %s",
+                                       label, e)
 
     # ------------------------------------------------------------------
     # internal
     # ------------------------------------------------------------------
 
-    def _get_store(self) -> VectorStore:
-        # Double-check locking：避免并发 search() 时创建多个 VectorStore 实例
-        if self._store is None:
-            with self._store_lock:
-                if self._store is None:
-                    self._store = VectorStore(
-                        persist_dir=self._vector_dir,
-                        embedding_model=self._embedding_model,
-                        rerank_model=self._rerank_model,
-                        embedding_function=self._custom_ef,
-                    )
-        return self._store
+    def _get_store(self, partition: Optional[str] = None) -> VectorStore:
+        """返回分区对应的 VectorStore（懒创建）。
+
+        ``partition`` 为 None 且存在活动分区（ingest/dedup 循环重绑中）时
+        返回**活动分区**的 store——管线代码内部的 ``self._get_store()`` 无参
+        调用由此自动落到当前正在同步的分区库。None 且无活动分区 / 默认分区
+        时返回默认分区 store（双检锁逻辑，既有调用点零改动）。
+        """
+        if partition is None and self._active_partition is not None:
+            partition = self._active_partition["name"]
+        slug = self._partition_slug_of(partition)
+        if slug is None or slug == self._default_partition_slug():
+            # Double-check locking：避免并发 search() 时创建多个 VectorStore 实例
+            if self._store is None:
+                with self._store_lock:
+                    if self._store is None:
+                        self._store = VectorStore(
+                            persist_dir=self._vector_dir,
+                            embedding_model=self._embedding_model,
+                            rerank_model=self._rerank_model,
+                            embedding_function=self._custom_ef,
+                        )
+            return self._store
+        with self._store_lock:
+            store = self._stores.get(slug)
+            if store is None:
+                pdir = self._partition_dirs().get(slug)
+                store = VectorStore(
+                    persist_dir=os.path.join(pdir, "vectors"),
+                    embedding_model=self._embedding_model,
+                    rerank_model=self._rerank_model,
+                    embedding_function=self._custom_ef,
+                )
+                self._stores[slug] = store
+            return store
+
+    # ------------------------------------------------------------------
+    # 多知识分区：解析 / slug / 活动分区切换
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_partitions(rag_partitions: str) -> List[Dict[str, Any]]:
+        """解析分区 JSON；非法/空 → 空列表（单知识库模式）。"""
+        if not (rag_partitions or "").strip():
+            return []
+        try:
+            data = json.loads(rag_partitions)
+            if isinstance(data, list):
+                return [p for p in data if isinstance(p, dict)
+                        and p.get("name") and p.get("path")]
+        except (ValueError, TypeError):
+            pass
+        return []
+
+    @staticmethod
+    def _partition_slug(name: str) -> str:
+        """分区名 → 唯一目录名：可读前缀（alnum/CJK/._-，截 32）+ md5 前 12 位。"""
+        import hashlib
+        h = hashlib.md5(name.encode("utf-8")).hexdigest()[:12]
+        safe = "".join(c for c in name if c.isalnum() or c in "._-")[:32]
+        return f"{safe or 'partition'}_{h}"
+
+    def _enabled_partitions(self) -> List[Dict[str, Any]]:
+        """启用分区列表（default 分区排最前；无 rag_partitions 时为空 = 单库）。"""
+        parts = [p for p in self._partitions if p.get("enabled")]
+        parts.sort(key=lambda p: (not p.get("default"),))
+        return parts
+
+    def _default_partition_slug(self) -> Optional[str]:
+        for p in self._partitions:
+            if p.get("default") and p.get("enabled"):
+                return self._partition_slug(p["name"])
+        return None
+
+    def _partition_slug_of(self, partition: Optional[str]) -> Optional[str]:
+        """分区参数（slug / 名称 / None）→ slug；None/空/默认分区 → None。"""
+        if not partition:
+            return None
+        default_slug = self._default_partition_slug()
+        for p in self._partitions:
+            slug = self._partition_slug(p["name"])
+            if partition in (p["name"], slug):
+                return slug
+        return None if default_slug is None else default_slug
+
+    def _partition_dirs(self) -> Dict[str, str]:
+        """slug → 分区 rag_dir。默认分区沿用 workspace/rag，其余独立子目录。"""
+        dirs: Dict[str, str] = {}
+        for p in self._partitions:
+            slug = self._partition_slug(p["name"])
+            if slug == self._default_partition_slug():
+                dirs[slug] = self._default_rag_dir
+            else:
+                dirs[slug] = os.path.join(self._default_rag_dir,
+                                          "partitions", slug)
+        return dirs
+
+    def _set_active_partition(self, p: Optional[Dict[str, Any]]) -> None:
+        """把管线目录属性重绑到指定分区（ingest/dedup 循环内调用）。
+
+        默认分区 → 恢复 workspace/rag 原布局；其它分区 → partitions/<slug>/。
+        结束后必须调 ``_reset_active_partition()`` 恢复。
+        """
+        if p is None:
+            self._reset_active_partition()
+            return
+        slug = self._partition_slug(p["name"])
+        dirs = self._partition_dirs()
+        rag_dir = dirs.get(slug, self._default_rag_dir)
+        self._rag_dir = rag_dir
+        self._markdown_dir = os.path.join(rag_dir, "documents")
+        self._vector_dir = os.path.join(rag_dir, "vectors")
+        self._knowledge_base = p.get("path") or self._default_knowledge_base
+        self._active_partition = p
+
+    def _reset_active_partition(self) -> None:
+        self._rag_dir = self._default_rag_dir
+        self._markdown_dir = self._default_markdown_dir
+        self._vector_dir = self._default_vector_dir
+        self._knowledge_base = self._default_knowledge_base
+        self._active_partition = None
 
 
 def _safe_filename(path: str) -> str:

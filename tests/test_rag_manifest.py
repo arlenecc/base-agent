@@ -127,7 +127,8 @@ class _FakeStore:
         self.deleted_md_paths = []
         self._count = 0
 
-    def add_streaming(self, chunk_iter, batch_size=100, on_batch=None, is_cancelled=None):
+    def add_streaming(self, chunk_iter, batch_size=100, on_batch=None,
+                      is_cancelled=None, defer_embeddings=False):
         added = 0
         for chunk in chunk_iter:
             self.records.append(chunk)
@@ -136,6 +137,15 @@ class _FakeStore:
         if on_batch:
             on_batch(added, added)
         return added
+
+    def count_pending(self):
+        return 0
+
+    def has_pending(self):
+        return False
+
+    def start_backfill(self, log_cb=None):
+        return False
 
     def delete_by_source(self, source):
         self.deleted_sources.append(source)

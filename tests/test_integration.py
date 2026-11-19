@@ -121,9 +121,15 @@ def test_e2e_skill_suggested_after_repeat(config, recording_callbacks):
 
 def test_main_window_constructs(qapp, tmp_path, monkeypatch):
     # point config path at a temp file so we don't touch the user's real config
+    import json
     import agent.ui.main_window as mw
 
     monkeypatch.setattr(mw, "CONFIG_PATH", str(tmp_path / "cfg.json"))
+    # AgentConfig 默认 llm_provider="local"：_on_apply_config 重建 agent 时会
+    # 加载本地 MLX 权重并做 KV 预热，阻塞数分钟（与 test_ui_flow._make_window
+    # 同款隔离：API provider 无 preload_system_kv，即点即用）。
+    (tmp_path / "cfg.json").write_text(json.dumps(
+        {"llm_provider": "api", "aux_llm_provider": "api"}))
     win = mw.MainWindow()
     assert win.base_url_edit is not None
     assert win.model_combo is not None

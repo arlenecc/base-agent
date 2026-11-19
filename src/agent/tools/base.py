@@ -604,6 +604,8 @@ class ToolRegistry:
             engine = RAGEngine(
                 workspace=self.config.workspace,
                 knowledge_base=kb,
+                # 多知识分区（JSON；空串 = 单知识库模式）
+                rag_partitions=str(getattr(self.config, "rag_partitions", "") or ""),
                 embedding_model=_emb_model,
                 rerank_model=getattr(self.config, "rag_rerank_model",
                                      DEFAULT_RERANK_MODEL),
@@ -655,6 +657,22 @@ class ToolRegistry:
                     self.config, "rag_reading_chunk_min", 2500) or 2500),
                 reading_semantic_threshold=float(getattr(
                     self.config, "rag_reading_semantic_threshold", 0.55)),
+                embed_background=bool(getattr(
+                    self.config, "rag_embed_background", True)),
+                # RAG 检索模式三选一（vector/fast/decision）+ 决策判定参数。
+                rag_mode=str(getattr(self.config, "rag_mode", "vector") or "vector"),
+                rag_decision_model_backend=str(getattr(
+                    self.config, "rag_decision_model_backend", "mlx-vlm") or "mlx-vlm"),
+                rag_decision_model_path=str(getattr(
+                    self.config, "rag_decision_model_path", "") or ""),
+                rag_decision_coarse_k=int(getattr(
+                    self.config, "rag_decision_coarse_k", 50) or 50),
+                rag_decision_use_core_sentences=bool(getattr(
+                    self.config, "rag_decision_use_core_sentences", True)),
+                rag_decision_core_top=int(getattr(
+                    self.config, "rag_decision_core_top", 3) or 3),
+                rag_decision_top_n=int(getattr(
+                    self.config, "rag_decision_top_n", 5) or 5),
             )
             self._rag_engine = engine
             # KG 查询期关键词抽取用辅助模型：工具注册时已持有 aux_llm_getter，
