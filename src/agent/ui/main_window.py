@@ -2783,7 +2783,7 @@ class MainWindow(QMainWindow):
         # 知识图谱检索（spec 第八/九步）：策略下拉 + 构建按钮 + 状态
         # ------------------------------------------------------------------
         kg_row = QHBoxLayout(); kg_row.setSpacing(8)
-        kg_row.addWidget(QLabel("RAG 检索策略:"))
+        kg_row.addWidget(QLabel("知识图谱融合策略:"))
         self.kg_strategy_combo = _combo(
             ["naive（原文检索）", "local（实体细节）", "global（关系宏观）",
              "hybrid（实体+关系）", "mix（实体+关系+原文）"])
