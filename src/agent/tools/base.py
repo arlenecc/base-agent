@@ -606,6 +606,8 @@ class ToolRegistry:
                 knowledge_base=kb,
                 # 多知识分区（JSON；空串 = 单知识库模式）
                 rag_partitions=str(getattr(self.config, "rag_partitions", "") or ""),
+                rag_multi_decision_mode=bool(getattr(
+                    self.config, "rag_multi_decision_mode", False)),
                 embedding_model=_emb_model,
                 rerank_model=getattr(self.config, "rag_rerank_model",
                                      DEFAULT_RERANK_MODEL),

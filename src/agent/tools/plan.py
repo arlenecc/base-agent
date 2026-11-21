@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Any, Optional
 
 from ..config import AgentConfig
@@ -21,6 +22,8 @@ from ..kernel.session import (
 )
 from ..skills import _keywords_of
 from .base import Tool, ToolRegistry, ToolResult
+
+logger = logging.getLogger(__name__)
 
 # patch 允许修改的字段（title 用 replace 语义单独处理，不进这里）
 _PATCHABLE = ("status", "note")
@@ -153,6 +156,11 @@ class UpdatePlanTool(Tool):
                     False,
                     error="create needs a goal and at least one non-empty step title",
                 )
+            # ---- 计划评审（决策模型）：步骤合理性不足 → 拒绝并要求重新规划 ----
+            # 模型不可用 → 直接放行（按原方式）；同一目标最多拒绝 2 次。
+            review_ok, review_fb = self._review_plan(sess, plan)
+            if not review_ok:
+                return ToolResult(False, error=review_fb)
             # 新建计划时把第一步标为 doing：给模型一个明确的「当前位置」。
             # 仅当模型没有显式设定任何状态时才提升——否则会把模型标好的
             # doing/done 覆盖回 doing，计划面板显示错乱。
@@ -355,6 +363,42 @@ class UpdatePlanTool(Tool):
             )
 
         return ToolResult(False, error=f"unknown op: {op!r}")
+
+    # ------------------------------------------------------------------
+    def _review_plan(self, sess: Session, plan: dict) -> tuple:
+        """计划评审（决策模型）：返回 (是否通过, 拒绝反馈)。
+
+        - 决策模型不可用 → 通过（跳过评审，按原方式）；
+        - 单步计划不做评审（平凡任务无合理性可评）；
+        - 拒绝次数按目标键控记录在 ``sess.working``：换目标/新任务自动
+          重新计数，同一目标最多拒绝 ``PLAN_REVIEW_MAX_REJECTS`` 次，
+          超限放行（避免 create↔拒绝 死循环卡死任务）。
+        """
+        from ..plan_review import (
+            PLAN_REVIEW_MAX_REJECTS, PLAN_REVIEW_REJECTS_KEY,
+            load_plan_model, review_plan_steps,
+        )
+        steps = plan.get("steps") or []
+        if len(steps) < 2:
+            return True, ""
+        model = load_plan_model(self.config)
+        if model is None:
+            return True, ""
+        goal = str(plan.get("goal") or "")
+        rec = sess.working.get(PLAN_REVIEW_REJECTS_KEY)
+        if not (isinstance(rec, dict) and rec.get("goal") == goal):
+            rec = {"goal": goal, "rejects": 0}
+        if int(rec.get("rejects", 0)) >= PLAN_REVIEW_MAX_REJECTS:
+            logger.info("计划评审：目标 %r 已拒绝 %d 次，本次放行",
+                        goal[:40], rec.get("rejects", 0))
+            return True, ""
+        ok, fb = review_plan_steps(model, goal, steps)
+        if not ok:
+            rec["rejects"] = int(rec.get("rejects", 0)) + 1
+            sess.working[PLAN_REVIEW_REJECTS_KEY] = rec
+            logger.info("计划评审：拒绝 %d 步计划（第 %d/%d 次）",
+                        len(steps), rec["rejects"], PLAN_REVIEW_MAX_REJECTS)
+        return ok, fb
 
     # ------------------------------------------------------------------
     def _notify(self, sess: Session) -> None:

@@ -112,6 +112,20 @@ def _reset_chunk_tokenizer():
     _chunker.configure_tokenizer(None)
 
 
+@pytest.fixture(autouse=True)
+def _no_decision_model(monkeypatch):
+    """测试密封：禁用计划评审/收尾拦截的决策模型加载。
+
+    本机存在默认决策模型（Meteor）时，计划评审与收尾拦截会在脚本化测试里
+    真实加载模型并改变计划创建/自动续跑行为——统一禁用，保证不依赖机器上
+    是否装了模型。决策模型本身的专项测试见 test_plan_review.py（自行注入
+    FakeModel，不受本夹具影响）与 RAG 检索侧测试（走各自的 monkeypatch）。
+    """
+    from agent import plan_review as _pr
+    monkeypatch.setattr(_pr, "load_plan_model", lambda cfg: None)
+    yield
+
+
 @pytest.fixture()
 def tmp_workspace(tmp_path):
     """An isolated working directory used as the agent's filesystem root."""

@@ -23,6 +23,38 @@ from agent.rag.multi_search import (
 
 
 # ---------------------------------------------------------------------------
+# 引擎：分区数据删除（UI「删除」按钮入口）
+# ---------------------------------------------------------------------------
+
+def test_delete_partition_data(tmp_path):
+    """命名分区整目录删除；默认分区清理自身但保留 partitions/；无数据跳过。"""
+    from agent.rag.engine import RAGEngine
+    ws = str(tmp_path)
+    rag = os.path.join(ws, "rag")
+    # 命名分区：数据目录被整删
+    slug = RAGEngine._partition_slug("法律")
+    pdir = os.path.join(rag, "partitions", slug)
+    os.makedirs(os.path.join(pdir, "vectors"))
+    with open(os.path.join(pdir, "manifest.json"), "w") as f:
+        f.write("{}")
+    ok, msg = RAGEngine.delete_partition_data(ws, "法律", False)
+    assert ok and not os.path.exists(pdir)
+    # 默认分区：manifest/documents 清理，其它分区目录保留
+    os.makedirs(os.path.join(rag, "documents"))
+    with open(os.path.join(rag, "manifest.json"), "w") as f:
+        f.write("{}")
+    os.makedirs(pdir)  # 模拟另一命名分区仍存在
+    ok, msg = RAGEngine.delete_partition_data(ws, "默认知识库", True)
+    assert ok
+    assert not os.path.exists(os.path.join(rag, "manifest.json"))
+    assert not os.path.exists(os.path.join(rag, "documents"))
+    assert os.path.isdir(pdir)
+    # 无数据目录 → 成功跳过
+    ok, msg = RAGEngine.delete_partition_data(ws, "不存在", False)
+    assert ok and "跳过" in msg
+
+
+# ---------------------------------------------------------------------------
 # config：分区归一
 # ---------------------------------------------------------------------------
 
@@ -261,7 +293,9 @@ class _FakePartEngine:
     def __init__(self, per_store):
         self._per_store = per_store
 
-    def _get_store(self, name):
+    def _get_store(self, name=None):
+        if name is None:  # 无参调用 = 默认分区 store
+            name = next(iter(self._per_store))
         return self._per_store[name]
 
     def _partition_slug(self, name):
@@ -339,9 +373,9 @@ def test_multi_decision_empty_coarse_returns_empty():
 # 引擎三模式分发：多分区生效、reranker 屏蔽
 # ---------------------------------------------------------------------------
 
-def _engine_with_stores(monkeypatch, parts, rag_mode):
+def _engine_with_stores(monkeypatch, parts, rag_mode, **kw):
     """构造真引擎（分区解析），但注入假 store 与假模型，隔离 IO。"""
-    eng = _mk_engine(parts, str(tempfile.mkdtemp()), rag_mode=rag_mode)
+    eng = _mk_engine(parts, str(tempfile.mkdtemp()), rag_mode=rag_mode, **kw)
     fake = _FakePartEngine({
         "科技": _FakeStore(_chunks("tech", 60)),
         "法律": _FakeStore(_chunks("law", 60)),
@@ -354,24 +388,81 @@ def _engine_with_stores(monkeypatch, parts, rag_mode):
 
 
 def test_engine_multi_partition_vector_mode_fuses(monkeypatch, tmp_path):
+    """默认路径：各库粗筛（库级屏蔽 reranker）→ 融合 → 一次 reranker 精排 → top3。"""
     eng = _engine_with_stores(monkeypatch, _two_partitions(tmp_path), "vector")
     # search_with_rerank 在假 store 上不存在 → 打补丁记录 use_reranker
-    calls = []
+    rerank_calls = []
 
     class _RecordingStore(_FakeStore):
         def search_with_rerank(self, query, top_k=5, where=None,
                                min_similarity=0.5, use_reranker=True):
-            calls.append(use_reranker)
-            return _chunks("r", 3)
+            return _chunks("r", 8) if use_reranker is False else []
+
+        def rerank(self, query, candidates, top_k=5, min_similarity=None):
+            rerank_calls.append(len(candidates))
+            return list(candidates[:top_k])
 
     fake = _FakePartEngine({"科技": _RecordingStore([]),
-                            "法律": _RecordingStore([])})
+                            "法律": _RecordingStore([]),
+                            None: _RecordingStore([])})  # None = 默认库（精排用）
     monkeypatch.setattr(eng, "_get_store", fake._get_store, raising=False)
     eng._min_similarity = 0.5
     results = eng.search("合同", top_k=5)
-    assert calls and all(c is False for c in calls)  # 多库联合屏蔽 reranker
-    assert len(results) <= 5
+    # 精排只对融合池跑一次（候选 ≤ 融合池 20），取前 3
+    assert rerank_calls and rerank_calls[0] <= FUSION_POOL
+    assert len(results) <= 3
     assert all("partition" in r for r in results)
+
+
+def test_engine_multi_partition_fast_mode_no_rerank(monkeypatch, tmp_path):
+    """fast 模式默认路径：库级两段式精排已含于粗筛，融合后不再 rerank，取 top3。"""
+    eng = _engine_with_stores(monkeypatch, _two_partitions(tmp_path), "fast")
+    rerank_calls = []
+    swr_calls = []
+
+    class _FastStore(_FakeStore):
+        def search_with_rerank(self, query, top_k=5, where=None,
+                               min_similarity=0.5, use_reranker=True):
+            swr_calls.append((top_k, use_reranker))
+            return _chunks("r", 6)
+
+        def rerank(self, *a, **kw):
+            rerank_calls.append(1)
+            raise AssertionError("fast 模式融合后不应再 rerank")
+
+    fake = _FakePartEngine({"科技": _FastStore([]), "法律": _FastStore([])})
+    monkeypatch.setattr(eng, "_get_store", fake._get_store, raising=False)
+    eng._min_similarity = 0.5
+    results = eng.search("合同", top_k=5)
+    assert swr_calls and all(t == 20 and u is False for t, u in swr_calls)
+    assert not rerank_calls
+    assert 0 < len(results) <= 3
+    assert all("partition" in r for r in results)
+
+
+def test_engine_multi_partition_judgement_toggle(monkeypatch, tmp_path):
+    """判定开关开：路由选库 → 各库混合粗筛 20 → 融合 20 → 判定 → top3。"""
+    from agent.rag.multi_search import COARSE_PER_LIB
+    parts = _two_partitions(tmp_path)
+    eng = _engine_with_stores(monkeypatch, parts, "vector",
+                              rag_multi_decision_mode=True)
+    swr_calls = []
+
+    class _ToggleStore(_FakeStore):
+        def search_with_rerank(self, query, top_k=5, where=None,
+                               min_similarity=0.5, use_reranker=True):
+            swr_calls.append((top_k, use_reranker))
+            return _chunks("law", 30)
+
+    fake = _FakePartEngine({"科技": _ToggleStore([]), "法律": _ToggleStore([])})
+    monkeypatch.setattr(eng, "_get_store", fake._get_store, raising=False)
+    eng._min_similarity = 0.5
+    results = eng.search("合同效力", top_k=5)
+    # 各库粗筛 20 条且库级屏蔽 reranker；判定模型批量评判后取前 3
+    assert swr_calls and all(t == COARSE_PER_LIB and u is False
+                             for t, u in swr_calls)
+    assert 0 < len(results) <= MULTI_DECISION_TOP
+    assert all("partition" in r and "score" in r for r in results)
 
 
 def test_engine_multi_partition_decision_mode(monkeypatch, tmp_path):
@@ -379,6 +470,38 @@ def test_engine_multi_partition_decision_mode(monkeypatch, tmp_path):
     results = eng.search("合同效力", top_k=5)
     assert 0 < len(results) <= MULTI_DECISION_TOP
     assert results[0]["partition"] == "法律"
+
+
+def test_engine_multi_partition_bm25_prefilter(monkeypatch, tmp_path):
+    """BM25 快筛：零命中库不参与粗筛；全部零命中保留全库兜底。"""
+    eng = _engine_with_stores(monkeypatch, _two_partitions(tmp_path), "vector")
+    coarse_seen = []
+
+    class _PreStore(_FakeStore):
+        def __init__(self, chunks, hits):
+            super().__init__(chunks)
+            self._hits = hits
+
+        def search_fts(self, query, top_k=50, where=None):
+            return self._chunks[:top_k] if self._hits else []
+
+        def search_with_rerank(self, query, top_k=5, where=None,
+                               min_similarity=0.5, use_reranker=True):
+            coarse_seen.append(top_k)
+            return _chunks("r", 4)
+
+    fake = _FakePartEngine({
+        "科技": _PreStore(_chunks("tech", 5), hits=True),   # 命中 → 参与粗筛
+        "法律": _PreStore(_chunks("law", 5), hits=False),   # 零命中 → 排除
+        None: _PreStore(_chunks("r", 0), hits=True),        # 默认库（融合精排用）
+    })
+    monkeypatch.setattr(eng, "_get_store", fake._get_store, raising=False)
+    eng._min_similarity = 0.5
+    eng._rerank_enabled = False  # 跳过 reranker，聚焦快筛行为
+    results = eng.search("科技问题", top_k=5)
+    # 只有科技库进入粗筛（法律库零 BM25 命中被排除）；融合后取 top3
+    assert len(coarse_seen) == 1
+    assert 0 < len(results) <= 3
 
 
 def test_engine_single_partition_uses_legacy_path(monkeypatch, tmp_path):
@@ -414,6 +537,9 @@ def test_engine_no_partitions_legacy_mode(monkeypatch, tmp_path):
 
 
 def test_fusion_pool_constant():
-    """按用户规格：融合池 20、最终返回 3。"""
+    """按用户规格：每库粗筛 20、融合池 20、精排/判定后返回 3。"""
+    from agent.rag.multi_search import COARSE_PER_LIB, MULTI_FINAL_TOP
+    assert COARSE_PER_LIB == 20
     assert FUSION_POOL == 20
+    assert MULTI_FINAL_TOP == 3
     assert MULTI_DECISION_TOP == 3

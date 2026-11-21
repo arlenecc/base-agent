@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -708,6 +709,9 @@ class RAGEngine:
         rag_decision_top_n: int = 5,
         # ---- 多知识分区（JSON 数组字符串，见 config.rag_partitions）----
         rag_partitions: str = "",
+        # 多库联合检索使用判定模式（vector/fast 模式下生效，见
+        # config.rag_multi_decision_mode）
+        rag_multi_decision_mode: bool = False,
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -721,6 +725,9 @@ class RAGEngine:
         # 分区」（ingest/dedup 循环时重绑，结束恢复默认），全部既有管线代码
         # 无需感知分区。
         self._partitions = self._parse_partitions(rag_partitions)
+        # 多库联合检索判定模式开关（vector/fast 模式）：开 = 路由选库 +
+        # 融合后决策模型判定取 top3；关 = 全库粗筛融合后按各模式原精排取 top3。
+        self._multi_decision_mode = bool(rag_multi_decision_mode)
         self._default_rag_dir = self._rag_dir
         self._default_markdown_dir = self._markdown_dir
         self._default_vector_dir = self._vector_dir
@@ -1052,28 +1059,69 @@ class RAGEngine:
                 glean=self._kg_glean, raw_json=self._kg_raw_json)
             self._kg_retriever = KGRetriever(
                 self._rag_dir, self._get_store(), extractor,
-                estimate_tokens=estimate_tokens)
+                estimate_tokens=estimate_tokens,
+                chunk_lookup=self._lookup_chunks_across_partitions)
         return self._kg_retriever
 
-    def _kg_search(self, query: str, strategy: str) -> Optional[List[Dict[str, Any]]]:
-        """知识图谱检索路径；图谱未构建或无召回时返回 None（回退 naive）。"""
+    def _lookup_chunks_across_partitions(self, ids: List[str]) -> List[Dict[str, Any]]:
+        """按 chunk id 在全部启用分区中反查切片（图谱证据溯源用）。
+
+        多分区图谱是统一构建的，证据 id 可能来自任一分区；单库时只有
+        默认 store，行为与旧实现一致。
+        """
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        for p in (self._enabled_partitions() or [None]):
+            name = p["name"] if p else None
+            try:
+                store = self._get_store(name)
+                rows = store.get_chunks_by_ids(ids) or []
+            except Exception as e:
+                logger.debug("KG: 分区 %r 反查切片失败: %s", name, e)
+                continue
+            for r in rows:
+                rid = r.get("id") or ""
+                if rid and rid in seen:
+                    continue
+                if rid:
+                    seen.add(rid)
+                out.append(r)
+        return out
+
+    def _kg_search(self, query: str, strategy: str,
+                   top_k: int = 5,
+                   source: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        """知识图谱检索路径；图谱未构建或无召回时返回 None（回退基线检索）。
+
+        对所有 RAG 模式生效：mix 策略的原文 chunk 直召回走 ``_base_search``，
+        因此极速检索（二值两段式）、决策判定（BM25 粗筛 + 判定）与多分区
+        联合检索的候选都会与图谱实体/关系融合；rerank 仅在向量检索模式且
+        精排开启时使用交叉编码（极速/判定/多分区保持各自的原精排方案）。
+        """
         try:
             retriever = self._get_kg_retriever()
             if not retriever.graph_ready():
-                logger.warning("KG: 策略 %s 需要知识图谱（尚未构建），回退 naive。"
+                logger.warning("KG: 策略 %s 需要知识图谱（尚未构建），回退基线检索。"
                                "请在配置面板点击「构建知识图谱」", strategy)
+                return None
+            if not self._any_partition_has_data():
+                logger.info("KG: 各分区均无切片，回退基线检索")
                 return None
             store = self._get_store()
 
             def _chunk_recall(q: str, k: int) -> List[Dict[str, Any]]:
-                return store.search_with_rerank(
-                    q, top_k=k, min_similarity=self._min_similarity,
-                    use_reranker=self._rerank_enabled)
+                # 融合各模式的候选：极速=二值两段式；判定=粗筛+判定；
+                # 多分区=各库粗筛 RRF 融合；向量=混合检索 + reranker。
+                return self._base_search(q, top_k=k, source=source)
 
             def _rerank(q: str, cands: List[Dict[str, Any]], top_k: int = 10):
                 # retriever 以 rerank(q, cands, top_k=n) 关键字形式回调。
-                return store.rerank(q, cands, top_k=top_k,
-                                    min_similarity=self._min_similarity)
+                # 仅向量模式且精排开启时跑交叉编码；其它模式保持各自排序，
+                # 避免与「屏蔽 reranker」的极速/多库设计冲突。
+                if self._rag_mode == "vector" and self._rerank_enabled:
+                    return store.rerank(q, cands, top_k=top_k,
+                                        min_similarity=self._min_similarity)
+                return list(cands)[:top_k]
 
             results = retriever.search(query, strategy,
                                        chunk_recall=_chunk_recall,
@@ -1083,8 +1131,19 @@ class RAGEngine:
             # 检索的最终条数语义。
             return results or None
         except Exception as e:
-            logger.warning("KG: 图谱检索失败，回退 naive: %s", e, exc_info=True)
+            logger.warning("KG: 图谱检索失败，回退基线检索: %s", e, exc_info=True)
             return None
+
+    def _any_partition_has_data(self) -> bool:
+        """任一启用分区（或单库）有切片——图谱检索/构建的可用性判据。"""
+        for p in (self._enabled_partitions() or [None]):
+            try:
+                store = self._get_store(p["name"] if p else None)
+                if store.count() > 0:
+                    return True
+            except Exception:
+                continue
+        return False
 
     # ------------------------------------------------------------------
     # 知识图谱 MCP 工具路径（rag_mcp_server 的 9 个 kg 工具薄封装调用）
@@ -1148,8 +1207,22 @@ class RAGEngine:
         from .kg.builder import KGBuilder
         from .kg.extractor import create_extractor
         store = self._get_store()
-        if store.count() == 0:
+        # 多知识分区：各分区（含极速检索模式使用的库）的切片一并抽取，
+        # 统一进同一张图谱（实体按名聚合即融合）。全部分区为空才报错。
+        stores: List[tuple] = []
+        for p in (self._enabled_partitions() or [None]):
+            name = p["name"] if p else ""
+            try:
+                s = self._get_store(name or None)
+                if s.count() > 0:
+                    stores.append((name, s))
+            except Exception as e:
+                logger.warning("KG: 分区 %r 切片检查失败: %s", name, e)
+        if not stores:
             raise RuntimeError("知识库为空：请先入库文档再构建知识图谱")
+        if len(stores) > 1:
+            logger.info("KG: 多分区统一抽取 %d 个库: %s", len(stores),
+                        ", ".join(n or "默认" for n, _ in stores))
         extractor = create_extractor(
             self._kg_extractor_scheme, self._aux_llm,
             max_entities=self._kg_max_entities,
@@ -1159,7 +1232,7 @@ class RAGEngine:
         if not extractor.available:
             raise RuntimeError(getattr(extractor, "unavailable_reason", "")
                                or "抽取器不可用")
-        builder = KGBuilder(self._rag_dir, store, extractor)
+        builder = KGBuilder(self._rag_dir, store, extractor, stores=stores)
         try:
             stats = builder.build(doc_filter=doc_name or None, rebuild=rebuild)
         finally:
@@ -3025,11 +3098,35 @@ class RAGEngine:
         """
         if self._reading_mode:
             return self._reading_search(query, top_k=top_k, source=source)
+        # 知识图谱策略（local/global/hybrid/mix）对所有 RAG 模式生效：
+        # 向量检索 / 极速检索 / 决策判定 / 多分区联合共用同一条图谱；
+        # 图谱未构建或无召回时回退到基线检索（_base_search）。
+        if self._kg_strategy != "naive":
+            kg_results = self._kg_search(query, self._kg_strategy,
+                                         top_k=top_k, source=source)
+            if kg_results:
+                logger.info("🔍 知识库检索: KG 策略 %s 命中 %d 条", self._kg_strategy,
+                            len(kg_results))
+                return kg_results
+            logger.info("  └─ KG 策略 %s 无结果/不可用，回退基线原文检索",
+                        self._kg_strategy)
+        return self._base_search(query, top_k=top_k, source=source)
+
+    def _base_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """基线检索（不含知识图谱）：按当前模式分发。
+
+        决策判定 / 多分区联合 / 单库混合检索三条路径，供 ``search`` 在图谱
+        策略未命中时回退，也供 KG 的 mix 策略做原文 chunk 直召。
+        """
         if self._rag_mode == "decision":
             return self._decision_search(query, source=source)
-        # 多知识分区联合检索（启用分区 ≥2）：决策模型路由 → 各库混合检索
-        # （屏蔽 reranker，避免 N 库 × cross-encoder 长停顿）→ 按路由得分
-        # 加权 RRF 融合。单分区/无分区时走原单库路径，行为不变。
+        # 多知识分区联合检索（启用分区 ≥2）：全库粗筛 → RRF 融合 → 模式精排 /
+        # 判定模式（决策模型路由选库 + 融合后判定），见 _multi_partition_search。
         if len(self._enabled_partitions()) >= 2:
             return self._multi_partition_search(query, top_k=top_k, source=source)
         t0 = time.monotonic()
@@ -3038,16 +3135,8 @@ class RAGEngine:
         if store_count == 0:
             logger.info("🔍 知识库检索: 向量库为空，无结果返回 (查询=%r)", query[:60])
             return []
-        # 知识图谱策略分发（spec 第八步）：naive = 原始实现；local/global/
-        # hybrid/mix 走 KG 三路召回，图谱未构建或无召回时自动回退 naive。
-        if self._kg_strategy != "naive":
-            kg_results = self._kg_search(query, self._kg_strategy)
-            if kg_results:
-                logger.info("🔍 知识库检索: KG 策略 %s 命中 %d 条", self._kg_strategy,
-                            len(kg_results))
-                return kg_results
-            logger.info("  └─ KG 策略 %s 无结果/不可用，回退 naive 原文检索",
-                        self._kg_strategy)
+        # 知识图谱策略已在 search() 入口统一分发（对所有模式生效），
+        # 这里只做基线混合检索。
         # 构造 SQL 过滤条件：source 字段存完整路径，用 LIKE 匹配文档名。
         where = None
         if source:
@@ -3089,37 +3178,116 @@ class RAGEngine:
         top_k: int = 5,
         source: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """多分区联合检索（vector/fast 模式）：路由 → 各库混合检索 → 加权融合。
+        """多分区联合检索（vector/fast 模式）。
 
-        多库联合时屏蔽 reranker（use_reranker=False，保留各库向量 + BM25 的
-        RRF 融合），跨库按路由得分加权融合后取 top_k。
+        两条路径（由「多库联合检索使用判定模式」开关分发）：
+
+        默认（开关关）：**BM25 快筛可用库**（问句在库内零 BM25 命中的分区
+        不参与粗筛，避免污染候选池；全部零命中时保留全库兜底）→ 每个可用
+        分区各粗筛 ``COARSE_PER_LIB`` 条候选
+        （各库向量 + BM25 混合检索，库级屏蔽 reranker 避免 N 库 × 精排长停顿）
+        → 全库候选加权 RRF 融合（无路由，等权）取前 ``FUSION_POOL`` 条
+        → **沿用本模式原有精排方案**：vector = 对融合候选做一次 reranker
+        交叉编码精排；fast = 各库粗筛内已含二值量化两段式精排（rag_mode=fast
+        强制开启），融合序即精排序 → 最终取前 ``MULTI_FINAL_TOP`` 条。
+
+        判定模式（开关开）：路由（决策模型判定去哪些库）→ 命中库各粗筛
+        ``COARSE_PER_LIB`` 条 → RRF 融合取前 ``FUSION_POOL`` 条 → 决策模型
+        对融合候选一次批量判定 → 取前 ``MULTI_FINAL_TOP`` 条。
         """
         from .decision_model import get_decision_model
-        from .multi_search import fuse_partition_results, route_partitions
+        from .multi_search import (
+            COARSE_PER_LIB, FUSION_POOL, MULTI_FINAL_TOP,
+            fuse_partition_results, multi_decision_search, route_partitions,
+        )
 
         t0 = time.monotonic()
         partitions = self._enabled_partitions()
-        model = get_decision_model(self._decision_backend,
-                                   self._decision_model_path)
-        routed = route_partitions(
-            query, partitions, model,
-            hit_probe=lambda p: bool(self._get_store(p["name"]).search_fts(
-                query, top_k=1)))
-        route_scores = {str(p.get("name") or ""): s for p, s in routed}
-        logger.info("🌐 多分区联合检索 (%s): 查询=%r 命中库 %d/%d",
-                    self._rag_mode, query[:60], len(routed), len(partitions))
         where = None
         if source:
             where = f"source LIKE '%{_escape_like(source)}%' ESCAPE '\\'"
-        per_partition: Dict[str, List[Dict[str, Any]]] = {}
-        for p, _score in routed:
-            name = str(p.get("name") or "")
-            store = self._get_store(name)
+        logger.info("🌐 多分区联合检索 (%s): 查询=%r 分区 %d 个, 判定模式=%s",
+                    self._rag_mode, query[:60], len(partitions),
+                    "开" if self._multi_decision_mode else "关")
+
+        # ---- 判定模式：路由选库 → 各库粗筛 → 融合 → 决策模型判定 → top3 ----
+        model = None
+        if self._multi_decision_mode:
             try:
-                results = store.search_with_rerank(
-                    query, top_k=top_k, where=where,
+                model = get_decision_model(self._decision_backend,
+                                           self._decision_model_path)
+            except Exception as e:
+                logger.warning("  └─ ⚠ 决策模型获取失败: %s", e)
+                model = None
+            if model is not None:
+                routed = route_partitions(
+                    query, partitions, model,
+                    hit_probe=lambda p: bool(self._get_store(p["name"]).search_fts(
+                        query, top_k=1)))
+                route_scores = {str(p.get("name") or ""): s for p, s in routed}
+                logger.info("  ├─ 分区路由命中 %d/%d 库", len(routed),
+                            len(partitions))
+
+                def _fetch_hybrid(name: str) -> List[Dict[str, Any]]:
+                    # 各库粗筛 = 原混合检索（vector+BM25），库级屏蔽 reranker：
+                    # 精排统一移到融合后的决策模型批量判定
+                    return self._get_store(name).search_with_rerank(
+                        query, top_k=COARSE_PER_LIB, where=where,
+                        min_similarity=self._min_similarity,
+                        use_reranker=False) or []
+
+                try:
+                    results = multi_decision_search(
+                        self, query, routed, model,
+                        fetch_candidates=_fetch_hybrid,
+                        use_core_sentences=self._decision_use_core,
+                        core_top=self._decision_core_top,
+                    )
+                except Exception as e:
+                    logger.warning("  └─ ⚠ 多库判定检索失败，回退融合排序: %s", e)
+                    results = []
+                logger.info("  └─ ✅ 多分区判定检索完成: 返回 %d 条 (耗时 %.2fs)",
+                            len(results), time.monotonic() - t0)
+                for i, r in enumerate(results, 1):
+                    logger.info("      [%d] %s@%s (判定分: %.4f) | %s...", i,
+                                r.get("partition", "?"),
+                                os.path.basename(r.get("source") or ""),
+                                r.get("score") or 0,
+                                (r.get("text") or "")[:60].replace("\n", " "))
+                return results
+            # 模型不可用 → 落入默认融合路径（等权全库检索，不中断）
+
+        # ---- 默认：BM25 快筛可用库 → 全库粗筛 20 → RRF 等权融合前 20 ----
+        # ----           → 模式精排 → top3                              ----
+        # BM25 快筛：问句在库内零 BM25 命中的分区完全不相关，不参与粗筛——
+        # 免得其候选污染融合池。全部零命中（纯语义问句/专名不在词表）时保留
+        # 全库兜底，保证检索永远有落点。
+        usable: List[Dict[str, Any]] = []
+        for p in partitions:
+            name = str(p.get("name") or "")
+            try:
+                hit = bool(self._get_store(name).search_fts(query, top_k=1))
+            except Exception as e:
+                logger.warning("  └─ ⚠ 分区 %r BM25 快筛失败: %s", name, e)
+                hit = False
+            if hit:
+                usable.append(p)
+        if usable and len(usable) < len(partitions):
+            logger.info("  ├─ BM25 快筛可用库: %d/%d（零命中库已排除: %s）",
+                        len(usable), len(partitions), ", ".join(
+                            str(p.get("name")) for p in partitions
+                            if p not in usable))
+            partitions = usable
+        elif not usable:
+            logger.info("  ├─ BM25 快筛: 各库均零命中（纯语义问句），保留全库粗筛")
+        per_partition: Dict[str, List[Dict[str, Any]]] = {}
+        for p in partitions:
+            name = str(p.get("name") or "")
+            try:
+                results = self._get_store(name).search_with_rerank(
+                    query, top_k=COARSE_PER_LIB, where=where,
                     min_similarity=self._min_similarity,
-                    use_reranker=False,  # 多库联合屏蔽精排
+                    use_reranker=False,  # 精排统一移到融合后（一次性）
                 ) or []
             except Exception as e:
                 logger.warning("  └─ ⚠ 分区 %r 检索失败: %s", name, e)
@@ -3127,15 +3295,35 @@ class RAGEngine:
             for r in results:
                 r["_partition"] = name
             per_partition[name] = results
-        fused = fuse_partition_results(per_partition, route_scores,
-                                       top_k=top_k)
+        # 无路由 → route_scores 空 → 各库等权（fuse 内部默认 1.0）
+        fused = fuse_partition_results(per_partition, {},
+                                       top_k=FUSION_POOL)
+        # ---- 模式精排 ----
+        if self._rag_mode == "vector" and self._rerank_enabled and fused:
+            # vector 模式：对融合候选做**一次** reranker 交叉编码精排
+            # （单库语义阈值同样适用；reranker 不可用时自动回退向量距离排序）
+            store = self._get_store()
+            logger.info("  ├─ 融合后精排: reranker 对 %d 条融合候选交叉编码打分",
+                        len(fused))
+            fused = store.rerank(query, fused, top_k=MULTI_FINAL_TOP,
+                                 min_similarity=self._min_similarity)
+            for r in fused:
+                r["partition"] = r.pop("_partition",
+                                       r.get("partition", ""))
+        elif fused:
+            # fast 模式：二值量化两段式精排已在各库粗筛内完成（rag_mode=fast
+            # 强制开启），reranker 关闭/其它模式直接按融合序取 top3
+            fused = fused[:MULTI_FINAL_TOP]
+            for r in fused:
+                r["partition"] = r.pop("_partition",
+                                       r.get("partition", ""))
         logger.info("  └─ ✅ 多分区检索完成: 返回 %d 条 (耗时 %.2fs)",
                     len(fused), time.monotonic() - t0)
         for i, r in enumerate(fused, 1):
-            logger.info("      [%d] %s@%s (融合分: %.4f) | %s...", i,
+            logger.info("      [%d] %s@%s (分: %.4f) | %s...", i,
                         r.get("partition", "?"),
                         os.path.basename(r.get("source") or ""),
-                        r.get("fusion_score") or 0,
+                        r.get("score") or r.get("fusion_score") or 0,
                         (r.get("text") or "")[:60].replace("\n", " "))
         return fused
 
@@ -4051,6 +4239,47 @@ class RAGEngine:
         h = hashlib.md5(name.encode("utf-8")).hexdigest()[:12]
         safe = "".join(c for c in name if c.isalnum() or c in "._-")[:32]
         return f"{safe or 'partition'}_{h}"
+
+    @staticmethod
+    def delete_partition_data(workspace: str, name: str,
+                              is_default: bool = False) -> Tuple[bool, str]:
+        """删除知识库分区及其数据文件（UI「删除」按钮入口）。
+
+        - 命名分区：整目录删除 ``workspace/rag/partitions/<slug>/``（向量库、
+          documents、manifest、simhash 指纹索引、Markdown 缓存等全部数据）；
+        - 默认分区：清理 ``workspace/rag`` 下除 ``partitions/`` 子目录外的
+          **自身**数据（manifest、documents/、vectors/、simhash_index 及
+          阅读模式产物），保留其它命名分区的存储不被误删。
+
+        只删数据不碰源目录；返回 (是否成功, 说明)。
+        """
+        rag_dir = os.path.join(workspace or "", "rag")
+        if not os.path.isdir(rag_dir):
+            return True, "无数据目录，跳过文件清理"
+        if is_default:
+            try:
+                removed = 0
+                for entry in os.listdir(rag_dir):
+                    if entry == "partitions":
+                        continue  # 保留其它命名分区的存储
+                    p = os.path.join(rag_dir, entry)
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+                    removed += 1
+                return True, f"已清理默认分区数据 {removed} 项（保留其它分区目录）"
+            except OSError as e:
+                return False, f"删除默认分区数据失败: {e}"
+        slug = RAGEngine._partition_slug(name or "")
+        data_dir = os.path.join(rag_dir, "partitions", slug)
+        if not os.path.isdir(data_dir):
+            return True, f"分区 {name!r} 无数据目录，跳过文件清理"
+        try:
+            shutil.rmtree(data_dir)
+        except OSError as e:
+            return False, f"删除分区数据目录失败: {data_dir}: {e}"
+        return True, f"已删除数据目录 partitions/{slug}"
 
     def _enabled_partitions(self) -> List[Dict[str, Any]]:
         """启用分区列表（default 分区排最前；无 rag_partitions 时为空 = 单库）。"""

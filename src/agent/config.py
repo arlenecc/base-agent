@@ -161,6 +161,11 @@ class AgentConfig:
     # 默认分区沿用 workspace/rag 旧布局（老用户零迁移）；其余分区数据存于
     # workspace/rag/partitions/<slug>/。空串 = 单知识库（现行为）。
     rag_partitions: str = ""
+    # 多库联合检索使用判定模式（仅向量检索/极速检索模式生效）：开启后多库
+    # 联合检索先由决策模型判定去哪些库检索，各库粗筛候选 RRF 融合取前 20
+    # 后再由决策模型判定一次，取前 3 返回；关闭（默认）则全库粗筛融合后
+    # 沿用各模式原精排（vector= reranker；fast= 二值量化两段式），取前 3。
+    rag_multi_decision_mode: bool = False
     # 章节内语义低谷阈值（默认 0.55，代码会按分布自适应且不低于 0.15）。
     rag_reading_semantic_threshold: float = 0.55
     # 辅助模型归纳精简（rag_search 后处理）的触发区间（按检索分片总字数）：
@@ -504,7 +509,8 @@ class AgentConfig:
                     "rag_presentation_mode",
                     "rag_reading_mode_enabled", "rag_reading_use_ann",
                     "rag_embed_background",
-                    "rag_decision_use_core_sentences")
+                    "rag_decision_use_core_sentences",
+                    "rag_multi_decision_mode")
 
     def __post_init__(self) -> None:
         """构造期即归一多知识分区（_migrate 只在 load() 路径触发）。"""

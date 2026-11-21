@@ -918,10 +918,25 @@ class BuildKGWorker(QThread):
                 overlap_percent=getattr(self._config, "rag_chunk_overlap_percent", 0.10),
                 use_semantic=getattr(self._config, "rag_chunk_semantic", True),
                 clamp_model=effective_embedding_model(self._config),
+                # 多知识分区：各分区的切片一并抽取，统一进同一张图谱
+                rag_partitions=str(getattr(self._config, "rag_partitions", "") or ""),
             )
             store = self._engine._get_store()
-            if store.count() == 0:
+            # 汇总所有启用分区（含极速检索模式使用的库）；全空才报错
+            stores = []
+            for p in (self._engine._enabled_partitions() or [None]):
+                name = p["name"] if p else ""
+                try:
+                    s = self._engine._get_store(name or None)
+                    if s.count() > 0:
+                        stores.append((name, s))
+                except Exception as e:
+                    self._emit_log(f"[kg] ⚠ 分区「{name or '默认'}」切片检查失败: {e}")
+            if not stores:
                 raise RuntimeError("知识库为空：请先同步知识库（有切片才能抽取实体/关系）")
+            if len(stores) > 1:
+                self._emit_log("[kg] 多分区统一抽取 %d 个库: %s" % (
+                    len(stores), ", ".join(n or "默认" for n, _ in stores)))
             extractor = create_extractor(
                 scheme, aux_client,
                 max_entities=int(getattr(self._config, "rag_kg_max_entities", 20)),
@@ -934,7 +949,7 @@ class BuildKGWorker(QThread):
                 raise RuntimeError(getattr(extractor, "unavailable_reason", "")
                                    or "抽取器不可用")
             builder = KGBuilder(
-                self._engine._rag_dir, store, extractor,
+                self._engine._rag_dir, store, extractor, stores=stores,
                 progress_callback=lambda d, t, m: self.kg_progress.emit(d, t, m),
                 cancel_event=self._cancel,
                 log_callback=self._emit_log,
@@ -2599,6 +2614,23 @@ class MainWindow(QMainWindow):
             "二值粗筛第一阶段汉明距离保留的候选数（rag_binary_prefilter_top，默认 200）。")
         r.addWidget(self.bin_prefilter_top_combo)
         vlay.addLayout(r)
+
+        # row4: 多库联合检索判定模式开关（仅多知识分区联合检索时生效）
+        self.multi_decision_chk_vec = QCheckBox("多库联合检索使用判定模式")
+        self.multi_decision_chk_vec.setChecked(
+            bool(getattr(self.config, "rag_multi_decision_mode", False)))
+        self.multi_decision_chk_vec.setToolTip(
+            "多知识分区联合检索（向量检索/极速检索模式）的可选判定链路：\n"
+            "· 开启：决策模型先判定去哪些库检索（路由选库）→ 各库粗筛 20 条 →\n"
+            "  RRF 融合取前 20 → 决策模型对融合候选再判定一次 → 取前 3 返回；\n"
+            "· 关闭（默认）：所有启用库各粗筛 20 条 → RRF 融合取前 20 →\n"
+            "  沿用本模式原精排（向量模式 reranker / 极速模式二值量化两段式）→\n"
+            "  取前 3 返回。\n"
+            "判定模式需要本地决策模型可用；不可用时自动回退融合排序。")
+        r4 = QHBoxLayout(); r4.setSpacing(8)
+        r4.addWidget(self.multi_decision_chk_vec)
+        r4.addStretch(1)
+        vlay.addLayout(r4)
         klay.addWidget(self.rag_vector_w)
 
         # ---- 极速检索模式组：检索阅读模式（ColBERT）子分组 ----
@@ -2607,6 +2639,21 @@ class MainWindow(QMainWindow):
         flay = QVBoxLayout(self.rag_fast_w)
         flay.setContentsMargins(0, 0, 0, 0)
         flay.setSpacing(8)
+        # 多库联合检索判定模式开关（与向量检索模式组同一配置项，镜像显示）
+        self.multi_decision_chk_fast = QCheckBox("多库联合检索使用判定模式")
+        self.multi_decision_chk_fast.setChecked(
+            bool(getattr(self.config, "rag_multi_decision_mode", False)))
+        self.multi_decision_chk_fast.setToolTip(
+            self.multi_decision_chk_vec.toolTip())
+        # 两个模式组的开关镜像同一配置项：任一变化同步到另一个
+        self.multi_decision_chk_fast.toggled.connect(
+            self.multi_decision_chk_vec.setChecked)
+        self.multi_decision_chk_vec.toggled.connect(
+            self.multi_decision_chk_fast.setChecked)
+        fr = QHBoxLayout(); fr.setSpacing(8)
+        fr.addWidget(self.multi_decision_chk_fast)
+        fr.addStretch(1)
+        flay.addLayout(fr)
         klay.addWidget(self.rag_fast_w)
 
         # ---- 决策判定模式组：决策模型 / 粗筛数量 / 核心句 / TopN ----
@@ -3666,9 +3713,10 @@ class MainWindow(QMainWindow):
         self.kb_sync_btn.setFixedWidth(96)
         self.kb_sync_btn.setStyleSheet("font-weight:600;")
         self.kb_sync_btn.setToolTip(
-            "直接同步知识库（无需打开设置窗口）：\n"
-            "左键：增量同步（只处理新增/修改的文件）\n"
-            "右键：强制全量重新处理"
+            "一键同步所有知识库（无需打开设置窗口）：\n"
+            "左键：增量同步所有启用的知识分区（只处理新增/修改的文件）\n"
+            "右键：强制全量重新处理（所有分区）\n"
+            "分区行内的「同步」按钮则只同步该分区。"
         )
         self.kb_sync_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
         self._kb_force_sync_action = self.kb_sync_btn.addAction("强制全量重新处理")
@@ -3982,6 +4030,10 @@ class MainWindow(QMainWindow):
         self.rag_mode_combo.setCurrentText(_RAG_MODE_VALUE_TO_DISPLAY.get(
             str(getattr(self.config, "rag_mode", "vector") or "vector"),
             "向量检索模式"))
+        # 多库联合检索判定模式开关（两模式组镜像同步）
+        _mdm = bool(getattr(self.config, "rag_multi_decision_mode", False))
+        self.multi_decision_chk_vec.setChecked(_mdm)
+        self.multi_decision_chk_fast.setChecked(_mdm)
         self.decision_backend_combo.setCurrentText(
             _DECISION_BACKEND_TO_DISPLAY.get(
                 str(getattr(self.config, "rag_decision_model_backend",
@@ -4114,6 +4166,13 @@ class MainWindow(QMainWindow):
         dedup_btn = QPushButton("去重")
         dedup_btn.setFixedWidth(48)
         dedup_btn.setToolTip("仅对本知识分区的向量库做去重（清理重复向量）")
+        del_btn = QPushButton("删除")
+        del_btn.setFixedWidth(48)
+        del_btn.setEnabled(not bool(default))
+        del_btn.setToolTip(
+            "删除该知识库：移除本行配置并删除其数据目录\n"
+            "（向量库、清单、simhash 指纹、Markdown 缓存等），源目录不受影响。\n"
+            "默认知识库不可删除：先把「设为默认」给其它分区后再删除。")
         r.addWidget(QLabel("启用"))
         r.addWidget(enabled_chk)
         r.addWidget(default_btn)
@@ -4125,12 +4184,14 @@ class MainWindow(QMainWindow):
         r.addWidget(sync_btn)
         r.addWidget(stop_btn)
         r.addWidget(dedup_btn)
+        r.addWidget(del_btn)
         row = {
             "widget": row_w, "enabled_chk": enabled_chk,
             "default_btn": default_btn, "name_edit": name_edit,
             "path_edit": path_edit, "browse_btn": browse_btn,
             "sync_btn": sync_btn, "apply_btn": apply_btn,
             "stop_btn": stop_btn, "dedup_btn": dedup_btn,
+            "del_btn": del_btn,
         }
         # 动态行的信号就地连接（静态行的连接集中在 _wire_signals）
         browse_btn.clicked.connect(lambda: self._on_pick_partition_path(row))
@@ -4138,8 +4199,11 @@ class MainWindow(QMainWindow):
         apply_btn.clicked.connect(self._on_apply_config)
         stop_btn.clicked.connect(self._on_stop_sync)
         dedup_btn.clicked.connect(lambda: self._on_dedup_partition(row))
+        del_btn.clicked.connect(lambda: self._on_delete_partition(row))
         enabled_chk.toggled.connect(lambda _on: self._enforce_partition_constraints(row))
         default_btn.toggled.connect(lambda _on: self._enforce_partition_constraints(row))
+        # 默认分区不可删除：默认标记移动时同步切换「删除」按钮可用性
+        default_btn.toggled.connect(lambda on: del_btn.setEnabled(not on))
         self._partitions_lay.addWidget(row_w)
         self._partition_rows.append(row)
         return row
@@ -4175,6 +4239,10 @@ class MainWindow(QMainWindow):
                  and r is not changed), None)
             if first_enabled is not None:
                 first_enabled["default_btn"].setChecked(True)
+        # 默认分区不可删除：统一同步各行「删除」按钮可用性（默认标记的
+        # blockSignals 摘除路径不触发 toggled 信号，这里兜底刷新）
+        for r in rows:
+            r["del_btn"].setEnabled(not r["default_btn"].isChecked())
 
     def _on_add_partition_row(self) -> None:
         """复制最后一行配置块生成新行（名称留空待用户修改）。"""
@@ -4203,6 +4271,68 @@ class MainWindow(QMainWindow):
             # 名称留空时以目录名作为默认领域名
             if not row["name_edit"].text().strip():
                 row["name_edit"].setText(os.path.basename(d) or "")
+
+    def _on_delete_partition(self, row: Dict[str, Any]) -> None:
+        """行内删除按钮：删除该知识库的行配置及其数据文件。
+
+        - **默认知识库不可删除**（按钮禁用 + 本方法约束兜底）；
+        - 命名分区：删除 workspace/rag/partitions/<slug>/（引擎 slug 口径）；
+        - 删到最后一行时按 knowledge_base 重建单行，配置立即落盘。
+        """
+        name = row["name_edit"].text().strip()
+        path = row["path_edit"].text().strip()
+        is_default = row["default_btn"].isChecked()
+        if is_default:
+            # 默认知识库不可删除（按钮已禁用，此处为约束兜底）
+            QMessageBox.information(
+                self, "无法删除",
+                "默认知识库不允许删除。\n请先把「设为默认」给其它知识分区，"
+                "再删除该分区。")
+            return
+        label = name or os.path.basename(path) or "(未命名)"
+        scope = ("默认知识库（仅清理自身数据，其它分区存储保留）"
+                 if is_default else "该分区的全部数据目录")
+        ret = QMessageBox.question(
+            self, "删除知识库",
+            f"确定删除知识库「{label}」？\n\n"
+            f"将删除{scope}：向量库、清单、simhash 指纹、Markdown 缓存等。\n"
+            "源目录中的文件不受影响。此操作不可撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ok, msg = RAGEngine.delete_partition_data(
+                self.config.workspace, name, is_default)
+        except Exception as e:
+            ok, msg = False, f"{type(e).__name__}: {e}"
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not ok:
+            QMessageBox.warning(self, "删除知识库失败", msg)
+            self._append_log(f"⚠ 知识库「{label}」数据删除失败：{msg}")
+            return
+        self._append_log(f"🗑 知识库「{label}」已删除：{msg}")
+        # 移除行 UI
+        self._partitions_lay.removeWidget(row["widget"])
+        row["widget"].setParent(None)
+        row["widget"].deleteLater()
+        self._partition_rows.remove(row)
+        if not self._partition_rows:
+            # 删到最后一行 → 按 knowledge_base 重建单行（与 _apply_partitions
+            # 的老用户兜底一致），保证分区列表永不为空。
+            kb_default = str(getattr(self.config, "knowledge_base", "") or "")
+            self._make_partition_row(
+                name="默认知识库", path=kb_default,
+                enabled=bool(kb_default), default=True)
+        # 默认约束重排（删掉默认行时让给第一个启用行）+ 配置立即落盘
+        first = self._partition_rows[0]
+        self._enforce_partition_constraints(first)
+        self._gather_partitions()
+        self.config.save(CONFIG_PATH)
+        self._apply_partitions()  # 用落盘后的归一配置重建行区（默认标记归位）
+        self._append_log("✅ 分区配置已更新并保存")
 
     def _on_sync_partition(self, row: Dict[str, Any]) -> None:
         """行内同步按钮：仅同步该分区（走 SyncKnowledgeWorker，带分区参数）。"""
@@ -4430,6 +4560,9 @@ class MainWindow(QMainWindow):
         # 数值项夹紧到下拉允许的选项（与 config._migrate 归一一致）。
         self.config.rag_mode = _RAG_MODE_DISPLAY_TO_VALUE.get(
             self.rag_mode_combo.currentText().strip(), "vector")
+        # 多库联合检索判定模式（两模式组开关镜像同一配置项，任读其一）
+        self.config.rag_multi_decision_mode = (
+            self.multi_decision_chk_vec.isChecked())
         self.config.rag_decision_model_backend = (
             _DECISION_BACKEND_DISPLAY_TO_VALUE.get(
                 self.decision_backend_combo.currentText().strip(), "mlx-vlm"))
@@ -4892,6 +5025,11 @@ class MainWindow(QMainWindow):
             self._gather_partitions()
             kb = partition_path or partition
         else:
+            # 主界面「知识同步」= 一键同步**所有**启用知识库：先收集分区行
+            # 当前配置（新增/改名/启用状态即时生效，无需先点「应用配置」），
+            # 再交由 SyncKnowledgeWorker 调 engine.ingest()（partition=""）
+            # 循环同步全部启用分区。
+            self._gather_partitions()
             kb = self.knowledge_base_edit.text().strip()
             if not kb:
                 QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")

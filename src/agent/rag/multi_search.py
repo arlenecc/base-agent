@@ -1,20 +1,20 @@
-"""多知识分区联合检索：决策模型路由 + 跨分区加权 RRF 融合。
+"""多知识分区联合检索：库级粗筛 + 跨分区 RRF 融合 + 可选判定模式。
 
-流程（查询期，多分区且启用 ≥2 时生效）：
+流程（查询期，多分区且启用 ≥2 时生效；vector/fast 由引擎的
+``rag_multi_decision_mode`` 开关分发，decision 模式恒走判定管线）：
 
-1. **路由**：Meteor 决策模型对每个分区名（领域标签）与问句打相关性分
-   （0~1），取 >threshold 的分区按分降序；全部低于阈值时保底最高分 1 个；
-   模型不可用 / 仅 1 个启用分区 → 跳过路由（零额外开销）。
-2. **各分区粗筛**：调用方按模式自行检索（vector/fast = 各库混合检索，
-   decision = 各库 BM25 粗筛 coarse_k 条）。
-3. **跨库融合**：路由得分 min-max 归一化为库权重 → weighted RRF
-   （复用 vector_store._rrf_fuse，key=(分区, source, chunk_index)）。
-4. **判定**（decision 模式，先融合后判定）：融合池取前 ``FUSION_POOL``
-   条 → 核心句提取（复用 decision_search.extract_core_sentences）→
-   判定模型一次批量打分 → 取前 ``MULTI_DECISION_TOP`` 返回。
+1. **默认路径（vector/fast，开关关）**：所有启用分区各粗筛
+   ``COARSE_PER_LIB`` 条（各库混合检索，库级屏蔽 reranker）→ 加权 RRF
+   融合（无路由等权）取前 ``FUSION_POOL`` 条 → 引擎侧按模式精排
+   （vector = reranker 一次交叉编码；fast = 两段式已在库级完成）→
+   取前 ``MULTI_FINAL_TOP`` 条。
+2. **判定路径（开关开 / decision 模式）**：路由（决策模型按分区名打分，
+   ``route_partitions``，BM25 命中探针保底）→ 命中库粗筛 → 加权 RRF
+   融合取前 ``FUSION_POOL`` 条 → 核心句 → 判定模型一次批量打分 →
+   取前 ``MULTI_DECISION_TOP`` 条返回。
 
-多分区联合时由引擎侧屏蔽 reranker（use_reranker=False），避免 N 库 ×
-cross-encoder 的长停顿。
+库级粗筛一律屏蔽 reranker（避免 N 库 × cross-encoder 长停顿）；vector
+模式的精排移到融合后对 ``FUSION_POOL`` 条候选一次性执行。
 """
 from __future__ import annotations
 
@@ -30,8 +30,12 @@ logger = logging.getLogger(__name__)
 
 # 路由判定阈值：分区名与问句的相关性得分（0~1）超过它才入选。
 ROUTE_THRESHOLD = 0.5
-# 多库联合（decision 模式）：融合池大小（各库粗筛候选加权 RRF 后保留的条数）。
+# 多库联合（vector/fast 默认路径 & 判定路径）：每库粗筛候选数。
+COARSE_PER_LIB = 20
+# 多库联合：融合池大小（各库粗筛候选加权 RRF 后保留的条数）。
 FUSION_POOL = 20
+# 多库联合（vector/fast）：精排/判定后返回的最终切片数。
+MULTI_FINAL_TOP = 3
 # 多库联合（decision 模式）：判定后返回的相关切片数。
 MULTI_DECISION_TOP = 3
 
@@ -145,11 +149,13 @@ def multi_decision_search(
     use_core_sentences: bool = True,
     core_top: int = 3,
     where: Optional[str] = None,
+    fetch_candidates: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
-    """多库联合判定管线（decision 模式）：先融合后判定。
+    """多库联合判定管线：先融合后判定。
 
-    1. 各分区 BM25 粗筛 ``coarse_k`` 条（store.search_fts，``where`` 为可选
-       定向检索过滤）；
+    1. 各分区粗筛 ``coarse_k`` 条：默认 ``store.search_fts``（BM25，
+       ``where`` 为可选定向检索过滤）；传入 ``fetch_candidates(name)``
+       闭包时改由它提供候选（vector/fast 判定路径用各库混合检索粗筛）；
     2. 全部候选按路由得分加权 RRF 融合，取前 ``FUSION_POOL`` 条；
     3. 融合候选提取核心句（截短输入），判定模型**一次批量**打分；
     4. 取判定分最高 ``MULTI_DECISION_TOP`` 条返回。
@@ -168,9 +174,13 @@ def multi_decision_search(
         store_names[name] = slug
         route_scores[name] = float(score)
         try:
-            cands = store.search_fts(query, top_k=coarse_k, where=where) or []
+            if fetch_candidates is not None:
+                cands = fetch_candidates(name) or []
+            else:
+                cands = store.search_fts(query, top_k=coarse_k,
+                                         where=where) or []
         except Exception as e:
-            logger.warning("  └─ ⚠ 分区 %r BM25 粗筛失败: %s", name, e)
+            logger.warning("  └─ ⚠ 分区 %r 粗筛失败: %s", name, e)
             cands = []
         tagged = []
         for c in cands:

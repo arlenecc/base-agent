@@ -894,6 +894,147 @@ def test_partition_rows_empty_row_skipped_in_gather(qtbot, tmp_path, monkeypatch
     assert len(parts) == 1
 
 
+def test_kb_sync_button_syncs_all_partitions(qtbot, tmp_path, monkeypatch):
+    """主界面「知识同步」= 一键同步所有知识库：
+    未保存的分区行配置即时收集进 config，依赖检查收到默认分区路径。"""
+    import agent.ui.main_window as mw
+    from unittest.mock import MagicMock
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    created = []
+
+    def _fake_deps(kb_path):
+        created.append(kb_path)
+        return MagicMock()  # progress/deps_finished.connect 均被吞掉，流程停在此步
+
+    monkeypatch.setattr(mw, "InstallDepsWorker", _fake_deps)
+
+    # 模拟用户在分区行新增一个知识库但未点「应用配置」
+    win._make_partition_row(name="法律", path=str(tmp_path / "law"),
+                            enabled=True, default=False)
+    win.kb_sync_btn.click()
+
+    import json as _json
+    parts = _json.loads(win.config.rag_partitions)
+    names = {p["name"] for p in parts}
+    assert "法律" in names  # 未保存的分区行已被一键同步收集
+    # 依赖检查以默认分区路径发起（主按钮无分区参数 → 全部启用分区）
+    assert created and created[-1] == win.knowledge_base_edit.text().strip()
+
+
+def test_partition_delete_button_removes_row_and_data(qtbot, tmp_path, monkeypatch):
+    """行内「删除」按钮：确认后移除该行、删除分区数据目录并落盘配置。"""
+    import agent.ui.main_window as mw
+    from agent.rag.engine import RAGEngine
+    from PyQt6.QtWidgets import QMessageBox
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    # 新增命名分区并落盘
+    law_src = tmp_path / "law_src"
+    law_src.mkdir()
+    win._make_partition_row(name="法律", path=str(law_src),
+                            enabled=True, default=False)
+    win._gather_partitions()
+    win.config.save(mw.CONFIG_PATH)
+    # 造分区数据目录（引擎 slug 口径；workspace = tmp_path/"ws"）
+    slug = RAGEngine._partition_slug("法律")
+    pdir = tmp_path / "ws" / "rag" / "partitions" / slug
+    pdir.mkdir(parents=True)
+    (pdir / "manifest.json").write_text("{}")
+    # 跳过确认对话框（直接确认）
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+
+    win._on_delete_partition(win._partition_rows[-1])
+
+    # 行被移除；数据目录被删除；配置落盘且不含该分区
+    assert "法律" not in {r["name_edit"].text().strip()
+                          for r in win._partition_rows}
+    assert not pdir.exists()
+    parts = json.loads(win.config.rag_partitions)
+    assert "法律" not in {p["name"] for p in parts}
+    # 源目录不受影响
+    assert law_src.exists()
+
+
+def test_partition_delete_default_refused(qtbot, tmp_path, monkeypatch):
+    """默认知识库不允许删除：删除按钮禁用；绕过按钮调处理函数也被兜底拒绝。"""
+    import agent.ui.main_window as mw
+    from agent.rag.engine import RAGEngine
+    from PyQt6.QtWidgets import QMessageBox
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    law_src = tmp_path / "law_src"
+    law_src.mkdir()
+    win._make_partition_row(name="法律", path=str(law_src),
+                            enabled=True, default=False)
+    win._gather_partitions()
+    win.config.save(mw.CONFIG_PATH)
+    rag = tmp_path / "ws" / "rag"
+    (rag / "documents").mkdir(parents=True)
+    (rag / "manifest.json").write_text("{}")
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    monkeypatch.setattr(QMessageBox, "information",
+                        staticmethod(lambda *a, **k: None))
+
+    default_row = win._partition_rows[0]
+    assert default_row["default_btn"].isChecked()
+    assert not default_row["del_btn"].isEnabled()  # 默认行删除按钮禁用
+    # 命名行删除按钮可用
+    assert win._partition_rows[-1]["del_btn"].isEnabled()
+
+    # 兜底：即使直接调处理函数也不删
+    win._on_delete_partition(default_row)
+    assert default_row in win._partition_rows
+    assert (rag / "manifest.json").exists()      # 数据未被清理
+    assert (rag / "documents").exists()
+    parts = json.loads(win.config.rag_partitions)
+    assert any(p.get("default") for p in parts)  # 默认分区仍在配置中
+
+
+def test_partition_delete_named_keeps_default_data(qtbot, tmp_path, monkeypatch):
+    """删除命名分区：只删 partitions/<slug>/，默认分区的根存储不受影响。"""
+    import agent.ui.main_window as mw
+    from agent.rag.engine import RAGEngine
+    from PyQt6.QtWidgets import QMessageBox
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    law_src = tmp_path / "law_src"
+    law_src.mkdir()
+    win._make_partition_row(name="法律", path=str(law_src),
+                            enabled=True, default=False)
+    win._gather_partitions()
+    win.config.save(mw.CONFIG_PATH)
+    rag = tmp_path / "ws" / "rag"
+    (rag / "partitions" / RAGEngine._partition_slug("法律")).mkdir(parents=True)
+    (rag / "documents").mkdir(parents=True)
+    (rag / "manifest.json").write_text("{}")
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+
+    # 删除命名分区行「法律」（默认行不可删，保持不动）
+    win._on_delete_partition(win._partition_rows[-1])
+
+    assert not (rag / "partitions" / RAGEngine._partition_slug("法律")).exists()
+    # 默认分区的根存储（manifest/documents）不被误删
+    assert (rag / "manifest.json").exists()
+    assert (rag / "documents").is_dir()
+    parts = json.loads(win.config.rag_partitions)
+    assert "法律" not in {p["name"] for p in parts}
+    defaults = [p for p in parts if p.get("default")]
+    assert len(defaults) == 1
+
+
+
 def test_rag_partitions_config_field_in_whitelist():
     """rag_partitions 在 _STR_FIELDS 白名单（可保存/加载）。"""
     from agent.config import AgentConfig

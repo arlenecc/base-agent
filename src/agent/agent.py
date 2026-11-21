@@ -1291,6 +1291,10 @@ class Agent:
             # _finish_nudge 等记账也随 run 重置）；最多续 _AUTO_CONTINUE_MAX 段，
             # 期间用户点「终止」立即停。额度用尽才真正交回用户。
             segments = 0
+            # 收尾拦截状态：本轮请求文本 + 已强制续跑次数（每用户轮重置）
+            self._current_request = user_input
+            self._gate_continues = 0
+            self._gate_feedback = ""
             t_run_start = time.monotonic()
             while (segments < _AUTO_CONTINUE_MAX
                    and self._auto_continue
@@ -1336,23 +1340,45 @@ class Agent:
                         emit_finished=False,
                     )
                 else:
-                    self._log(f"[agent] 模型提前收尾但计划未完成（{open_ids}），自动续跑 "
-                              f"{segments}/{_AUTO_CONTINUE_MAX}")
-                    self.session.working["__plan_boundary__"] = (
-                        f"你上一条回复被判为提前收尾，但计划中仍有未完成步骤：{open_ids}。{fail_txt}\n"
-                        "若这些步骤的工作**实际已经完成**，立即用 update_plan"
-                        "(op=\"patch\", step_id=..., status=\"done\", note=\"结论\") 逐一收尾，"
-                        "然后给出最终答复；若尚未完成，继续执行；"
-                        "只有至少 3 种不同方法都确认不可行，才标为 blocked/skipped "
-                        "并写明原因后再给出最终答复。"
-                        "不要再次只给出文字总结就停止。"
-                    )
-                    result = self.kernel.run(
-                        "[System] 上一条回复被判定为提前收尾，已自动续跑。"
-                        "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。",
-                        resume=True,
-                        emit_finished=False,
-                    )
+                    gate_fb = self._gate_feedback
+                    self._gate_feedback = ""
+                    if gate_fb:
+                        # 收尾拦截（决策模型）触发的续跑：反馈经
+                        # __plan_boundary__ 通道注入（anchor 每轮回注）
+                        self._log(f"[agent] 收尾拦截触发，自动续跑 {segments}/"
+                                  f"{_AUTO_CONTINUE_MAX}")
+                        self.session.working["__plan_boundary__"] = (
+                            f"[收尾拦截] 决策模型评审认为任务尚未真正完成：\n"
+                            f"{gate_fb}\n"
+                            "若你已完成全部工作，请补充用 update_plan 收尾后"
+                            "给出**有依据的**最终答复。"
+                        )
+                        result = self.kernel.run(
+                            "[System] 收尾拦截：决策模型判定当前依据不足以支撑"
+                            "最终答复（可能存在假装收尾或信息不足直答），已自动"
+                            "续跑。请按上面反馈继续补充必要的工具调用与验证；"
+                            "不要询问用户是否继续。",
+                            resume=True,
+                            emit_finished=False,
+                        )
+                    else:
+                        self._log(f"[agent] 模型提前收尾但计划未完成（{open_ids}），自动续跑 "
+                                  f"{segments}/{_AUTO_CONTINUE_MAX}")
+                        self.session.working["__plan_boundary__"] = (
+                            f"你上一条回复被判为提前收尾，但计划中仍有未完成步骤：{open_ids}。{fail_txt}\n"
+                            "若这些步骤的工作**实际已经完成**，立即用 update_plan"
+                            "(op=\"patch\", step_id=..., status=\"done\", note=\"结论\") 逐一收尾，"
+                            "然后给出最终答复；若尚未完成，继续执行；"
+                            "只有至少 3 种不同方法都确认不可行，才标为 blocked/skipped "
+                            "并写明原因后再给出最终答复。"
+                            "不要再次只给出文字总结就停止。"
+                        )
+                        result = self.kernel.run(
+                            "[System] 上一条回复被判定为提前收尾，已自动续跑。"
+                            "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。",
+                            resume=True,
+                            emit_finished=False,
+                        )
                 carry = self.kernel.failure_snapshot()
             if result.reason is ExitReason.MAX_TURNS:
                 if segments:
@@ -1450,8 +1476,59 @@ class Agent:
         if result.reason is ExitReason.MAX_TURNS:
             return True
         if result.reason is ExitReason.DONE:
-            return bool(self.session.plan_open_steps())
+            if self.session.plan_open_steps():
+                return True
+            # 收尾拦截（决策模型）：计划表面完成/直接作答时，判定是否真的
+            # 完成了——防「假装收尾」与「信息不足直答」。
+            return self._decision_gate(result)
         return False
+
+    # 决策模型（计划评审/收尾拦截）的实例级惰性缓存：加载失败缓存 None，
+    # 之后所有拦截点静默跳过（按原方式），不再反复尝试加载。
+    _plan_model_cache: Any = None
+    _plan_model_loaded: bool = False
+    _current_request: str = ""
+    _gate_continues: int = 0
+    _gate_feedback: str = ""
+
+    def _plan_model(self) -> Any:
+        """惰性加载决策模型（进程级单例，RAG 多库检索共用同一实例）。"""
+        if self._plan_model_loaded:
+            return self._plan_model_cache
+        from .plan_review import load_plan_model
+        self._plan_model_cache = load_plan_model(self.config)
+        self._plan_model_loaded = True
+        return self._plan_model_cache
+
+    def _decision_gate(self, result: KernelResult) -> bool:
+        """收尾拦截：决策模型判定未真正完成 → True（强制续跑）。
+
+        证据 = 已完成计划步骤的 title+note（无计划则用最终答复文本）；
+        请求 = 本轮用户输入。模型不可用 / 超过强制续跑上限 → False
+        （按原方式收尾）。
+        """
+        from .plan_review import COMPLETION_MAX_FORCE, check_plan_completion
+        model = self._plan_model()
+        if model is None or self._gate_continues >= COMPLETION_MAX_FORCE:
+            return False
+        request = self._current_request or ""
+        evidence: List[str] = []
+        plan = self.session.get_plan()
+        if isinstance(plan, dict):
+            for s in plan.get("steps") or []:
+                if s.get("status") == "done":
+                    evidence.append(
+                        f"{s.get('title', '')} {s.get('note', '')}".strip())
+        if not evidence:
+            evidence = [str(getattr(result, "text", "") or "")]
+        ok, fb = check_plan_completion(model, request, evidence)
+        if ok:
+            return False
+        self._gate_continues += 1
+        self._gate_feedback = fb
+        self._log("[agent] 收尾拦截：决策模型判定未真正完成，强制续跑 "
+                  f"{self._gate_continues}/{COMPLETION_MAX_FORCE}")
+        return True
 
     def _cancelled(self) -> bool:
         try:

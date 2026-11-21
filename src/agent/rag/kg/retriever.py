@@ -45,10 +45,14 @@ class KGRetriever:
         store,                     # rag.vector_store.VectorStore
         extractor: KGExtractor,
         estimate_tokens=None,      # chunker.estimate_tokens
+        chunk_lookup=None,         # Callable[[List[str]], List[dict]] 跨分区按 id 反查
     ):
         self._rag_dir = rag_dir
         self._store = store
         self._extractor = extractor
+        # 多知识分区：图谱统一构建，证据 id 可能来自任一分区——由引擎注入
+        # 跨库反查（单库/未注入时回退主 store）。
+        self._chunk_lookup = chunk_lookup
         self._estimate_tokens = estimate_tokens or (lambda s: max(1, len(s) // 2))
         self._kg_store: Optional[KGStore] = None
 
@@ -358,7 +362,14 @@ class KGRetriever:
                     ids.append(cid)
         if not ids:
             return []
-        chunks = self._store.get_chunks_by_ids(ids)
+        if self._chunk_lookup is not None:
+            try:
+                chunks = self._chunk_lookup(ids)
+            except Exception as e:
+                logger.warning("KG: 跨分区反查切片失败，回退主库: %s", e)
+                chunks = self._store.get_chunks_by_ids(ids)
+        else:
+            chunks = self._store.get_chunks_by_ids(ids)
         # 带上 id / chunk_index：检索即展示模式下这些切片要变成可点击气泡，
         # 阅读器需要按（source, chunk_index）翻页（缺字段会退化成「第 ? 片」）。
         return [{"id": c.get("id") or "",

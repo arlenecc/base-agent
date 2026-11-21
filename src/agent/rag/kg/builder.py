@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -43,6 +45,14 @@ def kg_dir_for(rag_dir: str) -> str:
     return os.path.join(rag_dir, "kg")
 
 
+# 快照加载缓存：快照绝对路径 → (mtime_ns, size, KnowledgeGraph)（只读共享）。
+# 按路径键控而非全局限一份：多个工作区/引擎（UI 同步引擎 + agent 引擎）交替
+# 检索时不会互相踢缓存；每条路径只保留最新版本。
+_SNAPSHOT_CACHE: Dict[str, tuple] = {}
+_SNAPSHOT_CACHE_LOCK = threading.Lock()
+_SNAPSHOT_CACHE_MAX_PATHS = 8
+
+
 def snapshot_path_for(rag_dir: str) -> str:
     import os
     return os.path.join(kg_dir_for(rag_dir), "graph_snapshot.json")
@@ -64,9 +74,14 @@ class KGBuilder:
         cancel_event=None,
         log_callback: Optional[Callable[[str], None]] = None,
         resolver: Optional[EntityResolver] = None,
+        stores: Optional[List[Any]] = None,
     ):
         self._rag_dir = rag_dir
         self._store = store
+        # 多知识分区：``stores`` 为 [(分区名, store), ...]，一次构建把各分区
+        # 的全部切片统一抽取进**同一个**知识图谱（实体按名聚合，天然融合）。
+        # 单库/默认分区时留空，等价于只抽主 store。
+        self._stores: List[tuple] = list(stores) if stores else [("", store)]
         self._extractor = extractor
         self._progress = progress_callback or (lambda d, t, m: None)
         self._cancel_event = cancel_event
@@ -96,6 +111,36 @@ class KGBuilder:
 
     # ------------------------------------------------------------------
 
+    def _collect_chunks(self) -> List[Dict[str, Any]]:
+        """汇总全部数据源（默认/极速/各知识分区）的切片。
+
+        多分区时逐库读取并标注 ``_partition``；跨库同 id（同一源目录被两个
+        分区挂载）只保留一份，避免同一正文被重复抽取、把证据权重翻倍。
+        """
+        out: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+        for label, st in self._stores:
+            try:
+                part = list(st.iter_all_chunks())
+            except Exception as e:
+                logger.warning("KG: 读取分区 %r 切片失败: %s", label, e)
+                self._log(f"[kg] ⚠ 分区「{label or '默认'}」切片读取失败: {e}")
+                continue
+            kept = 0
+            for c in part:
+                cid = c.get("id") or ""
+                if cid and cid in seen_ids:
+                    continue
+                if cid:
+                    seen_ids.add(cid)
+                if label:
+                    c["_partition"] = label
+                out.append(c)
+                kept += 1
+            if label:
+                self._log(f"[kg] 分区「{label}」切片 {kept} 条")
+        return out
+
     def build(self, limit: Optional[int] = None,
               doc_filter: Optional[str] = None,
               rebuild: bool = False) -> Dict[str, Any]:
@@ -111,7 +156,7 @@ class KGBuilder:
         if rebuild:
             self._log("[kg] 重建模式：清空已有图谱数据（实体/关系/向量）...")
             self._kg_store.clear()
-        chunks = list(self._store.iter_all_chunks())
+        chunks = self._collect_chunks()
         if doc_filter:
             chunks = [c for c in chunks
                       if doc_filter in (c.get("source") or "")]
@@ -412,10 +457,32 @@ def vectorize_pending_rows(kg_store: "KGStore", embedder: "KGEmbedder") -> int:
 # ---------------------------------------------------------------------------
 
 def load_or_rebuild_graph(rag_dir: str, store) -> Optional[KnowledgeGraph]:
-    """检索期加载图：优先快照，缺失/损坏时从 KGStore 重建（内存图，不落盘）。"""
+    """检索期加载图：优先快照，缺失/损坏时从 KGStore 重建（内存图，不落盘）。
+
+    快照加载按 ``(路径, mtime, size)`` 缓存：图谱动辄数千节点（实测 5000
+    节点 2.2MB / 每次解析 27ms），而检索期每次查询都要取图——不缓存时这段
+    固定开销随规模线性增长。缓存的图只被检索器读（neighbor_edges/get_node），
+    快照重建/更新会刷新 mtime，缓存自然失效。
+    """
+    path = snapshot_path_for(rag_dir)
+    abspath = os.path.abspath(path)
+    try:
+        st = os.stat(path)
+        key: Optional[tuple] = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None:
+        with _SNAPSHOT_CACHE_LOCK:
+            cached = _SNAPSHOT_CACHE.get(abspath)
+        if cached is not None and cached[0] == key[0] and cached[1] == key[1]:
+            return cached[2]
     graph = KnowledgeGraph()
-    snap = snapshot_path_for(rag_dir)
-    if graph.load_snapshot(snap):
+    if graph.load_snapshot(path):
+        if key is not None:
+            with _SNAPSHOT_CACHE_LOCK:
+                _SNAPSHOT_CACHE[abspath] = (key[0], key[1], graph)
+                while len(_SNAPSHOT_CACHE) > _SNAPSHOT_CACHE_MAX_PATHS:
+                    _SNAPSHOT_CACHE.pop(next(iter(_SNAPSHOT_CACHE)))
         return graph
     kg_store = KGStore(kg_dir_for(rag_dir))
     try:

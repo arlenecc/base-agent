@@ -1823,3 +1823,111 @@ class TestStablePrefixReuse:
             builder.close()
         assert llm.kinds == ["extract"]      # 只有 1 条描述，无需归纳
 
+
+# ---------------------------------------------------------------------------
+# 多知识分区：统一抽取 + 图谱策略对全模式生效
+# ---------------------------------------------------------------------------
+
+class TestMultiPartitionKg:
+    """图谱抽取覆盖全部分区（含极速模式使用的库），检索期图谱策略
+    对向量/极速/判定/多分区模式统一生效。"""
+
+    EXTRACT = TestEngineKgTools.EXTRACT_A
+    _seed = staticmethod(TestEngineKgTools._seed)
+
+    def _make_engine(self, tmp_path, rag_mode="vector", partitions=None):
+        from agent.rag.engine import RAGEngine
+        eng = RAGEngine(
+            workspace=str(tmp_path / "ws"),
+            knowledge_base=str(tmp_path / "kb"),
+            embedding_function=CallableEF(),
+            rag_mode=rag_mode,
+            rag_partitions=json.dumps(partitions or [], ensure_ascii=False))
+        eng.set_aux_llm(FakeLLM(extract_output=self.EXTRACT))
+        return eng
+
+    @staticmethod
+    def _two_partitions(tmp_path):
+        return [{"name": "默认知识库", "path": str(tmp_path / "kb"),
+                 "enabled": True, "default": True},
+                {"name": "法律", "path": str(tmp_path / "law"),
+                 "enabled": True, "default": False}]
+
+    def test_kg_ingest_covers_all_partitions(self, tmp_path):
+        """各分区切片一并抽取，统一进同一张图谱（默认分区根目录）。"""
+        eng = self._make_engine(tmp_path, partitions=self._two_partitions(tmp_path))
+        try:
+            self._seed(eng)                                   # 默认分区 2 片
+            eng._get_store("法律").add([
+                {"text": "合同法规定合同效力。", "source": str(tmp_path / "law" / "c.md"),
+                 "chunk_index": 0}])
+            stats = eng.kg_ingest()
+            assert stats["chunks"] == 3                       # 2 + 1 全部抽取
+            # 图谱只有一份，落在默认 rag 根目录（统一融合）
+            from agent.rag.kg.builder import kg_dir_for
+            kg = KGStore(kg_dir_for(eng._rag_dir))
+            try:
+                assert kg.counts()["entities"] > 0
+            finally:
+                kg.close()
+            assert not os.path.isdir(os.path.join(
+                eng._rag_dir, "partitions", eng._partition_slug("法律"), "kg"))
+        finally:
+            eng.close()
+
+    def test_kg_strategy_effective_in_all_modes(self, tmp_path):
+        """non-naive 策略在向量/极速/判定模式下都走图谱（而非基线直返）。"""
+        for mode in ("vector", "fast", "decision"):
+            eng = self._make_engine(tmp_path / mode, rag_mode=mode)
+            try:
+                self._seed(eng)
+                eng.kg_ingest()
+                eng.set_kg_strategy("local")
+                res = eng.search("苹果公司 创始人", top_k=5)
+                assert res, f"{mode} 模式图谱检索无结果"
+                assert any(r.get("kind") == "kg_entity" for r in res), \
+                    f"{mode} 模式未走图谱策略: {[r.get('kind') for r in res]}"
+            finally:
+                eng.close()
+
+    def test_kg_strategy_effective_in_multi_partition(self, tmp_path):
+        """多分区联合检索前，图谱策略同样优先生效。"""
+        eng = self._make_engine(tmp_path, partitions=self._two_partitions(tmp_path))
+        try:
+            self._seed(eng)
+            eng._get_store("法律").add([
+                {"text": "苹果公司涉及合同纠纷。", "source": str(tmp_path / "law" / "c.md"),
+                 "chunk_index": 0}])
+            eng.kg_ingest()
+            eng.set_kg_strategy("local")
+            res = eng.search("苹果公司", top_k=5)
+            assert any(r.get("kind") == "kg_entity" for r in res)
+        finally:
+            eng.close()
+
+    def test_kg_falls_back_when_graph_missing(self, tmp_path):
+        """图谱未构建：non-naive 策略回退基线检索，不阻断。"""
+        eng = self._make_engine(tmp_path, rag_mode="fast")
+        try:
+            self._seed(eng)
+            eng.set_kg_strategy("mix")
+            res = eng.search("苹果公司", top_k=5)
+            assert res and all(r.get("kind") is None for r in res)
+        finally:
+            eng.close()
+
+    def test_lookup_chunks_across_partitions(self, tmp_path):
+        """按 id 反查覆盖命名分区（图谱证据溯源）。"""
+        eng = self._make_engine(tmp_path, partitions=self._two_partitions(tmp_path))
+        try:
+            self._seed(eng)
+            eng._get_store("法律").add([
+                {"text": "合同法条文。", "source": str(tmp_path / "law" / "c.md"),
+                 "chunk_index": 0}])
+            law_chunks = eng._get_store("法律").iter_all_chunks()
+            ids = [c["id"] for c in law_chunks]
+            rows = eng._lookup_chunks_across_partitions(ids)
+            assert {r["id"] for r in rows} == set(ids)
+        finally:
+            eng.close()
+
