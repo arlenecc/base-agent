@@ -171,6 +171,12 @@ class SkillSearchTool(Tool):
         if not query:
             return ToolResult(False, error="op 'search' requires 'query'")
         results = idx.search(query, top_k=top_k)
+        # 记录本回合候选：skill_load 前由决策模型判定是否合适/选哪一个。
+        try:
+            from ..skill_gate import record_candidates
+            record_candidates(self.registry, query, results)
+        except Exception as e:
+            logger.debug("skill_search: 候选记录失败(忽略): %s", e)
         log_skill_event(
             self.config.workspace, "keyword_search",
             query=query, top_k=top_k, count=len(results),
@@ -227,9 +233,21 @@ class SkillSemanticSearchTool(Tool):
 
         candidates = result.get("candidates", [])
         if not candidates:
+            try:
+                from ..skill_gate import record_candidates
+                record_candidates(self.registry, query, [])
+            except Exception:
+                pass
             log_skill_event(self.config.workspace, "semantic_search",
                             query=query, top_k=top_k, count=0)
             return ToolResult(True, output="找不到匹配的技能。")
+
+        # 记录本回合候选：skill_load 前由决策模型判定是否合适/选哪一个。
+        try:
+            from ..skill_gate import record_candidates
+            record_candidates(self.registry, query, candidates[:top_k])
+        except Exception as e:
+            logger.debug("skill_semantic_search: 候选记录失败(忽略): %s", e)
 
         # Compact output: dir + name + tags + description (truncated).
         items = []
@@ -296,6 +314,20 @@ class SkillLoadTool(Tool):
                 False,
                 error=f"refusing unsafe entry outside the skill directory: {entry!r}",
             )
+
+        # 加载前判定（决策模型）：检索返回多个技能时只允许加载最匹配的一个；
+        # 仅一个技能时校验是否合适，不合适则禁止加载。模型不可用/本回合无
+        # 检索记录时放行（保持原行为）。
+        try:
+            from ..skill_gate import judge_skill_load
+            allowed, reason = judge_skill_load(self.registry, self.config, path)
+        except Exception as e:
+            logger.debug("skill_load: 判定异常，放行: %s", e)
+            allowed, reason = True, ""
+        if not allowed:
+            log_skill_event(self.config.workspace, "load_blocked",
+                            path=path, entry=entry, reason=reason[:200])
+            return ToolResult(False, error=reason)
 
         # 1) Try the semantic retriever first (SKILL.md directory).
         # 必须走 get_skill_retriever()（按目录缓存、跟随当前 workspace）。

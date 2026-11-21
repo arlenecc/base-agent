@@ -1194,6 +1194,13 @@ class Agent:
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
         self._last_user_text = user_input
+        # 新用户回合：清空上一回合的技能检索记录（技能加载前判定按用户回合
+        # 生效；内核 turn_index 一次请求内会多次递增，不能用作回合键）。
+        try:
+            from . import skill_gate
+            skill_gate.clear_state(self.tools)
+        except Exception:
+            pass
         # 标记「用户在等回复」：后台 aux 任务据此让路（见 _last_activity 注释）
         self._last_activity = time.monotonic()
         self._log(f"USER: {user_input}")
@@ -2034,13 +2041,37 @@ class Agent:
             user_text = self._last_user_text
             matched = self.skills.match(user_text) if user_text else None
             if matched:
-                # 技能 prompt 是用户自写的原文，长度不可控；截断并提示用
-                # skill_tools(op=load) 读全文，避免长技能把系统提示撑大。
-                sp = matched.prompt or ""
-                if len(sp) > _MAX_SKILL_PROMPT_CHARS:
-                    sp = (sp[:_MAX_SKILL_PROMPT_CHARS] +
-                          "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）")
-                parts.append(f"# Active skill: {matched.name}\n{sp}")
+                # 使用前判定（决策模型）：单个技能也校验是否与当前任务匹配，
+                # 不匹配则禁止注入/使用；同时登记为候选，后续 skill_load 会
+                # 再次走同一判定（保持行为一致）。
+                desc = (matched.prompt or "")[:_MAX_SKILL_PROMPT_CHARS]
+                allowed, gate_reason = True, ""
+                if self.tools is not None:
+                    try:
+                        from . import skill_gate
+                        allowed, gate_reason = skill_gate.judge_skill_injection(
+                            self.tools, self.config, matched.name,
+                            desc[:220])
+                        skill_gate.record_candidates(
+                            self.tools, user_text,
+                            [{"name": matched.name, "path": matched.name,
+                              "description": desc[:220]}])
+                    except Exception as e:
+                        self._log(f"[skills] 判定异常(放行): {e}")
+                        allowed = True
+                if not allowed:
+                    self._log(f"[skills] 禁止使用技能 {matched.name}: {gate_reason}")
+                    parts.append(
+                        f"# Skill gate: 技能 {matched.name} 与当前任务不匹配，"
+                        "已禁止使用；请直接按常规工具流程处理。")
+                else:
+                    # 技能 prompt 是用户自写的原文，长度不可控；截断并提示用
+                    # skill_tools(op=load) 读全文，避免长技能把系统提示撑大。
+                    sp = matched.prompt or ""
+                    if len(sp) > _MAX_SKILL_PROMPT_CHARS:
+                        sp = (sp[:_MAX_SKILL_PROMPT_CHARS] +
+                              "\n…（已截断，用 skill_tools(op=\"load\") 读取完整技能内容）")
+                    parts.append(f"# Active skill: {matched.name}\n{sp}")
             elif user_text and self.tools is not None:
                 # 两条轻量兜底：.agent/skills 的关键词索引 + workspace/skills
                 # 的 frontmatter 提示索引。后者覆盖用户下载/蒸馏出来的 SKILL.md
@@ -2063,12 +2094,32 @@ class Agent:
                     name = str(best.get("name") or "")
                     path = str(best.get("path") or "")
                     desc = str(best.get("description") or "")[:200]
-                    parts.append(
-                        f"# Relevant skill: {name}\n"
-                        f"技能库中有匹配技能（path: {path}）：{desc}\n"
-                        f"若与当前任务相关，先调用 skill_tools(op=\"load\", "
-                        f"path=\"{path}\") 读取完整指令，再按指令执行。"
-                    )
+                    # 自动提示也是「检索」：登记候选，加载前由决策模型判定
+                    try:
+                        from . import skill_gate
+                        skill_gate.record_hint(self.tools, user_text, {
+                            "name": name, "path": path, "description": desc,
+                        })
+                    except Exception:
+                        pass
+                    # 摘要注入前判定：技能与当前任务不匹配时不注入提示，
+                    # 避免把模型引向不合适的技能（阈值同选择/加载判定）。
+                    hint_ok, hint_reason = True, ""
+                    try:
+                        from . import skill_gate
+                        hint_ok, hint_reason = skill_gate.judge_skill_injection(
+                            self.tools, self.config, name, desc)
+                    except Exception as e:
+                        self._log(f"[skills] 提示判定异常(放行): {e}")
+                    if not hint_ok:
+                        self._log(f"[skills] 抑制技能提示 {name}: {hint_reason}")
+                    else:
+                        parts.append(
+                            f"# Relevant skill: {name}\n"
+                            f"技能库中有匹配技能（path: {path}）：{desc}\n"
+                            f"若与当前任务相关，先调用 skill_tools(op=\"load\", "
+                            f"path=\"{path}\") 读取完整指令，再按指令执行。"
+                        )
         except Exception:  # pragma: no cover
             pass
         return "\n\n".join(parts)
