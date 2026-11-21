@@ -759,7 +759,8 @@ class AgentConfig:
         if self.rag_mode not in ("vector", "fast", "decision"):
             self.rag_mode = "vector"
         # 决策判定模式参数归一：UI 只提供固定选项，非法值回退默认。
-        if self.rag_decision_model_backend not in ("mlx-vlm", "mlx-lm", "gguf"):
+        if self.rag_decision_model_backend not in ("mlx-vlm", "valen",
+                                                   "mlx-lm", "gguf"):
             self.rag_decision_model_backend = "mlx-vlm"
         if self.rag_decision_coarse_k not in (20, 50, 100):
             self.rag_decision_coarse_k = 50

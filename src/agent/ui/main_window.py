@@ -81,9 +81,11 @@ _RAG_MODE_VALUE_TO_DISPLAY = {
     "decision": "决策判定模式",
 }
 _DECISION_BACKEND_DISPLAY_TO_VALUE = {
-    "MLX-VLM": "mlx-vlm", "MLX-LM": "mlx-lm", "GGUF": "gguf"}
+    "MLX-VLM": "mlx-vlm", "VALEN": "valen",
+    "MLX-LM": "mlx-lm", "GGUF": "gguf"}
 _DECISION_BACKEND_TO_DISPLAY = {
-    "mlx-vlm": "MLX-VLM", "mlx-lm": "MLX-LM", "gguf": "GGUF"}
+    "mlx-vlm": "MLX-VLM", "valen": "VALEN",
+    "mlx-lm": "MLX-LM", "gguf": "GGUF"}
 
 # KG 三元组抽取方案下拉标签 ↔ 内部标识（rag_kg_extractor：llm_raw/llm_pydantic/gliner）。
 _KG_EXTRACTOR_DISPLAY = {
@@ -2662,11 +2664,13 @@ class MainWindow(QMainWindow):
         dlay.setContentsMargins(0, 0, 0, 0)
         dlay.setSpacing(8)
         # 行1：决策模型（后端下拉 + 模型路径 + 选择）
-        self.decision_backend_combo = _combo(["MLX-VLM", "MLX-LM", "GGUF"], 110)
+        self.decision_backend_combo = _combo(
+            ["MLX-VLM", "VALEN", "MLX-LM", "GGUF"], 110)
         self.decision_backend_combo.setToolTip(
             "决策模型后端（rag_decision_model_backend）：\n"
-            "· MLX-VLM（默认）：PKU-KCL-Meteor-0.8B 带 readout 判定头，"
-            "readout 协议直接出相关性概率，最快最准；\n"
+            "· MLX-VLM（默认）：PKU-KCL-Meteor-0.8B readout 判定头；\n"
+            "  路径指向 Valen 目录（decision_head.*）时自动切换 MixerHead 协议；\n"
+            "· VALEN：Valen-Decision MixerHead 协议（block 注意力 + 决策头）；\n"
             "· MLX-LM：生成式判定（输出 0-100 相关性数字）；\n"
             "· GGUF：同上，走 llama.cpp（需 .gguf 权重）。")
         self.decision_backend_combo.setCurrentText(
@@ -2674,7 +2678,8 @@ class MainWindow(QMainWindow):
                 str(getattr(self.config, "rag_decision_model_backend",
                             "mlx-vlm") or "mlx-vlm"), "MLX-VLM"))
         self.decision_path_edit = _path(
-            "留空=自动使用 models/PKU-KCL-Meteor-0.8B-mlx-int4", 200)
+            "留空=自动使用 models/PKU-KCL-Meteor-0.8B-mlx-int4"
+            "（VALEN 后端用 models/Valen-Decision-1.5-0.8B-mlx-int4）", 200)
         self.decision_path_edit.setText(
             str(getattr(self.config, "rag_decision_model_path", "") or ""))
         r = QHBoxLayout(); r.setSpacing(8)

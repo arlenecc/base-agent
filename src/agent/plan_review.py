@@ -40,11 +40,17 @@ PLAN_REVIEW_REJECTS_KEY = "__plan_review_rejects__"
 
 
 def load_plan_model(config: Any) -> Optional[Any]:
-    """按配置加载决策模型（进程级单例）；不可用 → None（拦截点跳过）。"""
+    """按配置加载决策模型（进程级单例）；不可用 → None（拦截点跳过）。
+
+    后端与模型路径都取自配置：选 VALEN 时走 MixerHead 协议；后端仍为
+    mlx-vlm 但路径指向 Valen 目录时由加载层自动识别协议。
+    """
     path = str(getattr(config, "rag_decision_model_path", "") or "")
+    backend = str(getattr(config, "rag_decision_model_backend", "mlx-vlm")
+                  or "mlx-vlm")
     try:
         from .rag.decision_model import get_decision_model
-        return get_decision_model("mlx-vlm", path)
+        return get_decision_model(backend, path)
     except Exception as e:
         logger.debug("决策模型加载失败，计划评审/收尾拦截跳过: %s", e)
         return None

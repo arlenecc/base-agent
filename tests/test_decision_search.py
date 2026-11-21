@@ -272,6 +272,8 @@ def _bare_engine(rag_mode="decision", reading_mode=False):
     eng._partitions = []
     eng._stores = {}
     eng._active_partition = None
+    # 知识图谱策略（search 入口会读取；naive = 不走向量图谱）
+    eng._kg_strategy = "naive"
     return eng
 
 
