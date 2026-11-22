@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, List, Optional, Tuple
 
+from .core_opinion import simplify_texts_for_scoring
+
 logger = logging.getLogger(__name__)
 
 # 计划评审：步骤与目标的平均相关分低于该值 → 拒绝计划（退回模型完善）。
@@ -77,7 +79,9 @@ def review_plan_steps(
     if model is None or not titles:
         return True, ""
     try:
-        scores = [float(s) for s in model.score(goal, titles)]
+        # 超长步骤标题先压成核心观点句，避免决策模型被长文本拖慢。
+        scored_titles = simplify_texts_for_scoring(titles)
+        scores = [float(s) for s in model.score(goal, scored_titles)]
     except Exception as e:
         logger.warning("计划评审打分失败，放行: %s", e)
         return True, ""
@@ -114,7 +118,10 @@ def check_plan_completion(
     if model is None or not texts or not str(request or "").strip():
         return True, ""
     try:
-        scores = [float(s) for s in model.score(request, texts)]
+        # 证据（步骤 note / 最终答复）可能很长：先抽核心观点句再打分，
+        # 保留覆盖面同时显著缩短决策模型输入。
+        scored_texts = simplify_texts_for_scoring(texts)
+        scores = [float(s) for s in model.score(request, scored_texts)]
     except Exception as e:
         logger.warning("完成度判定打分失败，放行收尾: %s", e)
         return True, ""
