@@ -527,11 +527,12 @@ def test_gguf_kv_reuse_disabled_uses_legacy_path(monkeypatch):
     calls = {"legacy": 0}
 
     def fake_legacy(self, messages, tools, temperature, max_tokens=None,
-                    kv_group="main"):
+                    kv_group="main", enable_thinking=None):
         calls["legacy"] += 1
         return iter([])
 
-    def boom_reuse(self, messages, tools, temperature):
+    def boom_reuse(self, messages, tools, temperature, max_tokens=None,
+                   enable_thinking=None):
         raise AssertionError("开关关闭时不该走复用路径")
 
     monkeypatch.setattr(LocalLLMClient, "_stream_gguf_legacy", fake_legacy)
@@ -555,11 +556,12 @@ def test_gguf_kv_reuse_enabled_tries_reuse_then_falls_back(monkeypatch):
     c._gguf_ids = [1, 2, 3]
     calls = {"legacy": 0}
 
-    def boom_reuse(self, messages, tools, temperature):
+    def boom_reuse(self, messages, tools, temperature, max_tokens=None,
+                   enable_thinking=None):
         raise RuntimeError("boom")
 
     def fake_legacy(self, messages, tools, temperature, max_tokens=None,
-                    kv_group="main"):
+                    kv_group="main", enable_thinking=None):
         calls["legacy"] += 1
         return iter([])
 
@@ -1064,6 +1066,27 @@ def test_resolve_model_path_falls_back_to_home_models(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+def test_batch_collect_one_passes_call_max_tokens(monkeypatch):
+    """单条 kg 抽取：_batch_collect_one 必须把调用级 max_tokens 透传给
+    chat_stream；旧实现丢弃它，KG 每片会按 aux 默认 8192 生成。"""
+    from agent.local.llm import LocalLLMClient
+    c = LocalLLMClient("/tmp/x", backend="mlx")
+    c._loaded = True
+    seen = {}
+
+    def fake_stream(messages, tools=None, temperature=0.7, kv_group="main",
+                    enable_thinking=None, max_tokens=None):
+        seen["max_tokens"] = max_tokens
+        yield types.SimpleNamespace(type="content", content="ok")
+        yield types.SimpleNamespace(type="done", content="")
+
+    monkeypatch.setattr(c, "chat_stream", fake_stream)
+    out = c._batch_collect_one(
+        [{"role": "user", "content": "hi"}], None, 0.1, 64, False, "kg")
+    assert out == "ok"
+    assert seen["max_tokens"] == 64
+
+
 # 非 MLX 后端 batch_chat 兜底路径：不能与 chat_stream 自死锁
 # ---------------------------------------------------------------------------
 

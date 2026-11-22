@@ -118,9 +118,9 @@ class StartLongTermUpdateTool(Tool):
         "ONLY entry point for writing L2/L3 long-term memory. Call after finishing "
         "a task or reaching an important checkpoint; rejected if the session has "
         f"fewer than {LONG_TERM_MIN_TURNS} turns (short tasks must not touch "
-        "long-term memory). Returns the 【记忆提纯】prompt; then classify verified "
-        "facts by the L0 decision tree and append them with "
-        "file_tools(op='append') to memory/global_mem.txt (L2) or "
+        "long-term memory). Returns the 【记忆提纯】prompt plus a self-contained "
+        "decision_tree/write_rules; classify verified facts with them and append "
+        "with file_tools(op='append') to memory/global_mem.txt (L2) or "
         "memory/xxx_sop.md (L3). Never overwrite, never store unverified/"
         "volatile data."
     )

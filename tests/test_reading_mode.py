@@ -39,6 +39,8 @@ def _engine(tmp_path) -> RAGEngine:
     eng = RAGEngine(
         workspace=str(tmp_path),
         knowledge_base=str(tmp_path / "kb"),
+        # 阅读模式由检索模式决定：极速检索 = 阅读模式。
+        rag_mode="fast",
         reading_mode=True,
         reading_quant_bits=4,
         reading_coarse_k=10,
@@ -202,6 +204,7 @@ def test_rag_search_tool_reading_mode_injects_top_chunk_only():
             return "should not be used"
 
     cfg = AgentConfig()
+    cfg.rag_mode = "fast"
     cfg.rag_reading_mode_enabled = True
     cfg.rag_reading_top_n = 3
     tool = RagSearchTool(FakeEngine())
@@ -261,6 +264,7 @@ def test_doc_search_tool_reading_mode_bubbles_and_blocks_mutation(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(ds, "_get_store", lambda config: store)
     cfg = AgentConfig()
+    cfg.rag_mode = "fast"
     cfg.rag_reading_mode_enabled = True
     tool = ds.DocSearchTool()
     tool.bind(cfg, None)

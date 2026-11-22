@@ -73,6 +73,10 @@ def test_send_streams_content_into_chat(qtbot, tmp_path, monkeypatch):
     assert "你" in html
     assert "助手" in html
     assert "总计 3 tokens" in win.token_label.text()
+    # 上下文占用率与 token/速度同排显示，且首轮后不再是 "--"。
+    assert win.context_label.text().startswith("上下文 ")
+    assert win.context_label.text() != "上下文 --"
+    assert "预算" in win.context_label.toolTip()
     assert win.send_btn.isEnabled()
     assert not win.stop_btn.isEnabled()
 

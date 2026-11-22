@@ -804,8 +804,11 @@ class RAGEngine:
         self._aux_llm: Any = None
         self._kg_retriever: Optional[Any] = None
         # 检索阅读模式：解析出 Markdown 后旁路原有切片/embedding/向量库/reranker，
-        # 改用 doc_chunker + ColBERT 三表。参数在此夹紧，防止手改 config 越界。
-        self._reading_mode = bool(reading_mode)
+        # 改用 doc_chunker + ColBERT 三表。是否生效由 rag_mode 决定（fast =
+        # 极速检索模式，固定使用阅读模式）；reading_mode 形参保留给直接构造
+        # 引擎的调用方，但与 rag_mode 不一致时以 rag_mode 为准，避免「选了
+        # 向量检索却因为旧配置里的开关 true 而静默进入阅读模式」。
+        self._reading_mode = False
         self._reading_quant_bits = int(reading_quant_bits)
         if self._reading_quant_bits not in (2, 4):
             self._reading_quant_bits = 4
@@ -841,6 +844,14 @@ class RAGEngine:
         self._rag_mode = str(rag_mode or "vector").strip().lower()
         if self._rag_mode not in ("vector", "fast", "decision"):
             self._rag_mode = "vector"
+        # 阅读模式与检索模式强绑定：fast（极速检索）固定走 ColBERT 阅读模式；
+        # vector/decision 即使旧配置里 rag_reading_mode_enabled=True 也不生效。
+        self._reading_mode = bool(reading_mode) and self._rag_mode == "fast"
+        if reading_mode and not self._reading_mode:
+            logger.warning(
+                "RAG: rag_reading_mode_enabled=True 但 rag_mode=%s，"
+                "按所选检索模式关闭阅读模式（阅读模式仅随极速检索模式启用）",
+                self._rag_mode)
         self._decision_backend = str(rag_decision_model_backend or "mlx-vlm")
         self._decision_model_path = (rag_decision_model_path or "").strip()
         self._decision_coarse_k = int(rag_decision_coarse_k)
@@ -2763,6 +2774,12 @@ class RAGEngine:
                 except OSError as e:
                     # 增量保存失败不致命：最坏情况是进程被杀后这批文件重做一遍。
                     logger.warning("RAG: 增量保存 manifest 失败（不影响本次同步）: %s", e)
+            # reading 模式不走 deferred 分支；deferred/added 必须在 try 之前
+            # 初始化：旧实现只在非 reading 分支给 deferred 赋值，reading 模式
+            # 收尾时 `if deferred` 直接 UnboundLocalError；写入异常时 added
+            # 也可能尚未赋值，导致异常处理路径再抛一次 UnboundLocalError。
+            added = 0
+            deferred = False
             try:
                 # 批量 200（旧值 20）：LanceDB 每次 add 都会产生一个新
                 # fragment，小批量在大库上留下海量碎片，检索要逐段扫描。

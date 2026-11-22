@@ -160,15 +160,21 @@ _LITE_TOOL_NAMES = frozenset({
     "file_tools", "code_run", "shell_run", "web_scan", "search_tool",
     "doc_search_tool", "ask_user", "rag_tools", "long_memory",
 })
-# 输入含 URL/域名/明确点名工具时**强制全量工具组**：这类输入是用户在指挥
-# 具体的工具操作，几乎必然是多步（抓取 → 处理 → 输出），需要 update_plan
-# 建计划、需要完整工具面。实测「用 web_scan 抓 cnn.com 今日新闻并总结」
-# 被判成简单任务 → lite 组（无 update_plan）→ 模型直接文字收尾，计划面板
-# 空白、任务不执行——正是用户报告的「计划不执行」。
+# 输入含 URL/域名/明确点名工具、或定时任务意图时**强制全量工具组**：这类
+# 输入是用户在指挥具体的工具操作，几乎必然是多步（抓取 → 处理 → 输出），
+# 需要 update_plan 建计划、需要完整工具面。实测「用 web_scan 抓 cnn.com 今日
+# 新闻并总结」被判成简单任务 → lite 组（无 update_plan）→ 模型直接文字收尾，
+# 计划面板空白、任务不执行——正是用户报告的「计划不执行」。定时任务同理：
+# schedule_tools 不在 lite 组，若按短句判成简单任务，schema 不下发，模型不会
+# 创建任务。
 _NEEDS_FULL_TOOLS_RE = re.compile(
     r"(https?://|\b[a-z0-9-]+\.(?:com|cn|net|org|io|dev|app|xyz)\b|"
     r"web_scan|search_tool|code_run|shell_run|file_tools|rag_tools|long_memory|"
-    r"skill_tools|doc_search_tool|doc_search|长文档|整本书|ColBERT)", re.I)
+    r"skill_tools|doc_search_tool|doc_search|长文档|整本书|ColBERT|"
+    r"schedule_tools|定时任务|定时|每天|每日|每周|每月|每年|"
+    r"周[一二三四五六日天]|星期[一二三四五六日天]|\d+\s*月\s*\d+\s*[日号]|"
+    r"\d+\s*(?:分钟|小时)\s*(?:后|之后)|每隔\s*\d+|明天|后天|今晚|明早|提醒)",
+    re.I)
 
 # 寒暄 / 自我认知（能力、功能、身份）类问答：答案就在系统提示里，不需要
 # 推理也不需要工具。但本地小模型会无视系统提示的软禁令：连发 rag_* 空转
@@ -708,7 +714,8 @@ class KernelLoop:
             return _carry_task_text(task_text, hint)
 
         def _redirect(hint: str, rec, resp, tool_calls=None,
-                      pending: Optional[str] = None) -> Optional[str]:
+                      pending: Optional[str] = None,
+                      reset_guards: bool = True) -> Optional[str]:
             """把被拦截的一轮**正常提交**（不 rollback），纠正反馈注入下一轮。
 
             旧实现用 _rollback_turn 摘掉整轮。但本轮 token 已经 eval 进
@@ -727,6 +734,10 @@ class KernelLoop:
             _MAX_SAME_REDIRECTS 次仍无效时返回 None，调用方应放行（不再
             continue）；hint 变化（如「第 n 次提醒」）则重新计数，因此不削减
             反思门的失败感知 / 只规划不执行等合法宽预算。
+
+            ``reset_guards=False`` 供空回复/工具格式错误等重试路径使用：这些
+            路径仍要靠 _empty_retry/_tool_parse_retry 计数兜底，不能在提交
+            本轮后清零，否则重试会无限循环。
             """
             # 必须用完整 hint：反思门的「这是第 n 次提醒」在文本靠后位置，
             # 截断前缀会把逐轮变化的合法提醒误判成同一句，反而削掉宽预算。
@@ -752,7 +763,10 @@ class KernelLoop:
                 resp.summary or l2_summary(resp.content, [tc.name for tc in tcs]),
                 raw_content=resp.raw_content,
             )
-            self._reset_retry_guards()
+            # 重试类路径（空回复/工具格式错误）不能重置重试计数，否则会
+            # 无限循环；反思门/成果核验才需要在本轮提交后清零。
+            if reset_guards:
+                self._reset_retry_guards()
             return pending if pending is not None else _carry_task(hint)
 
         # ---- 寒暄 / 能力类问答：直接文字作答，完全不进 LLM 循环 ----
@@ -1114,13 +1128,24 @@ class KernelLoop:
                 if event == "retry_summary":
                     # summary-only 专用重试：明确把模型推向工具调用，而不是
                     # 泛泛的「重新生成」（实测泛化提示拉不回这种形态）。
-                    self._rollback_turn(session)
-                    pending = _carry_task(
+                    hint = (
                         "[ERROR] 你上一条回复只有一个 <summary> 任务复述，"
                         "没有任何正文、也没有调用任何工具——这不是有效的执行。"
                         "请立即：1) 调用完成本任务所需的第一个工具（例如 "
                         "web_scan 抓取页面 / file_tools 读取文件）；2) 等工具"
                         "结果返回后再输出正文。不要只复述计划。")
+                    # 缓存不可回退（Qwen3.5 ArraysCache / GGUF hybrid）时，
+                    # 回滚会让下一轮 prompt 变成旧缓存的前缀 → 整段重建。
+                    # 保留本轮、追加纠正，历史只增不减，KV 严格扩展。
+                    if not self._can_rewind_kv():
+                        p = _redirect(hint, rec, resp, pending=_carry_task(hint),
+                                      reset_guards=False)
+                        if p is not None:
+                            pending = p
+                            self.log("[kernel] 保留 summary-only 本轮以维持 KV 前缀")
+                            continue
+                    self._rollback_turn(session)
+                    pending = _carry_task(hint)
                     continue
                 if event == "retry":
                     self._rollback_turn(session)
@@ -1129,9 +1154,8 @@ class KernelLoop:
                         "如需操作必须显式调用工具。")
                     continue
                 if event == "retry_tool":
-                    self._rollback_turn(session)
                     if self._is_local_backend:
-                        pending = _carry_task(
+                        hint = (
                             "[ERROR] 检测到你输出了工具调用文本，但它没有被解析成可执行调用。"
                             "请**直接**按下列格式发起一个调用（不要写在思考过程里）：\n"
                             '<tool_call>{"name":"file_tools","arguments":{"op":"read",'
@@ -1139,11 +1163,20 @@ class KernelLoop:
                             "参数中的换行/引号必须正确转义；要写多行文件时，"
                             "先用 code_run 生成内容，不要直接塞进 JSON 字符串。")
                     else:
-                        pending = _carry_task(
+                        hint = (
                             "[ERROR] 检测到你只在正文/思考里描述了工具调用，"
                             "但没有真正发起 function call。"
                             "请直接使用工具调用（tool_calls）发起，"
                             "不要把调用写成正文文字。")
+                    if not self._can_rewind_kv():
+                        p = _redirect(hint, rec, resp, pending=_carry_task(hint),
+                                      reset_guards=False)
+                        if p is not None:
+                            pending = p
+                            self.log("[kernel] 保留工具格式错误本轮以维持 KV 前缀")
+                            continue
+                    self._rollback_turn(session)
+                    pending = _carry_task(hint)
                     continue
                 if event == "done_tool_parse":
                     # 重试额度用尽：给用户一条可见、可行动的说明，不能空着退场。
@@ -1159,15 +1192,23 @@ class KernelLoop:
                 if event == "reask":
                     self._reask_guard += 1
                     if self._reask_guard <= 1:
-                        # 第一次只是提醒：整轮作废重来（这一轮没有 assistant
-                        # 输出，留着只会污染历史）。
-                        self._rollback_turn(session)
-                        pending = _carry_task(
+                        hint = (
                             "[System] 检测到你上轮主要内容是大段代码却未调用工具。"
                             "若这些代码需要执行/写入/分析，请显式调用 code_run / "
                             "file_tools；"
-                            "若只是展示给用户的示例，请在回复中补充自然语言说明。"
-                        )
+                            "若只是展示给用户的示例，请在回复中补充自然语言说明。")
+                        # 第一次只是提醒：可回退后端整轮作废重来；不可回退
+                        # 后端保留本轮（含代码块）并追加纠正，避免全量 prefill。
+                        if not self._can_rewind_kv():
+                            p = _redirect(hint, rec, resp,
+                                          pending=_carry_task(hint),
+                                          reset_guards=False)
+                            if p is not None:
+                                pending = p
+                                self.log("[kernel] 保留未执行代码本轮以维持 KV 前缀")
+                                continue
+                        self._rollback_turn(session)
+                        pending = _carry_task(hint)
                         continue
                     # 第二次不再纠缠：把这轮的正文当作最终答复收下。
                     # 注意必须在 finish_turn 之后再 break —— 回滚会把 rec 从
@@ -1575,6 +1616,16 @@ class KernelLoop:
         except Exception as e:
             self.log(f"[kernel] invalidate_kv failed: {e}")
 
+    def _can_rewind_kv(self) -> bool:
+        """当前本地缓存能否安全回退一轮（决定回滚 vs append-only 纠正）。"""
+        try:
+            fn = getattr(self._llm(), "can_rewind_kv", None)
+            if callable(fn):
+                return bool(fn())
+        except Exception as e:
+            self.log(f"[kernel] can_rewind_kv failed: {e}")
+        return True
+
     def _ask(self, messages: List[Dict[str, Any]]) -> Optional[LLMResponse]:
         content_buf: List[str] = []
         reasoning_buf: List[str] = []
@@ -1636,6 +1687,9 @@ class KernelLoop:
                         if kv_reuse is not None and kv_eval:
                             self.log(f"[perf] KV reuse={kv_reuse} eval={kv_eval}"
                                      + ("（全量预填充）" if not kv_reuse else ""))
+                        spec = usage.get("spec_decode")
+                        if spec == "active":
+                            self.log("[perf] 投机解码: active")
                         continue
                     # 无 EOS 熔断：模型漏 EOS / 退化复读时会一直生成到 max_tokens
                     # （本地 2B 实测单轮 4.7 万字 / 663s）。超阈值即中止流——

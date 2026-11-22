@@ -64,11 +64,16 @@ _READING_RAG_TOOLS_DESCRIPTION = (
 
 
 def _reading_enabled(engine: Any, config: Any) -> bool:
-    """阅读模式以引擎实际管线为准，config 仅在引擎未提供属性时兜底。"""
+    """阅读模式以引擎实际管线为准，config 仅在引擎未提供属性时兜底。
+
+    兜底也按 rag_mode 判断：极速检索模式 = 阅读模式；旧的独立开关字段不再
+    作为是否进入阅读管线的依据。
+    """
     mode = getattr(engine, "reading_mode", None)
     if mode is not None:
         return bool(mode)
-    return bool(getattr(config, "rag_reading_mode_enabled", False))
+    return (str(getattr(config, "rag_mode", "vector") or "vector")
+            .strip().lower() == "fast")
 
 
 def _is_graph_item(item: Dict[str, Any]) -> bool:

@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -107,6 +108,30 @@ class DecisionModel:
     """判定模型基类：score(query, texts) -> 每片 0~1 相关性分。"""
 
     backend = ""
+    # 判定分数缓存：计划步骤/证据在多次评审间通常不变，避免重复前向。
+    # 键 (query, text)，小容量 LRU；只缓存成功算出的分，异常仍走原兜底。
+    _SCORE_CACHE_MAX = 256
+
+    def _init_score_cache(self) -> None:
+        self._score_cache: "OrderedDict" = OrderedDict()
+
+    def _cache_get(self, query: str, text: str) -> Optional[float]:
+        try:
+            key = (query, text)
+            val = self._score_cache.get(key)
+            if val is not None:
+                self._score_cache.move_to_end(key)
+            return val
+        except Exception:
+            return None
+
+    def _cache_put(self, query: str, text: str, value: float) -> None:
+        try:
+            self._score_cache[(query, text)] = float(value)
+            while len(self._score_cache) > self._SCORE_CACHE_MAX:
+                self._score_cache.popitem(last=False)
+        except Exception:
+            pass
 
     def score(self, query: str, texts: Sequence[str]) -> List[float]:
         raise NotImplementedError
@@ -162,6 +187,7 @@ class MeteorReadoutModel(DecisionModel):
             self._lang_mod = None
         self._n_options = len(_SCORE_CRITERIA)
         self._lock = threading.RLock()
+        self._init_score_cache()
         logger.info("决策模型(Meteor readout)加载完成: %s", directory)
 
     # ------------------------------------------------------------------ prompt
@@ -205,18 +231,78 @@ class MeteorReadoutModel(DecisionModel):
             if self._lang_mod is not None and self._orig_mask_fn is not None:
                 self._lang_mod._create_qwen3_5_attention_mask = self._orig_mask_fn
 
+    def _score_batch(self, query: str, texts: Sequence[str]) -> List[float]:
+        """同长度分组批量前向；不同长度各自成组，避免 padding 掩码语义问题。"""
+        mx, np = self._mx, self._np
+        q = _score_question(query)
+        items = [self._prompt_ids(t, q) for t in texts]
+        groups: "OrderedDict[int, List[int]]" = OrderedDict()
+        for i, ids in enumerate(items):
+            groups.setdefault(len(ids), []).append(i)
+        out = [0.0] * len(texts)
+        patched = (self._lang_mod is not None and self._orig_mask_fn is not None)
+        if patched:
+            self._lang_mod._create_qwen3_5_attention_mask = (
+                lambda h, cache: None if cache is None
+                else self._orig_mask_fn(h, cache))
+        try:
+            for _length, idxs in groups.items():
+                # 上一组失败时 _score_one 会把自己的 patch 还原成 orig；
+                # 这里每组重新施加 noncausal patch，避免后续组用错掩码。
+                if patched:
+                    self._lang_mod._create_qwen3_5_attention_mask = (
+                        lambda h, cache: None if cache is None
+                        else self._orig_mask_fn(h, cache))
+                try:
+                    arr = np.stack([items[i] for i in idxs])
+                    res = self._lm(mx.array(arr), return_hidden=True,
+                                   skip_logits=True)
+                    mx.eval(res.hidden_states[0])
+                    last = np.array(mx.astype(
+                        res.hidden_states[0][:, -1], mx.float32))
+                    scores = last @ self._readout[:self._n_options].T
+                    probs = np.exp(
+                        (scores - scores.max(axis=1, keepdims=True))
+                        / self._temperature)
+                    probs = probs / probs.sum(axis=1, keepdims=True)
+                    expected = (probs * np.arange(self._n_options)).sum(axis=1)
+                    vals = expected / (self._n_options - 1)
+                    for j, i in enumerate(idxs):
+                        out[i] = _clamp_score(vals[j])
+                except Exception as e:
+                    # 批量前向失败 → 逐条回退（不影响正确性，只损失吞吐）。
+                    logger.warning("决策模型批量判定失败，逐条回退: %s", e)
+                    for i in idxs:
+                        try:
+                            out[i] = self._score_one(query, texts[i])
+                        except Exception as e2:
+                            logger.warning(
+                                "决策模型单片判定失败，按 0 分处理: %s", e2)
+                            out[i] = 0.0
+        finally:
+            if patched:
+                self._lang_mod._create_qwen3_5_attention_mask = self._orig_mask_fn
+        return out
+
     def score(self, query: str, texts: Sequence[str]) -> List[float]:
         if not texts:
             return []
-        out: List[float] = []
         with self._lock:
-            for text in texts:
-                try:
-                    out.append(self._score_one(query, text))
-                except Exception as e:
-                    logger.warning("决策模型单片判定失败，按 0 分处理: %s", e)
-                    out.append(0.0)
-        return out
+            results: List[Optional[float]] = [None] * len(texts)
+            missing: List[int] = []
+            for i, text in enumerate(texts):
+                cached = self._cache_get(query, text)
+                if cached is None:
+                    missing.append(i)
+                else:
+                    results[i] = cached
+            if missing:
+                vals = self._score_batch(
+                    query, [texts[i] for i in missing])
+                for i, val in zip(missing, vals):
+                    results[i] = val
+                    self._cache_put(query, texts[i], val)
+            return [0.0 if v is None else float(v) for v in results]
 
     def close(self) -> None:
         self._lm = None
@@ -271,6 +357,7 @@ class ValenMixerModel(DecisionModel):
         self._lm = model.language_model
         self._n_options = len(_SCORE_CRITERIA)
         self._lock = threading.RLock()
+        self._init_score_cache()
         logger.info("决策模型(Valen mixer)加载完成: %s", directory)
 
     # ------------------------------------------------------------------ prompt
@@ -392,18 +479,87 @@ class ValenMixerModel(DecisionModel):
         expected = float(sum(i * float(p) for i, p in enumerate(probs)))
         return _clamp_score(expected / (self._n_options - 1))
 
+    def _score_batch(self, query: str, texts: Sequence[str]) -> List[float]:
+        """同长度分组批量前向：把 [1,1,S,S] block 掩码堆成 [B,1,S,S]。"""
+        mx, np = self._mx, self._np
+        instructions = _score_question(query)
+        items = [self._prompt(text, instructions) for text in texts]
+        groups: "OrderedDict[int, List[int]]" = OrderedDict()
+        for i, (_ids, _seg, _prefix, _meta) in enumerate(items):
+            groups.setdefault(len(_ids), []).append(i)
+        out = [0.0] * len(texts)
+        orig = self._language._create_qwen3_5_attention_mask
+        for length, idxs in groups.items():
+            try:
+                batch_ids, masks, metas = [], [], []
+                for i in idxs:
+                    ids, segments, prefix, meta = items[i]
+                    pos = np.arange(length)
+                    key_prefix = pos[None, :] < prefix
+                    query_prefix = pos[:, None] < prefix
+                    visible = np.where(
+                        query_prefix, key_prefix,
+                        key_prefix | (segments[None, :] == 0)
+                        | (segments[None, :] == segments[:, None]))
+                    batch_ids.append(ids)
+                    masks.append(visible[None, None])
+                    metas.append(meta)
+                mask = mx.array(np.stack(masks))
+
+                def patched(h, cache, _mask=mask, _length=length):
+                    return (_mask if cache is None and h.shape[1] == _length
+                            else orig(h, cache))
+
+                self._language._create_qwen3_5_attention_mask = patched
+                res = self._lm(mx.array(np.stack(batch_ids)),
+                               return_hidden=True, skip_logits=True)
+                mx.eval(res.hidden_states[0])
+                hidden_all = np.array(
+                    mx.astype(res.hidden_states[0], mx.float32))
+                for j, i in enumerate(idxs):
+                    hidden = hidden_all[j]
+                    logits = (self._head_logits(
+                        self._features(hidden, metas[j]))
+                        .double().numpy())
+                    probs = np.exp(
+                        (logits - logits.max()) / self._temperature)
+                    probs = probs / probs.sum()
+                    expected = float(sum(
+                        k * float(p) for k, p in enumerate(probs)))
+                    out[i] = _clamp_score(
+                        expected / (self._n_options - 1))
+            except Exception as e:
+                logger.warning("Valen 批量判定失败，逐条回退: %s", e)
+                for i in idxs:
+                    try:
+                        out[i] = self._score_one(query, texts[i])
+                    except Exception as e2:
+                        logger.warning(
+                            "Valen 决策模型单片判定失败，按 0 分处理: %s", e2)
+                        out[i] = 0.0
+            finally:
+                self._language._create_qwen3_5_attention_mask = orig
+        return out
+
     def score(self, query: str, texts: Sequence[str]) -> List[float]:
         if not texts:
             return []
-        out: List[float] = []
         with self._lock:
-            for text in texts:
-                try:
-                    out.append(self._score_one(query, text))
-                except Exception as e:
-                    logger.warning("Valen 决策模型单片判定失败，按 0 分处理: %s", e)
-                    out.append(0.0)
-        return out
+            results: List[Optional[float]] = [None] * len(texts)
+            missing: List[int] = []
+            for i, text in enumerate(texts):
+                cached = self._cache_get(query, text)
+                if cached is None:
+                    missing.append(i)
+                else:
+                    results[i] = cached
+            if missing:
+                vals = self._score_batch(
+                    query, [texts[i] for i in missing])
+                for i, val in zip(missing, vals):
+                    results[i] = val
+                    self._cache_put(query, texts[i], val)
+            return [0.0 if v is None else float(v) for v in results]
 
     def close(self) -> None:
         self._lm = None

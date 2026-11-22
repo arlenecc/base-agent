@@ -66,6 +66,13 @@ class AgentConfig:
     kernel_max_tool_chars: int = 6_000
     # L3 折叠摘要区保留的最大摘要行数。
     kernel_max_digest_lines: int = 40
+    # 多级记忆管理（L0~L4）常驻提示开关。默认关闭：不把 L0 META-SOP 与
+    # L1 全局索引拼进 system prompt，避免长期占用上下文预算（实测 L0+L1
+    # 约 1~2k token）。关闭不影响记忆工具：update_working_checkpoint 仍写
+    # Session key_info；start_long_term_update 仍可用，并在调用时按需物化
+    # L0 全文、回执中自带决策树与写入规则。L2/L3/L4 的磁盘数据与后台维护
+    # 保持原行为，只是不再常驻注入。
+    memory_system_enabled: bool = False
 
     # RAG settings
     # 切片大小，单位 = token。chunker.estimate_tokens 优先用生效 embedding 模型
@@ -106,6 +113,9 @@ class AgentConfig:
     # 关闭时退回旧行为：全部结果格式化/精简后注入。
     rag_presentation_mode: bool = True
     # ---- 检索阅读模式（ColBERT 旁路）----
+    # 是否启用由 rag_mode 决定：rag_mode="fast"（极速检索模式）即启用，
+    # vector/decision 即关闭。UI 不再提供独立开关；本字段由 UI 在保存配置时
+    # 按 rag_mode 派生，保留仅为兼容旧配置/旧调用方。
     # 开启后知识库同步在文档解析为 Markdown 之后，跳过原有「token 切片 →
     # embedding → 向量库」链路，改用 doc_chunker + Jina ColBERT v2 残差量化
     # 写 LanceDB 三表；检索用 BM25 + 中心向量 RRF 粗筛 + MaxSim 精排。
@@ -375,6 +385,15 @@ class AgentConfig:
     # prefill 批大小（mlx-lm 的 prefill_step_size）：长 prompt（系统提示约 5900
     # token）预填充的分块大小，调大加快缓存失效轮（压缩）的重填；0 = 用默认值。
     local_llm_prefill_step_size: int = 4096
+    # GGUF 上下文窗口（token）。0 = 自动（max_tokens + 1024，下限 8192）。
+    # 默认 max_tokens=32768 时自动值约 33792，KV 显存/加载时间偏高；只做
+    # 多轮对话、长文档场景可显式降到 16384/24576。显式值小于 prompt 长度
+    # 时会触发容量保护（整体重建），启动日志会给出提示。
+    local_llm_n_ctx: int = 0
+    # GGUF 批处理大小（llama.cpp n_batch / n_ubatch）。默认 512；调大
+    # （如 1024）可减少长 prompt 预填充的批次数，代价是更高的瞬时内存。
+    local_llm_n_batch: int = 512
+    local_llm_n_ubatch: int = 512
 
     embedding_provider: str = "local"
     # 默认 embedding：jina-embeddings-v5-text-nano 的 MLX int4 权重（EuroBERT-
@@ -461,6 +480,8 @@ class AgentConfig:
                    "rag_binary_prefilter_top",
                    "aux_max_tokens", "aux_top_k",
                    "local_llm_num_draft_tokens", "local_llm_prefill_step_size",
+                   "local_llm_n_ctx", "local_llm_n_batch",
+                   "local_llm_n_ubatch",
                    "rag_mcp_port",
                    "rag_kg_max_entities", "rag_kg_max_relations",
                    "rag_kg_max_description_chars",
@@ -510,7 +531,8 @@ class AgentConfig:
                     "rag_reading_mode_enabled", "rag_reading_use_ann",
                     "rag_embed_background",
                     "rag_decision_use_core_sentences",
-                    "rag_multi_decision_mode")
+                    "rag_multi_decision_mode",
+                    "memory_system_enabled")
 
     def __post_init__(self) -> None:
         """构造期即归一多知识分区（_migrate 只在 load() 路径触发）。"""

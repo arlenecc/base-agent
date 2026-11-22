@@ -409,14 +409,24 @@ def is_l23_write(call: Any) -> bool:
 
 def long_term_update_payload(transcript: str, focus: str, layout: MemoryLayout) -> Dict[str, Any]:
     """改进 6：start_long_term_update 的回执（prompt 门控，不直接写记忆）。"""
+    # 工具按需自维护：即使多级记忆管理关闭、L0/L1 不再常驻 system prompt，
+    # 这里也保证 L0 全文可读；回执本身再带一份决策树/写入规则，二者都能独立
+    # 支撑模型完成归类，不依赖 L0/L1 常驻。
+    try:
+        ensure_l0(layout)
+    except Exception:
+        pass
     return {
         "status": "MEMORY_PURIFY_REQUESTED",
         "focus": focus or "",
-        "prompt": MEMORY_PURIFY_PROMPT,
+        "prompt": (MEMORY_PURIFY_PROMPT +
+                   "\n（若 L0/L1 未常驻，按本回执的 decision_tree / "
+                   "write_rules 执行，无需先读常驻提示。）"),
         "transcript": (transcript or "")[-4000:],
         "decision_tree": (
-            "写前先 file_read('memory/memory_management_sop.md') 读 META-SOP 全文与决策树，"
-            "读完提炼进 key_info。速记：环境特异性事实 → file_append 到 "
+            "按下列 decision_tree / write_rules 直接归类即可（不依赖 L0/L1 常驻）；"
+            "如需完整细则可 file_read('memory/memory_management_sop.md')，文件不存在时"
+            "以本回执为准。速记：环境特异性事实 → file_append 到 "
             "memory/global_mem.txt 的 ## [SECTION]；特定任务技术 → 新建或追加 "
             "memory/xxx_sop.md；通用规律 → L1 [RULES] 一句；通用常识/易变状态 → 丢弃"
         ),

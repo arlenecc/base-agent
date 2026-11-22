@@ -25,6 +25,8 @@ def _fake_model(cache_type):
                 return [ArraysCache(10)]
             if cache_type == "rotating":
                 return [RotatingKVCache(max_size=10, keep=4)]
+            if cache_type == "mixed":
+                return [KVCache(), ArraysCache(10), KVCache()]
             return [KVCache()]
     return _M()
 
@@ -39,11 +41,22 @@ class TestMlxKvQuantCache:
         assert isinstance(out, list) and len(out) == 1
         assert isinstance(out[0], QuantizedKVCache)
 
-    def test_rotating_kv_cache_is_quantized(self):
-        from mlx_lm.models.cache import QuantizedKVCache
+    def test_rotating_kv_cache_is_preserved(self):
+        """RotatingKVCache 保留原类型：QuantizedKVCache 不含滑动窗口语义。"""
+        from mlx_lm.models.cache import RotatingKVCache
         c = _make_client(kv_quant=True, model=_fake_model("rotating"))
         out = c._make_prompt_cache()
+        assert isinstance(out[0], RotatingKVCache)
+
+    def test_mixed_cache_quantizes_only_standard_layers(self):
+        """混合模型：只量化标准 KV 层，ArraysCache 原样保留。"""
+        from mlx_lm.models.cache import (
+            ArraysCache, KVCache, QuantizedKVCache)
+        c = _make_client(kv_quant=True, model=_fake_model("mixed"))
+        out = c._make_prompt_cache()
         assert isinstance(out[0], QuantizedKVCache)
+        assert isinstance(out[1], ArraysCache)
+        assert isinstance(out[2], QuantizedKVCache)
 
     def test_arrays_cache_falls_back(self):
         """线性注意力模型（ArraysCache）无标准 KV，量化不适用 → 原样返回。"""
@@ -65,6 +78,18 @@ class TestMlxKvQuantCache:
         out = c._make_prompt_cache()
         from mlx_lm.models.cache import KVCache
         assert isinstance(out, list) and isinstance(out[0], KVCache)
+
+
+def test_can_rewind_kv_reflects_cache_trimmability():
+    """内核靠 can_rewind_kv 决定回滚还是 append-only 纠正。"""
+    from mlx_lm.models.cache import ArraysCache, KVCache
+    c = _make_client(kv_quant=True, model=_fake_model("standard"))
+    c._cache_token_ids = [1]
+    c._mlx_cache = [KVCache()]
+    assert c.can_rewind_kv() is True
+    # Qwen3.5 线性注意力层不可裁剪 → 必须走 append-only，避免全量重填。
+    c._mlx_cache = [ArraysCache(10)]
+    assert c.can_rewind_kv() is False
 
 
 def test_gguf_kv_quant_kwargs_built():

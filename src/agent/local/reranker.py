@@ -62,6 +62,13 @@ class LocalReranker:
     def close(self) -> None:
         """释放后端权重 / ONNX InferenceSession（单例淘汰与测试清理用）。"""
         with self._load_lock:
+            if self._backend == "gguf" and self._model is not None:
+                close = getattr(self._model, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
             self._model = None
             self._tokenizer = None
             self._session = None

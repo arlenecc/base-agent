@@ -129,6 +129,9 @@ _RAG_LOG_PREFIXES = (
     f"{_PKG_ROOT}.tools.rag_tool",
     f"{_PKG_ROOT}.tools.base",
     f"{_PKG_ROOT}.ui.main_window",
+    # 本地模型推理/加载日志：KV 命中、GGUF/MLX prefill 进度、降级原因。
+    # 这些是用户判断「为什么这一句慢」的直接证据，必须能进 UI 日志面板。
+    f"{_PKG_ROOT}.local",
 )
 # RAG 子模块 logger 全名（同步 worker 临时 handler / 日志桥接 level 设置共用）
 _RAG_SUB_LOGGERS = tuple(
@@ -733,6 +736,17 @@ class AgentWorker(QThread):
         # 为空；即便真有消息排队，也先预热再处理，状态机只有一条路径。
         try:
             try:
+                # 先预填 system 段：preload_kv 会建立主对话缓存并把 4k+ token
+                # 的 prefill 图跑热；随后的 warm_up 只需一个短 prompt 编译
+                # decode 形状，不再重复整段 6k prompt 的前向（旧顺序是
+                # warm_up 全量 + preload 全量，启动预热约翻倍）。
+                self._callbacks.bridge.status.emit(
+                    "系统提示预填中（预填上下文 KV，请稍候）")
+                self._agent.preload_kv()
+            except Exception as e:
+                logger.warning("系统提示预热失败(忽略): %s", e)
+                self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
+            try:
                 self._callbacks.bridge.status.emit(
                     "主模型预热中（首次推理 / 计算图编译，请稍候）")
                 self._agent.warm_up()
@@ -740,18 +754,37 @@ class AgentWorker(QThread):
                 logger.warning("主模型预热失败(忽略): %s", e)
                 self._callbacks.bridge.status.emit(
                     "预热失败，但仍可对话（首句会偏慢）")
-            try:
-                self._callbacks.bridge.status.emit(
-                    "系统提示预填中（预填上下文 KV，请稍候）")
-                self._agent.preload_kv()
-            except Exception as e:
-                logger.warning("系统提示预热失败(忽略): %s", e)
-                self._callbacks.bridge.status.emit("系统提示预热失败（首句会偏慢）")
         finally:
             # 无论预热成功/失败/异常，都必须解锁发送按钮并显示最终态。
             # 漏掉这一步会把 UI 永久锁在「预热中」，比预热本身失效更糟。
             # 传 self 让 UI 能识别「已被替换的旧 worker」的迟到信号。
             self._callbacks.bridge.warmup_done.emit(self)
+
+        # 决策模型（计划评审/收尾拦截/RAG 决策模式）后台预热：首次调用时
+        # 同步加载 0.8B 权重需要 1.5~4.6s，会直接卡住第一次 update_plan。
+        # 放在 warmup_done 之后、用户空闲时加载，避免与主模型首句抢 GPU。
+        def _preload_decision_model() -> None:
+            try:
+                time.sleep(1.0)
+                if not self._queue.empty():
+                    logger.debug("决策模型后台预热跳过：已有待处理消息")
+                    return
+                # 主模型正在生成时不要抢 GPU（决策模型也是 MLX 前向）。
+                lock = getattr(getattr(self._agent, "llm", None),
+                               "_gen_lock", None)
+                if lock is not None:
+                    if not lock.acquire(blocking=False):
+                        logger.debug("决策模型后台预热跳过：主模型正在生成")
+                        return
+                    lock.release()
+                from ..plan_review import load_plan_model
+                load_plan_model(self._agent.config)
+                logger.info("决策模型后台预热完成")
+            except Exception as e:
+                logger.debug("决策模型后台预热跳过: %s", e)
+
+        threading.Thread(target=_preload_decision_model, daemon=True,
+                         name="decision-preload").start()
         while True:
             text = self._queue.get()
             if text is None:
@@ -1180,8 +1213,11 @@ class SyncKnowledgeWorker(QThread):
                 # 避免 rag_embedding_model 的遗留值（如 bge 目录名）把 800 夹成 510。
                 clamp_model=effective_embedding_model(self._config),
                 # 检索阅读模式：Markdown 之后全部交给 ColBERT 三表。
-                reading_mode=bool(getattr(
-                    self._config, "rag_reading_mode_enabled", False)),
+                # 阅读模式不再由独立开关决定：极速检索模式固定使用 ColBERT
+                # 阅读模式；向量/决策模式即使用旧配置开关为 true 也不启用。
+                reading_mode=(
+                    str(getattr(self._config, "rag_mode", "vector")
+                        or "vector").strip().lower() == "fast"),
                 reading_quant_bits=int(getattr(
                     self._config, "rag_reading_quant_bits", 4) or 4),
                 reading_coarse_k=int(getattr(
@@ -2294,9 +2330,9 @@ class MainWindow(QMainWindow):
         self.kv_quant_check = QCheckBox("KV量化")
         self.kv_quant_check.setToolTip(
             "KV cache INT8 量化（省显存，质量近乎无损）：同等上下文长度下 KV 显存约"
-            "减半。MLX 在模型默认缓存为标准 KV 缓存时生效（Qwen3.5 等线性注意力模型"
-            "无标准 KV，自动跳过）；GGUF 通过 llama.cpp 的 type_k/type_v=q8_0 生效。"
-            "主模型与辅助模型都启用。")
+            "减半。MLX 按层处理——标准 KV 层量化，线性注意力层的 ArraysCache 原样"
+            "保留（Qwen3.5 等混合模型的全注意力层同样会量化）；GGUF 通过 "
+            "llama.cpp 的 type_k/type_v=q8_0 生效。主模型与辅助模型都启用。")
         self.flash_attn_check = QCheckBox("FA")
         self.flash_attn_check.setToolTip(
             "Flash attention（融合注意力），默认启用：长上下文与显存受限设备收益明显，"
@@ -2481,10 +2517,12 @@ class MainWindow(QMainWindow):
         self.rag_mode_combo.setToolTip(
             "RAG 检索召回路径三选一：\n"
             "· 向量检索模式（默认）：Embedding 向量 + BM25 混合召回 + Reranker 精排；\n"
-            "· 极速检索模式：强制开启二值量化粗筛两段式（汉明距离极速选候选），大库显著更快；\n"
+            "· 极速检索模式：固定使用检索阅读模式（ColBERT 长文档旁路），\n"
+            "  大库显著更快；选中即启用，无需额外开关；\n"
             "· 决策判定模式：BM25 粗筛 → 字符级 BM25 选核心句 → 本地决策模型逐片\n"
             "  判定相关性，返回 TopN 相关切片（不走向量检索与 Reranker）。\n"
-            "切换模式后点「应用配置」生效。")
+            "切换模式后点「应用配置」生效；极速模式自动开启阅读模式，\n"
+            "向量/决策模式自动关闭阅读模式。")
         r.addWidget(self.rag_mode_combo)
         r.addStretch(1)
         klay.addLayout(r)
@@ -2743,6 +2781,24 @@ class MainWindow(QMainWindow):
         adv_lay = QVBoxLayout(adv_box)
         adv_lay.setContentsMargins(10, 8, 10, 8)
         adv_lay.setSpacing(8)
+
+        # 多级记忆管理常驻提示：默认关闭，避免 L0/L1 每轮占用上下文预算。
+        # 关闭只影响 system prompt 注入；记忆工具与磁盘数据仍可用。
+        mem_row = QHBoxLayout(); mem_row.setSpacing(8)
+        self.memory_system_chk = QCheckBox("启用多级记忆管理（L0/L1 常驻）")
+        self.memory_system_chk.setChecked(
+            bool(getattr(self.config, "memory_system_enabled", False)))
+        self.memory_system_chk.setToolTip(
+            "开启后：L0 META-SOP + L1 全局索引常驻 system prompt（约 1~2k token），\n"
+            "模型每轮都能直接看到记忆公理、层级索引与写入规则。\n"
+            "关闭（默认）：不注入 L0/L1，节省长期上下文占用；\n"
+            "update_working_checkpoint 仍正常写 key_info；\n"
+            "start_long_term_update 仍可用，并在调用时按需物化 L0 全文、\n"
+            "回执自带决策树与写入规则，不依赖 L0/L1 常驻。\n"
+            "L2/L3/L4 磁盘数据与后台维护保持原行为。")
+        mem_row.addWidget(self.memory_system_chk)
+        mem_row.addStretch(1)
+        adv_lay.addLayout(mem_row)
 
         # 将 RAG 能力以 MCP 工具形式对外暴露，供其它大模型应用对接使用。
         mcp_row = QHBoxLayout(); mcp_row.setSpacing(8)
@@ -3027,19 +3083,23 @@ class MainWindow(QMainWindow):
 
         # row1：启用 / 量化残差 / 粗筛候选 / 精选 topN / ANN / 构建索引
         r = QHBoxLayout(); r.setSpacing(8)
-        self.reading_mode_chk = QCheckBox("启用检索阅读模式")
-        self.reading_mode_chk.setChecked(
-            bool(getattr(self.config, "rag_reading_mode_enabled", False)))
-        self.reading_mode_chk.setToolTip(
-            "开启后，知识库同步在文档解析为 Markdown 之后，跳过原有\n"
+        # 是否启用阅读模式由「检索模式」下拉唯一决定：选中极速检索模式即
+        # 自动启用（本组也只在该模式下显示），不再提供独立开关，避免
+        # 「选了向量检索但阅读开关还开着」导致实际走阅读管线。
+        self.reading_mode_label = QLabel("极速检索模式固定使用检索阅读模式（ColBERT）")
+        self.reading_mode_label.setStyleSheet("font-weight:600;")
+        self.reading_mode_label.setToolTip(
+            "阅读模式不再单独开关：检索模式选择「极速检索模式」时自动启用，\n"
+            "选择向量检索 / 决策判定模式时自动关闭。\n"
+            "启用后，知识库同步在文档解析为 Markdown 之后，跳过原有\n"
             "「token 切片 → embedding → 向量库 → reranker」链路，改用\n"
             "Jina ColBERT v2（64 维 INT8）残差量化写 LanceDB 三表。\n"
             "召回时只把排名最高的一片长切片注入上下文供模型总结，其余\n"
             "切片作为回复末尾的可点击气泡展示。\n\n"
             "注意：目录/摘要等元数据按模式各存一份，两种模式的文档互相\n"
-            "独立——切换本开关后需重新同步知识库，文件归属会随同步迁移\n"
-            "（旧模式库中的对应数据自动清理）。")
-        r.addWidget(self.reading_mode_chk)
+            "独立——切换到极速检索模式后需重新同步知识库，文件归属会随同步\n"
+            "迁移（旧模式库中的对应数据自动清理）。")
+        r.addWidget(self.reading_mode_label)
         r.addSpacing(10)
         r.addWidget(QLabel("量化残差:"))
         self.reading_quant_combo = _combo(["4bit", "2bit"])
@@ -3134,19 +3194,19 @@ class MainWindow(QMainWindow):
         rlay.addLayout(r2)
 
         self.reading_mode_hint = QLabel(
-            "启用后：解析出 Markdown 的全部后续处理（切片 / 词向量 / 入库 / "
-            "检索召回 / MaxSim 精排）由 ColBERT 旁路接管；请重新执行一次"
-            "「开始同步」以生成 ColBERT 索引；首次使用会自动从 hf-mirror.com "
-            "下载模型。")
+            "选中「极速检索模式」后：解析出 Markdown 的全部后续处理（切片 / "
+            "词向量 / 入库 / 检索召回 / MaxSim 精排）由 ColBERT 旁路接管；"
+            "请重新执行一次「开始同步」以生成 ColBERT 索引；首次使用会自动从 "
+            "hf-mirror.com 下载模型。")
         self.reading_mode_hint.setStyleSheet("color:#6b7280;")
         self.reading_mode_hint.setWordWrap(True)
         rlay.addWidget(self.reading_mode_hint)
 
-        self.reading_mode_chk.toggled.connect(self._sync_reading_mode_controls)
         # 阅读模式分组并入「极速检索模式」组：随 rag_fast_w 一起显隐。
         flay.addWidget(reading_box)
         self._sync_reading_mode_controls(
-            self.reading_mode_chk.isChecked())
+            _RAG_MODE_DISPLAY_TO_VALUE.get(
+                self.rag_mode_combo.currentText(), "vector") == "fast")
         lay.addStretch(1)
 
         # 主模型模式切换 & 加载/卸载按钮
@@ -3206,8 +3266,13 @@ class MainWindow(QMainWindow):
 
     # ---- 检索阅读模式（ColBERT）配置区 ----
 
+    def _current_rag_mode(self) -> str:
+        """当前下拉选中的检索模式（内部值 vector/fast/decision）。"""
+        return _RAG_MODE_DISPLAY_TO_VALUE.get(
+            self.rag_mode_combo.currentText().strip(), "vector")
+
     def _sync_reading_mode_controls(self, enabled: bool) -> None:
-        """启用开关关闭时，阅读模式参数置灰（避免误以为已生效）。"""
+        """阅读模式参数是否可编辑：仅在极速检索模式（自动启用阅读模式）下可编辑。"""
         for name in (
             "reading_quant_combo", "reading_coarse_combo",
             "reading_topn_combo", "reading_ann_chk",
@@ -3226,8 +3291,7 @@ class MainWindow(QMainWindow):
 
     def _sync_rag_mode_controls(self) -> None:
         """RAG 检索模式三选一联动：只显示当前模式对应的配置行。"""
-        mode = _RAG_MODE_DISPLAY_TO_VALUE.get(
-            self.rag_mode_combo.currentText(), "vector")
+        mode = self._current_rag_mode()
         groups = {
             "vector": getattr(self, "rag_vector_w", None),
             "fast": getattr(self, "rag_fast_w", None),
@@ -3236,6 +3300,8 @@ class MainWindow(QMainWindow):
         for key, widget in groups.items():
             if widget is not None:
                 widget.setVisible(key == mode)
+        # 阅读模式参数只在极速检索模式（= 自动启用阅读模式）下可编辑。
+        self._sync_reading_mode_controls(mode == "fast")
 
     def _on_build_reading_index(self) -> None:
         """后台构建/续建 ColBERT 中心向量 ANN 索引。"""
@@ -3253,10 +3319,11 @@ class MainWindow(QMainWindow):
                 "知识同步正在进行，请完成或停止同步后再构建/续建索引。")
             return
         self._gather_config_from_widgets()
-        if not self.config.rag_reading_mode_enabled:
+        if self._current_rag_mode() != "fast":
             QMessageBox.information(
                 self, "检索阅读模式",
-                "请先勾选「启用检索阅读模式」，再构建向量索引。")
+                "检索阅读模式仅随「极速检索模式」启用。请先在「检索模式」"
+                "下拉中选择「极速检索模式」，再构建向量索引。")
             return
         if getattr(self, "_reading_index_worker", None) is not None and \
                 self._reading_index_worker.isRunning():
@@ -3273,7 +3340,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._on_reading_index_failed)
         worker.finished.connect(
             lambda: self.reading_index_btn.setEnabled(
-                self.reading_mode_chk.isChecked()))
+                self._current_rag_mode() == "fast"))
         self._reading_index_worker = worker
         worker.start()
 
@@ -3621,6 +3688,7 @@ class MainWindow(QMainWindow):
                 pass
         self._llm = None
         self._agent = None
+        self._update_context_usage()
         self._mark_model_unloaded("main")
         # 卸载后不再等任何 warmup_done，避免残留的预热态把发送锁死。
         self._set_warming(False)
@@ -3764,9 +3832,16 @@ class MainWindow(QMainWindow):
         self.speed_label.setStyleSheet("color:#6b7280;")
         self.token_label = QLabel("总计 0 tokens")
         self.token_label.setStyleSheet("color:#6b7280;")
+        # 当前上下文预算使用率（system + 历史 + 工具 + 本轮 prompt）。
+        self.context_label = QLabel("上下文 --")
+        self.context_label.setStyleSheet("color:#6b7280;")
+        self.context_label.setToolTip(
+            "当前会话上下文预算使用率：已使用 token / 上下文预算总量。")
         stats_row.addWidget(self.speed_label)
         stats_row.addWidget(QLabel("|"))
         stats_row.addWidget(self.token_label)
+        stats_row.addWidget(QLabel("|"))
+        stats_row.addWidget(self.context_label)
         stats_row.addStretch(1)
         llay.addLayout(stats_row)
 
@@ -4056,10 +4131,10 @@ class MainWindow(QMainWindow):
         _dtopn = str(int(getattr(self.config, "rag_decision_top_n", 5) or 5))
         self.decision_topn_combo.setCurrentText(
             _dtopn if _dtopn in ("3", "5", "10") else "5")
+        self.memory_system_chk.setChecked(
+            bool(getattr(self.config, "memory_system_enabled", False)))
         self._sync_rag_mode_controls()
-        # 检索阅读模式（ColBERT）
-        self.reading_mode_chk.setChecked(
-            bool(getattr(self.config, "rag_reading_mode_enabled", False)))
+        # 检索阅读模式（ColBERT）：是否启用由检索模式决定，无独立开关。
         self.reading_quant_combo.setCurrentText(
             "2bit" if int(getattr(self.config, "rag_reading_quant_bits", 4)) == 2
             else "4bit")
@@ -4082,7 +4157,7 @@ class MainWindow(QMainWindow):
         self.reading_min_score_edit.setText(
             str(getattr(self.config, "rag_reading_min_score", 0.61)))
         self._sync_reading_mode_controls(
-            self.reading_mode_chk.isChecked())
+            self._current_rag_mode() == "fast")
         # RAG 检索策略（知识图谱，spec 第八步）：策略名 → 下拉索引。
         _kg_fwd = {"naive": 0, "local": 1, "global": 2, "hybrid": 3, "mix": 4}
         self.kg_strategy_combo.setCurrentIndex(
@@ -4592,8 +4667,11 @@ class MainWindow(QMainWindow):
             _dtopn_save = 5
         self.config.rag_decision_top_n = (
             _dtopn_save if _dtopn_save in (3, 5, 10) else 5)
-        # 检索阅读模式（ColBERT）：UI 固定选项，仍夹紧兜底。
-        self.config.rag_reading_mode_enabled = self.reading_mode_chk.isChecked()
+        # 检索阅读模式（ColBERT）：不再有独立开关，严格跟随检索模式——
+        # 极速检索模式 = 阅读模式开启；向量/决策模式 = 关闭。
+        self.config.rag_reading_mode_enabled = (
+            self.config.rag_mode == "fast")
+        self.config.memory_system_enabled = self.memory_system_chk.isChecked()
         self.config.rag_embed_background = self.embed_bg_chk.isChecked()
         self.config.rag_reading_quant_bits = (
             2 if "2" in self.reading_quant_combo.currentText() else 4)
@@ -4817,6 +4895,7 @@ class MainWindow(QMainWindow):
             return
         self._llm = new_llm
         self._agent = new_agent
+        self._update_context_usage()
         # 重建成功 → 强杀标志复位：旧实现一次强杀后该标志恒为 True，之后
         # 每次退出都跳过 tools.shutdown()/agent.close()，泄漏 MCP 子进程与
         # httpx 连接池（关闭路径被永久短路）。新 agent 是全新实例，锁无残留。
@@ -4894,7 +4973,7 @@ class MainWindow(QMainWindow):
         self._dedup_vectors_impl(partition=name or None)
 
     def _dedup_vectors_impl(self, partition: Optional[str] = None) -> None:
-        if getattr(self.config, "rag_reading_mode_enabled", False):
+        if self._current_rag_mode() == "fast":
             QMessageBox.information(
                 self, "检索阅读模式",
                 "检索阅读模式使用独立的 ColBERT 三表索引，重复文件已在同步"
@@ -5087,11 +5166,11 @@ class MainWindow(QMainWindow):
 
     def _on_build_kg(self) -> None:
         """「构建知识图谱」按钮：后台 KGBuilder（辅助模型抽取实体/关系）。"""
-        if getattr(self.config, "rag_reading_mode_enabled", False):
+        if self._current_rag_mode() == "fast":
             QMessageBox.information(
                 self._front_dialog(), "检索阅读模式",
                 "检索阅读模式使用独立的 ColBERT 三表索引，目前未适配知识图谱"
-                "构建。\n请切换到普通知识库模式并同步后再构建知识图谱。")
+                "构建。\n请切换到向量检索 / 决策判定模式并同步后再构建知识图谱。")
             return
         if getattr(self, "_kg_worker", None) is not None and self._kg_worker.isRunning():
             QMessageBox.information(self._front_dialog(), "构建中", "知识图谱正在构建中，请等待完成或取消。")
@@ -5145,7 +5224,7 @@ class MainWindow(QMainWindow):
 
     def _on_consolidate_kg(self) -> None:
         """「实体消歧」按钮：对库内现有实体做语义向量消歧（无需辅助模型）。"""
-        if getattr(self.config, "rag_reading_mode_enabled", False):
+        if self._current_rag_mode() == "fast":
             QMessageBox.information(
                 self._front_dialog(), "检索阅读模式",
                 "检索阅读模式未适配知识图谱，实体消歧暂不可用。")
@@ -5467,8 +5546,9 @@ class MainWindow(QMainWindow):
                 )
                 if deleted > 0:
                     summary += f"已清理删除文件：{deleted} 个\n"
-                _reading = bool(getattr(
-                    self.config, "rag_reading_mode_enabled", False))
+                _reading = (
+                    str(getattr(self.config, "rag_mode", "vector")
+                        or "vector").strip().lower() == "fast")
                 summary += (
                     f"检索阅读切片：{chunks} 个（最高分切片注入上下文，其余气泡展示）\n"
                     if _reading else f"向量切片：{chunks} 个\n")
@@ -5479,7 +5559,8 @@ class MainWindow(QMainWindow):
                     msg += f"  - {e}\n"
                 if len(errors) > 5:
                     msg += f"  …（还有 {len(errors) - 5} 个）\n"
-            if getattr(self.config, "rag_reading_mode_enabled", False):
+            if (str(getattr(self.config, "rag_mode", "vector")
+                    or "vector").strip().lower() == "fast"):
                 msg += ("\n后续对话将在检索阅读模式下把最高分切片注入上下文供总结，"
                         "其余切片以气泡展示。")
             else:
@@ -6183,10 +6264,48 @@ class MainWindow(QMainWindow):
         # to jump between API total (no estimate) and agent total (with estimate).
         pass
 
+    def _update_context_usage(self) -> None:
+        """刷新「上下文 XX%」：读取 Agent 当前会话的 token 预算使用率。"""
+        label = getattr(self, "context_label", None)
+        if label is None:
+            return
+        session = getattr(getattr(self, "_agent", None), "session", None)
+        budget = getattr(session, "budget", None)
+        if budget is None:
+            label.setText("上下文 --")
+            label.setStyleSheet("color:#6b7280;")
+            label.setToolTip("当前没有活动会话或上下文预算不可用。")
+            return
+        try:
+            used = max(0, int(budget.used()))
+            total = max(0, int(getattr(budget, "total", 0) or 0))
+        except Exception:
+            label.setText("上下文 --")
+            label.setStyleSheet("color:#6b7280;")
+            return
+        if total <= 0:
+            label.setText("上下文 --")
+            label.setStyleSheet("color:#6b7280;")
+            return
+        pct = min(100.0, used * 100.0 / total)
+        label.setText(f"上下文 {pct:.0f}%")
+        label.setToolTip(
+            f"上下文预算：{used} / {total} tokens"
+            "（含系统提示、历史、工具定义与当前 prompt）")
+        if pct >= 85.0:
+            color = "#dc2626"      # 接近预算上限
+        elif pct >= 65.0:
+            color = "#d97706"      # 需要留意
+        else:
+            color = "#6b7280"
+        label.setStyleSheet(f"color:{color};")
+
     def _on_speed(self, total_tokens: int, speed: float) -> None:
         self._total_tokens = total_tokens
         self.token_label.setText(f"总计 {total_tokens} tokens")
         self.speed_label.setText(f"{speed:.1f} tok/s")
+        # token 速度回调每 ~0.3s 一次，正好用作上下文占用率的刷新点。
+        self._update_context_usage()
 
     def _on_skill_suggested(self, skill) -> None:
         """Cache the skill suggestion for showing AFTER the run finishes.
@@ -6393,6 +6512,9 @@ class MainWindow(QMainWindow):
         # WARNING(30) 导致 INFO(20) 日志在传播到 handler 前被拦截。
         for _name in _RAG_SUB_LOGGERS:
             logging.getLogger(_name).setLevel(logging.DEBUG)
+        # 本地推理只放行 INFO（KV 命中、prefill 进度、降级原因）；DEBUG 里
+        # 有大量逐轮前缀诊断，全开会把 UI 日志面板刷爆。
+        logging.getLogger(f"{_PKG_ROOT}.local").setLevel(logging.INFO)
 
         # 保存到模块级变量，供 closeEvent 清理使用。
         _LOG_HANDLER = self._log_handler
@@ -6448,6 +6570,7 @@ class MainWindow(QMainWindow):
         self.token_label.setText("总计 0 tokens")
         if self._agent is not None:
             self._agent.reset()
+        self._update_context_usage()
 
     @staticmethod
     def _escape(text: str) -> str:

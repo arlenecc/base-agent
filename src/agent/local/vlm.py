@@ -32,6 +32,9 @@ class LocalVLMClient:
         self._model = None
         self._processor = None
         self._load_lock = threading.Lock()
+        # llama.cpp / MLX VLM 前向都不是线程安全的：并发调用会踩同一份
+        # 权重/上下文。与 LocalLLMClient 同款串行化。
+        self._gen_lock = threading.RLock()
         self._loaded = False
 
     def _ensure_model(self) -> None:
@@ -125,9 +128,10 @@ class LocalVLMClient:
         """返回模型对（图像+文本）的回复字符串。"""
         self._ensure_model()
         images = images or []
-        if self._backend == "mlx":
-            return self._chat_mlx(prompt, images)
-        return self._chat_gguf(prompt, images)
+        with self._gen_lock:
+            if self._backend == "mlx":
+                return self._chat_mlx(prompt, images)
+            return self._chat_gguf(prompt, images)
 
     def _chat_mlx(self, prompt: str, images: List[str]) -> str:
         from mlx_vlm import generate
@@ -159,5 +163,14 @@ class LocalVLMClient:
         return f"local-vlm:{self._backend}:{base}"
 
     def close(self) -> None:
+        # GGUF 的上下文/权重在 C++ 侧，主动 close() 比等 GC 更及时。
+        if self._backend == "gguf" and self._model is not None:
+            close = getattr(self._model, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         self._model = None
+        self._processor = None
         self._loaded = False

@@ -308,6 +308,15 @@ def test_rag_mode_roundtrip_persists(tmp_path):
     assert cfg2.rag_decision_use_core_sentences is False
 
 
+def test_memory_system_switch_default_off_and_roundtrip(tmp_path):
+    """多级记忆管理默认关闭；开启后能持久化并正确读回。"""
+    p = tmp_path / "c.json"
+    assert AgentConfig().memory_system_enabled is False
+    cfg = AgentConfig(memory_system_enabled=True)
+    cfg.save(str(p))
+    assert AgentConfig.load(str(p)).memory_system_enabled is True
+
+
 def test_rag_mode_migration_from_binary_prefilter(tmp_path):
     """旧配置（无 rag_mode 键）勾选了快速粗筛 → 迁移为极速检索模式。"""
     p = tmp_path / "c.json"

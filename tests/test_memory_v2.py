@@ -37,6 +37,8 @@ def cfg(tmp_path):
     c = AgentConfig()
     c.workspace = str(tmp_path)
     c.knowledge_base = str(tmp_path / "kb")
+    # 这些用例验证 L0/L1 常驻行为；默认关闭，这里显式开启。
+    c.memory_system_enabled = True
     return c
 
 
@@ -176,6 +178,29 @@ def test_system_prompt_injects_l0_and_l1(cfg, layout):
     assert "[RULES]" in open(layout.l1_path, encoding="utf-8").read()
     # L0 恒定、L1 是独立的一段（两次构建一致 → KV 前缀稳定）
     assert agent._system_prompt() == prompt
+
+
+def test_system_prompt_memory_switch_default_off(tmp_path):
+    """默认关闭：system prompt 不含 L0/L1；工具回执按需自维护 L0。"""
+    from agent.memory_v2 import long_term_update_payload
+
+    c = AgentConfig()
+    c.workspace = str(tmp_path)
+    assert c.memory_system_enabled is False
+    agent = Agent(llm=_MockLLM([]), config=c, callbacks=_Noop())
+    prompt = agent._system_prompt()
+    assert "核心公理" not in prompt
+    assert "全局记忆 L0~L4" not in prompt
+    assert "# [Global Memory Insight]" not in prompt
+    l0_path = os.path.join(str(tmp_path), "memory", "memory_management_sop.md")
+    assert not os.path.isfile(l0_path), "关闭时不应预创建 L0 文件"
+
+    # start_long_term_update 的回执独立自维护：调用时物化 L0，且自带规则。
+    payload = long_term_update_payload(
+        "transcript", "", MemoryLayout(str(tmp_path)))
+    assert "不依赖 L0/L1 常驻" in payload["decision_tree"]
+    assert "write_rules" in payload and payload["paths"]["L2"]
+    assert os.path.isfile(l0_path), "工具调用时应按需物化 L0"
 
 
 def test_l0_full_materialized_but_never_overwritten(layout):

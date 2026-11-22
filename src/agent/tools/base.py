@@ -639,8 +639,10 @@ class ToolRegistry:
                 kg_glean=bool(getattr(self.config, "rag_kg_glean_enabled", True)),
                 kg_raw_json=bool(getattr(self.config, "rag_kg_llm_raw_json", False)),
                 # 检索阅读模式：解析 Markdown 后旁路普通切片/embedding/向量库。
-                reading_mode=bool(getattr(
-                    self.config, "rag_reading_mode_enabled", False)),
+                # 是否启用由 rag_mode 决定（fast = 极速检索 = 阅读模式）。
+                reading_mode=(
+                    str(getattr(self.config, "rag_mode", "vector")
+                        or "vector").strip().lower() == "fast"),
                 reading_quant_bits=int(getattr(
                     self.config, "rag_reading_quant_bits", 4) or 4),
                 reading_coarse_k=int(getattr(

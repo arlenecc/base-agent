@@ -65,6 +65,11 @@ def build_llm_client(config) -> Any:
             # gguf 视觉塔（mmproj）与 onnx 分词器路径：可选，留空走默认。
             mmproj=getattr(config, "local_llm_mmproj_path", "") or "",
             tokenizer_path=getattr(config, "local_llm_tokenizer_path", "") or "",
+            # GGUF 上下文/批处理：n_ctx=0 → 按 max_tokens 自动推导；
+            # 显式值/批大小用于降低默认 33k 上下文的 KV 内存或加快 prefill。
+            n_ctx=int(getattr(config, "local_llm_n_ctx", 0) or 0),
+            n_batch=int(getattr(config, "local_llm_n_batch", 512) or 512),
+            n_ubatch=int(getattr(config, "local_llm_n_ubatch", 512) or 512),
         )
     # 默认：网络 API
     from ..llm_client import LLMClient

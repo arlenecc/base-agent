@@ -407,12 +407,12 @@ class Session:
     def _turn_messages(self, t: TurnRecord) -> List[Dict[str, Any]]:
         # 进行中的轮（还没产出任何东西）不进消息列表：末尾挂一条空 assistant
         # 会让模型从空回合继续生成。
-        if not t.prompt and not t.assistant_text and not t.tool_calls:
+        if not (t.prompt or t.assistant_text or t.tool_calls or t.raw_content):
             return []
         out: List[Dict[str, Any]] = []
         if t.prompt:
             out.append({"role": "user", "content": t.prompt})
-        if not (t.assistant_text or t.tool_calls):
+        if not (t.assistant_text or t.tool_calls or t.raw_content):
             return out
         assistant: Dict[str, Any] = {"role": "assistant", "content": t.assistant_text or None}
         # 第二视图：模型原始输出。HTTP 后端不认识这个键（安全忽略），本地 MLX

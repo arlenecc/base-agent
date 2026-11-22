@@ -35,6 +35,8 @@ def cfg(tmp_path):
     c = AgentConfig()
     c.workspace = str(tmp_path)
     c.knowledge_base = str(tmp_path / "kb")
+    # 本文件验证 L0/L1 常驻链路；默认关闭，这里显式开启。
+    c.memory_system_enabled = True
     return c
 
 

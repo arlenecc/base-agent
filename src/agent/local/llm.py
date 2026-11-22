@@ -17,16 +17,27 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 # StreamEvent 数据类与 LLMClient 同源，保证内核解析一致。
 from ..llm_client import StreamEvent  # noqa: E402
+
+
+def _stable_hash(obj: Any) -> bytes:
+    """把 messages/tools 等结构压成稳定指纹（用于 prompt 渲染缓存）。"""
+    try:
+        raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        raw = repr(obj)
+    return hashlib.sha1(raw.encode("utf-8", "ignore")).digest()
 
 
 def _kv_diag(group, cached, prompt, reuse, suffix, ttft, total,
@@ -747,6 +758,9 @@ class LocalLLMClient:
         flash_attn: bool = True,
         mmproj: str = "",
         tokenizer_path: str = "",
+        n_ctx: int = 0,
+        n_batch: int = 512,
+        n_ubatch: int = 512,
     ):
         # 跨轮 KV / 前缀复用开关（MLX 与 GGUF 都遵守，默认开）。
         # 关闭后每轮整体重建（全量预填充）——用于排查前缀错位导致的乱码，
@@ -800,6 +814,28 @@ class LocalLLMClient:
         self._enable_thinking = bool(enable_thinking)
         self._num_draft_tokens = int(num_draft_tokens)
         self._prefill_step_size = int(prefill_step_size)
+        # GGUF 上下文/批处理参数：n_ctx=0 → 按 max_tokens 自动推导；
+        # n_batch/n_ubatch 直接透传给 llama.cpp（默认 512）。
+        self._n_ctx = max(0, int(n_ctx or 0))
+        self._n_batch = max(1, int(n_batch or 512))
+        self._n_ubatch = max(1, int(n_ubatch or 512))
+        # 投机解码实际状态（"off" / "active" / "unavailable:原因"），供日志与
+        # UI 观测「配置了但当前模型不支持」的情况。
+        self._spec_decode_status = "off"
+        # 稳定的 prompt 渲染缓存（同一历史重试时避免重复 Jinja/tokenize）。
+        # 仅保留最近几条，避免长会话把渲染结果常驻内存。
+        self._prompt_cache: "OrderedDict[Any, Any]" = OrderedDict()
+        self._prompt_cache_limit = 4
+        # GGUF：aux 调用冲掉主 KV 后，不再用后台线程立刻重放（会与下一轮
+        # 主对话抢锁/堆积线程），改为记录待恢复状态，下一次主对话真正到来
+        # 且新 prompt 仍以旧序列为前缀时，再一次性恢复。
+        self._gguf_pending_restore: Optional[Tuple[List[int], List[List[int]]]] = None
+        # GGUF 部分 KV 裁剪能力探测结果（None=未探测；False=底层不支持）。
+        self._gguf_trim_supported: Optional[bool] = None
+        # /tmp 诊断日志默认关闭（BASE_AGENT_KV_DIAG=1 打开）；常规运行只保留
+        # 结构化 logger 行，避免每轮多次 decode 与磁盘写。
+        self._kv_diag_enabled = os.environ.get(
+            "BASE_AGENT_KV_DIAG", "").strip().lower() in ("1", "true", "yes", "on")
         # 投机解码草稿源：指向已加载的辅助模型 client（复用其权重，不另起草稿）。
         # 惰性取值——真正生成时才取 draft_source._model（此时必然已加载），避免
         # 「加载时 _model 尚为 None」的时序坑；None 表示不启用投机解码。
@@ -822,6 +858,15 @@ class LocalLLMClient:
         # 每轮只预填充本轮新增 token（对齐 Ollama 的 prompt cache 行为）。
         self._mlx_cache = None
         self._cache_token_ids: List[int] = []
+        # 模板在 assistant 内容后追加的结束 token（如 Qwen 的 <|im_end|>）。
+        # 生成被 max_tokens 截断时，模型没吐这个 token；下一轮模板却会补上，
+        # 导致「缓存少 1 token」→ ArraysCache 无法裁剪 → 全量重建。这里探测
+        # 一次并缓存，截断轮结束时把该 token 显式 eval 进 KV。
+        self._mlx_end_ids: Optional[List[int]] = None
+        # 每轮真实生成 token（与 messages 中的 assistant 顺序一一对应）：
+        # (gen_ids, 是否因截断而缺少结束 token)。仅截断轮需要用它把历史
+        # assistant 内容替换成真实 token，避免 decode→encode 的边界漂移。
+        self._mlx_gen_history: List[Tuple[List[int], bool]] = []
         # GGUF（llama.cpp）的跨轮前缀状态：当前已 eval 进上下文的 token 序列。
         # llama.cpp 的 KV 缓存在 C++ context 里（不是线程局部），但**不能裁剪**
         # ——本 build 的 kv_cache_seq_rm 不支持（llama-cpp-python 会打印
@@ -866,15 +911,20 @@ class LocalLLMClient:
             # 模型（重）加载后旧 KV 缓存全部失效
             self._mlx_cache = None
             self._cache_token_ids = []
+            self._mlx_end_ids = None
+            self._mlx_gen_history = []
+            self._prompt_cache.clear()
+            self._gguf_pending_restore = None
+            self._gguf_trim_supported = None
             self._loaded = True
 
     def _make_prompt_cache(self):
-        """构造 MLX 的 prompt cache；开启 KV 量化时改用 ``QuantizedKVCache`` 省显存。
+        """构造 MLX 的 prompt cache；开启 KV 量化时按层改用 ``QuantizedKVCache``。
 
-        仅当模型默认缓存是**标准 KV 缓存**（``KVCache`` / ``RotatingKVCache``）时
-        才量化：Qwen3.5 等线性注意力模型用 ``ArraysCache``（不存标准 KV），量化
-        无意义且会破坏注意力，此时退回默认缓存（功能不降级）。任何异常都退回
-        ``make_prompt_cache``，绝不因量化把加载/生成搞挂。
+        仅替换**标准 KV 层**（``KVCache``）：``RotatingKVCache`` 保留原类型
+        （量化版没有滑动窗口语义），线性注意力层的 ``ArraysCache`` 也没有
+        KV 可量化。这样混合模型（Qwen3.5 等）的全注意力层同样能省显存，
+        又不会破坏其它层的缓存类型。任何异常都退回 ``make_prompt_cache``。
         """
         from mlx_lm.models.cache import (
             make_prompt_cache, QuantizedKVCache, KVCache, RotatingKVCache)
@@ -882,22 +932,176 @@ class LocalLLMClient:
             return make_prompt_cache(self._model)
         try:
             default = make_prompt_cache(self._model)
-            if (not default
-                    or not isinstance(default[0], (KVCache, RotatingKVCache))):
-                logger.info(
-                    "LLM: 模型默认缓存非标准 KV（%s），跳过 KV 量化",
-                    type(default[0]).__name__ if default else "空")
+            if not default:
                 return default
-            n = len(default)
+            # 按层判断，而不是只看 default[0]：
+            #   * 标准 KVCache → 替换为 QuantizedKVCache；
+            #   * RotatingKVCache → 原样保留（QuantizedKVCache 不带滑动窗口
+            #     语义，直接替换会改变模型行为）；
+            #   * ArraysCache / CacheList 等线性注意力状态 → 原样保留。
+            # 混合模型（Qwen3.5：每 4 层 1 层全注意力）因此也能量化全注意力
+            # 层，同时不会把线性注意力状态错误地换成 KV 缓存。
+            cache: List[Any] = []
+            n_kv = n_rot = n_other = 0
+            for c in default:
+                if isinstance(c, RotatingKVCache):
+                    cache.append(c)
+                    n_rot += 1
+                elif isinstance(c, KVCache):
+                    cache.append(QuantizedKVCache(
+                        group_size=self._kv_quant_group,
+                        bits=self._kv_quant_bits))
+                    n_kv += 1
+                else:
+                    cache.append(c)
+                    n_other += 1
+            if n_kv == 0:
+                logger.info(
+                    "LLM: 模型没有标准 KV 层（旋转=%d / 其它=%d），跳过 KV 量化",
+                    n_rot, n_other)
+                return default
             logger.info(
-                "LLM: KV cache 启用 INT%d 量化（group=%d，%d 层）",
-                self._kv_quant_bits, self._kv_quant_group, n)
-            return [QuantizedKVCache(group_size=self._kv_quant_group,
-                                     bits=self._kv_quant_bits)
-                    for _ in range(n)]
+                "LLM: KV cache 启用 INT%d 量化（group=%d；标准 KV %d 层，"
+                "旋转 %d 层保留，其它 %d 层保留）",
+                self._kv_quant_bits, self._kv_quant_group, n_kv,
+                n_rot, n_other)
+            return cache
         except Exception as e:  # 量化缓存构造失败 → 退回默认，不影响生成
             logger.warning("LLM: KV 量化缓存构造失败，退回默认: %s", e)
             return make_prompt_cache(self._model)
+
+    # ------------------------------------------------------------------
+    # prompt 渲染缓存：同一段历史的重试/回滚重发不再重复 Jinja + tokenize
+    # ------------------------------------------------------------------
+    def _prompt_cache_get(self, key: Any) -> Optional[Any]:
+        try:
+            val = self._prompt_cache.get(key)
+            if val is not None:
+                self._prompt_cache.move_to_end(key)
+            return val
+        except Exception:
+            return None
+
+    def _prompt_cache_put(self, key: Any, value: Any) -> None:
+        try:
+            self._prompt_cache[key] = value
+            while len(self._prompt_cache) > self._prompt_cache_limit:
+                self._prompt_cache.popitem(last=False)
+        except Exception:
+            pass
+
+    def _render_mlx_prompt(self, messages, tools, eff_think: bool):
+        """渲染 MLX chat prompt + token ids（带小容量缓存）。"""
+        key = ("mlx", _stable_hash(messages), _stable_hash(tools or []),
+               bool(eff_think))
+        hit = self._prompt_cache_get(key)
+        if hit is not None:
+            return hit
+        tok = self._tokenizer
+        try:
+            prompt = tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                tools=tools if tools else None,
+                enable_thinking=eff_think,
+            )
+        except Exception:
+            prompt = tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+        ids = tok.encode(prompt)
+        self._prompt_cache_put(key, (prompt, ids))
+        return prompt, ids
+
+    def _mlx_assistant_end_ids(self) -> List[int]:
+        """探测模板在 assistant 内容后追加的结束 token（如 ``<|im_end|>``）。
+
+        用一条最小对话渲染后取「assistant 内容之后、下一个分隔符之前」的
+        非空白 token。只在首次调用时探测并缓存；探测失败回退到 tokenizer
+        的 eos_token_id（Qwen 系即 ``<|im_end|>``）。
+        """
+        if self._mlx_end_ids is not None:
+            return self._mlx_end_ids
+        tok = self._tokenizer
+        try:
+            marker = "ZZASSTZZ"
+            text = tok.apply_chat_template(
+                [{"role": "user", "content": "u"},
+                 {"role": "assistant", "content": marker}],
+                tokenize=False, add_generation_prompt=False)
+            pos = text.rfind(marker)
+            if pos < 0:
+                raise ValueError("assistant marker not found in chat prompt")
+            full = tok.encode(text)
+            before = tok.encode(text[:pos + len(marker)])
+            if full[:len(before)] != before:
+                raise ValueError("token prefix mismatch around assistant marker")
+            end_ids: List[int] = []
+            for t in full[len(before):]:
+                if str(tok.decode([t])).strip():
+                    end_ids.append(int(t))
+                elif end_ids:
+                    break
+            self._mlx_end_ids = end_ids
+            if end_ids:
+                logger.info(
+                    "LLM: assistant 结束 token ids=%s（截断轮补齐 KV 用）",
+                    end_ids)
+            return end_ids
+        except Exception as e:
+            eos = getattr(tok, "eos_token_id", None)
+            ids = [int(eos)] if isinstance(eos, int) else []
+            self._mlx_end_ids = ids
+            logger.debug(
+                "LLM: assistant 结束 token 探测失败，回退 eos=%s: %s", ids, e)
+            return ids
+
+    def _mlx_splice_assistant_ids(self, ids_full: List[int], prompt: str,
+                                  messages, gen_history) -> Optional[List[int]]:
+        """把**截断轮**的历史 assistant 内容替换成真实生成 token。
+
+        正常结束的轮次仍走 raw_content 文本重建（现有双视图路径已验证）；
+        只有被 max_tokens 截断的轮次，decode→encode 可能在最后一个 token
+        边界漂移，导致缓存与下一轮 prompt 差几个 token、ArraysCache 无法
+        trim。这里把这些轮次的 assistant 内容段直接换成生成时的 gen_ids。
+        """
+        hist = [m for m in messages
+                if isinstance(m, dict) and m.get("role") == "assistant"]
+        H = len(hist)
+        if H == 0 or len(gen_history) != H:
+            return None
+        if not any(x is not None for x in gen_history):
+            return None
+        tok = self._tokenizer
+        try:
+            hdr = tok.encode(_ASSISTANT_MARK)
+            end_ids = self._mlx_assistant_end_ids()
+            if not hdr or not end_ids:
+                return None
+            end_id = int(end_ids[0])
+            gp = _assistant_prompt_prefix(prompt)
+            gp_ids = tok.encode(gp) if gp else []
+            n = len(ids_full)
+            positions = []
+            for i in range(0, n - len(hdr) + 1):
+                if ids_full[i:i + len(hdr)] == hdr:
+                    positions.append(i)
+            if len(positions) < H + 1:
+                return None
+            out = list(ids_full)
+            for k in range(H - 1, -1, -1):
+                if gen_history[k] is None:
+                    continue
+                start = positions[k] + len(hdr)
+                e = start
+                while e < n and ids_full[e] != end_id:
+                    e += 1
+                if e >= n:
+                    return None
+                out[start:e] = list(gp_ids) + list(gen_history[k])
+            return out
+        except Exception as e:
+            logger.debug("MLX 截断轮 splice 跳过: %s", e)
+            return None
 
     def _load_mlx(self) -> None:
         if not os.path.isdir(self._path):
@@ -969,18 +1173,30 @@ class LocalLLMClient:
                 "GGUF LLM 后端不可用：未安装 llama-cpp-python。\n"
                 f"原始错误: {type(e).__name__}: {e}"
             ) from e
-        # n_ctx 必须由 max_tokens 推导：旧实现硬编码 4096，而 max_tokens 默认
-        # 32768——llama.cpp 的生成受上下文长度限制，长上下文场景下生成早停/
-        # 报错，max_tokens 形同虚设且静默发生。预留 1k 给 prompt 余量，
-        # 下限 8192（短 max_tokens 时也有基本的多轮空间）。
-        n_ctx = max(8192, min(self._max_tokens + 1024, 131072))
+        # n_ctx 优先级：显式配置 local_llm_n_ctx > 由 max_tokens 推导。
+        # 旧实现硬编码 4096，而 max_tokens 默认 32768——llama.cpp 的生成受
+        # 上下文长度限制，长上下文场景下生成早停/报错，max_tokens 形同虚设
+        # 且静默发生。推导值预留 1k 给 prompt 余量，下限 8192。
+        # 显式 n_ctx 让「只做多轮对话」的用户不必为 32k 生成上限预留 33k KV。
+        if self._n_ctx > 0:
+            n_ctx = max(2048, min(self._n_ctx, 131072))
+        else:
+            n_ctx = max(8192, min(self._max_tokens + 1024, 131072))
+        if n_ctx < self._max_tokens:
+            logger.warning(
+                "GGUF: n_ctx=%d 小于 max_tokens=%d，生成长度会在上下文上限"
+                "提前停止（可调大 local_llm_n_ctx 或调小 max_tokens）",
+                n_ctx, self._max_tokens)
+        n_batch = max(1, int(self._n_batch))
+        n_ubatch = min(max(1, int(self._n_ubatch)), n_batch)
         # Flash attention 默认启用：长上下文与显存受限设备收益明显（Metal 上
         # compute buffer 实测 612→493 MiB，-19%）。但不同 llama.cpp 构建/后端
         # 对 FA 与量化 KV 的支持并不一致——尤其 type_k/type_v=q8_0 必须与
         # flash_attn=True 配套，否则 "Failed to create llama_context"。所以按
         # 「能力从强到保守」逐级尝试，任何一级成功即用，绝不让开关把加载搞挂。
         common: Dict[str, Any] = dict(
-            model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False)
+            model_path=gguf, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False,
+            n_batch=n_batch, n_ubatch=n_ubatch)
         # mmproj 视觉塔（多模态 GGUF 才需要）：仅当用户显式配置时加入——
         # 纯文本 GGUF 传了反而会被 llama.cpp 拒绝。降级时必须保留它。
         if self._mmproj:
@@ -1020,8 +1236,10 @@ class LocalLLMClient:
             self._kv_quant_applied = use_kv
             self._flash_attn_applied = use_fa
             logger.info(
-                "LLM: GGUF 上下文已就绪（KV=%s, flash_attn=%s, n_ctx=%d）",
-                "q8_0" if use_kv else "f16", "on" if use_fa else "off", n_ctx)
+                "LLM: GGUF 上下文已就绪（KV=%s, flash_attn=%s, n_ctx=%d, "
+                "n_batch=%d, n_ubatch=%d）",
+                "q8_0" if use_kv else "f16", "on" if use_fa else "off",
+                n_ctx, n_batch, n_ubatch)
             if (use_kv, use_fa) != (self._kv_quant, self._flash_attn):
                 logger.warning(
                     "LLM: 当前构建不支持所请求组合，已自动降级为 KV=%s / "
@@ -1232,7 +1450,8 @@ class LocalLLMClient:
             try:
                 _prompt, ids = self._gguf_render(
                     [{"role": "system", "content": system_prompt}], tools,
-                    add_generation_prompt=False)
+                    add_generation_prompt=False,
+                    enable_thinking=self._enable_thinking)
                 if not ids:
                     return
                 # 先清空上下文：warm_up 走 aux 旧路径（create_chat_completion(reset=True)）
@@ -1245,25 +1464,47 @@ class LocalLLMClient:
                 self._model.eval(ids)
                 self._gguf_ids = list(ids)
                 self._gguf_gen_history = []
+                self._gguf_pending_restore = None
                 logger.info("LLM: GGUF 系统提示已预填（%d token）", len(ids))
             except Exception as e:
                 logger.warning("GGUF 系统提示预填失败(忽略): %s", e)
                 self._gguf_ids = []
                 self._gguf_gen_history = []
+                self._gguf_pending_restore = None
 
-    def _gguf_render(self, messages, tools=None, add_generation_prompt: bool = True):
+    def _gguf_render(self, messages, tools=None, add_generation_prompt: bool = True,
+                     enable_thinking: Optional[bool] = None):
         """渲染 GGUF chat prompt → ``(prompt_text, token_ids)``；不可用返回 (None, None)。
 
         tokenize 参数与 llama-cpp-python ``_create_completion`` 完全一致
         （``add_bos=False, special=True``），否则复用时前缀对不上。
+
+        ``enable_thinking`` 会透传给 Jinja 模板（Qwen3 系模板支持）；模板不
+        支持该变量时自动回退到不带参数的渲染，不让一个可选参数把整轮搞挂。
+        渲染结果按 messages/tools 指纹做小容量缓存，回滚重发时省掉一次
+        Jinja + 全量 tokenize。
         """
         fmt = (self._gguf_fmt if add_generation_prompt else self._gguf_fmt_sys)
         if fmt is None or self._model is None:
             return None, None
+        key = ("gguf", bool(add_generation_prompt),
+               None if enable_thinking is None else bool(enable_thinking),
+               _stable_hash(messages), _stable_hash(tools or []))
+        hit = self._prompt_cache_get(key)
+        if hit is not None:
+            return hit
         try:
             # 注意：add_generation_prompt 已在构造期决定，这里不能再传
             # （否则 jinja2 render 报 duplicate keyword）。
-            resp = fmt(messages=messages, tools=tools or None)
+            try:
+                if enable_thinking is None:
+                    resp = fmt(messages=messages, tools=tools or None)
+                else:
+                    resp = fmt(messages=messages, tools=tools or None,
+                               enable_thinking=bool(enable_thinking))
+            except Exception:
+                # 模板不支持 enable_thinking / 严格 undefined → 退回基础渲染。
+                resp = fmt(messages=messages, tools=tools or None)
             # ChatFormatterResponse 是 TypedDict（dict），不同版本也可能是
             # dataclass —— 两种都取一遍。
             prompt = None
@@ -1281,6 +1522,7 @@ class LocalLLMClient:
             if fix is not None:
                 ids = LocalLLMClient._gguf_patch_boundary(
                     ids, fix[0], fix[1], fix[2])
+            self._prompt_cache_put(key, (prompt, ids))
             return prompt, ids
         except Exception as e:
             logger.debug("GGUF prompt 渲染失败（降级为无前缀复用）: %s", e)
@@ -1526,7 +1768,8 @@ class LocalLLMClient:
         out: List[str] = []
         for ev in self.chat_stream(
                 messages, tools=tools, temperature=temperature,
-                kv_group=kv_group, enable_thinking=enable_thinking):
+                kv_group=kv_group, enable_thinking=enable_thinking,
+                max_tokens=max_tokens):
             if ev.type == "content":
                 out.append(ev.content)
             elif ev.type == "done":
@@ -1617,7 +1860,6 @@ class LocalLLMClient:
         from mlx_lm.sample_utils import make_sampler, make_logits_processors
 
         tok = self._tokenizer
-        hf = getattr(tok, "tokenizer", tok)
         # 双视图历史：本地后端读 raw_content，把 assistant 消息还原成「生成时
         # 的逐 token 序列」，跨轮 KV 前缀才对得上。HTTP 后端的历史没有该字段，
         # messages 原样不动（零影响）。
@@ -1625,16 +1867,22 @@ class LocalLLMClient:
         mt = self._max_tokens if max_tokens is None else int(max_tokens)
         eff_think = (self._enable_thinking
                      if enable_thinking is None else bool(enable_thinking))
-        try:
-            prompt = tok.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                tools=tools if tools else None,
-                enable_thinking=eff_think,
-            )
-        except Exception:
-            prompt = tok.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
+        # 渲染缓存：同一段历史的重试（回滚重发 / 工具格式纠正）直接复用
+        # prompt 与 token ids，省掉一次 Jinja 渲染 + 全量 tokenize。
+        prompt, prompt_ids = self._render_mlx_prompt(messages, tools, eff_think)
+        # 截断轮的历史 assistant 内容用真实 gen_ids 替换（见
+        # _mlx_splice_assistant_ids）；正常轮保持 raw_content 文本重建不变。
+        hist_n = sum(1 for m in messages
+                     if isinstance(m, dict) and m.get("role") == "assistant")
+        if len(self._mlx_gen_history) != hist_n:
+            self._mlx_gen_history = []
+        if any(flag for _ids, flag in self._mlx_gen_history):
+            splice_hist = [ids if flag else None
+                           for ids, flag in self._mlx_gen_history]
+            spliced = self._mlx_splice_assistant_ids(
+                prompt_ids, prompt, messages, splice_hist)
+            if spliced is not None:
+                prompt_ids = spliced
         # 模板把 <think> 预填进生成提示时（enable_thinking 默认开），模型输出
         # 直接以推理正文开始、只含闭合标签——按「已在 think 内」起步，否则
         # 推理会全部落进正文（对话区）。
@@ -1648,6 +1896,8 @@ class LocalLLMClient:
             repetition_penalty=self._repetition_penalty or None,
             repetition_context_size=20,
         ) if self._repetition_penalty and self._repetition_penalty != 1.0 else []
+        if not (self._draft_source is not None and self._num_draft_tokens > 0):
+            self._spec_decode_status = "off"
 
         # ---- 跨轮 KV 缓存复用（对齐 Ollama 的 prompt cache）----
         # 缓存只创建一次（实例级），之后每轮传入同一个 cache，只把**本轮新增
@@ -1659,9 +1909,8 @@ class LocalLLMClient:
         #   ② 新 prompt 更短（回退、上下文收缩后重试）——必须把缓存裁到公共
         #      前缀，裁不动就整体重建。
         # 中途分叉一律整体重建：绝不拿错位的缓存去续算（会输出乱码）。
-        from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+        from mlx_lm.models.cache import trim_prompt_cache
 
-        prompt_ids = tok.encode(prompt)
         # KV 缓存按「调用组」隔离：主对话(kv_group="main")与构建期抽取
         # ("kg") 用持久缓存跨轮复用；其余辅助调用走一次性本地缓存，
         # 绝不污染主对话的实例级缓存——否则辅助调用会改写 self._mlx_cache /
@@ -1793,10 +2042,19 @@ class LocalLLMClient:
                             and can_trim_prompt_cache(dm.make_cache())):
                         draft_model = dm
                         draft_lock = getattr(ds, "_gen_lock", None)
+                        if self._spec_decode_status != "active":
+                            logger.info("LLM: 投机解码已启用（draft=%s, %d token）",
+                                        type(dm).__name__, self._num_draft_tokens)
+                        self._spec_decode_status = "active"
                     else:
-                        logger.debug(
-                            "LLM: prompt cache 不可裁剪，关闭投机解码"
-                            "（降级为普通生成）")
+                        if not self._spec_decode_status.startswith("unavailable"):
+                            logger.info(
+                                "LLM: 当前模型缓存不可裁剪（ArraysCache/线性注意力），"
+                                "投机解码不可用，已降级为普通生成")
+                        self._spec_decode_status = "unavailable:cache_not_trimmable"
+                else:
+                    self._spec_decode_status = "unavailable:draft_not_loaded"
+            completed = False
             try:
                 # 持有 aux 的生成锁：防止主模型把 aux 当草稿做前向时，aux 自身正在
                 # 别处生成（权重前向非线程安全）。本仓库本地模式下二者在 worker
@@ -1808,6 +2066,18 @@ class LocalLLMClient:
                 # 预填充；0 表示用 mlx-lm 默认值（普通 2048 / 投机 512）。
                 if self._prefill_step_size and self._prefill_step_size > 0:
                     _sg_kwargs["prefill_step_size"] = self._prefill_step_size
+                # 预填充进度：mlx-lm 的 generate_step 原生支持
+                # prompt_progress_callback(processed, total)。长 prompt 全量重建
+                # 时 UI 不再长时间静默；投机解码路径会忽略该回调（库内部弹出）。
+                if len(suffix_ids) > 512:
+                    logger.info("MLX prefill start: %d token（group=%s）",
+                                len(suffix_ids), kv_group)
+
+                def _on_prefill(done: int, total: int) -> None:
+                    if total > 512 and done and done < total:
+                        logger.info("MLX prefill: %d/%d token", done, total)
+
+                _sg_kwargs["prompt_progress_callback"] = _on_prefill
                 # 草稿模型需独立 KV 缓存，且与主缓存【拼接】后整体传入
                 # stream_generate（mlx 按 len(model.layers) 切片：前半主缓存、
                 # 后半草稿缓存）。草稿缓存不持久化、每轮新建——草稿模型每轮重新
@@ -1838,43 +2108,79 @@ class LocalLLMClient:
                                 int(t.item()) if hasattr(t, "item") else int(t))
                         except (ValueError, TypeError):
                             pass
+                completed = True
             finally:
                 if draft_lock is not None:
                     draft_lock.release()
                 _total = time.time() - _t0
                 _ttft = _first_ts[0] if _first_ts[0] is not None else _total
-                # 诊断：重算公共前缀长度 + 解码两端前几个 token，定位 reuse=0 的根因
-                # （缓存对象丢失 vs prompt 前缀对不上）。
-                _lim = min(len(cached_ids), len(prompt_ids))
-                _common = 0
-                while _common < _lim and cached_ids[_common] == prompt_ids[_common]:
-                    _common += 1
-                try:
-                    _fc = tok.decode(cached_ids[:16])
-                except Exception:
-                    _fc = str(cached_ids[:16])
-                try:
-                    _fp = tok.decode(prompt_ids[:16])
-                except Exception:
-                    _fp = str(prompt_ids[:16])
-                _lo = max(0, _common - 8)
-                _hi = min(_lim, _common + 60)
-                try:
-                    _div_c = tok.decode(cached_ids[_lo:_hi])
-                except Exception:
-                    _div_c = str(cached_ids[_lo:_hi])
-                try:
-                    _div_p = tok.decode(prompt_ids[_lo:_hi])
-                except Exception:
-                    _div_p = str(prompt_ids[_lo:_hi])
-                _kv_diag(kv_group, len(cached_ids), len(prompt_ids), reuse,
-                         len(suffix_ids), _ttft, _total, _common,
-                         thread_mismatch[0], _fc, _fp, _div_c, _div_p)
+                # /tmp 诊断默认关闭（BASE_AGENT_KV_DIAG=1 打开）：常规运行只
+                # 保留上面一行结构化 logger，避免每轮多次 decode + 磁盘写。
+                if self._kv_diag_enabled:
+                    # 诊断：重算公共前缀长度 + 解码两端前几个 token，定位 reuse=0
+                    # 的根因（缓存对象丢失 vs prompt 前缀对不上）。
+                    _lim = min(len(cached_ids), len(prompt_ids))
+                    _common = 0
+                    while _common < _lim and cached_ids[_common] == prompt_ids[_common]:
+                        _common += 1
+                    try:
+                        _fc = tok.decode(cached_ids[:16])
+                    except Exception:
+                        _fc = str(cached_ids[:16])
+                    try:
+                        _fp = tok.decode(prompt_ids[:16])
+                    except Exception:
+                        _fp = str(prompt_ids[:16])
+                    _lo = max(0, _common - 8)
+                    _hi = min(_lim, _common + 60)
+                    try:
+                        _div_c = tok.decode(cached_ids[_lo:_hi])
+                    except Exception:
+                        _div_c = str(cached_ids[_lo:_hi])
+                    try:
+                        _div_p = tok.decode(prompt_ids[_lo:_hi])
+                    except Exception:
+                        _div_p = str(prompt_ids[_lo:_hi])
+                    _kv_diag(kv_group, len(cached_ids), len(prompt_ids), reuse,
+                             len(suffix_ids), _ttft, _total, _common,
+                             thread_mismatch[0], _fc, _fp, _div_c, _div_p)
+                # 截断轮补齐：max_tokens 截断时模型没有吐出模板会在下一轮补上的
+                # assistant 结束 token（如 <|im_end|>）。此时缓存比下一轮 prompt
+                # 少 1 token，ArraysCache 又无法 trim → 整段重建。这里主动把结束
+                # token eval 进主缓存，使下一轮仍是严格前缀扩展。
+                extra_end: List[int] = []
+                if persist and completed:
+                    end_ids = self._mlx_assistant_end_ids()
+                    already = bool(end_ids) and len(gen_ids) >= len(end_ids) \
+                        and gen_ids[-len(end_ids):] == end_ids
+                    if end_ids and not already:
+                        try:
+                            out = self._model(
+                                mx.expand_dims(mx.array(end_ids), 0), cache)
+                            first_out = (
+                                out[0] if isinstance(out, tuple) and out else out)
+                            if first_out is not None:
+                                mx.eval(first_out)
+                            try:
+                                mx.eval([c.state for c in cache])
+                            except Exception:
+                                pass
+                            extra_end = list(end_ids)
+                            logger.info(
+                                "LLM: 截断轮已补齐 assistant 结束 token %s",
+                                extra_end)
+                        except Exception as e:
+                            logger.debug(
+                                "LLM: 截断轮补齐结束 token 失败（不影响本轮）: %s", e)
                 # 无论生成到哪一步（含中途取消）都如实记录缓存对应的 token
                 # 序列：命中的话缓存现在覆盖到整个 prompt + 已生成部分。
                 # 仅主对话持久化；aux 调用不写，避免污染主对话缓存。
                 if persist:
-                    self._cache_token_ids = list(prompt_ids) + gen_ids
+                    self._cache_token_ids = (
+                        list(prompt_ids) + gen_ids + extra_end)
+                    if completed:
+                        self._mlx_gen_history.append(
+                            (list(gen_ids), bool(extra_end)))
 
         def _raw_getter() -> str:
             ids = gen_ref[0] if gen_ref else []
@@ -1898,6 +2204,7 @@ class LocalLLMClient:
                     "prompt_tokens": len(prompt_ids),
                     "completion_tokens": n_gen,
                     "total_tokens": len(prompt_ids) + n_gen,
+                    "spec_decode": self._spec_decode_status,
                 }
             yield ev
 
@@ -1919,7 +2226,8 @@ class LocalLLMClient:
         if persist and self._gguf_fmt is not None:
             try:
                 yield from self._stream_gguf_reuse(
-                    messages, tools, temperature)
+                    messages, tools, temperature, max_tokens=mt,
+                    enable_thinking=enable_thinking)
                 return
             except Exception as e:
                 # 复用路径失败不致命：清干净状态后退回旧路径（功能不降级）。
@@ -1930,10 +2238,14 @@ class LocalLLMClient:
                     pass
                 self._gguf_ids = []
                 self._gguf_gen_history = []
+                self._gguf_pending_restore = None
         yield from self._stream_gguf_legacy(messages, tools, temperature,
-                                            max_tokens, kv_group=kv_group)
+                                            max_tokens, kv_group=kv_group,
+                                            enable_thinking=enable_thinking)
 
-    def _stream_gguf_reuse(self, messages, tools, temperature):
+    def _stream_gguf_reuse(self, messages, tools, temperature,
+                           max_tokens: Optional[int] = None,
+                           enable_thinking: Optional[bool] = None):
         """GGUF 跨轮前缀复用：只把**新增**的 token eval 进 llama.cpp 上下文。
 
         为什么必须自己管（而不是靠 llama-cpp-python 内置的 prefix-match）：
@@ -1951,10 +2263,33 @@ class LocalLLMClient:
         # 双视图历史：把 assistant 消息还原成生成时的逐 token 序列（与 MLX 同款），
         # 否则下轮 prompt 在 assistant 处就分叉、复用直接失效。
         messages = _rebuild_raw_messages(messages)
-        prompt, ids = self._gguf_render(messages, tools,
-                                        add_generation_prompt=True)
+        if enable_thinking is None:
+            prompt, ids = self._gguf_render(
+                messages, tools, add_generation_prompt=True)
+        else:
+            prompt, ids = self._gguf_render(
+                messages, tools, add_generation_prompt=True,
+                enable_thinking=bool(enable_thinking))
         if not ids:
             raise RuntimeError("GGUF prompt 为空（渲染失败）")
+
+        # aux 调用（同一 Llama 实例的 create_chat_completion）会 reset 掉主
+        # 对话上下文。旧实现用后台线程立刻重放，既可能与下一轮主对话抢锁，
+        # 也会在用户不再追问时白付一次全量 eval。这里改为**懒恢复**：先把
+        # aux 前的真实生成历史接回 splice，再判断新 prompt 是否仍以旧序列为
+        # 严格前缀；是才真正 reset + eval 恢复，否就直接全量重建。
+        pending = self._gguf_pending_restore
+        self._gguf_pending_restore = None
+        p_ids: List[int] = []
+        if pending is not None:
+            p_ids, p_hist = pending
+            if p_ids and p_hist is not None:
+                self._gguf_ids = list(p_ids)
+                self._gguf_gen_history = list(p_hist)
+            else:
+                p_ids = []
+                self._gguf_ids = []
+                self._gguf_gen_history = []
 
         # 用真实生成 token 替换历史 assistant 内容（绕过不可逆的 detokenize→tokenize
         # 与 Qwen 模板重渲染剥离思考前缀），使 ids 成为 cached 的严格扩展、命中 form①。
@@ -1971,6 +2306,25 @@ class LocalLLMClient:
             spliced = None
         if spliced is not None:
             ids = spliced
+
+        # 懒恢复：只有新 prompt 仍是 aux 前缓存的严格前缀时才值得重放。
+        if p_ids:
+            if len(p_ids) <= len(ids) and ids[:len(p_ids)] == p_ids:
+                try:
+                    self._model.reset()
+                    self._model.eval(p_ids)
+                    logger.info(
+                        "GGUF KV: 恢复 aux 调用前的主对话缓存（%d token）",
+                        len(p_ids))
+                except Exception as e:
+                    logger.warning("GGUF KV 恢复失败，按全量重建: %s", e)
+                    self._gguf_ids = []
+                    self._gguf_gen_history = []
+            else:
+                logger.info(
+                    "GGUF KV: 新 prompt 与 aux 前缓存不连续，丢弃待恢复状态")
+                self._gguf_ids = []
+                self._gguf_gen_history = []
 
         cached = self._gguf_ids
         # 状态一致性校验：``_gguf_ids`` 记录的是「底层 llama.cpp 上下文里应当
@@ -2003,7 +2357,15 @@ class LocalLLMClient:
         if cached and common == len(cached) and common < len(ids):
             suffix = ids[common:]      # 严格扩展 → 只 eval 增量
             reuse_n = common
-        elif cached and 0 < common < len(ids) and self._gguf_trim_kv(common):
+        elif (cached and common == len(ids) and common < len(cached)
+              and self._gguf_trim_kv(common)):
+            # 新 prompt 是缓存的前缀（回滚 / 重试）：裁掉已生成尾部，
+            # 无需再 eval 任何 token。旧实现只认「严格扩展」，这种场景
+            # 会走全量 reset——与 can_rewind_kv 的判断不一致。
+            suffix = []
+            reuse_n = common
+        elif (cached and 0 < common < len(ids)
+              and common < len(cached) and self._gguf_trim_kv(common)):
             # 同前缀分叉（KG 逐片抽取：system+任务说明相同、只有正文不同）
             # → 把 KV 裁回公共前缀，只 eval 变化的正文段。
             suffix = ids[common:]
@@ -2016,8 +2378,7 @@ class LocalLLMClient:
             "GGUF KV: cached=%d prompt=%d reuse=%d eval=%d",
             len(cached), len(ids), reuse_n, len(suffix))
         if reuse_n == 0 and len(ids) > 1000:
-            # WARNING 才能到 UI 日志面板（INFO 被桥接 Filter 挡掉）。全量
-            # 预填充是本模型唯一的秒级卡顿来源，必须让用户/排查者看得见：
+            # 全量预填充是本模型唯一的秒级卡顿来源，必须让用户/排查者看得见：
             # 命中复用时每轮只 eval 十余个 token（~15ms），退化则要按
             # ~900 tok/s 重算整个 system+tools（真实配置 5k+ token ≈ 6s）。
             logger.warning(
@@ -2045,7 +2406,10 @@ class LocalLLMClient:
         _CHUNK = 1024
         t_prefill = time.time()
         try:
-            if len(suffix) <= _CHUNK:
+            if not suffix:
+                # 回滚到缓存的严格前缀：KV 已裁剪到位，无需再 eval。
+                pass
+            elif len(suffix) <= _CHUNK:
                 self._model.eval(suffix)
                 if len(suffix) > 512:
                     logger.info("GGUF prefill: %d token（%.2fs）",
@@ -2075,17 +2439,20 @@ class LocalLLMClient:
         start_in_think = _prompt_endswith_think_open(prompt)
         stop_ids = self._gguf_stop_ids()
         gen_ids: List[int] = []
+        mt = self._max_tokens if max_tokens is None else int(max_tokens)
 
         def _produce():
             t0 = time.time()
             first_ts: List[Optional[float]] = [None]
-            for _ in range(max(1, int(self._max_tokens))):
+            stop_id: Optional[int] = None
+            for _ in range(max(1, int(mt))):
                 tok_id = self._model.sample(
                     top_k=self._top_k, top_p=self._top_p,
                     min_p=self._min_p, temp=temperature,
                     repeat_penalty=self._repetition_penalty or 1.0,
                 )
                 if tok_id in stop_ids or self._gguf_is_eog(tok_id):
+                    stop_id = int(tok_id)
                     break
                 # 上下文容量：prompt + 已生成 token 逼近 n_ctx 时停手
                 # （llama.cpp 溢出会报错或静默截断）。
@@ -2111,10 +2478,31 @@ class LocalLLMClient:
                 if piece:
                     yield piece
                 self._model.eval([tok_id])
-            # 生成结束：上下文 = prompt + 已生成 token（供下轮复用）
-            self._gguf_ids = list(ids) + gen_ids
+            # 生成结束：上下文 = prompt + 已生成 token + assistant 结束 token。
+            # 模板会在下一轮 assistant 内容后补 <|im_end|> 等结束 token，但
+            # 采样循环在 stop/EOG 上 break、没有把它 eval 进上下文。补上后下一轮
+            # prompt 才是严格前缀扩展（hybrid/recurrent 也不用全量重建）。
+            end_id = stop_id
+            if end_id is None:
+                try:
+                    eos = self._model.token_eos()
+                    if isinstance(eos, int) and eos >= 0:
+                        end_id = int(eos)
+                except Exception:
+                    end_id = None
+            if end_id is not None and end_id >= 0:
+                try:
+                    self._model.eval([end_id])
+                    self._gguf_ids = list(ids) + gen_ids + [end_id]
+                except Exception as e:
+                    logger.debug("GGUF: 补齐 assistant 结束 token 失败: %s", e)
+                    self._gguf_ids = list(ids) + gen_ids
+            else:
+                self._gguf_ids = list(ids) + gen_ids
             # 记录本轮真实生成 token（client 采样得到，非 round-trip），供下一轮
             # 把重渲染的历史 assistant 内容替换回来，维持 form① 跨轮严格前缀命中。
+            # 注意不含结束 token：raw_content 必须保持模型实际生成的内容，模板
+            # 会自己补结束 token；若把合成 end 也放进来，会出现重复结束标记。
             self._gguf_gen_history.append(list(gen_ids))
 
         # 模板在 assistant 起始标记后预置的片段（<think>\n\n</think>\n\n 等）。
@@ -2162,21 +2550,34 @@ class LocalLLMClient:
         partial kv removal not supported）返回 False，调用方退回 reset +
         全量预填充——功能不受影响，只是该模型拿不到增量收益。
         """
+        if self._gguf_trim_supported is False:
+            return False
         if getattr(self._model, "_is_recurrent", False) or getattr(
                 self._model, "_is_hybrid", False):
+            self._gguf_trim_supported = False
+            logger.info(
+                "GGUF KV: 当前模型为 hybrid/recurrent 内存，部分裁剪不可用"
+                "（退回全量预填充）")
             return False
         try:
             ctx = getattr(self._model, "_ctx", None)
             rm = getattr(ctx, "kv_cache_seq_rm", None)
             if not callable(rm) or keep <= 0:
+                self._gguf_trim_supported = False
                 return False
             if not bool(rm(-1, int(keep), -1)):
+                self._gguf_trim_supported = False
+                logger.info(
+                    "GGUF KV: 底层 kv_cache_seq_rm 不支持部分删除"
+                    "（退回全量预填充）")
                 return False
             # 底层 KV 已裁到 keep，同步 Python 侧游标；eval 内部的
             # kv_cache_seq_rm(-1, n_tokens, -1) 随之变成 no-op。
             self._model.n_tokens = int(keep)
+            self._gguf_trim_supported = True
             return True
         except Exception as e:
+            self._gguf_trim_supported = False
             logger.debug("GGUF KV 部分裁剪失败: %s", e)
             return False
 
@@ -2230,8 +2631,14 @@ class LocalLLMClient:
 
     def _stream_gguf_legacy(self, messages, tools, temperature,
                             max_tokens: Optional[int] = None,
-                            kv_group: str = "main"):
-        """旧路径：整轮走 ``create_chat_completion``（无跨轮复用）。"""
+                            kv_group: str = "main",
+                            enable_thinking: Optional[bool] = None):
+        """旧路径：整轮生成（无跨轮复用）。
+
+        ``tools=None`` 且已有 chat formatter 时，用自渲染 prompt +
+        ``create_completion``（token ids 直接喂入）以透传 ``enable_thinking``；
+        有工具时仍走 ``create_chat_completion``，保留原生结构化 tool_calls。
+        """
         # 旧路径每轮 reset（create_chat_completion → generate(reset=True)），
         # 预填/复用状态不再有效 → 清空，避免下轮拿过期序列做前缀判断。
         # aux 调用（事实抽取/技能选择/预热）与主对话复用**同一 Llama 实例**时，
@@ -2252,20 +2659,60 @@ class LocalLLMClient:
         except Exception:
             pass
         mt = self._max_tokens if max_tokens is None else int(max_tokens)
-        create = getattr(self._model, "create_chat_completion", None)
-        if create is None:
-            raise RuntimeError("llama-cpp-python 版本过旧，缺少 create_chat_completion")
-        kwargs: Dict[str, Any] = {
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": mt,
-            "stream": True,
-        }
+        # create_chat_completion 不暴露 enable_thinking。辅助任务（tools=None）
+        # 改用自己渲染的 prompt + create_completion，才能把「关闭思考」真正
+        # 传给 Qwen3 系模板；有工具时仍走原生 chat_completion（保留结构化
+        # tool_calls 解析）。
+        use_prompt = (not tools) and (self._gguf_fmt is not None)
+        prompt_text = None
+        prompt_ids = None
+        if use_prompt:
+            eff_think = (self._enable_thinking if enable_thinking is None
+                         else bool(enable_thinking))
+            prompt_text, prompt_ids = self._gguf_render(
+                messages, None, add_generation_prompt=True,
+                enable_thinking=eff_think)
+            if not prompt_text and not prompt_ids:
+                use_prompt = False
+        if use_prompt:
+            create = getattr(self._model, "create_completion", None)
+            if create is None:
+                use_prompt = False
+        if not use_prompt:
+            create = getattr(self._model, "create_chat_completion", None)
+            if create is None:
+                raise RuntimeError(
+                    "llama-cpp-python 版本过旧，缺少 create_chat_completion")
+        sampling: Dict[str, Any] = {}
         if self._top_p:
-            kwargs["top_p"] = self._top_p
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            sampling["top_p"] = self._top_p
+        if self._top_k:
+            sampling["top_k"] = self._top_k
+        if self._min_p:
+            sampling["min_p"] = self._min_p
+        if self._repetition_penalty and self._repetition_penalty != 1.0:
+            sampling["repeat_penalty"] = self._repetition_penalty
+        if use_prompt:
+            kwargs: Dict[str, Any] = {
+                # 传 token ids 而非字符串：避免 create_completion 再 tokenize
+                # 一次（可能补 BOS / 空格），保证与模板渲染逐 token 一致。
+                "prompt": list(prompt_ids) if prompt_ids else prompt_text,
+                "temperature": temperature,
+                "max_tokens": mt,
+                "stream": True,
+                **sampling,
+            }
+        else:
+            kwargs = {
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": mt,
+                "stream": True,
+                **sampling,
+            }
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
 
         splitter = _ThinkSplitter()
         full: List[str] = []
@@ -2274,6 +2721,15 @@ class LocalLLMClient:
         for chunk in create(**kwargs):
             choices = (chunk.get("choices") or []) if isinstance(chunk, dict) else []
             if not choices:
+                continue
+            if use_prompt:
+                # create_completion 的流式块是 choices[0].text。
+                text = choices[0].get("text") or ""
+                if text:
+                    full.append(text)
+                    for kind, seg in splitter.feed(text):
+                        if seg:
+                            yield StreamEvent(kind, content=seg)
                 continue
             delta = choices[0].get("delta", {}) or {}
             rc = delta.get("reasoning_content")
@@ -2322,53 +2778,17 @@ class LocalLLMClient:
         except Exception:
             pass
         if is_aux and prev_ids:
-            self._schedule_main_kv_restore(prev_ids, prev_hist)
+            # 懒恢复：不在这里起后台线程重放（会与下一轮主对话抢锁、且在
+            # 用户不再追问时白付一次全量 eval）。记录状态，等下一次主对话
+            # 真正到来且新 prompt 仍以旧序列为前缀时再恢复。
+            self._gguf_pending_restore = (list(prev_ids), list(prev_hist))
+            logger.info(
+                "KV: aux 调用后将主对话缓存标记为待恢复（%d token）",
+                len(prev_ids))
         # raw_content 供内核识别「输出了调用但解析失败」（GGUF 的 KV 重建不走
         # _rebuild_raw_messages，带上不会有副作用）。
         yield StreamEvent("done", tool_calls=calls_acc_list, usage={},
                           raw_content="".join(full))
-
-    def _schedule_main_kv_restore(self, ids: List[int],
-                                  gen_history: List[List[int]]) -> None:
-        """aux 生成结束后，在后台把主对话的跨轮 KV 重放回上下文。
-
-        aux 与主对话共用同一 Llama 实例，`create_chat_completion` 的 reset
-        会把主对话预填好的 system+tools KV（数千 token ≈ 数秒）整个冲掉；
-        不重放的话，用户下一次提问必然全量预填充。这里在 daemon 线程里
-        重放：拿不到 `_gen_lock` 就放弃——注意**调度点在 aux 流内部**，而
-        `chat_stream` 在整个流式期间持有该锁，恢复线程必须在启动后先等锁
-        释放（最多 ~2s）；等待期间用户若发起主对话，主对话会先抢到锁，此时
-        放弃恢复（主对话结束时上下文反正会重建），保证主对话永远优先。
-        """
-        if not ids:
-            return
-
-        def _restore() -> None:
-            try:
-                # 调度点在 aux 流内部（锁仍被 aux 流持有），先等锁释放。
-                got = False
-                for _ in range(40):          # 最多 ~2s
-                    if self._gen_lock.acquire(blocking=False):
-                        got = True
-                        break
-                    time.sleep(0.05)
-                if not got:
-                    logger.debug(
-                        "KV 恢复：锁未在等待窗口内释放（主对话已开始），跳过")
-                    return
-                try:
-                    self._model.reset()
-                    self._model.eval(ids)
-                    self._gguf_ids = list(ids)
-                    self._gguf_gen_history = list(gen_history)
-                    logger.info("KV: aux 调用后已重放主对话缓存（%d token）", len(ids))
-                finally:
-                    self._gen_lock.release()
-            except Exception as e:      # 恢复失败不致命：下轮全量预填充兜底
-                logger.warning("KV: aux 后重放主缓存失败(忽略): %s", e)
-
-        threading.Thread(target=_restore, daemon=True,
-                         name="gguf-kv-restore").start()
 
     # ---- ONNX ----
     def _stream_onnx(self, messages, tools, temperature, kv_group: str = "main",
@@ -2560,7 +2980,6 @@ class LocalLLMClient:
         if not self._kv_reuse:
             return        # 开关关闭 → 不做预填（每轮全量）
         import mlx.core as mx
-        from mlx_lm.models.cache import make_prompt_cache
         with self._gen_lock:
             self._ensure_model()
             if self._model is None:
@@ -2582,7 +3001,10 @@ class LocalLLMClient:
                         messages, tokenize=False, add_generation_prompt=False,
                     )
                 prompt_ids = tok.encode(prompt)
-                cache = make_prompt_cache(self._model)
+                # 与 _stream_mlx 重建时同源：标准 KV 层按 INT8 量化，避免
+                # 预填的 system 段（最长、最占显存）仍是 f16，导致量化开关
+                # 在首轮会话里实际没生效。
+                cache = self._make_prompt_cache()
                 # 仅前向、不解码：把系统提示的 KV 写进 cache，不追加生成 token。
                 out = self._model(mx.expand_dims(mx.array(prompt_ids), 0), cache)
                 if isinstance(out, tuple) and len(out) >= 2:
@@ -2615,6 +3037,40 @@ class LocalLLMClient:
         在 ``_stream_mlx`` 生成时惰性取值。
         """
         self._draft_source = client
+        if client is None:
+            self._spec_decode_status = "off"
+
+    def can_rewind_kv(self) -> bool:
+        """当前缓存能否安全地“回退一轮历史”（trim 掉末尾已生成 token）。
+
+        内核在空回复/工具格式错误等重试路径上会决定「回滚重写历史」还是
+        「保留本轮、追加纠正」。前者只有缓存可裁剪时才便宜：
+          * MLX：标准/量化 KV 可 trim；Qwen3.5 的 ArraysCache 不可；
+          * GGUF：hybrid/recurrent 或底层无 kv_cache_seq_rm 时不可；
+          * ONNX：past 只能追加，回退需要整体 reset。
+        返回 False 时，内核应改用 append-only 纠正，避免全量 prefill。
+        """
+        if self._backend == "mlx":
+            if self._mlx_cache is None or not self._cache_token_ids:
+                return True
+            try:
+                from mlx_lm.models.cache import can_trim_prompt_cache
+                return bool(can_trim_prompt_cache(self._mlx_cache))
+            except Exception:
+                return False
+        if self._backend == "gguf":
+            if not self._gguf_ids or self._model is None:
+                return True
+            if self._gguf_trim_supported is False:
+                return False
+            if getattr(self._model, "_is_recurrent", False) or getattr(
+                    self._model, "_is_hybrid", False):
+                return False
+            ctx = getattr(self._model, "_ctx", None)
+            return callable(getattr(ctx, "kv_cache_seq_rm", None))
+        if self._backend == "onnx":
+            return not bool(self._past)
+        return True
 
     def invalidate_kv_cache(self) -> None:
         """丢弃跨轮 KV 缓存。
@@ -2629,6 +3085,7 @@ class LocalLLMClient:
             logger.info("LLM: KV cache invalidated")
         self._mlx_cache = None
         self._cache_token_ids = []
+        self._mlx_gen_history = []
         self._kv_thread = None
         # GGUF：上下文里已 eval 的 token 序列失效（llama.cpp 的 KV 在 C++
         # context 里，必须显式 reset，否则下轮会拿旧上下文续算）。
@@ -2638,18 +3095,38 @@ class LocalLLMClient:
             except Exception:
                 pass
         self._gguf_ids = []
+        self._gguf_gen_history = []
+        self._gguf_pending_restore = None
         # ONNX 的 past_key_values 同样必须失效（会话重置/取消后不能拿旧 KV 续算）
         self._past = {}
         # ONNX 侧记录「past 对应的 prompt」，一并失效（见 _stream_onnx）
         self._onnx_prompt_ids = None
         self._onnx_kv_len = 0
+        # 历史已被改写：渲染缓存里的旧 prompt 不再有复用价值（key 也会变，
+        # 但显式清掉避免长会话残留）。
+        self._prompt_cache.clear()
 
     def close(self) -> None:
         # 释放大块权重：引用置空，等待 GC。会话级 ORT session 亦可析构。
         self.invalidate_kv_cache()
+        # GGUF：llama.cpp 的上下文/权重在 C++ 侧，主动 close() 比等 GC 更
+        # 及时——切换模型时避免新旧两份 GPU buffer 同时存在。
+        if self._backend == "gguf" and self._model is not None:
+            close = getattr(self._model, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         self._model = None
         self._session = None
         self._tokenizer = None
+        self._gguf_fmt = None
+        self._gguf_fmt_sys = None
+        self._gguf_boundary_fix = None
+        self._gguf_trim_supported = None
+        self._mlx_end_ids = None
+        self._spec_decode_status = "off"
         self._loaded = False
         # MLX 有独立的 Metal 缓冲池：权重 del 后只是回到池里、不立刻还给系统——
         # 必须显式 gc.collect() + mx.clear_cache() 才能真正回收统一内存。

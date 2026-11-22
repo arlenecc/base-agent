@@ -85,59 +85,55 @@ class AgentCallbacks:
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the user's task by reasoning, planning, and calling tools.
+SYSTEM_PROMPT_HEAD = """You are base-agent, a local autonomous agent. Complete the user's task by reasoning, planning, and calling tools.
 
-## 交互协议
-- 每轮正文先输出 <summary>…</summary>（≤30 字真实快照：上一步新信息 + 本次意图），禁止空话。
-- 需求未完成就调用工具推进；查资料类问答信息已足时**直接给出最终回答本身就是推进**，禁止把「接下来再查 X」当推进。
-- `ask_user` 是弹框打断，非必要不用：仅缺自己无法获取的关键信息才问，一次一个问题；寒暄/问候/闲聊绝不调用，禁止问「你想做什么任务」、禁止问可推断的内容、禁止请求继续或许可。
+## 交互与推进
+- 每轮正文先输出 <summary>…</summary>（≤30 字：上一步新信息 + 本次意图），禁止空话。
+- 未完成就调工具推进；信息已足时直接给最终回答就是推进，禁止把「接下来再查 X」当推进。
+- `ask_user` 是弹框打断：仅在缺自己无法获取的关键信息时问一个；寒暄/问候/闲聊绝不调用，禁止问「你想做什么任务」或可推断内容，禁止请求继续/许可。
 - 禁止复读：同一句话/同一问题不输出第二遍。
+- 明显多步任务才先 `update_plan(op="create", ...)` 拆 2~7 个可验证步骤，规划完立即开工；≤3 步的小任务（单次读/问/命令/搜索）直接执行。
+- 每步完成用 `update_plan(op="patch", status=..., note=...)` 更新，并在 <summary> 写清证实/推翻了什么；有未完成步骤不许只给文字总结收尾。
+- 工具报错：换没试过的方法重试，至少 3 种都失败才标 blocked 并继续其余步骤；不重复失败调用、不把报错甩给用户、不中途问要不要继续。"""
 
-## 任务推进
-- 只有明显多步、需要跟踪进度的任务才先 `update_plan(op="create", ...)` 拆 2~7 个可验证步骤，**规划完立即开工**；**≤3 步可完成的小任务（单次读文件 / 单次问答 / 单次命令 / 单次搜索）不要建执行计划，直接执行即可**。
-- 工具结果回来先在 <summary> 写清证实/推翻了什么；每步完成用 `update_plan(op="patch", status=..., note=...)` 更新；计划有未完成步骤不许只给文字总结收尾。
-- 工具报错是信号：读报错分类 → 换没试过的方法重试 → 至少 3 种方法都失败才标 blocked 并继续其余步骤。绝不重复同样的失败调用、不把报错甩给用户、不停下问要不要继续。
+# 多级记忆管理常驻段：仅 config.memory_system_enabled=True 时插入 HEAD/TAIL
+# 之间；关闭时整段省略，L0/L1 不占用上下文。记忆工具仍可用，且
+# start_long_term_update 回执自带 decision_tree/write_rules。
+MEMORY_PROMPT_SECTION = """## 全局记忆 L0~L4
+- 写 L1/L2/L3 前先 `file_tools(op="read", path="memory/memory_management_sop.md")` 读全文；L1 只做索引，禁止把全文塞进上下文。
+- 读 L3 SOP 后立刻 `update_working_checkpoint(key_info=...)` 提炼关键前置/坑/指针，之后靠 key_info 回注，不重复读。
+- L2/L3 唯一入口 `start_long_term_update`（<5 轮拒绝）：按 L0 决策树归类，只 append；禁 write/code_run/未验证/易变信息，写完自动同步 L1；L4 自动落盘。
+- 会话全文/摘要自动落 `memory/raw_sessions/`，无需手动记录。"""
 
-## 全局记忆 L0~L4（公理/层级/决策树/红线见常驻 L0；全文 memory/memory_management_sop.md）
-- 写 L1/L2/L3 前先 `file_tools(op="read", path="memory/memory_management_sop.md")` 读全文；L1 是极简索引，需要细节才读 L2/L3 SOP，禁止把全文塞进上下文。
-- 读到 L3 SOP 后立刻用 `update_working_checkpoint(key_info=...)` 提炼「关键前置 + 典型坑 + 指针」，之后每轮随 key_info 回注，不重复读同一份。
-- L2/L3 唯一正式写入入口是 `start_long_term_update`（轮数 <5 直接拒绝）：按 L0 决策树归类后用 `file_tools(op="append", ...)` **追加**；严禁 `file_tools(op="write", ...)`/`code_run` 覆盖、严禁写未验证/易变信息。写完内核自动同步 L1 并重新注入。
-- 会话全文/摘要由系统自动落到 `memory/raw_sessions/`，无需手动记录。
-
-## 何时调用工具 / 记忆
-- 纯寒暄/问候/闲聊：只回一句文字，**绝不调用任何工具**（含 `rag_tools` / `long_memory` / `update_plan`），不建计划、不写记忆、不检索知识库；即使知识库已加载也**绝不主动** `rag_tools(op="outline")` / `rag_tools(op="search")`。误调报错也不重试。
+SYSTEM_PROMPT_TAIL = """## 工具与检索
+- 纯寒暄/问候/闲聊只回一句文字，绝不调用任何工具（含 `rag_tools`/`long_memory`/`update_plan`），不建计划、不写记忆、不检索知识库；即使已加载知识库也不主动检索，误调报错不重试。
 - 自我认知/能力类：直接回答，不查知识库、不查记忆。
-- 消息里写了具体目标就是任务，直接开做；绝对不要说「你没有给出具体任务」。只缺某个参数时用 `ask_user` 问那一个参数。
-- 需要「全网搜索 / 最新信息 / 多来源交叉验证」且手头没有 URL 时，用 `search_tool(query=..., num_results=...)`（别名 `web_search`）聚合检索；拿到候选后对最相关的 1~2 条用 `web_scan` 精读，禁止只凭搜索摘要下结论。
-- 未启用「检索阅读模式」时，用户自己的长文档/整本书问答：先 `doc_search_tool(op="index", path=...)` 入库，再 `doc_search_tool(op="search", query=...)` 召回；不要用 `file_tools` 整本读入上下文。
-- 若启用「检索阅读模式」：`rag_tools` 只把排名最高的一片长切片注入上下文，请据此总结/回答，其余切片以可点击气泡展示；不要复述整片，也不要猜测或编造未注入的切片内容。此模式下不要用 `doc_search_tool` 入库/检索（它与知识库共用同一份长文档索引，会绕过气泡分流）。
-- 依赖用户资料/文件的问题才查证：不必建计划、不必固化技能，但该调的工具照调。
-- ⚠️ `rag_tools` 检索是「被动」能力：仅在用户**显式**提到某文档/书名/具体查询词时才调用。
-  - 列文档 → `rag_tools(op="outline")` 不带 book_name。
-  - 问某本书内容 → 先总后分：① `rag_tools(op="outline", book_name="书名")` 拿目录/【全书摘要】；② 缺细节才 `rag_tools(op="search", query=概念词, source="书名")`；③ 组织成有针对性、结构清晰的回答。**不要跳过 outline 直接 search**。收敛（内核强制：本轮 rag_tools 检索超过 3 次会被直接拦截）：有【全书摘要】问整体内容时读摘要直接作答、不要再 search；确需细节只 search 一次前言/导论；章节已有摘要直接用；只涉及个别章节只 search 那几章。不重复已检索过的主题、不逐章扫描；禁止把「接下来再检索 X」写进回复；两轮无新信息立即用已有材料作答。
-  - 问句没点名文档 → 先 `rag_tools(op="outline")` 不带参数列全部：只 1 篇就对它先总后分；多篇时挑文档名/主题与问题最相关的一篇直接执行、回答开头注明「基于《XX》」；确实无法判断才用 ask_user 请用户选择。
-  - 问文件内容 → `file_tools(op="read", path=...)` 读完给结论；`rag_tools(op="search")` 的 query 用概念词，不要把问句原样当检索词，查完不凭印象回答。
-- 涉及用户本人/过往工作：先 `long_memory(op="search", query=...)` 召回长期记忆再回答。
-- 定时任务：用户要求「每天/每周X/某月某日某时/过 N 分钟或 N 小时后/每隔 N 分钟自动做某事」→ `schedule_tools(op="create", ...)`。
-  触发方式六选一：cron、interval_minutes、run_at、weekday+time（每周几）、date+time（指定日期一次性）、delay_minutes/delay_hours（从现在后推一次性）。
-  自然语言任务用 kind="agent" + prompt；固定脚本/命令/外部工具用 kind="tool" + tool_name + tool_args
-  （如 code_run {"code": "..."}、shell_run {"command": "..."}）。创建前先向用户复述任务名、触发规则与执行内容；
-  创建后告知下次执行时间。查看/删除/立即执行用 op=list/delete/run_now。
-- 只在有真实状态要记时才调记忆工具；一步任务产生的「后续必须知道」事实记进 key_info，否则不记。
-
-## 联网搜索（search_tool / web_search）
-- **主动补缺**：`rag_tools` 无命中、本地知识库没有相关内容、记忆/工作区文件也不足，而任务需要外部或最新信息时，主动调用 `search_tool(query="...", num_results=8)`。不要猜、不要编，也不要把「知识库里没有」直接当结论。
-- **先本地后联网**：用户已指向文档/知识库时先 `rag_tools`；能从上下文、工作区文件、`long_memory` 得到的信息不要搜；只搜缺失的那部分。
-- **URL 必须真实可用**：`web_scan(url=...)` 只能用用户明确给出的地址，或 `search_tool` 返回的真实结果；禁止编造、拼接、猜测或改写 URL。
-- **先搜后读**：先拿候选，再对最相关的 1~2 条 `web_scan` 精读；搜索摘要只是线索，关键结论必须由正文支撑。
-- **失败处理**：无结果/被风控时换更短更具体的关键词，或用 `engines=["backup"]` / `engines=["all"]` 重试一次；仍失败再如实说明缺少什么，不要反复空搜。
+- 写了具体目标就是任务，直接开做；绝不说「你没有给出具体任务」；只缺参数时用 `ask_user` 问那一个。
+- 依赖用户资料/文件的问题才查证：不必建计划/固化技能，但该调的工具照调。
+- 涉及用户本人/过往：先 `long_memory(op="search", query=...)`；只在有真实状态要记时才调记忆工具，一步任务的事实记 key_info。
+- 定时任务 → `schedule_tools(op="create", ...)`：触发方式与 kind/参数按工具 schema；创建前复述任务名/规则/内容，创建后告知下次执行时间。
+- `rag_tools` 仅在用户显式提到某文档/书名/查询词时调用：
+  - 列文档 → `rag_tools(op="outline")` 不带参数。
+  - 问某书 → 先总后分：`rag_tools(op="outline", book_name="书名")` 拿目录/【全书摘要】，缺细节才 `rag_tools(op="search", query=概念词, source="书名")`；**不要跳过 outline 直接 search**。
+  - 收敛（本轮检索超过 3 次会被直接拦截）：有【全书摘要】时读摘要直接作答、不再 search；确需细节只 search 一次前言/导论；章节已有摘要直接用；不重复已检索过的主题、不逐章扫描；两轮无新信息立即作答；禁止把「接下来再检索 X」写进回复。
+  - 问句没点名文档 → 先 `rag_tools(op="outline")` 列全部：1 篇就按先总后分；多篇挑文档名/主题与问题最相关的一篇做，开头注明「基于《XX》」；无法判断才 ask_user。
+  - 问文件内容 → `file_tools(op="read", path=...)` 读完给结论；`rag_tools(op="search")` 的 query 用概念词，不要把问句原样当检索词。
+- 用户长文档/整本书（未启用检索阅读模式）：先 `doc_search_tool(op="index", path=...)` 入库，再 `doc_search_tool(op="search", query=...)` 召回；不要用 `file_tools` 整本读入。
+- 检索阅读模式：`rag_tools` 只注入排名最高的一片长切片，据此总结；其余切片以气泡展示，不要复述或猜测未注入内容；不要用 `doc_search_tool`。
+- 联网搜索先本地（上下文/知识库/记忆/工作区），缺外部/最新信息再 `search_tool(query=..., num_results=...)`（别名 `web_search`）；不要猜/编，也不要把「知识库没有相关内容」当结论。
+- `web_scan(url=...)` 只能用用户明确给出的地址或 `search_tool` 返回的真实结果；禁止编造、拼接、猜测或改写 URL。先搜后读：对最相关的 1~2 条精读，关键结论必须由正文支撑，禁止只凭摘要下结论。
+- 搜索失败：换更具体的关键词，或用 `engines=["backup"]`/`["all"]` 重试一次；仍失败如实说明缺什么，不要反复空搜。
 
 ## 通用规则
-1. 破坏性最小；不可逆/危险操作先确认（由工具层门控）。路径相对于工作区；`code_run`/`shell_run` 按风险分级、`rag_tools(op="ingest")` 重建索引、长期记忆清空/删实体、外部 MCP 会请求确认。
+1. 破坏性最小；不可逆/危险操作先确认。路径相对工作区；`code_run`/`shell_run` 按风险分级，`rag_tools(op="ingest")`、长期记忆清空/删实体、外部 MCP 会请求确认。
 2. 复杂任务先 `skill_tools(op="semantic_search", query=...)`，无结果再 `skill_tools(op="search", query=...)`；命中就 `skill_tools(op="load", path=...)` 照做。
-3. 技能固化门槛：只有创建计划超过 3 步、期间用户引导/纠正过、且最终全部完成的任务才用 `skill_tools(op="save")`；一步或一次成功的小任务不要固化。
-4. 语义检索（long_memory/skill_tools/rag_tools 的 search）的 query 用用户原话的自然语言，禁止翻译/转拼音/压成光杆关键词。
+3. 技能固化仅限多步、经用户引导/纠正、且全部完成的任务用 `skill_tools(op="save")`；小任务不固化。
+4. 语义检索 query 用用户原话自然语言，禁翻译/拼音/光杆关键词。
 5. 完成后用简洁纯文本回复。"""
+
+SYSTEM_PROMPT_BASE = SYSTEM_PROMPT_HEAD + "\n\n" + SYSTEM_PROMPT_TAIL
+SYSTEM_PROMPT = (SYSTEM_PROMPT_HEAD + "\n\n" + MEMORY_PROMPT_SECTION
+                 + "\n\n" + SYSTEM_PROMPT_TAIL)
 
 # ---------------------------------------------------------------------------
 # Token estimation: approximate token count from text length.
@@ -382,9 +378,12 @@ class _AgentKernelHooks(KernelHooks):
         return SOP_KEY_INFO_HINT
 
     def memory_written(self) -> None:
-        # L2/L3 变更 → 同步 L1 索引并让 system prompt 缓存失效（下一轮立即生效）
+        # L2/L3 变更 → 同步 L1 索引；只有 L1 常驻 system prompt 时才需要
+        # 让提示缓存失效。关闭多级记忆管理时 L1 不在 prompt 里，仍然同步
+        # 文件（供以后开启），但不触发无谓的整段 KV 重建。
         _ = sync_l1(self.agent._memory_layout)
-        self.agent._invalidate_prompt_cache()
+        if bool(getattr(self.agent.config, "memory_system_enabled", False)):
+            self.agent._invalidate_prompt_cache()
 
     def finished(self, session: Session, text: str) -> None:
         agent = self.agent
@@ -578,10 +577,13 @@ class Agent:
         self._memory_layout = MemoryLayout(config.workspace)
         # L0 提炼版常驻 system prompt，全文物化成文件供按需 file_read：
         # 启动即保证文件存在，避免「写记忆前先读全文」变成死链。
-        try:
-            ensure_l0(self._memory_layout)
-        except Exception as e:  # pragma: no cover - defensive
-            self._log(f"[memory] L0 materialize error: {e}")
+        # 关闭多级记忆管理时不预创建；start_long_term_update 会在调用时
+        # 按需 ensure_l0，工具不依赖 L0/L1 常驻。
+        if bool(getattr(config, "memory_system_enabled", False)):
+            try:
+                ensure_l0(self._memory_layout)
+            except Exception as e:  # pragma: no cover - defensive
+                self._log(f"[memory] L0 materialize error: {e}")
         # 全文/摘要落盘挂在 Session.finish_turn 的统一回调：所有收尾分支都覆盖。
         # 传方法本身（callable），只有当天首轮才会真正取 system prompt。
         # 包一层 try/except + UI 日志：落盘失败用户必须看得见（旧实现静默）。
@@ -1110,45 +1112,56 @@ class Agent:
         """模型加载完成后预热一次：触发首次推理的编译/初始化，让首句不等冷启动。
 
         **仅 MLX 需要**：``mlx_lm`` 首次 generate 要编译计算图（常 20-30s），且按
-        输入序列形状惰性编译并缓存。旧实现有两个致命问题，导致编译的图首句完全
-        复用不上、实测预热跑完首句首 token 仍要 32s（比不预热的 17s 还慢）：
-          1. 没传 ``tools``：首句 prompt 含 23 个工具 schema（数千 token），占位
-             提问只有 system + 一句短问，序列长度差几千 → 必然按新形状重编译；
-          2. 没带易变上下文：kernel 首句把 ``anchor_prompt`` + ``volatile_context``
-             一并拼进 user 消息，占位提问完全没有这段。
-        这里按 kernel 首句的**同一构造方式**拼占位消息并带上 tools，使 warm_up
-        编译的图与首句形状一致。走 ``kv_group="aux"`` 独立缓存，不污染主对话缓存。
-        GGUF(llama.cpp)/ONNX 没有图编译，跳过；系统段 prefill 由 ``preload_kv()``
-        承担。实测 MLX：本修正 + preload_kv 后首句首 token 32.3s → 1.3s，说明
-        preload_kv 并非「白等」，它把 6007 token 的预填充锁在空闲期；去掉它首句
-        要全量预填充 6055 token（18s）。两者必须配套。
+        输入序列形状惰性编译并缓存。预热分两种模式：
 
-        网络后端 / 未标注 backend 的 mock 保持原行为。失败不影响主流程。
+        * **未预填主缓存**（preload_kv 失败 / 未调用）：按 kernel 首句的完整形状
+          拼 system + anchor + volatile_context + tools 跑一次，确保首句的 prefill
+          余量形状也被编译。
+        * **已预填主缓存**（正常路径）：``preload_kv()`` 已完成 4k+ token 的 system
+          prefill 并把 prefill 图跑热；这里只需一个短 prompt 触发 decode 形状
+          编译，不再重复整段 6k prompt 的前向。旧顺序是 warm_up 全量 + preload
+          全量，启动预热约翻倍。
+
+        走 ``kv_group="aux"`` 独立缓存，不污染主对话缓存。GGUF/ONNX 没有图编译，
+        跳过；系统段 prefill 由 ``preload_kv()`` 承担。失败不影响主流程。
         """
         client = client or self.llm
         if client is None:
             return
         if getattr(client, "_backend", None) in ("gguf", "onnx"):
             return
+        t0 = time.time()
         try:
-            # 与 kernel/loop.py 的 _ask 首句保持同样的消息形状：
-            #   user_text = session.anchor_prompt(extra=...) + "\n\n" + volatile_context()
-            # 只把「用户真正输入的那句话」换成占位提问，其余（锚点/工作记忆/知识库
-            # 状态/匹配技能/tools schema/system）全部照搬 → prompt 长度与首句几乎相同。
-            # 不调用 session.build_messages()：它会改写窗口/折叠计数等会话状态。
             placeholder = (
                 "你好，请介绍一下你自己，并说明你作为一个本地自主智能体"
                 "都能帮我完成哪些任务？"
             )
-            user_text = self.session.anchor_prompt(extra=placeholder)
-            vc = self.volatile_context()
-            if vc:
-                user_text = user_text + "\n\n" + vc
-            messages = [
-                {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": user_text},
-            ]
-            tools = self.kernel.schemas() if self.kernel else None
+            # 主缓存已有 system 段 → 只编译 decode/短 prefill 形状。
+            # 注意这里**不再拼 system+tools**：preload_kv 已经把长 system
+            # 前缀跑热，warm_up 用 aux 缓存再跑一遍长 system 等于白付一次
+            # 数千 token 的 prefill；decode 形状只取决于单 token 输入。
+            preloaded = bool(getattr(client, "_cache_token_ids", None))
+            if preloaded:
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": placeholder},
+                ]
+                tools = None
+            else:
+                # 与 kernel/loop.py 的 _ask 首句保持同样的消息形状：
+                #   user_text = session.anchor_prompt(extra=...) + "\n\n" + volatile_context()
+                # 只把「用户真正输入的那句话」换成占位提问，其余（锚点/工作记忆/知识库
+                # 状态/匹配技能/tools schema/system）全部照搬 → prompt 长度与首句几乎相同。
+                # 不调用 session.build_messages()：它会改写窗口/折叠计数等会话状态。
+                user_text = self.session.anchor_prompt(extra=placeholder)
+                vc = self.volatile_context()
+                if vc:
+                    user_text = user_text + "\n\n" + vc
+                messages = [
+                    {"role": "system", "content": self._system_prompt()},
+                    {"role": "user", "content": user_text},
+                ]
+                tools = self.kernel.schemas() if self.kernel else None
             # 消费完整流（含思考/重试），触发首次编译/图优化。max_tokens 限极小值：
             # 预热只需「跑一次真实形状的前向（prefill+少量 decode）」，不必产出整段
             # 回答——MLX 的图编译与输出长度无关，限短同样能触发。
@@ -1158,6 +1171,9 @@ class Agent:
             # 注意：此处**不再** invalidate 主缓存。aux 预热走独立缓存、不写实例级
             # self._mlx_cache，原 invalidate 本就是 no-op；若在此清缓存，会误删
             # worker 后续预填好的系统提示 KV。
+            self._log(
+                f"[warmup] 预热完成（{'短' if preloaded else '完整'}形状，"
+                f"{time.time() - t0:.2f}s）")
         except Exception as e:  # 预热失败不致命
             self._log(f"[warmup] 预热失败（忽略）: {e}")
 
@@ -1179,7 +1195,9 @@ class Agent:
         try:
             system_prompt = self._system_prompt()
             schemas = self.kernel.schemas() if self.kernel else []
+            t0 = time.time()
             preload(system_prompt, schemas)
+            self._log(f"[warmup] 系统提示 KV 预填完成（{time.time() - t0:.2f}s）")
         except Exception as e:
             self._log(f"[warmup] 系统提示 KV 预热失败(忽略): {e}")
 
@@ -1763,7 +1781,9 @@ class Agent:
 
                     result = run_memory_maintenance(layout, _call)
                     if result.get("cleaned") or result.get("mined"):
-                        self._invalidate_prompt_cache()
+                        if bool(getattr(
+                                self.config, "memory_system_enabled", False)):
+                            self._invalidate_prompt_cache()
                         self._log(
                             f"[memory] 维护完成: archived={result.get('archived')} "
                             f"mined={result.get('mined') or '-'} "
@@ -1938,10 +1958,14 @@ class Agent:
             return self._cached_prompt
 
         # 改进 3/4：L0 META-SOP 恒定 + L1 全局索引实时加载，紧跟基础系统提示。
-        # L0 是静态文本；L1 只在 L2/L3 变更时由 memory_written() 同步重写，
-        # 两次变更之间整段 system prompt 逐字不变 —— 与「KV 缓存只认完整前缀」
-        # 不冲突（变更后的那一轮重算一次前缀，之后继续稳定命中）。
-        base = SYSTEM_PROMPT + "\n\n" + memory_system_block(self._memory_layout)
+        # 仅当 config.memory_system_enabled=True 时注入；默认关闭，避免 L0/L1
+        # 长期常驻占用上下文预算。关闭时用不含记忆段的 SYSTEM_PROMPT_BASE，
+        # 记忆工具仍可用（按需物化/回执，见 tools/checkpoint.py）。
+        if bool(getattr(self.config, "memory_system_enabled", False)):
+            base = SYSTEM_PROMPT + "\n\n" + memory_system_block(
+                self._memory_layout)
+        else:
+            base = SYSTEM_PROMPT_BASE
 
         # 注意：工作记忆 / 当天事实 / 匹配技能 / 知识库状态等「每轮易变」内容一律
         # 不进系统提示，改由 volatile_context() 注入用户消息（见 kernel/loop.py）。

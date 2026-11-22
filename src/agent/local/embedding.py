@@ -203,6 +203,13 @@ class LocalEmbeddingFunction:
         内存仍是两份权重并存。
         """
         with self._load_lock:
+            if self._backend == "gguf" and self._model is not None:
+                close = getattr(self._model, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
             self._model = None
             self._tokenizer = None
             self._session = None

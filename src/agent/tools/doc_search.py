@@ -123,8 +123,9 @@ class DocSearchTool(Tool):
         mode = getattr(engine, "reading_mode", None)
         if mode is not None:
             return bool(mode)
-        return bool(getattr(
-            getattr(self, "config", None), "rag_reading_mode_enabled", False))
+        config = getattr(self, "config", None)
+        return (str(getattr(config, "rag_mode", "vector") or "vector")
+                .strip().lower() == "fast")
 
     def bind(self, config: Any, registry: Any) -> None:
         self.config = config
