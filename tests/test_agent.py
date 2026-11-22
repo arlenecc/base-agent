@@ -1301,6 +1301,29 @@ def test_independent_read_only_tools_run_in_parallel(config, recording_callbacks
     assert [r["content"] for r in rec.tool_results] == ["R1", "R2"]
 
 
+def test_kb_content_question_must_not_fake_from_context(config, recording_callbacks):
+    """问「知识库里有什么」不能拿 Today's facts / 对话上下文冒充知识库。"""
+    from agent.kernel.loop import _KB_CONTENT_RE
+
+    assert _KB_CONTENT_RE.search("你知识库里有什么")
+    assert _KB_CONTENT_RE.search("我的知识库目前包含什么")
+    assert not _KB_CONTENT_RE.search("把这份文档存进知识库")
+
+    mock = MockLLM([
+        [_evt("content", "知识库包含上海天气信息。"),
+         _evt("done", usage={"total_tokens": 5})],
+        [_evt("content", "知识库目前为空。"),
+         _evt("done", usage={"total_tokens": 6})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+
+    final = agent.run("你知识库里有什么")
+
+    assert len(mock.calls) == 2, "未查库的答复应被打回一次"
+    assert "上海天气" not in final
+    assert "为空" in final
+
+
 def test_cancel_during_tool_execution_returns_promptly(config, recording_callbacks, monkeypatch):
     """工具执行期间取消：不能等工具跑完（shell/MCP 可能是几分钟）。"""
     import agent.agent as agent_mod

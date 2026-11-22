@@ -107,7 +107,8 @@ MEMORY_PROMPT_SECTION = """## 全局记忆 L0~L4
 
 SYSTEM_PROMPT_TAIL = """## 工具与检索
 - 纯寒暄/问候/闲聊只回一句文字，绝不调用任何工具（含 `rag_tools`/`long_memory`/`update_plan`），不建计划、不写记忆、不检索知识库；即使已加载知识库也不主动检索，误调报错不重试。
-- 自我认知/能力类：直接回答，不查知识库、不查记忆。
+- 自我认知/能力类（你是谁/你能做什么/有哪些功能）：直接回答，不查知识库、不查记忆。
+- 问知识库/记忆里有什么：必须分别调 `rag_tools(op="outline")` / `long_memory(op="search")`，以工具返回为准，空就如实说空；`# Today's facts`、工作记忆、对话历史只是上下文，不是知识库内容，禁止当作知识库回答。
 - 写了具体目标就是任务，直接开做；绝不说「你没有给出具体任务」；只缺参数时用 `ask_user` 问那一个。
 - 依赖用户资料/文件的问题才查证：不必建计划/固化技能，但该调的工具照调。
 - 涉及用户本人/过往：先 `long_memory(op="search", query=...)`；只在有真实状态要记时才调记忆工具，一步任务的事实记 key_info。
@@ -2010,12 +2011,14 @@ class Agent:
                     if len(sources) > 8:
                         source_list += f" (and {len(sources) - 8} more)"
                     parts.append(
-                        f"# Knowledge base\n{chunks} chunks in {len(sources)} "
+                        f"# Knowledge base (authoritative; only via rag_tools)\n"
+                        f"{chunks} chunks in {len(sources)} "
                         f"file(s): {source_list}. Answer from these via "
                         f"`rag_tools(op=\"search\")`.")
                 else:
                     parts.append(
-                        "# Knowledge base\nConfigured but empty. "
+                        "# Knowledge base (authoritative; only via rag_tools)\n"
+                        "Configured but empty. "
                         "Use `rag_tools(op=\"ingest\")` to index.")
         except Exception:  # pragma: no cover
             pass
@@ -2052,7 +2055,9 @@ class Agent:
                     fact_block = "\n".join(f"- {f}" for f in capped)
                     if dropped > 0:
                         fact_block += f"\n- (…{dropped} more omitted)"
-                    sub.append("# Today's facts (auto-extracted)\n" + fact_block)
+                    sub.append(
+                        "# Today's facts (from this conversation; NOT knowledge base)\n"
+                        + fact_block)
                 if compact_wm:
                     sub.append("# Work memory (internal state)\n" +
                                json.dumps(compact_wm, ensure_ascii=False,

@@ -176,6 +176,15 @@ _NEEDS_FULL_TOOLS_RE = re.compile(
     r"\d+\s*(?:分钟|小时)\s*(?:后|之后)|每隔\s*\d+|明天|后天|今晚|明早|提醒)",
     re.I)
 
+# 用户询问知识库里有什么：必须以 rag_tools(op="outline") 的工具返回为准。
+# 模型容易把 volatile_context 里的 # Today's facts / 工作记忆 / 对话历史
+# 当成知识库内容，编造出并不存在的资料清单（实测「你知识库里有什么」被
+# 回答成「知识库包含上海天气信息」，而知识库实际为空）。
+_KB_CONTENT_RE = re.compile(
+    r"(知识库|资料库|文档库)[^，。！？\n]{0,10}"
+    r"(有什么|有哪些|有啥|包含什么|包含哪些|内容是(?:什么|啥)|"
+    r"存了什么|收录了?(?:什么|哪些))", re.I)
+
 # 寒暄 / 自我认知（能力、功能、身份）类问答：答案就在系统提示里，不需要
 # 推理也不需要工具。但本地小模型会无视系统提示的软禁令：连发 rag_* 空转
 # 6 次才熔断（10s+），或把几百字内心独白塞进 <summary>、夹带工具 XML 残片，
@@ -468,6 +477,8 @@ class KernelLoop:
         self._tool_parse_retry = 0
         self._shrink_guard = 0
         self._reask_guard = 0
+        # 知识库内容询问未调工具的纠正次数（每次 run 重置，见 run()）
+        self._kb_content_nudge = 0
         # 通用复读防护：同一段正文反复出现且不调用工具时回滚重试，超过上限
         # 给用户可见的终止说明（见 _looks_degenerate_text）。
         self._repeat_retry = 0
@@ -612,6 +623,7 @@ class KernelLoop:
         self._tool_parse_retry = 0
         self._shrink_guard = 0
         self._reask_guard = 0
+        self._kb_content_nudge = 0
         self._repeat_retry = 0
         self._last_no_tool_norm = ""
         self._same_no_tool_streak = 0
@@ -926,6 +938,31 @@ class KernelLoop:
             # 工具），这里只处理网络 API 后端及未命中判定的输入，沿用原有
             # ask_user 硬门禁 / 问候熔断 / 失败熔断，不再额外 rollback。
             if not resp.has_calls:
+                # 知识库内容询问：模型不查工具就凭上下文作答，必须打回一次。
+                # volatile_context 同时注入「知识库为空」和 # Today's facts，
+                # 小模型会把当天事实当成知识库内容，编造出不存在的资料清单。
+                if (not self._did_work and not self._resume
+                        and _KB_CONTENT_RE.search(user_input or "")
+                        and self._kb_content_nudge < 1):
+                    self._kb_content_nudge += 1
+                    hint = (
+                        "[System] 用户问的是知识库内容，必须调用 "
+                        'rag_tools(op="outline") 查看真实结果后再回答；'
+                        "知识库为空就如实说空。# Today's facts、工作记忆、"
+                        "对话历史只是上下文，不是知识库内容，禁止把它们"
+                        "说成知识库内容。")
+                    if not self._can_rewind_kv():
+                        p = _redirect(hint, rec, resp,
+                                      pending=_carry_task(hint),
+                                      reset_guards=False)
+                        if p is not None:
+                            pending = p
+                            self.log("[kernel] 知识库内容询问未调工具，追加纠正反馈")
+                            continue
+                    self._rollback_turn(session)
+                    pending = _carry_task(hint)
+                    self.log("[kernel] 知识库内容询问未调工具，回滚本轮并要求查库")
+                    continue
                 # 通用复读防护：模型把「步骤4已完成 / 直接调用 search_tool」
                 # 整段复述几十次却一次工具都不调，会先被反思门反复提醒；
                 # 这里在进入反思门前直接判定退化输出并回滚，避免复读内容进
