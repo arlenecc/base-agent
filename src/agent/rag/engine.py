@@ -687,6 +687,9 @@ class RAGEngine:
         kg_max_description_chars: int = 100,
         kg_glean: bool = True,
         kg_raw_json: bool = False,
+        kg_constrained: bool = True,
+        kg_raw_constrained_json: bool = True,
+        kg_raw_constrained_delim: bool = False,
         # ---- 检索阅读模式（ColBERT 旁路）----
         reading_mode: bool = False,
         reading_quant_bits: int = 4,
@@ -801,6 +804,9 @@ class RAGEngine:
         self._kg_glean = bool(kg_glean)
         # llm_raw 方案的 JSON 输出开关（不涉及 llm_pydantic）。
         self._kg_raw_json = bool(kg_raw_json)
+        self._kg_constrained = bool(kg_constrained)
+        self._kg_raw_constrained_json = bool(kg_raw_constrained_json)
+        self._kg_raw_constrained_delim = bool(kg_raw_constrained_delim)
         self._aux_llm: Any = None
         self._kg_retriever: Optional[Any] = None
         # 检索阅读模式：解析出 Markdown 后旁路原有切片/embedding/向量库/reranker，
@@ -1040,7 +1046,10 @@ class RAGEngine:
         if self._kg_retriever is not None:
             from .kg.extractor import create_extractor
             self._kg_retriever._extractor = create_extractor(
-                self._kg_extractor_scheme, self._aux_llm)
+                self._kg_extractor_scheme, self._aux_llm,
+                constrained=self._kg_constrained,
+                raw_constrained_json=self._kg_raw_constrained_json,
+                raw_constrained_delim=self._kg_raw_constrained_delim)
 
     def kg_ready(self) -> bool:
         """图谱是否已构建（entities 表非空且有向量）。"""
@@ -1067,7 +1076,10 @@ class RAGEngine:
                 max_entities=self._kg_max_entities,
                 max_relations=self._kg_max_relations,
                 max_desc_chars=self._kg_max_description_chars,
-                glean=self._kg_glean, raw_json=self._kg_raw_json)
+                glean=self._kg_glean, raw_json=self._kg_raw_json,
+                constrained=self._kg_constrained,
+                raw_constrained_json=self._kg_raw_constrained_json,
+                raw_constrained_delim=self._kg_raw_constrained_delim)
             self._kg_retriever = KGRetriever(
                 self._rag_dir, self._get_store(), extractor,
                 estimate_tokens=estimate_tokens,
@@ -1239,7 +1251,10 @@ class RAGEngine:
             max_entities=self._kg_max_entities,
             max_relations=self._kg_max_relations,
             max_desc_chars=self._kg_max_description_chars,
-            glean=self._kg_glean, raw_json=self._kg_raw_json)
+            glean=self._kg_glean, raw_json=self._kg_raw_json,
+            constrained=self._kg_constrained,
+            raw_constrained_json=self._kg_raw_constrained_json,
+            raw_constrained_delim=self._kg_raw_constrained_delim)
         if not extractor.available:
             raise RuntimeError(getattr(extractor, "unavailable_reason", "")
                                or "抽取器不可用")
@@ -3659,6 +3674,18 @@ class RAGEngine:
                 chapters=chapters_json,
                 md_path=md_path,
             )
+        # 入库内联摘要：切片入库完成后立即用本地核心句方案生成本书的
+        # 章节摘要 + 全书摘要，写入 chapter_summaries.json 供 rag_outline
+        # 即刻使用（空闲调度器保留作缺失补充，会按指纹/idx 自动跳过已生成的书）。
+        # 仅 markdown 非空时执行（对账路径传 markdown="" 会被函数内跳过）。
+        if markdown and (md_path or source):
+            try:
+                from .chapter_summarizer import build_book_summaries_inline
+                build_book_summaries_inline(
+                    self._workspace, doc_name, markdown,
+                    md_path=md_path, source=source)
+            except Exception as e:
+                logger.warning("入库内联摘要（导入/调用）失败，不影响入库: %s", e)
         return digest
 
     def get_document_outline(self, doc_name: str) -> Optional[Dict[str, Any]]:
@@ -3831,6 +3858,33 @@ class RAGEngine:
         except Exception as e:
             logger.warning("RAG: 读取全书摘要失败: %s", e)
         return ""
+
+    def get_chapter_summaries(self, doc_name: str) -> list:
+        """返回某本书的逐章摘要列表（入库内联/空闲调度器产出，无则空）。
+
+        每项 ``{"idx","title","level","summary"}``，按 idx 排序。书名匹配
+        与 get_book_summary 一致（精确 → basename → 单向子串）。
+        """
+        try:
+            from .chapter_summarizer import load_summaries_state
+            books = load_summaries_state(self._workspace).get("books", {})
+            book = books.get(doc_name)
+            if book is None:
+                target = (doc_name or "").strip().lower()
+                for name, b in books.items():
+                    if name.lower() == target or os.path.basename(name).lower() == target:
+                        book = b
+                        break
+                if book is None and len(target) >= 4:
+                    hits = [b for name, b in books.items() if target in name.lower()]
+                    if len(hits) == 1:
+                        book = hits[0]
+            if book is None:
+                return []
+            return sorted(book.get("chapters", []), key=lambda c: c.get("idx", 0))
+        except Exception as e:
+            logger.warning("RAG: 读取章节摘要失败: %s", e)
+            return []
 
     def ensure_digests_for_cached_documents(self, refresh_stale: bool = False) -> int:
         """为已缓存 Markdown 的文档补做/重刷 digest（目录结构）。

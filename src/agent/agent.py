@@ -106,6 +106,7 @@ MEMORY_PROMPT_SECTION = """## 全局记忆 L0~L4
 - 会话全文/摘要自动落 `memory/raw_sessions/`，无需手动记录。"""
 
 SYSTEM_PROMPT_TAIL = """## 工具与检索
+- 日期/时间问题以用户消息里的 `# Current time` 为准；禁止用训练数据中的日期作答。
 - 纯寒暄/问候/闲聊只回一句文字，绝不调用任何工具（含 `rag_tools`/`long_memory`/`update_plan`），不建计划、不写记忆、不检索知识库；即使已加载知识库也不主动检索，误调报错不重试。
 - 自我认知/能力类（你是谁/你能做什么/有哪些功能）：直接回答，不查知识库、不查记忆。
 - 问知识库/记忆里有什么：必须分别调 `rag_tools(op="outline")` / `long_memory(op="search")`，以工具返回为准，空就如实说空；`# Today's facts`、工作记忆、对话历史只是上下文，不是知识库内容，禁止当作知识库回答。
@@ -353,7 +354,12 @@ class _AgentKernelHooks(KernelHooks):
         # 与 finished 的批量沉淀共用 _fact_extract_lock（持锁期间跑 LLM），若上一次
         # 沉淀仍在进行则自动跳过，不会堆叠。抽完清零批量计数器，避免紧接着的
         # finished 又重复抽同一段。
+        # 实时抽取默认关闭：旧轮全文已落盘 raw_sessions，由每 4h 日志扫描统一
+        # 抽取；只有显式开启 memory_turn_fact_extract_enabled 才走这里。
         agent = self.agent
+        if not bool(getattr(
+                agent.config, "memory_turn_fact_extract_enabled", False)):
+            return
         keep = session.raw_turns + 1
         n_discard = max(0, len(session.turns) - keep)
         if n_discard <= 0:
@@ -388,11 +394,10 @@ class _AgentKernelHooks(KernelHooks):
 
     def finished(self, session: Session, text: str) -> None:
         agent = self.agent
-        # 批量沉淀：不再每轮都抽。按会话累计轮数差值——每累计 raw_turns 个
-        # 真实内核轮做一次事实抽取 + 经验蒸馏（自动续跑段/长任务自然计入）；
-        # 内核「裁剪丢弃旧轮前」的 before_consolidate 强制沉淀并同步推进基准。
-        # distill_requested 时立即沉淀。批大小与内核折叠窗口对齐——保证裁剪前
-        # 总已把最近 raw_turns 轮的内容抽过，不会因折叠丢事实。
+        # 批量节奏：按会话累计轮数差值——每累计 raw_turns 个真实内核轮做一次
+        # 记忆维护 + 经验蒸馏（自动续跑段/长任务自然计入）；distill_requested
+        # 时立即沉淀。实时事实抽取默认关闭（见 memory_turn_fact_extract_enabled），
+        # 统一由每 4h 的 raw_sessions 日志扫描完成。
         turn_now = session.current_turn
         batch_due = (turn_now - agent._last_extract_turn) >= max(1, session.raw_turns)
         # 达到技能学习门槛的任务必须在本轮结束就蒸馏，不能等累计到 raw_turns：
@@ -404,11 +409,14 @@ class _AgentKernelHooks(KernelHooks):
         if not (batch_due or agent.kernel.distill_requested or skill_due):
             return
         agent._last_extract_turn = turn_now
-        # 既有能力：异步抽取事实写知识图谱（不阻塞回复）
-        try:
-            agent._maybe_extract_facts_async(text)
-        except Exception as e:
-            agent._log(f"[kernel] fact extraction error: {e}")
+        # 实时事实抽取默认关闭：由每 4h 的 raw_sessions 日志扫描统一抽取，
+        # 避免对话过程中反复调用 LLM。显式开启时才抽当前对话窗口。
+        if bool(getattr(
+                agent.config, "memory_turn_fact_extract_enabled", False)):
+            try:
+                agent._maybe_extract_facts_async(text)
+            except Exception as e:
+                agent._log(f"[kernel] fact extraction error: {e}")
         # 改进 7/8：任务终止边主引擎空闲 → 后台归档 + 辅助引擎挖掘/整理
         try:
             agent._run_memory_maintenance_async()
@@ -482,6 +490,9 @@ class Agent:
             config=config, callbacks=callbacks,
             aux_llm_getter=lambda: getattr(self, "aux_llm", None),
         )
+        # 参数错误时的约束解码重试钩子：只在签名预检失败的异常路径触发，
+        # 正常对话/正常工具调用零影响。用主模型 client（工具调用是主模型行为）。
+        self.tools.set_constrained_retry(self._constrained_tool_retry)
         self.skills = skills or SkillManager(
             path=os.path.join(config.workspace, ".agent", "skills.json"),
             skills_dir=os.path.join(config.workspace, ".agent", "skills"),
@@ -567,11 +578,10 @@ class Agent:
         # 不再被后台任务排到后面（本地后端 aux 与主模型共用同一实例时，
         # 插队还会冲掉跨轮 KV 缓存，见 _get_extract_llm 注释）。
         self._last_activity = time.monotonic()
-        # 事实抽取/蒸馏的批量计数：按「会话累计轮数」的差值计——每累计
-        # session.raw_turns 个真实内核轮才沉淀一次。旧实现用「每个用户轮 +1」
-        # 的计数器，emit_finished 收口到用户轮次末尾后，自动续跑 5 段 × 15 轮
-        # 只算 1 次，长任务的事实抽取频率大幅下降；差值对续跑段/长任务自然
-        # 累积。内核「裁剪丢弃旧轮前」强制沉淀时同步推进基准（见 before_consolidate）。
+        # 记忆维护/蒸馏的批量计数：按「会话累计轮数」差值计——每累计
+        # session.raw_turns 个真实内核轮才触发一次。实时事实抽取默认关闭
+        # （见 memory_turn_fact_extract_enabled），由 4h 日志扫描承担；
+        # 自动续跑段/长任务按差值自然累积。
         self._last_extract_turn = 0
 
         # ---- 改进 1~4：L0~L4 记忆体系 ----
@@ -595,10 +605,11 @@ class Agent:
                 self._log(f"[memory] 会话落盘失败（对话可能未存档）: {e}")
         self.session.on_turn_finished = _record_turn
         # 应用启动时先把「今天之前」的会话归档掉（纯文件 IO，不碰任何 LLM，
-        # 避免 UI 构造 Agent 时隐式加载辅助模型权重）。
+        # 避免 UI 构造 Agent 时隐式加载辅助模型权重）。归档完成后启动每 4 小时
+        # 的 raw_session 增量事实抽取任务（aux 优先、主模型 isolated 兜底）。
         try:
             threading.Thread(
-                target=lambda: archive_past_sessions(self._memory_layout),
+                target=self._boot_archive_then_fact_loop,
                 daemon=True, name="memory-archive-boot",
             ).start()
         except Exception as e:  # pragma: no cover - defensive
@@ -803,6 +814,8 @@ class Agent:
     def _maybe_extract_facts_async(self, assistant_reply: str) -> None:
         """Launch fact extraction in a daemon thread.
 
+        Only used when ``memory_turn_fact_extract_enabled=True``; by default
+        facts are extracted from ``raw_sessions`` every 4 hours instead.
         The extraction calls the LLM (200ms-2s) and we don't want to delay
         on_finished() — the user should get their reply immediately.  The
         thread is a daemon so it won't block process exit if the user
@@ -815,6 +828,9 @@ class Agent:
         the last exchange) lets the extractor resolve pronouns and project
         references ("这个项目用 X 吗") that a single isolated turn cannot.
         """
+        if not bool(getattr(
+                self.config, "memory_turn_fact_extract_enabled", False)):
+            return
         # Collect the last few user/assistant exchanges for context.
         recent: List[str] = []
         for t in reversed(self.session.turns):
@@ -859,6 +875,9 @@ class Agent:
         即将消失于上下文的旧轮先沉淀一遍，避免裁剪丢事实。同样走 daemon 线程 +
         ``_fact_extract_lock``，不会阻塞用户看到回复、也不会与别处沉淀堆叠。
         """
+        if not bool(getattr(
+                self.config, "memory_turn_fact_extract_enabled", False)):
+            return
         convs: List[str] = []
         for t in turns:
             if (t.prompt or "").strip():
@@ -878,7 +897,7 @@ class Agent:
         )
         thread.start()
 
-    def _extract_facts_sync(self, conversation: str) -> None:
+    def _extract_facts_sync(self, conversation: str) -> bool:
         # 先让路：主对话可能刚结束、用户正在等下一轮首 token（本地后端 aux
         # 与主模型共用实例，抢锁还会冲 KV 缓存）。
         self._wait_for_idle()
@@ -896,21 +915,35 @@ class Agent:
         lock = self._fact_extract_lock
         if not lock.acquire(blocking=False):
             # A previous extraction is still running; skip to avoid piling up.
-            return
+            return False
         try:
             from .graph_memory import extract_facts_via_llm
             extract_llm = self._get_extract_llm()
             if extract_llm is None:
                 # 拿不到专用客户端就跳过：绝不与 agent 线程共用 httpx.Client。
                 self._log("[memory] 跳过事实抽取（无可用专用客户端）")
-                return
-            data = extract_facts_via_llm(extract_llm, conversation)
+                return False
+            try:
+                data = extract_facts_via_llm(extract_llm, conversation)
+            except Exception as e:
+                # 辅助模型调用失败（加载不良/上下文溢出等）→ 切主模型重试一次。
+                # 主模型实例与 aux 独立：本地主模型可安全复用（kv_group 隔离），
+                # 外部主模型用专用 client，均在 _get_extract_llm 兜底路径里。
+                if getattr(self, "_extract_source", "") == "aux":
+                    self._log(
+                        f"[memory] 辅助模型事实抽取失败（{e}），改用主模型隔离兜底重试")
+                    fallback = self._extract_llm_main_fallback()
+                    if fallback is None:
+                        raise
+                    data = extract_facts_via_llm(fallback, conversation)
+                else:
+                    raise
 
             entities = data.get("entities", [])
             relations = data.get("relations", [])
             if not entities and not relations:
                 self._log("[memory] 本轮无可持久化事实（抽取为空或 LLM 返回空图）")
-                return
+                return False
 
             from .tools.memory import _get_long_memory
             lm = _get_long_memory(self.tools, self.config)
@@ -942,8 +975,10 @@ class Agent:
             # 同时追加到短期记忆（当天桶）：一次抽取，两份写入，避免重复抽取。
             if all_observations:
                 self._append_daily_facts(all_observations)
+            return True
         except Exception as e:  # pragma: no cover — best-effort
             self._log(f"[memory] 事实抽取失败: {e}")
+            return False
         finally:
             lock.release()
 
@@ -970,7 +1005,16 @@ class Agent:
         aux = getattr(self, "aux_llm", None)
         main_is_real = isinstance(self.llm, (LLMClient, LocalLLMClient))
         if aux is not None and main_is_real and isinstance(aux, (LLMClient, LocalLLMClient)):
+            self._extract_source = "aux"
             return aux
+        # 辅助模型不可用 → 主模型 isolated 兜底：本地主模型复用同一实例，
+        # 靠 kv_group="aux" 隔离 KV + _wait_for_idle 让路；外部主模型则走下方
+        # 独立 LLMClient。记下来源供 _extract_facts_sync 在失败时决定是否重试。
+        if aux is None and main_is_real:
+            self._extract_source = "main-fallback"
+            self._log(
+                "[memory] 辅助模型不可用，事实抽取将使用主模型隔离兜底"
+                "（响应可能变慢；抽取走独立 KV，不影响当前对话）")
 
         # 「应用配置」换模型后必须重建：缓存的客户端仍指向旧 base_url/model。
         # 本地模型按对象身份做 key（没有 base_url/model 属性）。
@@ -984,9 +1028,11 @@ class Agent:
         if not isinstance(self.llm, (LLMClient, LocalLLMClient)):
             # Non-LLMClient (test mock / scripted): reuse self.llm (no shared
             # socket state to race).
+            self._extract_source = "main-fallback"
             return self.llm
         if isinstance(self.llm, LocalLLMClient):
             # 本地模型：抽取复用主客户端，避免重复加载 GB 级权重（本地推理可共享）。
+            self._extract_source = "main-fallback"
             self._extract_llm = self.llm
             self._extract_llm_key = cur_key
             return self._extract_llm
@@ -1035,6 +1081,62 @@ class Agent:
                 pass
         finally:
             self._fact_extract_lock.release()
+        return None
+
+    def _constrained_tool_retry(self, tool_name, bad_args, error, tool_schema):
+        """参数错误时用约束解码重生成工具参数（仅异常路径，不影响普通对话）。
+
+        用主模型（工具调用是主模型行为）+ 工具自身 JSON schema 做约束，
+        保证重生成的参数在类型/必填/枚举层面合法。失败返回 None，由上层
+        沿用原 usage_hint 自纠流程。
+        """
+        llm = self.llm
+        chat_constrained = getattr(llm, "chat_constrained", None)
+        if not callable(chat_constrained):
+            return None   # 非 MLX / 外部模型：无约束解码能力，跳过
+        try:
+            import outlines
+            params = (tool_schema or {}).get("function", {}).get(
+                "parameters", {})
+            if not params:
+                return None
+            messages = [
+                {"role": "system", "content":
+                    "你是工具参数修正助手。根据错误提示修正工具调用参数。"
+                    "输出必须是符合给定 JSON schema 的参数对象。"},
+                {"role": "user", "content":
+                    f"工具: {tool_name}\n"
+                    f"错误: {error}\n"
+                    f"原参数: {json.dumps(bad_args, ensure_ascii=False)}\n"
+                    "请输出修正后的参数对象。"},
+            ]
+            out = chat_constrained(
+                messages, schema=outlines.json_schema(params), max_tokens=512)
+            if isinstance(out, str):
+                out = json.loads(out)
+            return out if isinstance(out, dict) else None
+        except Exception as e:
+            self._log(f"[tool] 约束解码重试失败（沿用原错误回灌）: {e}")
+            return None
+
+    def _extract_llm_main_fallback(self):
+        """强制返回主模型 client 用于事实抽取兜底（跳过 aux）。
+
+        本地主模型复用同一实例（kv_group="aux" 隔离 KV）；外部主模型则
+        复用/新建独立 LLMClient（连接池独立，不与 agent 线程竞态）。逻辑与
+        _get_extract_llm 的非 aux 分支一致，只是强制不走 aux。
+        """
+        from .llm_client import LLMClient
+        from .local.llm import LocalLLMClient
+
+        if not isinstance(self.llm, (LLMClient, LocalLLMClient)):
+            return self.llm   # mock / scripted：无共享 socket 状态
+        if isinstance(self.llm, LocalLLMClient):
+            return self.llm   # 本地：复用主实例，kv_group 隔离
+        # 外部 LLMClient：复用已缓存的专用 client（_get_extract_llm 已建好）
+        cached = getattr(self, "_extract_llm", None)
+        if cached is not None and isinstance(cached, LLMClient):
+            return cached
         return None
 
     def _close_extract_llm(self) -> None:
@@ -1739,6 +1841,51 @@ class Agent:
     # ------------------------------------------------------------------
     # 改进 7/8：后台记忆维护（归档 → 历史挖掘 → 记忆整理）
     # ------------------------------------------------------------------
+    def _boot_archive_then_fact_loop(self) -> None:
+        """启动归档（同步 IO）后进入每 N 小时 raw_session 增量事实抽取循环。"""
+        from .memory_v2 import archive_past_sessions
+        try:
+            archive_past_sessions(self._memory_layout)
+        except Exception as e:
+            self._log(f"[memory] boot archive error: {e}")
+        if not bool(getattr(self.config, "memory_fact_extract_enabled", True)):
+            return
+        hours = max(1, int(getattr(
+            self.config, "memory_fact_extract_interval_hours", 4) or 4))
+        interval = hours * 3600
+        # 启动后先跑一次（覆盖上次退出期间的遗漏），之后每 N 小时一次。
+        while True:
+            try:
+                self._run_periodic_fact_extraction()
+            except Exception as e:
+                self._log(f"[memory] 周期事实抽取异常: {e}")
+            time.sleep(interval)
+
+    def _run_periodic_fact_extraction(self) -> None:
+        """每 4 小时任务：增量扫描 raw_session（含归档 zip），抽取事实写入 graph。
+
+        抽取走 _extract_facts_sync 的完整链路（aux 优先、主模型 isolated 兜底、
+        失败切主模型重试）；仅日志提示，不弹框（后台 daemon 线程用户不在场）。
+        """
+        from .memory_v2 import pending_fact_sessions, mark_fact_session_done
+        layout = self._memory_layout
+        sessions = pending_fact_sessions(layout, max_items=10)
+        if not sessions:
+            return
+        self._log(f"[memory] 周期事实抽取: 待处理 {len(sessions)} 个 session")
+        for item in sessions:
+            key, text = item["key"], item["text"]
+            try:
+                ok = self._extract_facts_sync(text)
+                if ok:
+                    mark_fact_session_done(layout, key)
+                    self._log(f"[memory] 周期事实抽取完成: {key}")
+                else:
+                    # 抽取被跳过/失败 → 不推进游标，下轮重试（避免事实永久丢失）。
+                    self._log(f"[memory] 周期事实抽取未成功，保留游标待重试: {key}")
+            except Exception as e:
+                self._log(f"[memory] 周期事实抽取失败 {key}: {e}")
+
     def _run_memory_maintenance_async(self) -> None:
         """任务终止边触发：主引擎已空闲，后台线程做归档与辅助引擎提炼。
 
@@ -1986,8 +2133,8 @@ class Agent:
 
     # ------------------------------------------------------------------
     def volatile_context(self) -> str:
-        """每轮易变的即时上下文：知识库状态 + 内部工作记忆 + 当天自动抽取
-        事实 + 按当前用户输入匹配到的技能。
+        """每轮易变的即时上下文：当前时间 + 知识库状态 + 内部工作记忆 +
+        当天自动抽取事实 + 按当前用户输入匹配到的技能。
 
         这些原本拼进系统提示，但本模型 KV 缓存（ArraysCache）不可裁剪，多轮只认
         完整前缀匹配；系统提示哪怕加一个会变的 token 都会让前缀整体对不上 → 每轮
@@ -1996,6 +2143,22 @@ class Agent:
         回注的 key_info/plan 同源）。
         """
         parts: List[str] = []
+        # 当前时间必须每轮注入：模型不知道真实日期，不注入就会用训练数据里的
+        # 日期作答（实测问「现在是什么日期」回了 2024-06-19）。放在用户消息里
+        # 而不是系统提示，避免每分钟变化的 token 破坏系统提示前缀缓存。
+        try:
+            now = datetime.now().astimezone()
+            offset = now.strftime("%z")
+            if len(offset) == 5:
+                offset = f"{offset[:3]}:{offset[3:]}"
+            weekday = ("星期一", "星期二", "星期三", "星期四",
+                       "星期五", "星期六", "星期日")[now.weekday()]
+            parts.append(
+                f"# Current time\n{now:%Y-%m-%d %H:%M} "
+                f"(UTC{offset}, {weekday})\n"
+                "日期/时间问题以此为准；禁止使用训练数据中的日期。")
+        except Exception:  # pragma: no cover - 系统时钟异常时不影响检索上下文
+            pass
         # 知识库状态：30s TTL 缓存，但 reload / 背景索引都会改它，放进用户消息
         # 就不会再污染系统提示前缀。
         try:

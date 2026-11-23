@@ -887,12 +887,18 @@ class BuildKGWorker(QThread):
     kg_finished = pyqtSignal(dict)     # stats dict
     kg_failed = pyqtSignal(str)        # error message
     kg_progress = pyqtSignal(int, int, str)  # done, total, message
+    kg_fallback_notice = pyqtSignal()  # 辅助模型不可用→改走主模型（需提醒用户）
 
-    def __init__(self, workspace: str, knowledge_base: str, config=None):
+    def __init__(self, workspace: str, knowledge_base: str, config=None,
+                 fallback_main_client=None, notice_shown: bool = False):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._config = config
+        # 辅助模型不可用时的兜底：主线程传入的主模型 client（共享实例，
+        # 构建结束绝不 close）；None 表示不允许兜底。
+        self._fallback_main_client = fallback_main_client
+        self._notice_shown = notice_shown   # 主线程已弹过提示则不重复
         self._engine: Optional[RAGEngine] = None
         self._cancel = threading.Event()
         self._log_buffer: list = []
@@ -906,39 +912,41 @@ class BuildKGWorker(QThread):
         self._cancel.set()
 
     def _extraction_client(self):
-        """KG 抽取用的 LLM 客户端，返回 (client, 人类可读标签)。
+        """KG 抽取用 LLM 客户端，返回 (client, 标签, owns_client)。
 
-        **默认（且只）用辅助模型**：构建动辄数小时，绝不能占用主模型——否则
-        对话/工具调用全部排队（用户明确要求「不影响使用」）。这里单独构建一份
-        辅助模型实例，构建结束在 finally 里 close 释放，不碰 UI 的共享实例。
-
-        实测（同一 786 字正文切片，llm_raw，enable_thinking=False）：
-          * 0.8B：2.4s，只输出 ``<|COMPLETE|>`` → 0 实体 0 关系（不可用）；
-          * 2B / 2B-Agent：113s / 126s，7k-13k 字、136-144 实体（无视 20 上限），
-            token 预算耗尽 → 关系恒为 0；
-          * Spark-X2.6 1.7B：15.8s，3 实体 2 关系（关系字段只有 4 段，错位）；
-          * 4B（Qwen3.5 / Spark-X2.6）：约 24-30s，4-5 实体 + 4-5 关系，结构正确。
-        结论：辅助模型建议 ≥4B。
+        优先辅助模型（独立实例、构建结束 close 释放，不占主模型）；辅助模型
+        不可用时退回主线程传入的主模型 client（共享实例，owns=False，绝不
+        close），抽取走 kv_group="kg" 隔离，不污染主对话 KV。主模型兜底会让
+        对话响应变慢，已在主线程提前弹框告知用户。
         """
         from ..local.factory import build_aux_llm_client
         if bool(getattr(self._config, "aux_llm_enabled", False)):
-            return build_aux_llm_client(self._config), "辅助模型"
+            try:
+                return build_aux_llm_client(self._config), "辅助模型", True
+            except Exception as e:
+                logger.warning("辅助模型构建失败，尝试主模型兜底: %s", e)
+        if self._fallback_main_client is not None:
+            return self._fallback_main_client, "主模型（兜底，响应可能变慢）", False
         raise RuntimeError(
-            "知识图谱抽取需要辅助模型：请在「辅助模型」区域启用并加载"
-            "（建议 ≥4B，0.8B/2B 实测不可用），或把抽取方案切换为 GLiNER")
+            "知识图谱抽取需要辅助模型；辅助模型不可用且没有可用的主模型兜底。"
+            "请在「辅助模型」区域启用并加载（建议 ≥4B），或切换为 GLiNER 方案")
 
     def run(self) -> None:  # type: ignore[override]
         emit_stats = None
         emit_error = None
         aux_client = None
+        owns_client = False
         try:
             from ..rag.kg import KGBuilder, KGCancellation, create_extractor
             # 抽取方案：LLM 两种方案构建期必须有 LLM；GLiNER 不依赖。
             scheme = str(getattr(self._config, "rag_kg_extractor", "llm_raw")
                          or "llm_raw").lower()
             if scheme != "gliner":
-                aux_client, label = self._extraction_client()
+                aux_client, label, owns_client = self._extraction_client()
                 self._emit_log(f"[kg] 抽取使用{label}（首次加载可能需要编译/下载）...")
+                if (not owns_client and aux_client is not None
+                        and not self._notice_shown):
+                    self.kg_fallback_notice.emit()
             else:
                 self._emit_log("[kg] GLiNER 方案：不依赖辅助模型，加载本地 NER 模型...")
             self._engine = RAGEngine(
@@ -979,7 +987,13 @@ class BuildKGWorker(QThread):
                 max_desc_chars=int(getattr(
                     self._config, "rag_kg_max_description_chars", 100)),
                 glean=bool(getattr(self._config, "rag_kg_glean_enabled", True)),
-                raw_json=bool(getattr(self._config, "rag_kg_llm_raw_json", False)))
+                raw_json=bool(getattr(self._config, "rag_kg_llm_raw_json", False)),
+                constrained=bool(getattr(
+                    self._config, "rag_kg_constrained_decode", True)),
+                raw_constrained_json=bool(getattr(
+                    self._config, "rag_kg_raw_constrained_json", True)),
+                raw_constrained_delim=bool(getattr(
+                    self._config, "rag_kg_raw_constrained_delim", False)))
             if not extractor.available:
                 raise RuntimeError(getattr(extractor, "unavailable_reason", "")
                                    or "抽取器不可用")
@@ -1010,10 +1024,9 @@ class BuildKGWorker(QThread):
                 except Exception as e:
                     logger.warning("BuildKGWorker: engine close failed: %s", e)
             try:
-                if aux_client is not None:
-                    # 构建结束后立刻释放权重（4B 级模型占 2-3GB）：close() 会
-                    # 清引用并回收统一内存；旧实现只找 unload()，而
-                    # LocalLLMClient 没有该方法 → 内存要等 GC 才释放。
+                if owns_client and aux_client is not None:
+                    # 仅释放自建的辅助模型实例（4B 占 2-3GB）；主模型兜底是
+                    # 共享实例，close 会令 UI 对话持有的 client 失效，必须跳过。
                     for name in ("unload", "close"):
                         fn = getattr(aux_client, name, None)
                         if callable(fn):
@@ -5189,20 +5202,29 @@ class MainWindow(QMainWindow):
         if not kb:
             QMessageBox.warning(self._front_dialog(), "缺少知识库", "请先选择知识库目录")
             return
-        # LLM 两种抽取方案必须有辅助模型；GLiNER 方案不依赖，跳过该校验。
-        # 不占用主模型：构建期长达数小时，主模型留给对话与工具。
+        # LLM 两种抽取方案：优先辅助模型；不可用时回退主模型（isolated KV），
+        # 并弹框提醒用户响应会变慢。GLiNER 方案不依赖 LLM，跳过该判断。
         _kg_ext_rev = {i: k for i, k in enumerate(_KG_EXTRACTOR_DISPLAY)}
         _kg_scheme = _kg_ext_rev.get(self.kg_extractor_combo.currentIndex(), "llm_raw")
-        if (_kg_scheme != "gliner"
-                and not bool(getattr(self.config, "aux_llm_enabled", False))):
-            QMessageBox.warning(
+        fallback_client = None
+        if _kg_scheme != "gliner" and not bool(
+                getattr(self.config, "aux_llm_enabled", False)):
+            fallback_client = getattr(self, "_llm", None)
+            if fallback_client is None:
+                QMessageBox.warning(
+                    self._front_dialog(),
+                    "需要辅助模型",
+                    "知识图谱抽取需要辅助模型，且当前主模型也不可用。\n"
+                    "请在「辅助模型（本地专用）」区域启用并加载（建议 ≥4B），\n"
+                    "或确保主模型已连接，或切换为 GLiNER 方案。")
+                return
+            QMessageBox.information(
                 self._front_dialog(),
-                "需要辅助模型",
-                "知识图谱抽取使用辅助模型（不占用主模型）：请先在\n"
-                "「辅助模型（本地专用）」区域启用并加载（建议 ≥4B），\n"
-                "再点击「构建知识图谱」。\n"
-                "（或者把「抽取方案」切换为 GLiNER——不依赖 LLM）")
-            return
+                "辅助模型不可用",
+                "因辅助模型不可用，将使用主模型进行知识图谱抽取，"
+                "抽取期间系统响应会变慢，敬请谅解。\n\n"
+                "（抽取使用隔离 KV，不污染当前对话；如需更快，可在\n"
+                "「辅助模型」区域启用并加载后再构建，或切换 GLiNER 方案。）")
         try:
             self._gather_config_from_widgets()
             from ..local.factory import configure_local_models
@@ -5212,10 +5234,13 @@ class MainWindow(QMainWindow):
         self._append_log("[kg] ────────── 开始构建知识图谱 ──────────")
         self.kg_build_btn.setEnabled(False)
         self.kg_status_label.setText("状态: 构建中…")
-        self._kg_worker = BuildKGWorker(ws, kb, config=self.config)
+        self._kg_worker = BuildKGWorker(
+            ws, kb, config=self.config, fallback_main_client=fallback_client,
+            notice_shown=fallback_client is not None)   # 主线程已弹过则不重复
         self._kg_worker.kg_progress.connect(self._on_kg_progress)
         self._kg_worker.kg_finished.connect(self._on_kg_finished)
         self._kg_worker.kg_failed.connect(self._on_kg_failed)
+        self._kg_worker.kg_fallback_notice.connect(self._on_kg_fallback_notice)
         # deleteLater / 引用清理挂 built-in finished（run() 返回后触发）。
         self._kg_worker.finished.connect(self._kg_worker.deleteLater)
         self._kg_worker.finished.connect(self._on_kg_thread_finished)
@@ -5315,6 +5340,15 @@ class MainWindow(QMainWindow):
             if w is not None and w.isVisible():
                 return w
         return self
+
+    def _on_kg_fallback_notice(self) -> None:
+        """worker 线程发现辅助模型构建失败、改走主模型时提醒用户（主线程弹框）。"""
+        QMessageBox.information(
+            self._front_dialog(),
+            "辅助模型不可用",
+            "因辅助模型不可用，将使用主模型进行知识图谱抽取，"
+            "抽取期间系统响应会变慢，敬请谅解。\n\n"
+            "（抽取使用隔离 KV，不污染当前对话。）")
 
     def _on_kg_failed(self, error: str) -> None:
         self.kg_build_btn.setEnabled(True)

@@ -37,6 +37,18 @@ _ROW_START_RE = re.compile(
     r"(?i)(?=(?:entity|relation)\s*" + re.escape(_ROW_DELIM) + ")")
 _MAX_DESCRIPTIONS_FOR_SUMMARY = 12
 
+# Outlines CFG：约束 llm_raw 分隔符模式输出为「N 行 entity + M 行 relation +
+# COMPLETE」的合法结构。只保结构（字段内容仍由模型自由生成、解析器容错）。
+# 字段字符类排除 < > 与换行，避免与 <|#|> 分隔符冲突。
+_RAW_DELIM_CFG = r'''
+root ::= entity_rows relation_rows "<|COMPLETE|>"
+entity_rows ::= entity_row+
+relation_rows ::= relation_row*
+entity_row ::= "entity<|#|>" field "<|#|>" field "<|#|>" field "\n"
+relation_row ::= "relation<|#|>" field "<|#|>" field "<|#|>" field "<|#|>" field "\n"
+field ::= [^<>\n]+
+'''
+
 _ENTITY_TYPES = {
     "Person", "Creature", "Organization", "Location", "Event", "Concept",
     "Method", "Content", "Data", "Artifact", "NaturalObject", "Other",
@@ -199,7 +211,9 @@ class KGExtractor(BaseKGExtractor):
     def __init__(self, llm_client: Any = None, language: str = "中文", *,
                  max_entities: int = 20, max_relations: int = 50,
                  max_desc_chars: int = 100, glean: bool = True,
-                 json_output: bool = False):
+                 json_output: bool = False,
+                 constrained_json: bool = True,
+                 constrained_delim: bool = False):
         super().__init__(language, max_entities=max_entities,
                          max_relations=max_relations,
                          max_desc_chars=max_desc_chars, glean=glean)
@@ -207,6 +221,10 @@ class KGExtractor(BaseKGExtractor):
         # JSON 输出模式（配置项 rag_kg_llm_raw_json，仅 llm_raw 方案）：
         # 用 JSON 版 prompt + 无 pydantic 的宽松 JSON 解析；默认仍走 <|#|> 行格式。
         self.json_output = bool(json_output)
+        # 约束解码开关：JSON 模式默认开（补上语法合法性短板）；分隔符模式
+        # 默认关（CFG 只保结构不保语义，且现有解析器本就容错）。
+        self.constrained_json = bool(constrained_json)
+        self.constrained_delim = bool(constrained_delim)
         render = prompts.with_limits
         if self.json_output:
             sys_tpl = prompts.PYDANTIC_EXTRACT_SYSTEM
@@ -278,6 +296,39 @@ class KGExtractor(BaseKGExtractor):
                                         max_tokens=max_tokens)
         return (outs[0] if outs else "") or ""
 
+    def _extract_one(self, system: str, user: str) -> str:
+        """单轮抽取（llm_raw）：按子模式决定是否走约束解码，失败回退自由生成。"""
+        enabled = self.constrained_json if self.json_output else self.constrained_delim
+        if enabled and self._llm is not None:
+            chat_constrained = getattr(self._llm, "chat_constrained", None)
+            if callable(chat_constrained):
+                try:
+                    if self.json_output:
+                        # JSON 模式：用宽松 schema 约束 JSON 语法合法；
+                        # 仍由 parse_json_extraction_output 宽松解析（不改校验语义）。
+                        schema = _build_pydantic_models()
+                        if schema is None:
+                            raise RuntimeError("pydantic 不可用，无法构建约束 schema")
+                        out = chat_constrained(
+                            [{"role": "system", "content": system},
+                             {"role": "user", "content": user}],
+                            schema=schema, max_tokens=4096)
+                    else:
+                        # 分隔符模式：CFG 约束整段行格式 + COMPLETE 结束标记。
+                        import outlines
+                        out = chat_constrained(
+                            [{"role": "system", "content": system},
+                             {"role": "user", "content": user}],
+                            schema=outlines.cfg(_RAW_DELIM_CFG),
+                            max_tokens=4096)
+                    if isinstance(out, str):
+                        return out
+                    return json.dumps(out, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning(
+                        "KG: llm_raw 约束解码失败，回退自由生成: %s", e)
+        return self._chat(system, user, max_tokens=4096, kv_group="kg")
+
     # ------------------------------------------------------------------
     # 实体 + 关系抽取
     # ------------------------------------------------------------------
@@ -295,8 +346,7 @@ class KGExtractor(BaseKGExtractor):
             section_context=ctx,
             input_text=chunk_text,
         )
-        raw = self._chat(self._system_prompt, user, max_tokens=4096,
-                         kv_group="kg")
+        raw = self._extract_one(self._system_prompt, user)
         parser = (parse_json_extraction_output if self.json_output
                   else parse_extraction_output)
         entities, relations = parser(raw)
@@ -310,8 +360,7 @@ class KGExtractor(BaseKGExtractor):
                 input_text=chunk_text,
                 previous_output=(raw or "").strip()[:4000] or "（上一轮无有效输出）",
             )
-            raw2 = self._chat(self._system_prompt, cont_user, max_tokens=4096,
-                              kv_group="kg")
+            raw2 = self._extract_one(self._system_prompt, cont_user)
             e2, r2 = parser(raw2)
             entities, relations = _merge_extraction(entities, relations, e2, r2)
             logger.info("KG: 补漏轮生效（首轮 %d 实体/%d 关系 → 合并后 %d/%d）",
@@ -415,11 +464,13 @@ class PydanticLLMExtractor(KGExtractor):
 
     def __init__(self, llm_client: Any = None, language: str = "中文", *,
                  max_entities: int = 20, max_relations: int = 50,
-                 max_desc_chars: int = 100, glean: bool = True):
+                 max_desc_chars: int = 100, glean: bool = True,
+                 constrained: bool = False):
         super().__init__(llm_client, language,
                          max_entities=max_entities,
                          max_relations=max_relations,
                          max_desc_chars=max_desc_chars, glean=glean)
+        self.constrained = bool(constrained)
         # 覆盖父类渲染的 llm_raw 模板（本方案用 JSON 版 prompt）。
         self._system_prompt = prompts.with_limits(
             prompts.PYDANTIC_EXTRACT_SYSTEM, max_entities=self.max_entities,
@@ -447,6 +498,24 @@ class PydanticLLMExtractor(KGExtractor):
             return False
         return super().available
 
+    def _extract_one(self, system: str, user: str) -> str:
+        """单轮抽取：约束解码优先（若开启且 client 支持），失败回退自由生成。"""
+        if self.constrained and self._llm is not None:
+            chat_constrained = getattr(self._llm, "chat_constrained", None)
+            if callable(chat_constrained) and self._models is not None:
+                try:
+                    out = chat_constrained(
+                        [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+                        schema=self._models, max_tokens=4096)
+                    if isinstance(out, str):
+                        return out
+                    return json.dumps(out, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning(
+                        "KG: Outlines 约束解码失败，回退自由生成: %s", e)
+        return self._chat(system, user, max_tokens=4096, kv_group="kg")
+
     def extract_entities_relations(
         self, chunk_text: str, section_context: str = "",
     ) -> tuple:
@@ -458,8 +527,7 @@ class PydanticLLMExtractor(KGExtractor):
             section_context=ctx,
             input_text=chunk_text,
         )
-        raw = self._chat(self._system_prompt, user, max_tokens=4096,
-                         kv_group="kg")
+        raw = self._extract_one(self._system_prompt, user)
         entities, relations = self._parse_output(raw)
         if self.glean and _needs_glean(raw, entities, relations, json_mode=True):
             cont_user = self._continue_template.format(
@@ -468,8 +536,7 @@ class PydanticLLMExtractor(KGExtractor):
                 input_text=chunk_text,
                 previous_output=(raw or "").strip()[:4000] or "（上一轮无有效输出）",
             )
-            raw2 = self._chat(self._system_prompt, cont_user, max_tokens=4096,
-                              kv_group="kg")
+            raw2 = self._extract_one(self._system_prompt, cont_user)
             e2, r2 = self._parse_output(raw2)
             entities, relations = _merge_extraction(entities, relations, e2, r2)
             logger.info("KG: pydantic 补漏轮生效（首轮 %d 实体/%d 关系 → 合并后 %d/%d）",
@@ -654,7 +721,10 @@ def create_extractor(scheme: str, llm_client: Any = None,
                      max_entities: int = 20, max_relations: int = 50,
                      max_desc_chars: int = 100,
                      glean: bool = True,
-                     raw_json: bool = False) -> BaseKGExtractor:
+                     raw_json: bool = False,
+                     constrained: bool = False,
+                     raw_constrained_json: bool = True,
+                     raw_constrained_delim: bool = False) -> BaseKGExtractor:
     """按配置字符串构造抽取方案。
 
     scheme ∈ {llm_raw, llm_pydantic, gliner}；未知值回退 llm_raw 并告警。
@@ -667,12 +737,17 @@ def create_extractor(scheme: str, llm_client: Any = None,
     limits = dict(max_entities=max_entities, max_relations=max_relations,
                   max_desc_chars=max_desc_chars, glean=glean)
     if scheme == "llm_pydantic":
-        return PydanticLLMExtractor(llm_client, language, **limits)
+        return PydanticLLMExtractor(llm_client, language,
+                                    constrained=constrained, **limits)
     if scheme == "gliner":
         return GLiNERExtractor(language=language, **limits)
     if scheme != "llm_raw":
         logger.warning("KG: 未知抽取方案 %r，回退 llm_raw", scheme)
-    return KGExtractor(llm_client, language, **limits, json_output=raw_json)
+    # 总开关 constrained 关闭时，两个子开关一律失效（向后兼容默认行为）。
+    return KGExtractor(
+        llm_client, language, **limits, json_output=raw_json,
+        constrained_json=constrained and raw_constrained_json,
+        constrained_delim=constrained and raw_constrained_delim)
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,9 @@ from ..core_opinion import extract_core_opinion_sentences
 
 logger = logging.getLogger(__name__)
 
+# chapter_summaries.json 单写锁：空闲调度器与入库内联摘要共用，避免并发写竞态。
+_STATE_LOCK = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
@@ -151,7 +154,7 @@ class ChapterSummaryScheduler:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._next_due = 0.0          # monotonic；0 = 立即可跑首次
-        self._state_lock = threading.Lock()
+        self._state_lock = _STATE_LOCK   # 与入库内联摘要共用同一把状态写锁
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -228,14 +231,25 @@ class ChapterSummaryScheduler:
                 md_path = info.get("md_path") or ""
                 if not md_path or not os.path.isfile(md_path):
                     continue
+
+                def _run_book() -> Optional[float]:
+                    # 空章节跳过只写状态、不产生摘要，interval 可能为 None；
+                    # 必须按「章节记录数是否变化」补一次落盘，否则下次 tick
+                    # 又从同一空章节开始，永远推进不了。
+                    before = len((books.get(doc_name) or {}).get("chapters", []))
+                    interval = self._process_book(
+                        engine, cfg, doc_name, md_path, info, books)
+                    after = len((books.get(doc_name) or {}).get("chapters", []))
+                    if interval is not None or after != before:
+                        _save_summaries_state(workspace, state)
+                    return interval
+
                 book = books.get(doc_name)
                 total = _chapter_count_from_toc(info.get("chapters"))
                 if book is None or total <= 0:
                     # 新书：需要读 Markdown 提取章节（同时完成目录核对/修复）。
-                    interval = self._process_book(engine, cfg, doc_name, md_path,
-                                                  info, books)
+                    interval = _run_book()
                     if interval is not None:
-                        _save_summaries_state(workspace, state)
                         return interval
                     continue
                 # 已有进度：mtime/大小变化 → 原书更新，重置该书（摘要全部重做）。
@@ -252,18 +266,14 @@ class ChapterSummaryScheduler:
                         None, fingerprint, legacy_fingerprint):
                     logger.info("逐章摘要: 检测到《%s》内容已更新，重置该书进度", doc_name)
                     books.pop(doc_name, None)
-                    interval = self._process_book(engine, cfg, doc_name, md_path,
-                                                  info, books)
+                    interval = _run_book()
                     if interval is not None:
-                        _save_summaries_state(workspace, state)
                         return interval
                     continue
                 done = {c.get("idx") for c in book.get("chapters", [])}
                 if len(done) < total:
-                    interval = self._process_book(engine, cfg, doc_name, md_path,
-                                                  info, books)
+                    interval = _run_book()
                     if interval is not None:
-                        _save_summaries_state(workspace, state)
                         return interval
                     continue
                 # 章节全部完成 → 收尾全书摘要（一次）。
@@ -380,6 +390,28 @@ class ChapterSummaryScheduler:
         target = next((i for i in range(len(chapters)) if i not in done), None)
         if target is None:
             return None  # 全部完成（全书摘要由调用方收尾）
+
+        # 跳过无正文的章节（封面、献词、纯标题分隔页等）。旧实现把空章节
+        # 当成「摘要生成失败」反复冷却重试，会永远卡在第 0 章，后续章节
+        # 永远轮不到。这里直接记一条 skipped 占位推进游标。
+        while target is not None:
+            chapter = chapters[target]
+            if (getattr(chapter, "text", "") or "").strip():
+                break
+            book.setdefault("chapters", []).append({
+                "idx": target,
+                "title": chapter.title,
+                "level": chapter.level,
+                "summary": "",
+                "skipped": "empty",
+                "done_at": time.time(),
+            })
+            done.add(target)
+            logger.info("逐章摘要: 《%s》第 %d 章「%s」无正文，跳过",
+                        doc_name, target + 1, (chapter.title or "")[:30])
+            target = next((i for i in range(len(chapters)) if i not in done), None)
+        if target is None:
+            return None
 
         ch = chapters[target]
         # 核心句模式无需辅助模型：不 acquire（避免临时加载 GB 级权重）。
@@ -779,3 +811,83 @@ def _strip_wrappers(text: str) -> str:
         if t.startswith(prefix):
             t = t[len(prefix):].strip()
     return t
+
+# ---------------------------------------------------------------------------
+# 入库内联摘要（核心句方案）：切片入库完成后立即为每本书生成章节/全书摘要，
+# 写入与空闲调度器完全相同的 chapter_summaries.json，使 rag_outline 即刻可用。
+# 空闲调度器保留作缺失补充：它按 fingerprint/idx/book_summary 判重，内联已
+# 生成的书会被自然跳过，不重复抽取。
+# ---------------------------------------------------------------------------
+
+def build_book_summaries_inline(
+    workspace: str,
+    doc_name: str,
+    markdown: str,
+    md_path: str = "",
+    source: str = "",
+    force: bool = False,
+) -> bool:
+    """同步为单本书生成章节目录结构+逐章摘要+全书摘要（纯本地核心句）。
+
+    在切片入库（build_and_store_digest）末尾调用：此刻 markdown 全文与
+    md_path 都在手，直接抽取，不依赖辅助模型/向量库。结果与空闲调度器共用
+    ``chapter_summaries.json``；已有相同指纹且目录/摘要齐全时跳过（幂等）。
+
+    Returns: 是否本次生成/更新了内容。
+    """
+    raw = (markdown or "").strip()
+    if not raw or not workspace or not doc_name:
+        return False
+    try:
+        from .document_outline import extract_chapters
+        chapters = extract_chapters(raw)
+        if not chapters:
+            return False
+
+        with _STATE_LOCK:
+            state = load_summaries_state(workspace)
+            books = state.setdefault("books", {})
+            book = books.get(doc_name, {})
+            try:
+                st = os.stat(md_path) if md_path and os.path.isfile(md_path) else None
+                fingerprint = [int(st.st_mtime_ns), st.st_size] if st else None
+            except OSError:
+                fingerprint = None
+            content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+            # 去重：指纹/内容一致且逐章+全书摘要都齐全 → 跳过。
+            if not force and fingerprint is not None and \
+                    book.get("md_fingerprint") == fingerprint and \
+                    book.get("content_hash") == content_hash and \
+                    len(book.get("chapters", [])) == len(chapters) and \
+                    book.get("book_summary"):
+                return False
+
+            book["md_fingerprint"] = fingerprint
+            book["content_hash"] = content_hash
+            book["toc_fixed"] = True   # 内联已用原文实际目录，无需对账修复
+            records: list = []
+            for idx, ch in enumerate(chapters):
+                summary = ChapterSummaryScheduler._core_summary(
+                    ch.text or "", _CHAPTER_SUMMARY_MAX)
+                records.append({
+                    "idx": idx, "title": ch.title, "level": ch.level,
+                    "summary": summary, "done_at": time.time(),
+                })
+            book["chapters"] = records
+
+            # 全书摘要：目录 + 各章摘要 → 核心句压缩（复用调度器同款逻辑）
+            parts = [f"- {r['title']}：{r['summary']}" for r in records]
+            book["book_summary"] = ChapterSummaryScheduler._core_summary(
+                "\n".join(parts), 300, top_n=20)
+            book["book_summary_at"] = time.time()
+            books[doc_name] = book
+            _save_summaries_state(workspace, state)
+        logger.info("入库内联摘要: 《%s》%d 章 + 全书摘要已生成（核心句，无 aux）",
+                    doc_name, len(chapters))
+        return True
+    except Exception as e:
+        # 摘要失败不应阻断入库主流程（与空闲调度器失败冷却同策略：可补做）。
+        logger.warning("入库内联摘要失败（将由空闲调度器补做）: %s: %s", doc_name, e)
+        return False
+

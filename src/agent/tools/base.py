@@ -638,6 +638,12 @@ class ToolRegistry:
                     self.config, "rag_kg_max_description_chars", 100),
                 kg_glean=bool(getattr(self.config, "rag_kg_glean_enabled", True)),
                 kg_raw_json=bool(getattr(self.config, "rag_kg_llm_raw_json", False)),
+                kg_constrained=bool(getattr(
+                    self.config, "rag_kg_constrained_decode", True)),
+                kg_raw_constrained_json=bool(getattr(
+                    self.config, "rag_kg_raw_constrained_json", True)),
+                kg_raw_constrained_delim=bool(getattr(
+                    self.config, "rag_kg_raw_constrained_delim", False)),
                 # 检索阅读模式：解析 Markdown 后旁路普通切片/embedding/向量库。
                 # 是否启用由 rag_mode 决定（fast = 极速检索 = 阅读模式）。
                 reading_mode=(
@@ -927,6 +933,15 @@ class ToolRegistry:
         return [t.schema() for t in self._tools.values()
                 if not getattr(t, "_legacy", False)]
 
+    def set_constrained_retry(self, callback) -> None:
+        """注入「参数错误时用约束解码重生成」的回调。
+
+        回调签名 ``(tool_name, bad_args, error, tool_schema) -> Optional[dict]``；
+        返回修正后的参数 dict 则重试执行，返回 None 则沿用原错误回灌。
+        未注入时零开销、零行为变化（不影响普通对话与普通工具调用）。
+        """
+        self._constrained_retry = callback
+
     # ------------------------------------------------------------------
     def execute(self, name: str, args: Dict[str, Any]) -> ToolResult:
         tool = self._tools.get(name)
@@ -941,6 +956,15 @@ class ToolRegistry:
                       f"got {type(args).__name__}",
             )
 
+        # 参数类型强转（基于工具 schema）：模型常把数字/布尔写成字符串
+        # （"50"、"false"），Python 的签名 bind 不报错但工具内部语义错误。
+        # 这里按 schema 的 type 做安全转换，只对明确可推断的类型动手。
+        coerced, coercion_log = _coerce_args_by_schema(tool, args)
+        if coerced is not None:
+            args = coerced
+            if coercion_log:
+                logger.debug("tool %s 参数强转: %s", name, coercion_log)
+
         # 签名级预检：把「模型传错参数」和「工具内部抛 TypeError」区分开。
         # 旧实现靠捕获 run() 抛出的 TypeError 一律报 "Invalid arguments"——
         # 工具内部代码出 bug（比如对 None 调 .strip()）时模型会收到"参数
@@ -948,6 +972,31 @@ class ToolRegistry:
         try:
             self._signature_of(tool).bind(**args)
         except TypeError as e:
+            # 参数错误时先给「约束解码重试」一次机会（若 agent 注入了钩子）。
+            # 只在签名预检失败的异常路径触发：正常对话/正常工具调用零开销、
+            # 零行为变化。钩子失败/未注入则沿用原 usage_hint 自纠文案。
+            retry_cb = getattr(self, "_constrained_retry", None)
+            if callable(retry_cb) and not getattr(
+                    self, "_in_constrained_retry", False):
+                try:
+                    self._in_constrained_retry = True
+                    fixed = retry_cb(name, args, str(e), tool.schema())
+                    if isinstance(fixed, dict):
+                        # 用修正后的参数重新走一遍签名预检 + 执行
+                        try:
+                            self._signature_of(tool).bind(**fixed)
+                            result = tool.run(**fixed)
+                            if isinstance(result, ToolResult):
+                                logger.info(
+                                    "tool %s 约束解码重试成功（原参数错误: %s）",
+                                    name, e)
+                                return result
+                        except Exception:
+                            pass
+                except Exception as cb_err:
+                    logger.debug("约束解码重试钩子失败: %s", cb_err)
+                finally:
+                    self._in_constrained_retry = False
             # 参数错误最常见的后果是「模型原样重试 N 次」——它只看到
             # "missing a required argument: 'op'"，并不知道该怎么填。工具可
             # 选提供 usage_hint（一个能直接照抄的调用示例），在这里附上，
@@ -998,6 +1047,55 @@ class ToolRegistry:
             sig = inspect.signature(tool.run)
             ToolRegistry._signature_cache[key] = sig
         return sig
+
+
+def _coerce_args_by_schema(
+    tool: "Tool", args: Dict[str, Any],
+) -> tuple:
+    """按工具 schema 的 type 做安全参数强转。
+
+    模型（尤其小模型）常把数字/布尔写成字符串（``"50"`` / ``"false"``），
+    这些值能通过签名 bind 但工具内部语义错误。schema 的 type 是明确的
+    转换依据。只做**无损可推断**的转换；无法转换的原样保留（由签名预检
+    或工具内部报错），绝不猜测语义（如把 "read" 改成 "modify"）。
+
+    Returns ``(新args或None, 转换日志dict)``；无 schema 时返回 ``(None,{})``
+    表示无需处理。
+    """
+    schema = getattr(tool, "parameters", None) or {}
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(props, dict) or not isinstance(args, dict):
+        return None, {}
+    out = dict(args)
+    log: Dict[str, str] = {}
+    for key, spec in props.items():
+        if key not in out or not isinstance(spec, dict):
+            continue
+        val = out[key]
+        typ = spec.get("type")
+        # 字符串 → 数字（整数优先，保留浮点）
+        if typ in ("integer", "number") and isinstance(val, str):
+            s = val.strip()
+            try:
+                num = int(s) if typ == "integer" else float(s)
+                if typ == "integer" and num != float(s):
+                    continue   # "1.5" 不能塞进 integer
+                out[key] = num
+                log[key] = f"{val!r}→{num}"
+            except (ValueError, OverflowError):
+                pass
+        # 字符串 → 布尔（严格白名单，避免把 "read" 之类误转）
+        elif typ == "boolean" and isinstance(val, str):
+            low = val.strip().lower()
+            if low in ("true", "1", "yes", "on"):
+                out[key] = True
+                log[key] = f"{val!r}→True"
+            elif low in ("false", "0", "no", "off"):
+                out[key] = False
+                log[key] = f"{val!r}→False"
+        # 不做 string 反向转换：有些工具 schema 写 string 但 run 内部自己做
+        # 类型判断（如兼容 "false"/False），强转反而可能破坏既有语义。
+    return out, log
 
 
 def parse_args(raw: str) -> Dict[str, Any]:

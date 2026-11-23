@@ -288,8 +288,11 @@ def test_pipeline_archive_mine_cleanup(layout):
 # ---------------------------------------------------------------------------
 
 def test_pipeline_maintenance_does_not_starve_fact_extraction(cfg):
+    # 实时抽取默认关闭；本用例验证显式开启时的锁竞争行为。
+    cfg.memory_turn_fact_extract_enabled = True
     agent = Agent(llm=_MockLLM([]), config=cfg, callbacks=_Noop())
     agent.aux_llm = None  # 未加载辅助模型：维护只做归档
+    agent.session.raw_turns = 1  # 让批量条件立即满足
     # 让 _maybe_extract_facts_async 通过前置过滤
     agent._last_user_text = "请帮我把知识库项目的部署配置和环境事实整理一下"
     reply = "这是关于部署配置与环境事实的详细答复，包含具体路径与验证结论，内容足够长以通过事实抽取过滤。"
@@ -322,3 +325,24 @@ def test_pipeline_maintenance_does_not_starve_fact_extraction(cfg):
         time.sleep(0.1)
     assert "extract-done" in events, "事实抽取不得被后台维护抢锁挤掉"
     assert "extract-skipped" not in events
+
+
+def test_turn_fact_extraction_disabled_by_default(cfg):
+    """默认只在 4h 日志扫描抽取；当前对话结束时不触发实时抽取。"""
+    assert cfg.memory_turn_fact_extract_enabled is False
+    agent = Agent(llm=_MockLLM([]), config=cfg, callbacks=_Noop())
+    agent.session.raw_turns = 1  # 即便批量条件满足也不该实时抽取
+    agent._last_user_text = "请帮我整理部署配置和环境事实，确认路径与结论。"
+    reply = "这是足够长的回复，包含部署路径、环境变量与验证结论。"
+    for i in range(2):
+        rec = agent.session.start_turn(f"问题{i}")
+        agent.session.finish_turn(rec, reply, [], [], f"摘要{i}")
+
+    called = []
+    agent._maybe_extract_facts_async = lambda text: called.append(text)
+    agent._run_memory_maintenance_async = lambda: None
+    agent._distill_experience_async = lambda session: None
+    hooks = _AgentKernelHooks(agent)
+    hooks.finished(agent.session, reply)
+
+    assert called == [], "默认关闭时不得从当前对话实时抽取事实"

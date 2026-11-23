@@ -474,6 +474,20 @@ class RagOutlineTool(Tool):
                     doc.get("doc_name", book_name))
             except Exception:
                 book_summary = ""
+            # 逐章摘要（入库内联/空闲调度器产出）：按目录顺序附到对应标题下，
+            # 让 outline 一份输出同时具备「章节脉络 + 每章讲了什么」。
+            try:
+                ch_summaries = self._engine.get_chapter_summaries(
+                    doc.get("doc_name", book_name))
+            except Exception:
+                ch_summaries = []
+            if ch_summaries:
+                lines = ["【章节摘要】"]
+                for c in ch_summaries:
+                    if c.get("summary"):
+                        lines.append(f"- {c.get('title', '')}: {c['summary']}")
+                if len(lines) > 1:
+                    digest = f"{digest}\n\n" + "\n".join(lines)
             if book_summary:
                 digest = f"{digest}\n\n【全书摘要】\n{book_summary}"
             # 收敛指引无条件附加：无【全书摘要】时模型同样可能逐章刷 rag_search，

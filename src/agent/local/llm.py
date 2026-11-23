@@ -1620,6 +1620,46 @@ class LocalLLMClient:
             tok_src, trust_remote_code=True,
         )
 
+    def chat_constrained(
+        self,
+        messages: List[Dict[str, Any]],
+        schema: Any,
+        max_tokens: Optional[int] = None,
+    ) -> Any:
+        """用 Outlines 按 ``schema``（pydantic 模型 / JSON schema）约束解码。
+
+        复用本实例已加载的 MLX 权重与 tokenizer，不额外加载模型；约束保证
+        输出严格符合 schema（无需事后解析/重试）。仅 MLX 后端可用；其它后端
+        抛 RuntimeError 由调用方降级到自由生成。
+
+        返回 pydantic 模型实例或 dict（取决于 schema 类型）。
+        """
+        if self._backend != "mlx":
+            raise RuntimeError(
+                f"Outlines 约束解码仅支持 MLX 后端，当前为 {self._backend}")
+        try:
+            from outlines import Generator, from_mlxlm, json_schema
+        except ImportError as e:
+            raise RuntimeError(
+                "Outlines 未安装（pip install outlines）") from e
+        self._ensure_model()
+        if self._model is None or self._tokenizer is None:
+            raise RuntimeError("MLX 模型未加载，无法约束解码")
+
+        # 用与 chat_stream 相同的 chat 模板渲染 prompt（关闭思考，结构化输出）
+        prompt, _ids = self._render_mlx_prompt(messages, None, False)
+        model = from_mlxlm(self._model, self._tokenizer)
+        # pydantic 类须显式包成 JsonSchema；直接传类在 1.x 会被当普通类型处理。
+        from pydantic import BaseModel
+        output_type = json_schema(schema) if (
+            isinstance(schema, type) and issubclass(schema, BaseModel)) else schema
+        generator = Generator(model, output_type=output_type)
+        with self._gen_lock:
+            return generator(
+                prompt,
+                max_tokens=max_tokens or self._max_tokens,
+            )
+
     # ------------------------------------------------------------------
     def chat_stream(
         self,

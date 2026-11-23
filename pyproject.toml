@@ -20,6 +20,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 约束解码增强（KG 抽取 llm_pydantic 方案可选启用）：Outlines 1.x 原生支持
+# MLX 后端，按 JSON schema 在解码层强制合法结构。未安装自动回退自由生成。
+outlines = ["outlines>=1.2"]
 # pytest-qt 提供 `qapp` / `qtbot` fixture —— tests/test_bridge.py 与
 # tests/test_integration.py 依赖它构造 MainWindow；缺了这两个文件的用例
 # 会全部在 setup 阶段报 "fixture 'qapp' not found"。

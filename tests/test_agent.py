@@ -1408,6 +1408,16 @@ def test_tools_schemas_are_cached(config, recording_callbacks):
     assert agent._tools_schemas() is agent._tools_schemas()
 
 
+def test_volatile_context_injects_real_current_time(config, recording_callbacks):
+    """模型不知道真实日期，必须在每轮上下文中注入当前时间。"""
+    agent = Agent(llm=MockLLM([]), config=config,
+                  callbacks=recording_callbacks)
+    text = agent.volatile_context()
+    assert "# Current time" in text
+    assert time.strftime("%Y-%m-%d") in text
+    assert "禁止使用训练数据中的日期" in text
+
+
 def test_system_prompt_splits_greeting_from_simple_qa():
     """简单问答不该被「禁止调用任何工具」一刀切。
 

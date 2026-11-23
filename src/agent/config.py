@@ -73,6 +73,14 @@ class AgentConfig:
     # L0 全文、回执中自带决策树与写入规则。L2/L3/L4 的磁盘数据与后台维护
     # 保持原行为，只是不再常驻注入。
     memory_system_enabled: bool = False
+    # 每 4 小时增量扫描 raw_sessions、抽取事实写入 memory graph 的后台任务。
+    # 该任务独立运行，不依赖每轮对话抽取。
+    memory_fact_extract_enabled: bool = True
+    memory_fact_extract_interval_hours: int = 4
+    # 是否在每轮/任务结束时从当前对话实时抽取事实（写 graph observations
+    # 与当天事实）。默认关闭：实时抽取改由上面的 4h raw_sessions 日志扫描
+    # 统一完成，避免对话过程中反复调用 LLM；需要实时沉淀时可手动开启。
+    memory_turn_fact_extract_enabled: bool = False
 
     # RAG settings
     # 切片大小，单位 = token。chunker.estimate_tokens 优先用生效 embedding 模型
@@ -240,6 +248,16 @@ class AgentConfig:
     # 不依赖 pydantic）。与「llm_pydantic」方案无关：后者始终 JSON + 严格校验。
     # 仅配置文件可调（不放到配置面板）。
     rag_kg_llm_raw_json: bool = False
+    # 知识图谱抽取使用 Outlines 约束解码总开关（需 pip install outlines）：
+    # 由 schema 在解码层强制合法结构，输出更紧凑、更快、抗截断。
+    # 默认开启；仅 MLX 后端可用，不可用时自动回退自由生成。
+    # 各方案子开关见下方 rag_kg_raw_* / llm_pydantic 自身逻辑。
+    rag_kg_constrained_decode: bool = True
+    # llm_raw 方案的子开关（受 rag_kg_constrained_decode 总开关约束）：
+    # JSON 输出模式默认开（约束保证 JSON 语法合法，宽松解析不变）；
+    # 分隔符输出模式默认关（CFG 只保结构不保语义，解析器本就容错）。
+    rag_kg_raw_constrained_json: bool = True
+    rag_kg_raw_constrained_delim: bool = False
     # PDF 统一解析引擎切换（仅影响「有文本层的常规 PDF/office 文档」首选谁，
     # 扫描件/图片重 PDF 始终走 parsers 的 RapidOCR 路径）：
     #   - "docling"（默认，现状）：docling 统一解析，不可用回退按格式解析器
@@ -478,7 +496,7 @@ class AgentConfig:
                    "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
                    "rag_search_top_k", "rag_embedding_dims",
                    "rag_condense_min_chars", "mlx_cache_limit_mb",
-                   "rag_condense_max_chars",
+                   "rag_condense_max_chars", "memory_fact_extract_interval_hours",
                    "kernel_max_context_tokens", "kernel_raw_turns",
                    "kernel_consolidate_every", "kernel_max_tool_chars",
                    "kernel_max_digest_lines", "rag_ocr_pool_size",
@@ -533,6 +551,8 @@ class AgentConfig:
                     "rag_matryoshka_enabled", "rag_binary_prefilter_enabled",
                     "web_allow_private_hosts", "rag_mcp_enabled",
                     "rag_kg_glean_enabled", "rag_kg_llm_raw_json",
+                    "rag_kg_constrained_decode",
+                    "rag_kg_raw_constrained_json", "rag_kg_raw_constrained_delim",
                     "rag_presentation_mode",
                     "rag_reading_mode_enabled", "rag_reading_use_ann",
                     "rag_embed_background",
@@ -540,7 +560,9 @@ class AgentConfig:
                     "rag_condense_use_core_sentences",
                     "rag_summary_use_core_sentences",
                     "rag_multi_decision_mode",
-                    "memory_system_enabled")
+                    "memory_system_enabled",
+                    "memory_fact_extract_enabled",
+                    "memory_turn_fact_extract_enabled")
 
     def __post_init__(self) -> None:
         """构造期即归一多知识分区（_migrate 只在 load() 路径触发）。"""

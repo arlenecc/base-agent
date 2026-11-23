@@ -774,3 +774,101 @@ def run_memory_maintenance(layout: MemoryLayout,
     state["last_day"] = today
     _write(layout.maintenance_state_path, json.dumps(state, ensure_ascii=False, indent=2))
     return result
+
+
+# ---------------------------------------------------------------------------
+# 每 4 小时增量事实抽取：扫描 raw_sessions（含归档 zip），输出未处理的
+# session 文本。游标单独存 .fact_extract_state.json。每轮实时抽取默认关闭，
+# 本任务是事实抽取的主路径。
+# ---------------------------------------------------------------------------
+_FACT_STATE_FILENAME = ".fact_extract_state.json"
+_TEXT_MAX_CHARS = 4000   # 单个 session 送 LLM 的最大字数（防止超长日志爆上下文）
+
+
+def fact_extract_state_path(layout: MemoryLayout) -> str:
+    return os.path.join(layout.raw_dir, _FACT_STATE_FILENAME)
+
+
+def _session_text_for_facts(raw: str) -> str:
+    """从 raw_session 文本中剥离 SYSTEM/TOOLS，只留 USER + ASSISTANT_RESPONSE。
+
+    按 TURN_RE 分段，逐轮取 USER 与 ASSISTANT_RESPONSE 段，避免把工具输出
+    （可能很长且与事实无关）送进抽取 LLM。
+    """
+    if not raw:
+        return ""
+    parts: list[str] = []
+    sections = re.split(r"^## \[T\d+\][^\n]*\n", raw, flags=re.M)
+    for block in sections[1:] or [raw]:
+        kept: list[str] = []
+        cur = ""
+        for line in block.splitlines():
+            if line.startswith("### "):
+                cur = line.strip()
+                continue
+            if cur in ("### USER", "### AGENT", "### ASSISTANT_RESPONSE") and line.strip():
+                kept.append(line.strip())
+        if kept:
+            parts.append("\n".join(kept))
+    text = "\n\n".join(parts).strip()
+    return text[:_TEXT_MAX_CHARS]
+
+
+def pending_fact_sessions(layout: MemoryLayout, max_items: int = 20) -> list:
+    """返回未抽取事实的 session 列表 ``[{"key","text"}]``（增量，按时间序）。
+
+    同时扫描当天 .md 与已归档 .zip；游标记录已处理的 key（文件名/zip内文件名）。
+    抽取成功与否由调用方在 mark_fact_session_done 中登记。
+    """
+    if not layout.workspace:
+        return []
+    state = _json_state(fact_extract_state_path(layout))
+    done = set(state.get("processed") or [])
+    out: list = []
+    try:
+        names = sorted(os.listdir(layout.raw_dir))
+    except OSError:
+        return []
+
+    for name in names:
+        if len(out) >= max_items:
+            break
+        # 当天/历史 md
+        if name.endswith(".md") and _DAY_RE.match(name):
+            key = name
+            if key in done:
+                continue
+            text = _session_text_for_facts(_read(layout.full_path(name[:-3])))
+            if text:
+                out.append({"key": key, "text": text})
+            continue
+        # 已归档 zip：读取包内 {sid}.md / {sid}-digest.md
+        if name.endswith(".zip") and re.match(r"^\d{4}-\d{2}-\d{2}\.zip$", name):
+            zpath = layout.zip_path(name[:-4])
+            try:
+                with zipfile.ZipFile(zpath, "r") as zf:
+                    for inner in sorted(zf.namelist()):
+                        if not inner.endswith(".md") or inner.endswith("-digest.md"):
+                            continue
+                        key = f"{name}:{inner}"
+                        if key in done:
+                            continue
+                        raw = zf.read(inner).decode("utf-8", errors="replace")
+                        text = _session_text_for_facts(raw)
+                        if text:
+                            out.append({"key": key, "text": text})
+                        if len(out) >= max_items:
+                            break
+            except (OSError, zipfile.BadZipFile) as e:
+                logger.warning("[memory] 读取归档会话失败 %s: %s", name, e)
+    return out
+
+
+def mark_fact_session_done(layout: MemoryLayout, key: str) -> None:
+    """登记一个 session 已完成事实抽取（增量游标）。"""
+    state = _json_state(fact_extract_state_path(layout))
+    processed = set(state.get("processed") or [])
+    processed.add(key)
+    state["processed"] = sorted(processed)
+    _write(fact_extract_state_path(layout),
+           json.dumps(state, ensure_ascii=False, indent=2))

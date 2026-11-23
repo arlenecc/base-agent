@@ -366,7 +366,9 @@ def test_build_and_store_digest_routes_by_mode(tmp_path):
     assert eng.get_document_outline("auth")["doc_name"] == "docs/auth.md"
     # 全书摘要门控：文档不在库时直接拦截（未生成摘要时返回空串）
     assert eng.get_book_summary("不存在") == ""
-    assert eng.get_book_summary("auth") == ""
+    # 入库内联摘要已生成（核心句方案），无需等空闲调度器
+    assert eng.get_book_summary("auth") != ""
+    assert len(eng.get_chapter_summaries("auth")) == 2
 
 
 def test_build_and_store_digest_normal_mode_writes_documents_table(tmp_path):
