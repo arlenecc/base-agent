@@ -36,8 +36,9 @@ def test_chunk_attachments_dedup_and_used_flag():
     ]
     out = _chunk_attachments(items)
     assert [a["chunk_index"] for a in out] == [0, 4]
+    # 所有切片的核心句都注入上下文，统一标记「已参考」
     assert out[0]["used"] is True
-    assert out[1]["used"] is False
+    assert out[1]["used"] is True
     assert out[0]["text"] == "A0"        # 保留先到（排名更高）的文本
 
 

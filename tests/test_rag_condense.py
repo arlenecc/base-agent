@@ -24,6 +24,8 @@ def _legacy_tool(engine, aux_getter):
     tool = RagSearchTool(engine, aux_llm_getter=aux_getter)
     tool._config = SimpleNamespace(
         rag_presentation_mode=False,
+        # 显式关闭新的「核心句压缩」默认路径，走本测试要验证的 aux 摘要路径
+        rag_condense_use_core_sentences=False,
         rag_condense_min_chars=1,
         rag_condense_max_chars=1_000_000,
         rag_search_top_k=5,
@@ -105,23 +107,24 @@ def test_fallback_when_aux_raises():
 # 检索即展示（Retrieval-as-Presentation）
 # ---------------------------------------------------------------------------
 
-def test_presentation_injects_only_top_chunk():
+def test_presentation_injects_all_chunks():
     engine = _FakeEngine(_chunks(), "原始格式化长文本")
     tool = RagSearchTool(engine)          # 未 bind → 默认 presentation 开启
     res = tool.run(query="量子计算", top_k=3)
     assert res.success
-    # 只有排名最高的切片正文进上下文
+    # 所有切片的核心观点句都进上下文，保证覆盖面
     assert "量子计算利用叠加与纠缠" in res.output
-    assert "Shor 算法" not in res.output
+    assert "Shor 算法" in res.output
     assert "知识库检索到 2 个相关切片" in res.output
     assert "相关度: 0.9000" in res.output
-    # 两条召回都作为气泡附件；第一条标记为「已参考」
+    assert "相关度: 0.8000" in res.output
+    # 两条召回都作为气泡附件；都已注入上下文 → 都标记为「已参考」
     assert len(res.attachments) == 2
     assert res.attachments[0]["used"] is True
     assert res.attachments[0]["source"] == "/kb/q1.md"
-    assert res.attachments[1]["used"] is False
+    assert res.attachments[1]["used"] is True
     assert res.attachments[1]["text"] == "Shor 算法可多项式时间分解大整数。"
-    # 不走辅助模型精简（只有一片，无需归纳）
+    # 不走辅助模型精简（presentation 分支自行压缩）
     assert not engine.formatted_called
 
 
@@ -135,11 +138,11 @@ def test_presentation_keeps_graph_items_in_context():
     tool = RagSearchTool(engine)
     res = tool.run(query="量子计算", top_k=3)
     assert "[实体] 量子计算" in res.output          # 图谱实体仍进上下文
-    assert "量子计算利用叠加与纠缠" in res.output    # 排名最高的原文切片
-    assert "Shor 算法" not in res.output
+    assert "量子计算利用叠加与纠缠" in res.output    # 所有原文切片都注入
+    assert "Shor 算法" in res.output
     # 气泡只包含文档切片，不含图谱条目
     assert [a["source"] for a in res.attachments] == ["/kb/q1.md", "/kb/q2.md"]
-    assert res.attachments[0]["used"] is True
+    assert all(a["used"] for a in res.attachments)
 
 
 def test_presentation_empty_results_falls_back_to_formatted():
@@ -167,3 +170,20 @@ def test_build_condensed_output_includes_sources():
     out = build_condensed_output("q", _chunks(), "摘要内容")
     assert "摘要内容" in out
     assert "q1.md" in out and "q2.md" in out
+
+
+def test_core_sentence_default_no_aux_and_no_char_limit():
+    """默认走本地核心句压缩：不调用 aux，超 12000 字分片同样抽取。"""
+    long_text = ("量子计算利用叠加与纠缠实现并行计算。" * 1500)  # >12000 字
+    chunks = [{"text": long_text, "source": "/kb/long.md",
+               "chunk_index": 0, "score": 0.9}]
+    engine = _FakeEngine(chunks, "原始格式化")
+    aux = _FakeAux("aux 摘要内容")
+    tool = RagSearchTool(engine, aux_llm_getter=lambda: aux)
+    tool._config = SimpleNamespace(rag_presentation_mode=False)
+    res = tool.run(query="量子计算", top_k=3)
+    assert res.success
+    assert "核心句压缩" in res.output
+    assert "aux 摘要内容" not in res.output   # 默认路径不调 aux
+    assert len(res.output) < len(long_text)   # 确实压缩了
+    assert not engine.formatted_called        # 未回退格式化路径

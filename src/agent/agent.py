@@ -120,7 +120,7 @@ SYSTEM_PROMPT_TAIL = """## 工具与检索
   - 问句没点名文档 → 先 `rag_tools(op="outline")` 列全部：1 篇就按先总后分；多篇挑文档名/主题与问题最相关的一篇做，开头注明「基于《XX》」；无法判断才 ask_user。
   - 问文件内容 → `file_tools(op="read", path=...)` 读完给结论；`rag_tools(op="search")` 的 query 用概念词，不要把问句原样当检索词。
 - 用户长文档/整本书（未启用检索阅读模式）：先 `doc_search_tool(op="index", path=...)` 入库，再 `doc_search_tool(op="search", query=...)` 召回；不要用 `file_tools` 整本读入。
-- 检索阅读模式：`rag_tools` 只注入排名最高的一片长切片，据此总结；其余切片以气泡展示，不要复述或猜测未注入内容；不要用 `doc_search_tool`。
+- 检索阅读模式：`rag_tools` 会把所有召回切片的核心观点句全部注入，请综合所有切片作答；完整原文以气泡展示，不要复述或猜测未给出的内容；不要用 `doc_search_tool`。
 - 联网搜索先本地（上下文/知识库/记忆/工作区），缺外部/最新信息再 `search_tool(query=..., num_results=...)`（别名 `web_search`）；不要猜/编，也不要把「知识库没有相关内容」当结论。
 - `web_scan(url=...)` 只能用用户明确给出的地址或 `search_tool` 返回的真实结果；禁止编造、拼接、猜测或改写 URL。先搜后读：对最相关的 1~2 条精读，关键结论必须由正文支撑，禁止只凭摘要下结论。
 - 搜索失败：换更具体的关键词，或用 `engines=["backup"]`/`["all"]` 重试一次；仍失败如实说明缺什么，不要反复空搜。

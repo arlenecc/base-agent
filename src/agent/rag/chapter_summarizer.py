@@ -30,6 +30,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..atomic_io import atomic_write_json, backup_corrupt
+from ..core_opinion import extract_core_opinion_sentences
 
 logger = logging.getLogger(__name__)
 
@@ -267,13 +268,22 @@ class ChapterSummaryScheduler:
                     continue
                 # 章节全部完成 → 收尾全书摘要（一次）。
                 if not book.get("book_summary"):
-                    aux, mode = self._acquire_aux()
-                    try:
+                    use_core = bool(getattr(
+                        cfg, "rag_summary_use_core_sentences", True))
+                    if use_core:
+                        # 核心句模式无需辅助模型，不 acquire。
+                        aux, mode = None, "core"
                         summary = self._generate_book_summary(
                             aux, json.loads(info.get("chapters") or "[]"),
                             book.get("chapters", []))
-                    finally:
-                        self._release_aux(aux, mode)
+                    else:
+                        aux, mode = self._acquire_aux()
+                        try:
+                            summary = self._generate_book_summary(
+                                aux, json.loads(info.get("chapters") or "[]"),
+                                book.get("chapters", []))
+                        finally:
+                            self._release_aux(aux, mode)
                     if not summary:
                         return _FAILURE_COOLDOWN
                     book["book_summary"] = summary
@@ -372,11 +382,17 @@ class ChapterSummaryScheduler:
             return None  # 全部完成（全书摘要由调用方收尾）
 
         ch = chapters[target]
-        aux, mode = self._acquire_aux()
-        try:
+        # 核心句模式无需辅助模型：不 acquire（避免临时加载 GB 级权重）。
+        use_core = bool(getattr(cfg, "rag_summary_use_core_sentences", True))
+        if use_core:
+            aux, mode = None, "core"
             summary = self._generate_chapter_summary(aux, ch)
-        finally:
-            self._release_aux(aux, mode)
+        else:
+            aux, mode = self._acquire_aux()
+            try:
+                summary = self._generate_chapter_summary(aux, ch)
+            finally:
+                self._release_aux(aux, mode)
         if not summary:
             logger.warning("逐章摘要: 《%s》第 %d 章摘要生成失败（冷却重试）",
                            doc_name, target)
@@ -442,6 +458,33 @@ class ChapterSummaryScheduler:
                 break
         return "".join(out).strip()
 
+    @staticmethod
+    def _core_summary(text: str, max_chars: int, top_n: int = 12) -> str:
+        """本地核心句摘要（默认策略，不调用辅助模型）。
+
+        抽取核心观点句后按上限装箱，保留原文顺序；无字数门槛、无输入上限。
+        空输入返回空串；抽取不到句子时退化为原文硬截断。
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        sentences = extract_core_opinion_sentences(raw, top_n=top_n)
+        picked: list[str] = []
+        total = 0
+        for s in sentences:
+            s = s.strip()
+            if not s:
+                continue
+            if total + len(s) > max_chars and picked:
+                break
+            picked.append(s)
+            total += len(s)
+            if total >= max_chars:
+                break
+        if not picked:
+            return raw[:max_chars].rstrip() + ("…" if len(raw) > max_chars else "")
+        return "".join(picked).rstrip()
+
     # ------------------------------------------------------------------
     # 辅助引擎上下文窗口探测
     # ------------------------------------------------------------------
@@ -479,6 +522,14 @@ class ChapterSummaryScheduler:
         text = (getattr(chapter, "text", "") or "").strip()
         if not text:
             return ""
+
+        # 默认策略：本地核心句压缩（无字数门槛、不调用辅助模型）。
+        cfg = self._get_config()
+        if bool(getattr(cfg, "rag_summary_use_core_sentences", True)):
+            summary = self._core_summary(text, _CHAPTER_SUMMARY_MAX)
+            logger.info("核心句压缩章摘要《%s》: %d → %d 字",
+                        getattr(chapter, "title", ""), len(text), len(summary))
+            return summary
 
         ctx = self._aux_context_tokens(aux)
         budget_tokens = max(256, ctx - _SUMMARY_OUT_TOKENS - _SUMMARY_SYS_TOKENS)
@@ -654,8 +705,11 @@ class ChapterSummaryScheduler:
             else:
                 parts.append(f"- {title}")
         doc = "\n".join(parts)
-        # 同样尊重上下文窗口：全书摘要输入（目录+各章摘要）可能很长，按其
-        # 预算截断，避免小窗口辅助引擎溢出。
+        # 默认策略：本地核心句压缩全书摘要（不调用辅助模型）。
+        cfg = self._get_config()
+        if bool(getattr(cfg, "rag_summary_use_core_sentences", True)):
+            return self._core_summary(doc, 300, top_n=20)
+        # 辅助模型备用路径：同样尊重上下文窗口，避免小窗口辅助引擎溢出。
         budget_tokens = max(256, self._aux_context_tokens(aux)
                             - _SUMMARY_OUT_TOKENS - _SUMMARY_SYS_TOKENS)
         budget_chars = max(800, int(budget_tokens * _CHARS_PER_TOKEN))

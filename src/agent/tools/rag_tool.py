@@ -6,6 +6,7 @@ import os
 from typing import Any, Dict, TYPE_CHECKING
 
 from .base import Tool, ToolResult, ToolRegistry, _FanoutTool
+from ..core_opinion import simplify_for_scoring
 from ..rag.postprocess import (
     condense_retrieved_chunks,
     build_condensed_output,
@@ -16,8 +17,8 @@ logger = logging.getLogger(__name__)
 # 工具输出体积兜底（与 mcp_client / tools.memory 同策略）：引擎侧未对内部分片
 # 截断时，一次检索就能把上下文撑爆。
 _MAX_TOOL_OUTPUT_CHARS = 200_000
-# 检索即展示模式下，唯一进上下文的切片正文上限（字符）。单切片通常
-# ~800-1500 字；超长切片按此截断，避免一次检索就吃掉大块上下文。
+# 检索即展示模式下，单切片压缩后的硬上限（字符）。核心句抽取已把
+# 长切片压到 800 字以内；这里只兜底无标点/单句超长文本。
 _MAX_PRESENTATION_CHUNK_CHARS = 1500
 # 知识图谱结果：实体/关系是摘要形态，体积可控，**始终**进上下文。
 _GRAPH_KINDS = ("kg_entity", "kg_relation")
@@ -30,33 +31,34 @@ _DEFAULT_SEARCH_DESCRIPTION = (
     "在本地知识库中检索**资料内容**。仅当问题依赖用户的资料时使用"
     "（如查某主题的原文、某本书的细节）；「知识库里有什么/你能做什么」"
     "这类问题不适用——前者用 rag_tools(op='outline') 列文档，后者直接回答。"
-    "检索只把**最相关的一段原文**提供给你参考，其余召回切片会以气泡形式"
-    "展示给用户（用户可点击查看），据此作答即可，不要声称看不到其余内容。"
+    "检索会把**所有召回切片**抽取核心观点句后注入上下文；完整原文仍以气泡"
+    "展示给用户。请综合所有切片作答，不要声称看不到其余内容。"
 )
 _READING_SEARCH_DESCRIPTION = (
     "在本地知识库中检索**资料内容**（检索阅读模式）。仅当问题依赖用户的资料时"
     "使用；「知识库里有什么/你能做什么」这类问题不适用——前者用 "
     "rag_tools(op='outline') 列文档，后者直接回答。"
-    "只把排名最高的**一片**长切片注入上下文供你总结/回答，其余召回切片以"
-    "可点击的「参考切片」气泡附在回复末尾；不要复述整片原文，也不要猜测或"
-    "编造未提供的切片内容。"
+    "检索会把**所有召回切片**抽取核心观点句后注入上下文，请综合所有切片"
+    "总结/回答；完整原文以可点击的「参考切片」气泡附在回复末尾。不要复述"
+    "整片原文，也不要猜测或编造未给出的内容。"
 )
 _DEFAULT_RAG_TOOLS_DESCRIPTION = (
     "Unified local knowledge-base operations. op one of:\n"
-    "- search(query, top_k?, source?): retrieve material content; only the "
-    "top-ranked excerpt is provided to you, other hits are shown to the user "
-    "as reference chips (do not claim you cannot see them)\n"
+    "- search(query, top_k?, source?): retrieve material content; every "
+    "returned chunk is reduced to core opinion sentences and injected into "
+    "your context; full text stays available to the user as reference chips "
+    "(do not claim you cannot see the other chunks)\n"
     "- outline(book_name?): list all docs (no arg) or a document's outline\n"
     "- status(): knowledge-base status (chunks, sources)\n"
     "- ingest(force?): re-index the knowledge-base directory"
 )
 _READING_RAG_TOOLS_DESCRIPTION = (
     "Unified local knowledge-base operations (retrieval-reading mode). op one of:\n"
-    "- search(query, top_k?, source?): retrieve long-document chunks. Only the "
-    "top-ranked chunk is injected into your context for summarizing/answering; "
-    "all remaining hits are shown to the user as clickable reference chips at "
-    "the end of the reply. Do not restate the whole chunk, and never guess or "
-    "invent the content of chips you were not given.\n"
+    "- search(query, top_k?, source?): retrieve long-document chunks. Every "
+    "returned chunk is reduced to core opinion sentences and injected into "
+    "your context for summarizing/answering; full text stays available to the "
+    "user as clickable reference chips. Do not restate the whole chunk, and "
+    "never guess or invent content that was not provided.\n"
     "- outline(book_name?): list all docs (no arg) or a document's outline\n"
     "- status(): knowledge-base status (chunks, sources)\n"
     "- ingest(force?): re-index the knowledge-base directory"
@@ -80,11 +82,11 @@ def _is_graph_item(item: Dict[str, Any]) -> bool:
     return item.get("kind") in _GRAPH_KINDS
 
 
-def _chunk_attachments(items: list, mark_first_used: bool = True) -> list:
+def _chunk_attachments(items: list) -> list:
     """召回切片 → UI 气泡附件（同文档同序号去重，保留重排后的顺序）。
 
-    ``mark_first_used`` 为 True 时只有第一条（排名最高、真正进上下文的那片）
-    标记 ``used=True``；阅读模式只注入最高分切片，同样传 True。
+    所有切片的核心观点句都已注入上下文，因此统一标记 ``used=True``
+    （UI 显示「已参考」）；完整原文仍可点开查看。
     """
     out: list = []
     seen = set()
@@ -99,33 +101,49 @@ def _chunk_attachments(items: list, mark_first_used: bool = True) -> list:
             "chunk_index": r.get("chunk_index"),
             "score": float(r.get("score") or 0.0),
             "text": r.get("text") or "",
-            "used": bool(mark_first_used and not out),
+            "used": True,
         })
     return out
 
 
-def _format_presentation_output(graph_items: list, top_chunk: Any,
-                                total_chunks: int) -> str:
-    """检索即展示：图谱条目全量 + 排名最高的一段原文。"""
+def _compact_chunk_text(item: Dict[str, Any]) -> str:
+    """单个切片 → 核心观点句（默认 ≤800 字），再兜底硬截断。"""
+    text = simplify_for_scoring(str(item.get("text") or ""))
+    if len(text) > _MAX_PRESENTATION_CHUNK_CHARS:
+        text = text[:_MAX_PRESENTATION_CHUNK_CHARS] + "…"
+    return text
+
+
+def _format_chunk_blocks(doc_chunks: list) -> list:
+    """把多个切片格式化成「来源/相关度 + 核心观点句」块。"""
+    lines: list = []
+    for i, item in enumerate(doc_chunks, 1):
+        src = os.path.basename(item.get("source") or "") or "文档"
+        try:
+            score = float(item.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        lines.append(f"### [{i}] 来源: {src} (相关度: {score:.4f})")
+        lines.append(_compact_chunk_text(item))
+        lines.append("")
+    return lines
+
+
+def _format_presentation_output(graph_items: list, doc_chunks: list) -> str:
+    """检索即展示：图谱条目全量 + 所有切片的核心观点句全量注入。"""
     lines: list = []
     if graph_items:
         lines.append(f"知识图谱命中 {len(graph_items)} 条实体/关系：")
         lines.extend(str(it.get("text") or "") for it in graph_items)
-    if top_chunk is not None:
-        text = top_chunk.get("text") or ""
-        if len(text) > _MAX_PRESENTATION_CHUNK_CHARS:
-            text = text[:_MAX_PRESENTATION_CHUNK_CHARS] + "…"
-        src = os.path.basename(top_chunk.get("source") or "")
-        score = float(top_chunk.get("score") or 0.0)
+    if doc_chunks:
         lines.append(
-            f"知识库检索到 {total_chunks} 个相关切片；以下是与问题最相关的一段"
-            f"原文（其余 {max(0, total_chunks - 1)} 条已作为参考资料展示给用户，"
-            "未注入上下文，无需复述）：")
-        lines.append(f"### 来源: {src} (相关度: {score:.4f})")
-        lines.append(text)
+            f"知识库检索到 {len(doc_chunks)} 个相关切片；以下每个切片的"
+            "核心观点句均已注入上下文，请综合所有切片作答。完整原文已作为"
+            "参考切片气泡展示给用户，不要声称看不到其余内容。")
+        lines.extend(_format_chunk_blocks(doc_chunks))
     if not lines:
         lines.append("（知识库中未找到相关内容。）")
-    return "\n".join(lines)
+    return "\n".join(lines).strip()
 
 
 def _cap_output(text: str) -> str:
@@ -195,8 +213,9 @@ class RagSearchTool(Tool):
         # 保存 config 引用：默认 top_k 与辅助模型精简阈值都做成可配置项，
         # 运行时从这里读（bind 在工具注册时被调用，早于任何 run）。
         self._config = config
-        # 工具描述随模式切换：阅读模式下只注入最高分一片，其余出气泡；
-        # 描述必须与实际数据分流一致，否则模型会编造未提供的切片正文。
+        # 工具描述随模式切换：阅读模式/展示模式下所有切片抽取核心观点句
+        # 后注入，完整原文出气泡；描述必须与实际数据分流一致，否则模型会
+        # 编造未提供的切片正文。
         self.description = (
             _READING_SEARCH_DESCRIPTION
             if _reading_enabled(self._engine, config)
@@ -267,53 +286,44 @@ class RagSearchTool(Tool):
         try:
             # 先取重排后的原始分片（含完整 text，未截断），供辅助模型通读归纳。
             chunks = self._engine.search(query, top_k=top_k, source=source or None)
-            # 检索阅读模式：切片体量大（2500~3000 字），只把排名最高的一片
-            # 注入上下文供模型总结/回答；其余切片作为可点击气泡附在回复末尾，
-            # 避免一次检索吃满上下文，同时保证模型有真实依据可读。
+            # 检索阅读模式：所有召回切片都抽取核心观点句后注入，保证覆盖面；
+            # 完整原文仍作为可点击气泡附在回复末尾。
             if reading_mode:
                 attachments = _chunk_attachments(chunks) if chunks else []
+                doc_chunks = [r for r in chunks if not _is_graph_item(r)]
+                graph_items = [r for r in chunks if _is_graph_item(r)]
                 if chunks:
-                    top_chunk = chunks[0]
-                    text = top_chunk.get("text") or ""
-                    src = os.path.basename(
-                        top_chunk.get("source") or "") or "文档"
-                    score = float(top_chunk.get("score") or 0.0)
-                    rest = max(0, len(attachments) - 1)
                     output = (
                         f"检索阅读模式已召回 {len(attachments)} 个长文档切片。"
-                        "以下是与问题最相关的**一片**原文，已注入上下文，请据此"
-                        f"总结或回答；其余 {rest} 片没有注入，已作为可点击的"
-                        "「参考切片」气泡附在回复末尾，可提示用户点开阅读。"
-                        "只基于下面给出的原文作答，不要复述整片，也不要猜测或"
-                        "编造其余切片内容。"
-                    )
-                    output += (
-                        f"\n\n### 来源: {src} (相关度: {score:.4f})\n{text}")
+                        "以下每个切片的核心观点句均已注入上下文，请综合所有"
+                        "切片总结或回答；完整原文已作为可点击的「参考切片」"
+                        "气泡附在回复末尾，可提示用户点开阅读。不要复述整片"
+                        "原文，也不要猜测或编造未给出的内容。")
+                    extra = [str(it.get("text") or "") for it in graph_items]
+                    extra.extend(_format_chunk_blocks(doc_chunks))
+                    output += "\n\n" + "\n".join(extra)
                 else:
                     output = (
                         "检索阅读模式未召回匹配切片。请提示用户换一个更具体的"
                         "问题或先同步/导入对应文档，不要编造内容。")
                 logger.info(
-                    "✅ 阅读模式 RAG 检索 %d 条 → 上下文注入最高分 1 片，"
-                    "气泡 %d 条", len(chunks), len(attachments))
+                    "✅ 阅读模式 RAG 检索 %d 条 → 上下文注入全部 %d 片核心句，"
+                    "气泡 %d 条", len(chunks), len(doc_chunks), len(attachments))
                 return ToolResult(
                     success=True, output=_cap_output(output),
                     attachments=attachments)
-            # 检索即展示（Retrieval-as-Presentation）：默认数据分流——只有排名
-            # 最高的 1 个切片进上下文，其余切片只作为 UI 附件（气泡）展示，
-            # 避免召回多时模型被长上下文拖慢、召回少时又漏信息。图谱实体/关系
-            # 是摘要形态，仍全量进上下文。
+            # 检索即展示（Retrieval-as-Presentation）：图谱条目全量 + 所有
+            # 原文切片的核心观点句全量注入；完整原文作为气泡展示。
             if bool(getattr(cfg, "rag_presentation_mode", True)):
                 if chunks:
                     graph_items = [r for r in chunks if _is_graph_item(r)]
                     doc_chunks = [r for r in chunks if not _is_graph_item(r)]
-                    top_chunk = doc_chunks[0] if doc_chunks else None
                     output = _format_presentation_output(
-                        graph_items, top_chunk, len(doc_chunks))
+                        graph_items, doc_chunks)
                     logger.info(
-                        "✅ RAG 检索 %d 条 → 上下文注入 图谱 %d / 原文 %d，"
-                        "气泡展示 %d 条",
-                        len(chunks), len(graph_items), int(top_chunk is not None),
+                        "✅ RAG 检索 %d 条 → 上下文注入 图谱 %d / 原文 %d 片"
+                        "核心句，气泡展示 %d 条",
+                        len(chunks), len(graph_items), len(doc_chunks),
                         len(doc_chunks),
                     )
                     return ToolResult(
@@ -324,41 +334,53 @@ class RagSearchTool(Tool):
                     query, top_k=top_k, source=source or None,
                 )
                 return ToolResult(success=True, output=_cap_output(results))
-            aux = self._aux_llm_getter() if self._aux_llm_getter else None
             condensed = ""
-            if chunks and aux is not None:
-                total_chars = sum(len(r.get("text") or "") for r in chunks)
-                min_chars = int(getattr(cfg, "rag_condense_min_chars", 4000) or 4000)
-                max_in = int(getattr(cfg, "rag_condense_max_chars", 12000) or 12000)
-                # 仅当检索总量落在 [min, max] 区间才调用辅助模型归纳精简：
-                #   * 低于 min → 原样注入。内容本来就少，精简只会丢细节，
-                #     还白耗一次辅助模型调用（慢）；
-                #   * 高于 max → 也不送辅助模型（超出其舒适上下文，效果差），
-                #     交由下方格式化路径按相关度截断。
-                if total_chars < min_chars:
-                    logger.info(
-                        "  ├─ 检索总量 %d 字 < 精简下限 %d 字 → 跳过辅助模型归纳（原样注入）",
-                        total_chars, min_chars,
-                    )
-                elif total_chars > max_in:
-                    logger.info(
-                        "  ├─ 检索总量 %d 字 > 精简上限 %d 字 → 跳过辅助模型归纳（格式化截断）",
-                        total_chars, max_in,
-                    )
-                else:
-                    try:
-                        condensed = condense_retrieved_chunks(query, chunks, aux, max_chars=2000)
-                    except Exception as e:  # 精简异常不应让检索整体失败
-                        logger.warning("RAG 辅助模型精简异常，回退原始结果: %s", e)
-                        condensed = ""
-            if condensed:
-                output = build_condensed_output(query, chunks, condensed)
+            use_core = bool(getattr(cfg, "rag_condense_use_core_sentences", True))
+            if chunks and use_core:
+                # 默认路径：本地核心句压缩，无字数门槛、无输入上限（12000 字以上
+                # 同样逐切片抽取），不依赖辅助模型。逐切片压缩后拼成精简结果。
+                parts: list[str] = []
+                for i, r in enumerate(chunks, 1):
+                    txt = str(r.get("text") or "")
+                    core = simplify_for_scoring(txt, min_chars=0)
+                    if not core:
+                        continue
+                    src = r.get("source") or ""
+                    head = f"[片段 {i}]" + (f" 来源: {os.path.basename(src)}" if src else "")
+                    parts.append(f"{head}\n{core}")
+                condensed = "\n\n".join(parts)
                 logger.info(
-                    "✅ RAG 检索 %d 条 → 辅助模型精简为 %d 字注入主模型",
+                    "  ├─ 核心句压缩（本地，无字数门槛）: %d 条 → %d 字",
                     len(chunks), len(condensed),
                 )
+            elif chunks:
+                # 备用路径：开关关闭时保留原辅助模型摘要（含 [min,max] 区间约束）。
+                aux = self._aux_llm_getter() if self._aux_llm_getter else None
+                if aux is not None:
+                    total_chars = sum(len(r.get("text") or "") for r in chunks)
+                    min_chars = int(getattr(cfg, "rag_condense_min_chars", 4000) or 4000)
+                    max_in = int(getattr(cfg, "rag_condense_max_chars", 12000) or 12000)
+                    if total_chars < min_chars or total_chars > max_in:
+                        logger.info(
+                            "  ├─ 检索总量 %d 字不在 [%d,%d] → 跳过辅助模型归纳",
+                            total_chars, min_chars, max_in,
+                        )
+                    else:
+                        try:
+                            condensed = condense_retrieved_chunks(
+                                query, chunks, aux, max_chars=2000)
+                        except Exception as e:  # 精简异常不应让检索整体失败
+                            logger.warning("RAG 辅助模型精简异常，回退原始结果: %s", e)
+                            condensed = ""
+            if condensed:
+                method = "核心句压缩" if use_core else "辅助模型归纳"
+                output = build_condensed_output(query, chunks, condensed, method=method)
+                logger.info(
+                    "✅ RAG 检索 %d 条 → %s为 %d 字注入主模型",
+                    len(chunks), method, len(condensed),
+                )
                 return ToolResult(success=True, output=output)
-            # 回退：辅助模型不可用 / 总量不在精简区间 / 精简失败时，维持原格式化行为。
+            # 回退：浓缩未产出 / 辅助模型不可用 / 总量不在精简区间时，维持原格式化行为。
             results = self._engine.search_formatted(
                 query, top_k=top_k, source=source or None,
             )
@@ -501,7 +523,8 @@ class RagStatusTool(Tool):
             ]
             if status.get("reading_mode"):
                 lines.append(
-                    "  运行模式: 检索阅读模式（最高分 1 片注入上下文，其余仅气泡展示）")
+                    "  运行模式: 检索阅读模式（所有切片核心句注入上下文，"
+                    "完整原文仅气泡展示）")
             if status["sources"]:
                 sources = status["sources"]
                 # 大知识库可能索引了成百上千个文件，全量列出既挤占上下文也

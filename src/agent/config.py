@@ -119,7 +119,8 @@ class AgentConfig:
     # 开启后知识库同步在文档解析为 Markdown 之后，跳过原有「token 切片 →
     # embedding → 向量库」链路，改用 doc_chunker + Jina ColBERT v2 残差量化
     # 写 LanceDB 三表；检索用 BM25 + 中心向量 RRF 粗筛 + MaxSim 精排。
-    # 召回时最高分切片注入模型上下文供总结，其余切片作为回复末尾气泡。
+    # 召回时所有切片抽取核心观点句后注入模型上下文供综合总结，完整原文
+    # 作为回复末尾气泡；不再只注入最高分切片。
     rag_reading_mode_enabled: bool = False
     # 普通向量模式异步填充：同步时切片文本先行入库（无向量），同步立即
     # 完成、BM25 立即可用；后台 daemon 线程分批回填 embedding，向量检索
@@ -184,6 +185,11 @@ class AgentConfig:
     # 其舒适上下文），交由格式化路径按相关度截断。
     rag_condense_min_chars: int = 4000
     rag_condense_max_chars: int = 12000
+    # 检索结果浓缩策略：默认用本地「核心句压缩」（无字数门槛、任何长度都抽取，
+    # 不耗辅助模型）。关闭时回退旧的「辅助模型摘要」路径（受上面区间约束）。
+    rag_condense_use_core_sentences: bool = True
+    # 章节/全书摘要策略：默认同样用本地核心句压缩；关闭时才用辅助模型摘要。
+    rag_summary_use_core_sentences: bool = True
     rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
     # 重排序模型：**INT8 量化版**（~570MB）。fp32 全量是 2.27GB，4 倍体积
     # 4 倍内存，而 cross-encoder 只输出排序分数，INT8 的排序质量损失可忽略
@@ -531,6 +537,8 @@ class AgentConfig:
                     "rag_reading_mode_enabled", "rag_reading_use_ann",
                     "rag_embed_background",
                     "rag_decision_use_core_sentences",
+                    "rag_condense_use_core_sentences",
+                    "rag_summary_use_core_sentences",
                     "rag_multi_decision_mode",
                     "memory_system_enabled")
 

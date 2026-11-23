@@ -14,11 +14,15 @@ import os
 from typing import Any, Dict, Optional
 
 from .base import Tool, ToolResult
+from ..core_opinion import simplify_for_scoring
 from ..rag.colbert_store import (
     ColBertDocStore, ColBertStoreError, get_store_for_workspace,
     _MAX_COARSE, _MAX_TOP_K,
 )
 from ..rag.colbert_runtime import ColBertUnavailable
+
+
+_MAX_READING_CHUNK_CHARS = 1500
 
 
 def _get_store(config: Any) -> ColBertDocStore:
@@ -39,11 +43,11 @@ class DocSearchTool(Tool):
     _READING_DESCRIPTION = (
         "Long-document retrieval over the knowledge base (ColBERT + LanceDB). "
         "Retrieval-reading mode is on: the knowledge base is already indexed "
-        "by the sync pipeline, so use op='search' only. The top-ranked chunk is "
-        "provided to you for summarizing/answering; remaining hits are returned "
-        "as clickable chips for the user. op='index'/'delete' are disabled in "
-        "this mode — use rag_tools(op='ingest') and the knowledge-base sync "
-        "instead."
+        "by the sync pipeline, so use op='search' only. Every returned chunk is "
+        "reduced to core opinion sentences and injected into your context for "
+        "summarizing/answering; full text stays available as clickable chips "
+        "for the user. op='index'/'delete' are disabled in this mode — use "
+        "rag_tools(op='ingest') and the knowledge-base sync instead."
     )
     destructive = False
     parameters = {
@@ -215,7 +219,7 @@ class DocSearchTool(Tool):
 
     def _search_reading(self, store: ColBertDocStore, query: str,
                         top_k: int, coarse_k: int) -> ToolResult:
-        """阅读模式检索：最高分切片进上下文供总结，其余切片只做气泡附件。
+        """阅读模式检索：所有切片抽取核心观点句后注入，完整原文只做气泡附件。
 
         阅读模式的「精选 topN / 粗筛候选 / ANN」由配置窗口统一控制，
         与 rag_tools 保持一致，因此忽略模型传入的 top_k/coarse_k。
@@ -259,7 +263,8 @@ class DocSearchTool(Tool):
                 "chunk_index": h.get("chunk_index", 0),
                 "score": float(h.get("score") or 0.0),
                 "text": h.get("content") or "",
-                "used": not attachments,  # 只有最高分（首条）注入上下文
+                # 所有切片的核心观点句都会注入上下文
+                "used": True,
             })
         if not attachments:
             return ToolResult(
@@ -268,15 +273,20 @@ class DocSearchTool(Tool):
                         f'retrieval-reading mode. Ask the user to sync the '
                         f'knowledge base or rephrase the query; do not make up '
                         f'content.'))
-        top = attachments[0]
-        src = os.path.basename(top["source"]) or "文档"
-        rest = max(0, len(attachments) - 1)
+        blocks: list = []
+        for i, att in enumerate(attachments, 1):
+            text = simplify_for_scoring(str(att.get("text") or ""))
+            if len(text) > _MAX_READING_CHUNK_CHARS:
+                text = text[:_MAX_READING_CHUNK_CHARS] + "…"
+            src = os.path.basename(att["source"]) or "文档"
+            blocks.append(
+                f"### [{i}] 来源: {src} (相关度: {att['score']:.4f})\n{text}")
         output = (
             f"检索阅读模式已召回 {len(attachments)} 个长文档切片。"
-            "以下是与问题最相关的**一片**原文，已注入上下文，请据此总结或回答；"
-            f"其余 {rest} 片没有注入，已作为可点击的「参考切片」气泡附在回复末尾。"
-            "只基于下面给出的原文作答，不要复述整片，也不要猜测或编造其余切片内容。"
-            f"\n\n### 来源: {src} (相关度: {top['score']:.4f})\n{top['text']}")
+            "以下每个切片的核心观点句均已注入上下文，请综合所有切片总结或"
+            "回答；完整原文已作为可点击的「参考切片」气泡附在回复末尾。"
+            "不要复述整片原文，也不要猜测或编造未给出的内容。"
+            "\n\n" + "\n\n".join(blocks))
         return ToolResult(
             True, output=output, attachments=attachments)
 

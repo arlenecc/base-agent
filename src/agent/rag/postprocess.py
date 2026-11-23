@@ -102,13 +102,17 @@ def build_condensed_output(
     query: str,
     chunks: List[Dict[str, Any]],
     condensed: str,
+    method: str = "辅助模型归纳",
 ) -> str:
-    """把精简摘要包装成工具结果文本，并附带来源文件线索供主模型引用。"""
+    """把精简摘要包装成工具结果文本，并附带来源文件线索供主模型引用。
+
+    ``method`` 标明浓缩方式（核心句压缩 / 辅助模型归纳），便于主模型理解结果来源。
+    """
     sources = sorted({_basename(r.get("source") or "") for r in (chunks or []) if r.get("source")})
     src_line = f"（来源文件：{', '.join(sources)}）" if sources else ""
     return (
         f"从知识库检索到 {len(chunks)} 条相关内容（已重排序），"
-        f"经辅助模型归纳精简如下{src_line}：\n\n{condensed}"
+        f"经{method}精简如下{src_line}：\n\n{condensed}"
     )
 
 

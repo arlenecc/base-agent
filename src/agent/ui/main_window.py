@@ -3094,8 +3094,8 @@ class MainWindow(QMainWindow):
             "启用后，知识库同步在文档解析为 Markdown 之后，跳过原有\n"
             "「token 切片 → embedding → 向量库 → reranker」链路，改用\n"
             "Jina ColBERT v2（64 维 INT8）残差量化写 LanceDB 三表。\n"
-            "召回时只把排名最高的一片长切片注入上下文供模型总结，其余\n"
-            "切片作为回复末尾的可点击气泡展示。\n\n"
+            "召回时把所有切片抽取核心观点句后全部注入上下文供模型综合\n"
+            "总结，完整原文作为回复末尾的可点击气泡展示。\n\n"
             "注意：目录/摘要等元数据按模式各存一份，两种模式的文档互相\n"
             "独立——切换到极速检索模式后需重新同步知识库，文件归属会随同步\n"
             "迁移（旧模式库中的对应数据自动清理）。")
@@ -5550,7 +5550,8 @@ class MainWindow(QMainWindow):
                     str(getattr(self.config, "rag_mode", "vector")
                         or "vector").strip().lower() == "fast")
                 summary += (
-                    f"检索阅读切片：{chunks} 个（最高分切片注入上下文，其余气泡展示）\n"
+                    f"检索阅读切片：{chunks} 个（所有切片核心句注入上下文，"
+                    "完整原文气泡展示）\n"
                     if _reading else f"向量切片：{chunks} 个\n")
             msg = summary
             if errors:
@@ -5561,8 +5562,8 @@ class MainWindow(QMainWindow):
                     msg += f"  …（还有 {len(errors) - 5} 个）\n"
             if (str(getattr(self.config, "rag_mode", "vector")
                     or "vector").strip().lower() == "fast"):
-                msg += ("\n后续对话将在检索阅读模式下把最高分切片注入上下文供总结，"
-                        "其余切片以气泡展示。")
+                msg += ("\n后续对话将在检索阅读模式下把所有切片的核心观点句注入"
+                        "上下文供综合总结，完整原文以气泡展示。")
             else:
                 msg += "\n后续对话将自动参考知识库内容进行回答。"
             self._refresh_reading_index_status()

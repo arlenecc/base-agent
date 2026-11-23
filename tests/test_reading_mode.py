@@ -188,7 +188,7 @@ def test_reading_cleanup_deletes_colbert_chunks(tmp_path):
     assert stats["files_deleted"] == 1
 
 
-def test_rag_search_tool_reading_mode_injects_top_chunk_only():
+def test_rag_search_tool_reading_mode_injects_all_chunks():
     class FakeEngine:
         def search(self, query, top_k=5, source=None):
             return [
@@ -212,12 +212,48 @@ def test_rag_search_tool_reading_mode_injects_top_chunk_only():
     result = tool.run(query="认证流程")
     assert result.success
     assert len(result.attachments) == 3
-    assert result.attachments[0]["used"] is True
-    assert all(not a["used"] for a in result.attachments[1:])
+    assert all(a["used"] for a in result.attachments)
     assert "已注入上下文" in result.output
-    assert "第一片正文" in result.output       # 最高分切片给模型总结
-    assert "第二片正文" not in result.output   # 其余只出气泡
-    assert "第三片正文" not in result.output
+    # 所有切片都抽取核心句后进上下文，不再只给 top1
+    assert "第一片正文" in result.output
+    assert "第二片正文" in result.output
+    assert "第三片正文" in result.output
+
+
+def test_rag_search_tool_reading_mode_compacts_all_chunks():
+    """长切片也必须全部压缩后注入，不能只给 top1。"""
+    filler = "".join(
+        f"第{i}句是普通背景说明，不涉及关键结论。" for i in range(80))
+    chunks = [
+        {"source": "/docs/a.md", "chunk_index": 0, "score": 9.0,
+         "text": filler + "关键结论：一线城市住宿上限 500 元。"},
+        {"source": "/docs/b.md", "chunk_index": 0, "score": 8.0,
+         "text": filler + "关键结论：发票需在 7 个工作日内提交。"},
+        {"source": "/docs/c.md", "chunk_index": 0, "score": 7.0,
+         "text": filler + "关键结论：设备补贴每月 200 元。"},
+    ]
+
+    class FakeEngine:
+        def search(self, query, top_k=5, source=None):
+            return chunks
+
+        def search_formatted(self, *args, **kwargs):
+            return "should not be used"
+
+    cfg = AgentConfig()
+    cfg.rag_mode = "fast"
+    cfg.rag_reading_top_n = 3
+    tool = RagSearchTool(FakeEngine())
+    tool.bind(cfg, None)
+    res = tool.run(query="制度总结")
+
+    assert res.success
+    assert len(res.attachments) == 3
+    assert all(a["used"] for a in res.attachments)
+    for fact in ("500 元", "7 个工作日", "200 元"):
+        assert fact in res.output
+    assert len(res.output) < sum(len(c["text"]) for c in chunks), \
+        "长切片应先压缩再注入"
 
 
 def test_rag_search_tool_follows_engine_reading_mode_over_config():
@@ -244,16 +280,24 @@ def test_rag_search_tool_follows_engine_reading_mode_over_config():
 
 
 def test_doc_search_tool_reading_mode_bubbles_and_blocks_mutation(monkeypatch):
-    """doc_search_tool 与知识库共用三表：阅读模式下只出气泡，禁止绕过同步改索引。"""
+    """doc_search_tool 与知识库共用三表：阅读模式下所有切片压缩注入，禁止改索引。"""
     from agent.tools import doc_search as ds
+
+    filler = "".join(f"第{i}句是普通背景说明。" for i in range(60))
 
     class FakeStore:
         def search(self, query, top_k=5, coarse_k=20, include_content=True,
                    max_content_chars=1500, use_ann=False, min_score=0.0):
-            return [{"doc_id": "abc:00000", "title": "手册 > 认证",
-                     "source": "/docs/a.md", "chunk_index": 0,
-                     "content": "长切片正文" * 100, "score": 9.5,
-                     "token_count": 12}]
+            return [
+                {"doc_id": "abc:00000", "title": "手册 > 认证",
+                 "source": "/docs/a.md", "chunk_index": 0,
+                 "content": filler + "认证需提前 1 个工作日申请。",
+                 "score": 9.5, "token_count": 12},
+                {"doc_id": "abc:00001", "title": "手册 > 令牌",
+                 "source": "/docs/b.md", "chunk_index": 0,
+                 "content": filler + "令牌有效期为 7 天。",
+                 "score": 8.5, "token_count": 12},
+            ]
 
         def index_text(self, *args, **kwargs):
             raise AssertionError("reading mode must not index")
@@ -271,8 +315,10 @@ def test_doc_search_tool_reading_mode_bubbles_and_blocks_mutation(monkeypatch):
 
     r = tool.run(op="search", query="怎么认证")
     assert r.success
-    assert len(r.attachments) == 1 and r.attachments[0]["used"] is True
-    assert "长切片正文" in r.output            # 最高分切片进上下文
+    assert len(r.attachments) == 2
+    assert all(a["used"] for a in r.attachments)
+    assert "1 个工作日" in r.output       # 所有切片的核心句都注入
+    assert "7 天" in r.output
     assert "已注入上下文" in r.output
 
     r = tool.run(op="index", path="/docs/a.md")
